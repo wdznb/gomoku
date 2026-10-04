@@ -135,7 +135,7 @@ int VCFSearch::vcf_attack(Board& board, int color, int depth, int alpha, int bet
             return -100000 + depth;
         }
 
-        int score = -vcf_attack(board, color, depth - 1, -beta, -alpha, stop_flag);
+        int score = vcf_attack(board, color, depth - 1, alpha, beta, stop_flag);
 
         board.undo_last_move();
         board.undo_last_move();
@@ -209,8 +209,8 @@ VCFMove VCFSearch::search(const Board& board, int color, int max_depth,
 
         mutable_board.place_stone(block.pos.row, block.pos.col, block.color);
 
-        int score = -vcf_attack(mutable_board, color, max_depth - 1,
-                                -INT_MAX, -best_score, stop_flag);
+        int score = vcf_attack(mutable_board, color, max_depth - 1,
+                                -INT_MAX, INT_MAX, stop_flag);
 
         mutable_board.undo_last_move();
         mutable_board.undo_last_move();

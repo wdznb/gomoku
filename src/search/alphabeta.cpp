@@ -31,15 +31,17 @@ std::vector<Move> AlphaBetaSearch::generate_moves(const Board& board, int color)
 
 void AlphaBetaSearch::sort_moves(std::vector<Move>& moves, const Board& board, int color,
                                   const Move& tt_move) {
+    bool tt_swapped = false;
     if (tt_move.pos.is_valid()) {
         auto it = std::find_if(moves.begin(), moves.end(),
             [&](const Move& m) { return m.pos.row == tt_move.pos.row && m.pos.col == tt_move.pos.col; });
         if (it != moves.begin() && it != moves.end()) {
             std::iter_swap(moves.begin(), it);
+            tt_swapped = true;
         }
     }
 
-    std::sort(moves.begin() + (tt_move.pos.is_valid() ? 1 : 0), moves.end(),
+    std::sort(moves.begin() + (tt_swapped ? 1 : 0), moves.end(),
               [&](const Move& a, const Move& b) {
         int sa = evaluator_.evaluate_position_both(board, a.pos.row, a.pos.col, color);
         int sb = evaluator_.evaluate_position_both(board, b.pos.row, b.pos.col, color);
@@ -72,6 +74,9 @@ int AlphaBetaSearch::quiescence(Board& board, int alpha, int beta, int color,
         }
 
         if (is_threat) {
+            if (color == BLACK && PatternRecognizer::is_forbidden(board, pos.row, pos.col, color)) {
+                continue;
+            }
             threat_moves.push_back(Move(pos.row, pos.col, color));
         }
     }

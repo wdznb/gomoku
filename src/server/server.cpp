@@ -317,7 +317,7 @@ void GameServer::handle_restart(std::shared_ptr<WebSocketSession> session) {
     response["type"] = "state_sync";
     response["board"] = board_to_json(game->board());
     response["current_turn"] = "black";
-    response["game_status"] = "playing";
+    response["game_status"] = "waiting";
     send_message(session, response);
 }
 
@@ -355,7 +355,11 @@ json GameServer::game_state_json(const GameManager& game) {
             break;
         case GameStatus::GAME_OVER:
             state["game_status"] = "game_over";
-            state["winner"] = game.winner() == BLACK ? "black" : "white";
+            if (game.winner() == EMPTY) {
+                state["winner"] = "draw";
+            } else {
+                state["winner"] = game.winner() == BLACK ? "black" : "white";
+            }
             break;
     }
     
