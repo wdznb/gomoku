@@ -49,37 +49,41 @@ Move VCFSearch::find_block_move(const Board& board, int row, int col, int color)
         int dc = DIRECTIONS[d][1];
 
         int count = 1;
-        int empty_r = -1, empty_c = -1;
-        int empty_count = 0;
 
+        // Find forward extent of consecutive stones of `color`
+        int fwd_r = row, fwd_c = col;
         for (int i = 1; i <= 4; ++i) {
             int r = row + i * dr;
             int c = col + i * dc;
             if (!board.is_valid(r, c)) break;
-            if (board.get(r, c) == color) count++;
-            else if (board.is_empty(r, c)) {
-                empty_r = r;
-                empty_c = c;
-                empty_count++;
-            }
+            if (board.get(r, c) == color) { count++; fwd_r = r; fwd_c = c; }
             else break;
         }
 
+        // Find backward extent of consecutive stones of `color`
+        int bwd_r = row, bwd_c = col;
         for (int i = 1; i <= 4; ++i) {
             int r = row - i * dr;
             int c = col - i * dc;
             if (!board.is_valid(r, c)) break;
-            if (board.get(r, c) == color) count++;
-            else if (board.is_empty(r, c)) {
-                empty_r = r;
-                empty_c = c;
-                empty_count++;
-            }
+            if (board.get(r, c) == color) { count++; bwd_r = r; bwd_c = c; }
             else break;
         }
 
-        if (count == 4 && empty_count == 1) {
-            return Move(empty_r, empty_c, opponent(color));
+        if (count >= 4) {
+            // Check the two endpoints of the consecutive group
+            int check_fwd_r = fwd_r + dr, check_fwd_c = fwd_c + dc;
+            int check_bwd_r = bwd_r - dr, check_bwd_c = bwd_c - dc;
+
+            bool fwd_open = board.is_valid(check_fwd_r, check_fwd_c) &&
+                            board.is_empty(check_fwd_r, check_fwd_c);
+            bool bwd_open = board.is_valid(check_bwd_r, check_bwd_c) &&
+                            board.is_empty(check_bwd_r, check_bwd_c);
+
+            if (fwd_open && !bwd_open)
+                return Move(check_fwd_r, check_fwd_c, opponent(color));
+            if (bwd_open && !fwd_open)
+                return Move(check_bwd_r, check_bwd_c, opponent(color));
         }
     }
 
