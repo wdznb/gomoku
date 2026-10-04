@@ -13,6 +13,7 @@ std::vector<Move> VCFSearch::generate_rush_fours(const Board& board, int color) 
 
     for (const auto& pos : candidates) {
         if (!board.is_empty(pos.row, pos.col)) continue;
+        if (color == BLACK && PatternRecognizer::is_forbidden(board, pos.row, pos.col, color)) continue;
 
         PositionPattern pattern = PatternRecognizer::recognize_position(board, pos.row, pos.col, color);
 

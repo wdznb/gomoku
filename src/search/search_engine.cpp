@@ -75,13 +75,10 @@ SearchResult SearchEngine::search(const Board& board, int color,
             return result;
         }
 
-        VCFMove vcf_opp = vcf.search(board, opp, vcf_max_depth_, stop_flag);
-        if (vcf_opp.result == VCFResult::WIN) {
-            result.best_move = Move(vcf_opp.best_move.pos, color);
-            result.score = -50000;
-            result.method = "vcf_defense";
-            return result;
-        }
+        // Note: opponent VCF defense is handled by alphabeta search below.
+        // The opponent's VCF best_move is the attacker's own stone position,
+        // which cannot be used as our defense move. The alphabeta search
+        // will naturally find the best defensive move.
     }
 
     if (vct_enabled_ && !stop_flag.load()) {

@@ -13,6 +13,7 @@ std::vector<Move> VCTSearch::generate_attacks(const Board& board, int color) {
 
     for (const auto& pos : candidates) {
         if (!board.is_empty(pos.row, pos.col)) continue;
+        if (color == BLACK && PatternRecognizer::is_forbidden(board, pos.row, pos.col, color)) continue;
 
         PositionPattern pattern = PatternRecognizer::recognize_position(board, pos.row, pos.col, color);
 
@@ -145,8 +146,7 @@ int VCTSearch::vct_defend(Board& board, int color, int depth, int alpha, int bet
             int score = vct_attack(board, color, depth - 1, alpha, beta, stop_flag);
             board.undo_last_move();
             worst_for_attacker = std::min(worst_for_attacker, score);
-            beta = std::min(beta, worst_for_attacker);
-            if (alpha >= beta) break;
+            if (worst_for_attacker <= alpha) break;
         }
 
         board.undo_last_move();
@@ -207,8 +207,8 @@ int VCTSearch::vct_attack(Board& board, int color, int depth, int alpha, int bet
             
             if (board.has_five_in_a_row(def.pos.row, def.pos.col, def.color)) {
                 board.undo_last_move();
-                worst_for_attacker = -100000 - depth;
-                break;
+                board.undo_last_move();
+                return -100000 - depth;
             }
             
             int score = vct_defend(board, color, depth - 1, alpha, beta, stop_flag);
