@@ -153,22 +153,18 @@ PatternType PatternRecognizer::match_pattern(int window_code, bool /*is_center*/
                 return PatternType::SLEEPY_THREE;
             }
         } else {
-            bool can_extend_left = false;
-            bool can_extend_right = false;
+            bool can_live_four_left = false;
+            bool can_live_four_right = false;
             
-            if (left_pos >= 0 && cells[left_pos] == 0) {
-                if (left_pos - 1 >= 0 && cells[left_pos - 1] == 0) {
-                    can_extend_left = true;
-                }
+            if (left_pos >= 0 && cells[left_pos] == 0 && left_pos > 0) {
+                can_live_four_left = true;
             }
             
-            if (right_pos <= 8 && cells[right_pos] == 0) {
-                if (right_pos + 1 <= 8 && cells[right_pos + 1] == 0) {
-                    can_extend_right = true;
-                }
+            if (right_pos <= 8 && cells[right_pos] == 0 && right_pos < 8) {
+                can_live_four_right = true;
             }
             
-            if (can_extend_left || can_extend_right) {
+            if (can_live_four_left || can_live_four_right) {
                 return PatternType::LIVE_THREE;
             } else {
                 return PatternType::SLEEPY_THREE;
