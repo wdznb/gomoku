@@ -239,14 +239,6 @@ void GameServer::handle_make_move(std::shared_ptr<WebSocketSession> session, con
         send_error(session, "Invalid move");
         return;
     }
-    
-    if (game->status() == GameStatus::GAME_OVER) {
-        json response;
-        response["type"] = "game_over";
-        response["winner"] = game->winner() == BLACK ? "black" : "white";
-        response["reason"] = "five";
-        send_message(session, response);
-    }
 }
 
 void GameServer::handle_undo(std::shared_ptr<WebSocketSession> session) {

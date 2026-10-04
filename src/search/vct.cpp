@@ -72,7 +72,7 @@ std::vector<Move> VCTSearch::generate_defenses(const Board& board, int color,
         for (const auto& pos : candidates) {
             if (!board.is_empty(pos.row, pos.col)) continue;
             int dist = std::abs(pos.row - attack_row) + std::abs(pos.col - attack_col);
-            if (dist <= 3) {
+            if (dist <= 4) {
                 int score = evaluator_.evaluate_position(board, pos.row, pos.col, opp);
                 scored_defenses.emplace_back(score, Move(pos.row, pos.col, opp));
             }
@@ -135,6 +135,12 @@ int VCTSearch::vct_defend(Board& board, int color, int depth, int alpha, int bet
         int worst_for_attacker = INT_MAX;
         for (const auto& def : defenses) {
             board.place_stone(def.pos.row, def.pos.col, def.color);
+            
+            if (board.has_five_in_a_row(def.pos.row, def.pos.col, def.color)) {
+                board.undo_last_move();
+                return -100000 - depth;
+            }
+            
             int score = vct_attack(board, color, depth - 1, alpha, beta, stop_flag);
             board.undo_last_move();
             worst_for_attacker = std::min(worst_for_attacker, score);
@@ -197,6 +203,13 @@ int VCTSearch::vct_attack(Board& board, int color, int depth, int alpha, int bet
         int worst_for_attacker = INT_MAX;
         for (const auto& def : defenses) {
             board.place_stone(def.pos.row, def.pos.col, def.color);
+            
+            if (board.has_five_in_a_row(def.pos.row, def.pos.col, def.color)) {
+                board.undo_last_move();
+                worst_for_attacker = -100000 - depth;
+                break;
+            }
+            
             int score = vct_defend(board, color, depth - 1, alpha, beta, stop_flag);
             board.undo_last_move();
             worst_for_attacker = std::min(worst_for_attacker, score);

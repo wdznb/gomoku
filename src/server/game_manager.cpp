@@ -99,6 +99,8 @@ bool GameManager::undo() {
 void GameManager::resign(int color) {
     if (status_ == GameStatus::GAME_OVER) return;
     
+    stop_thinking();
+    
     winner_ = opponent(color);
     game_over_reason_ = "resign";
     status_ = GameStatus::GAME_OVER;

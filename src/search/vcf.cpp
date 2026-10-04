@@ -129,6 +129,12 @@ int VCFSearch::vcf_attack(Board& board, int color, int depth, int alpha, int bet
 
         board.place_stone(block.pos.row, block.pos.col, block.color);
 
+        if (board.has_five_in_a_row(block.pos.row, block.pos.col, block.color)) {
+            board.undo_last_move();
+            board.undo_last_move();
+            return -100000 + depth;
+        }
+
         int score = -vcf_attack(board, color, depth - 1, -beta, -alpha, stop_flag);
 
         board.undo_last_move();
