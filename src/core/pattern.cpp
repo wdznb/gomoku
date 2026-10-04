@@ -168,7 +168,7 @@ PatternType PatternRecognizer::match_pattern(int window_code, bool /*is_center*/
                 }
             }
             
-            if (can_extend_left || can_extend_right) {
+            if (has_left_space && has_right_space && (can_extend_left || can_extend_right)) {
                 return PatternType::LIVE_THREE;
             } else {
                 return PatternType::SLEEPY_THREE;
