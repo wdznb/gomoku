@@ -100,6 +100,12 @@ void GameManager::resign(int color) {
     if (status_ == GameStatus::GAME_OVER) return;
     
     stop_thinking();
+    if (search_thread_ && search_thread_->joinable()) {
+        search_thread_->join();
+    }
+    if (hint_thread_ && hint_thread_->joinable()) {
+        hint_thread_->join();
+    }
     
     winner_ = opponent(color);
     game_over_reason_ = "resign";
@@ -134,8 +140,6 @@ void GameManager::request_hint(int timeout_ms, int max_depth) {
 }
 
 void GameManager::start_ai_thinking(int timeout_ms, int max_depth) {
-    if (ai_thinking_.load()) return;
-    
     stop_thinking();
     if (search_thread_ && search_thread_->joinable()) {
         search_thread_->join();
@@ -159,7 +163,6 @@ void GameManager::start_ai_thinking() {
 
 void GameManager::stop_thinking() {
     stop_flag_.store(true);
-    ai_thinking_.store(false);
 }
 
 void GameManager::ai_thinking_worker(int timeout_ms, int max_depth) {

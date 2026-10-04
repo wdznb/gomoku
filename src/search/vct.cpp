@@ -287,6 +287,13 @@ VCTMove VCTSearch::search(const Board& board, int color, int max_depth,
         int worst = INT_MAX;
         for (const auto& def : defenses) {
             mutable_board.place_stone(def.pos.row, def.pos.col, def.color);
+            
+            if (mutable_board.has_five_in_a_row(def.pos.row, def.pos.col, def.color)) {
+                mutable_board.undo_last_move();
+                worst = -100000 - max_depth;
+                break;
+            }
+            
             int score = vct_defend(mutable_board, color, max_depth - 1,
                                    -INT_MAX, -best_score, stop_flag);
             mutable_board.undo_last_move();
