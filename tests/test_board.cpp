@@ -102,7 +102,7 @@ void test_active_empty() {
     Board board;
     
     size_t initial_size = board.active_empty().size();
-    assert(initial_size == 0);
+    assert(initial_size == BOARD_SIZE * BOARD_SIZE);
     
     board.place_stone(7, 7, BLACK);
     

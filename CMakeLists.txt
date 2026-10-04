@@ -5,16 +5,17 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-include(FetchContent)
-
 set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
 
-FetchContent_Declare(
-    json
-    URL https://github.com/nlohmann/json/archive/refs/tags/v3.11.2.tar.gz
-)
-
-FetchContent_MakeAvailable(json)
+find_package(nlohmann_json QUIET)
+if(NOT nlohmann_json_FOUND)
+    include(FetchContent)
+    FetchContent_Declare(
+        json
+        URL https://github.com/nlohmann/json/archive/refs/tags/v3.11.2.tar.gz
+    )
+    FetchContent_MakeAvailable(json)
+endif()
 
 find_package(Boost REQUIRED)
 find_package(Threads REQUIRED)
@@ -39,13 +40,13 @@ add_executable(gomoku_server ${GOMOKU_SOURCES})
 
 target_include_directories(gomoku_server PRIVATE
     ${CMAKE_SOURCE_DIR}/src
-    ${json_SOURCE_DIR}/include
     ${Boost_INCLUDE_DIRS}
 )
 
 target_link_libraries(gomoku_server PRIVATE
     ${Boost_LIBRARIES}
     Threads::Threads
+    nlohmann_json::nlohmann_json
 )
 
 if(UNIX)

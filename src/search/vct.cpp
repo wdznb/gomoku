@@ -8,7 +8,7 @@ VCTSearch::VCTSearch(const Evaluator& evaluator, TranspositionTable& tt)
     : evaluator_(evaluator), tt_(tt), node_limit_(500000), nodes_searched_(0) {}
 
 std::vector<Move> VCTSearch::generate_attacks(const Board& board, int color) {
-    std::vector<Move> moves;
+    std::vector<std::pair<int, Move>> scored_moves;
     const auto& candidates = board.active_empty();
 
     for (const auto& pos : candidates) {
@@ -27,23 +27,26 @@ std::vector<Move> VCTSearch::generate_attacks(const Board& board, int color) {
         }
 
         if (is_attack) {
-            moves.push_back(Move(pos.row, pos.col, color));
+            int score = evaluator_.evaluate_position(board, pos.row, pos.col, color);
+            scored_moves.emplace_back(score, Move(pos.row, pos.col, color));
         }
     }
 
-    std::sort(moves.begin(), moves.end(), [&](const Move& a, const Move& b) {
-        int sa = evaluator_.evaluate_position(board, a.pos.row, a.pos.col, color);
-        int sb = evaluator_.evaluate_position(board, b.pos.row, b.pos.col, color);
-        return sa > sb;
-    });
+    std::sort(scored_moves.begin(), scored_moves.end(),
+              [](const auto& a, const auto& b) { return a.first > b.first; });
 
+    std::vector<Move> moves;
+    moves.reserve(scored_moves.size());
+    for (auto& p : scored_moves) {
+        moves.push_back(std::move(p.second));
+    }
     return moves;
 }
 
 std::vector<Move> VCTSearch::generate_defenses(const Board& board, int color,
                                                  int attack_row, int attack_col) {
-    std::vector<Move> defenses;
     int opp = opponent(color);
+    std::vector<std::pair<int, Move>> scored_defenses;
     const auto& candidates = board.active_empty();
 
     for (const auto& pos : candidates) {
@@ -60,26 +63,30 @@ std::vector<Move> VCTSearch::generate_defenses(const Board& board, int color,
         }
 
         if (is_threat) {
-            defenses.push_back(Move(pos.row, pos.col, opp));
+            int score = evaluator_.evaluate_position(board, pos.row, pos.col, opp);
+            scored_defenses.emplace_back(score, Move(pos.row, pos.col, opp));
         }
     }
 
-    if (defenses.empty()) {
+    if (scored_defenses.empty()) {
         for (const auto& pos : candidates) {
             if (!board.is_empty(pos.row, pos.col)) continue;
             int dist = std::abs(pos.row - attack_row) + std::abs(pos.col - attack_col);
             if (dist <= 3) {
-                defenses.push_back(Move(pos.row, pos.col, opp));
+                int score = evaluator_.evaluate_position(board, pos.row, pos.col, opp);
+                scored_defenses.emplace_back(score, Move(pos.row, pos.col, opp));
             }
         }
     }
 
-    std::sort(defenses.begin(), defenses.end(), [&](const Move& a, const Move& b) {
-        int sa = evaluator_.evaluate_position(board, a.pos.row, a.pos.col, opponent(color));
-        int sb = evaluator_.evaluate_position(board, b.pos.row, b.pos.col, opponent(color));
-        return sa > sb;
-    });
+    std::sort(scored_defenses.begin(), scored_defenses.end(),
+              [](const auto& a, const auto& b) { return a.first > b.first; });
 
+    std::vector<Move> defenses;
+    defenses.reserve(scored_defenses.size());
+    for (auto& p : scored_defenses) {
+        defenses.push_back(std::move(p.second));
+    }
     return defenses;
 }
 

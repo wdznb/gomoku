@@ -57,6 +57,7 @@ void WebSocketSession::do_read() {
 }
 
 void WebSocketSession::send(const json& msg) {
+    std::lock_guard<std::mutex> lock(send_mutex_);
     bool write_in_progress = !send_queue_.empty();
     send_queue_.push(msg.dump());
     if (!write_in_progress) {
@@ -79,6 +80,7 @@ void WebSocketSession::do_write() {
                 std::cerr << "WebSocket write error: " << ec.message() << std::endl;
                 return;
             }
+            std::lock_guard<std::mutex> lock(self->send_mutex_);
             self->send_queue_.pop();
             self->do_write();
         });
@@ -215,7 +217,7 @@ void GameServer::handle_choose_side(std::shared_ptr<WebSocketSession> session, c
     send_message(session, response);
     
     if (game->current_turn() == game->ai_color()) {
-        game->start_ai_thinking(5000, 6);
+        game->start_ai_thinking();
     }
 }
 
@@ -245,7 +247,7 @@ void GameServer::handle_make_move(std::shared_ptr<WebSocketSession> session, con
         response["reason"] = "five";
         send_message(session, response);
     } else if (game->current_turn() == game->ai_color()) {
-        game->start_ai_thinking(5000, 6);
+        game->start_ai_thinking();
     }
 }
 
@@ -301,7 +303,14 @@ void GameServer::handle_stop_thinking(std::shared_ptr<WebSocketSession> session)
 }
 
 void GameServer::handle_set_config(std::shared_ptr<WebSocketSession> session, const json& msg) {
-    // Config is now per-request, not stored
+    std::lock_guard<std::mutex> lock(games_mutex_);
+    auto it = games_.find(session.get());
+    if (it == games_.end()) return;
+    
+    auto& game = it->second;
+    int timeout_ms = msg.value("timeout_ms", 5000);
+    int max_depth = msg.value("max_depth", 8);
+    game->set_config(timeout_ms, max_depth);
 }
 
 void GameServer::handle_restart(std::shared_ptr<WebSocketSession> session) {

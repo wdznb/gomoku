@@ -45,6 +45,7 @@ void Board::reset() {
     zobrist_hash_ = 0;
     has_neighbor_.fill(false);
     active_empty_.clear();
+    rebuild_active_empty();
 }
 
 bool Board::place_stone(int row, int col, int color) {

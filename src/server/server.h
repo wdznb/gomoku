@@ -38,6 +38,7 @@ private:
     beast::flat_buffer buffer_;
     std::queue<std::string> send_queue_;
     bool is_writing_ = false;
+    std::mutex send_mutex_;
     
     void do_read();
     void do_write();

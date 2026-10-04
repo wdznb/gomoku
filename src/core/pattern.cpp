@@ -192,7 +192,7 @@ PatternType PatternRecognizer::match_pattern(int window_code, bool /*is_center*/
         } else if (left_open || right_open) {
             return PatternType::SLEEPY_TWO;
         } else {
-            return PatternType::SLEEPY_TWO;
+            return PatternType::NONE;
         }
     }
     

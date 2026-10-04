@@ -65,7 +65,7 @@ SearchResult SearchEngine::search(const Board& board, int color,
     }
 
     if (vcf_enabled_ && !stop_flag.load()) {
-        VCFSearch vcf(evaluator_, tt_);
+        VCFSearch vcf(evaluator_, tt_vcf_);
         VCFMove vcf_result = vcf.search(board, color, vcf_max_depth_, stop_flag);
         if (vcf_result.result == VCFResult::WIN) {
             result.best_move = vcf_result.best_move;
@@ -85,7 +85,7 @@ SearchResult SearchEngine::search(const Board& board, int color,
     }
 
     if (vct_enabled_ && !stop_flag.load()) {
-        VCTSearch vct(evaluator_, tt_);
+        VCTSearch vct(evaluator_, tt_vct_);
         VCTMove vct_result = vct.search(board, color, vct_max_depth_, stop_flag);
         if (vct_result.result == VCTResult::WIN) {
             result.best_move = vct_result.best_move;
@@ -97,7 +97,7 @@ SearchResult SearchEngine::search(const Board& board, int color,
     }
 
     if (alphabeta_enabled_ && !stop_flag.load()) {
-        AlphaBetaSearch ab(evaluator_, tt_);
+        AlphaBetaSearch ab(evaluator_, tt_alphabeta_);
         int remaining_time = time_limit_ms;
         auto elapsed = std::chrono::high_resolution_clock::now() - start;
         int used_ms = static_cast<int>(

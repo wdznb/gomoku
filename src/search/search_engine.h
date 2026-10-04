@@ -47,12 +47,14 @@ public:
 
     void set_coefficients(const ThreatCoefficients& coeffs);
 
-    TranspositionTable& transposition_table() { return tt_; }
+    TranspositionTable& transposition_table() { return tt_alphabeta_; }
 
 private:
     Evaluator evaluator_;
     GreedySearch greedy_;
-    TranspositionTable tt_;
+    TranspositionTable tt_vcf_;
+    TranspositionTable tt_vct_;
+    TranspositionTable tt_alphabeta_;
 
     bool vcf_enabled_;
     bool vct_enabled_;

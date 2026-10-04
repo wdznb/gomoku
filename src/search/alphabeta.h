@@ -49,7 +49,8 @@ private:
                    std::atomic<bool>& stop_flag);
 
     std::vector<Move> generate_moves(const Board& board, int color);
-    void sort_moves(std::vector<Move>& moves, const Board& board, int color);
+    void sort_moves(std::vector<Move>& moves, const Board& board, int color,
+                    const Move& tt_move = Move());
 
     bool is_timeout() const;
 };

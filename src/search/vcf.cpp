@@ -8,7 +8,7 @@ VCFSearch::VCFSearch(const Evaluator& evaluator, TranspositionTable& tt)
     : evaluator_(evaluator), tt_(tt), node_limit_(1000000), nodes_searched_(0) {}
 
 std::vector<Move> VCFSearch::generate_rush_fours(const Board& board, int color) {
-    std::vector<Move> moves;
+    std::vector<std::pair<int, Move>> scored_moves;
     const auto& candidates = board.active_empty();
 
     for (const auto& pos : candidates) {
@@ -27,16 +27,18 @@ std::vector<Move> VCFSearch::generate_rush_fours(const Board& board, int color) 
 
         if (has_four) {
             int score = evaluator_.evaluate_position(board, pos.row, pos.col, color);
-            moves.push_back(Move(pos.row, pos.col, color));
+            scored_moves.emplace_back(score, Move(pos.row, pos.col, color));
         }
     }
 
-    std::sort(moves.begin(), moves.end(), [&](const Move& a, const Move& b) {
-        int sa = evaluator_.evaluate_position(board, a.pos.row, a.pos.col, color);
-        int sb = evaluator_.evaluate_position(board, b.pos.row, b.pos.col, color);
-        return sa > sb;
-    });
+    std::sort(scored_moves.begin(), scored_moves.end(),
+              [](const auto& a, const auto& b) { return a.first > b.first; });
 
+    std::vector<Move> moves;
+    moves.reserve(scored_moves.size());
+    for (auto& p : scored_moves) {
+        moves.push_back(std::move(p.second));
+    }
     return moves;
 }
 

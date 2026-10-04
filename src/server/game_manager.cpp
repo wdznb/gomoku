@@ -130,6 +130,10 @@ void GameManager::start_ai_thinking(int timeout_ms, int max_depth) {
         &GameManager::ai_thinking_worker, this, timeout_ms, max_depth);
 }
 
+void GameManager::start_ai_thinking() {
+    start_ai_thinking(timeout_ms_, max_depth_);
+}
+
 void GameManager::stop_thinking() {
     stop_flag_.store(true);
     ai_thinking_.store(false);
@@ -138,19 +142,16 @@ void GameManager::stop_thinking() {
 void GameManager::ai_thinking_worker(int timeout_ms, int max_depth) {
     SearchResult result = engine_.search(board_, ai_color_, max_depth, timeout_ms, stop_flag_);
     
-    ai_thinking_.store(false);
-    
     if (move_callback_ && !stop_flag_.load() && result.best_move.pos.is_valid()) {
+        std::lock_guard<std::mutex> lock(thinking_mutex_);
         if (board_.place_stone(result.best_move.pos, ai_color_)) {
             move_callback_(result.best_move, result.score, result.elapsed_ms);
             
             check_game_over();
-            
-            if (status_ == GameStatus::PLAYING && current_turn() == ai_color_) {
-                start_ai_thinking(timeout_ms_, max_depth_);
-            }
         }
     }
+    
+    ai_thinking_.store(false);
 }
 
 void GameManager::check_game_over() {
@@ -180,6 +181,11 @@ void GameManager::check_game_over() {
 void GameManager::set_coefficients(const ThreatCoefficients& coeffs) {
     evaluator_.set_coefficients(coeffs);
     engine_.set_coefficients(coeffs);
+}
+
+void GameManager::set_config(int timeout_ms, int max_depth) {
+    timeout_ms_ = timeout_ms;
+    max_depth_ = max_depth;
 }
 
 }

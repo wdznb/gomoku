@@ -29,8 +29,18 @@ std::vector<Move> AlphaBetaSearch::generate_moves(const Board& board, int color)
     return moves;
 }
 
-void AlphaBetaSearch::sort_moves(std::vector<Move>& moves, const Board& board, int color) {
-    std::sort(moves.begin(), moves.end(), [&](const Move& a, const Move& b) {
+void AlphaBetaSearch::sort_moves(std::vector<Move>& moves, const Board& board, int color,
+                                  const Move& tt_move) {
+    if (tt_move.pos.is_valid()) {
+        auto it = std::find_if(moves.begin(), moves.end(),
+            [&](const Move& m) { return m.pos.row == tt_move.pos.row && m.pos.col == tt_move.pos.col; });
+        if (it != moves.begin() && it != moves.end()) {
+            std::iter_swap(moves.begin(), it);
+        }
+    }
+
+    std::sort(moves.begin() + (tt_move.pos.is_valid() ? 1 : 0), moves.end(),
+              [&](const Move& a, const Move& b) {
         int sa = evaluator_.evaluate_position_both(board, a.pos.row, a.pos.col, color);
         int sb = evaluator_.evaluate_position_both(board, b.pos.row, b.pos.col, color);
         return sa > sb;
@@ -105,10 +115,14 @@ int AlphaBetaSearch::alphabeta(Board& board, int depth, int alpha, int beta, int
 
     uint64_t hash = board.zobrist_hash();
     const TTEntry* entry = tt_.lookup(hash);
+    Move tt_move;
     if (entry && entry->depth >= depth) {
         if (entry->flag == TTFlag::EXACT) return entry->value;
         if (entry->flag == TTFlag::LOWERBOUND && entry->value >= beta) return entry->value;
         if (entry->flag == TTFlag::UPPERBOUND && entry->value <= alpha) return entry->value;
+    }
+    if (entry) {
+        tt_move = entry->best_move;
     }
 
     int winner = board.check_winner();
@@ -123,7 +137,7 @@ int AlphaBetaSearch::alphabeta(Board& board, int depth, int alpha, int beta, int
     auto moves = generate_moves(board, color);
     if (moves.empty()) return evaluator_.evaluate_board(board, color);
 
-    sort_moves(moves, board, color);
+    sort_moves(moves, board, color, tt_move);
 
     Move best_move;
     int best_score = -INT_MAX;
@@ -152,7 +166,9 @@ int AlphaBetaSearch::alphabeta(Board& board, int depth, int alpha, int beta, int
         }
     }
 
-    tt_.store(hash, depth, best_score, best_move, flag);
+    if (best_score > -100000 && best_score < 100000) {
+        tt_.store(hash, depth, best_score, best_move, flag);
+    }
 
     return best_score;
 }

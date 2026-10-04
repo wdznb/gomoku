@@ -41,6 +41,7 @@ public:
     
     void request_hint(int timeout_ms, int max_depth);
     void start_ai_thinking(int timeout_ms, int max_depth);
+    void start_ai_thinking();
     void stop_thinking();
     
     bool is_ai_thinking() const { return ai_thinking_.load(); }
@@ -54,6 +55,7 @@ public:
     int winner() const { return winner_; }
     
     void set_coefficients(const ThreatCoefficients& coeffs);
+    void set_config(int timeout_ms, int max_depth);
     
 private:
     Board board_;
