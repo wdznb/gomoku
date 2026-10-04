@@ -138,6 +138,7 @@ int VCTSearch::vct_defend(Board& board, int color, int depth, int alpha, int bet
             
             if (board.has_five_in_a_row(def.pos.row, def.pos.col, def.color)) {
                 board.undo_last_move();
+                board.undo_last_move();
                 return -100000 - depth;
             }
             

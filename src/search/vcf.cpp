@@ -209,6 +209,12 @@ VCFMove VCFSearch::search(const Board& board, int color, int max_depth,
 
         mutable_board.place_stone(block.pos.row, block.pos.col, block.color);
 
+        if (mutable_board.has_five_in_a_row(block.pos.row, block.pos.col, block.color)) {
+            mutable_board.undo_last_move();
+            mutable_board.undo_last_move();
+            continue;
+        }
+
         int score = vcf_attack(mutable_board, color, max_depth - 1,
                                 -INT_MAX, INT_MAX, stop_flag);
 

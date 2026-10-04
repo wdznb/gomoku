@@ -233,13 +233,23 @@ CombinedPattern PatternRecognizer::recognize_combined(const Board& board, int ro
     combined.three_three = black_pattern.has_three_three || white_pattern.has_three_three;
     
     if (color == BLACK) {
-        if (black_pattern.has_three_three || black_pattern.has_four_four) {
-            combined.forbidden = true;
+        bool has_exact_five = false;
+        for (int d = 0; d < 4; ++d) {
+            if (black_pattern.directions[d].type == PatternType::FIVE) {
+                has_exact_five = true;
+                break;
+            }
         }
         
-        for (int d = 0; d < 4; ++d) {
-            if (black_pattern.directions[d].type == PatternType::LONG_FIVE) {
+        if (!has_exact_five) {
+            if (black_pattern.has_three_three || black_pattern.has_four_four) {
                 combined.forbidden = true;
+            }
+            
+            for (int d = 0; d < 4; ++d) {
+                if (black_pattern.directions[d].type == PatternType::LONG_FIVE) {
+                    combined.forbidden = true;
+                }
             }
         }
     }

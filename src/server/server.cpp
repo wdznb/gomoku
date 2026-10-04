@@ -390,7 +390,11 @@ void GameServer::setup_game_callbacks(std::shared_ptr<WebSocketSession> session,
     game.set_game_over_callback([this, session](int winner, const std::string& reason) {
         json msg;
         msg["type"] = "game_over";
-        msg["winner"] = winner == BLACK ? "black" : "white";
+        if (winner == EMPTY) {
+            msg["winner"] = "draw";
+        } else {
+            msg["winner"] = winner == BLACK ? "black" : "white";
+        }
         msg["reason"] = reason;
         send_message(session, msg);
     });
