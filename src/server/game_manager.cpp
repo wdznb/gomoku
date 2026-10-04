@@ -93,6 +93,10 @@ bool GameManager::undo() {
         game_over_reason_.clear();
     }
     
+    if (status_ == GameStatus::PLAYING && current_turn() == ai_color_) {
+        start_ai_thinking(timeout_ms_, max_depth_);
+    }
+    
     return true;
 }
 

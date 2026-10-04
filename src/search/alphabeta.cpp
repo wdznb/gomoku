@@ -115,6 +115,9 @@ int AlphaBetaSearch::alphabeta(Board& board, int depth, int alpha, int beta, int
                                 std::atomic<bool>& stop_flag) {
     nodes_searched_++;
     if (nodes_searched_ > node_limit_ || stop_flag.load() || is_timeout()) {
+        int winner = board.check_winner();
+        if (winner == color) return 100000 + depth;
+        if (winner == opponent(color)) return -100000 - depth;
         return evaluator_.evaluate_board(board, color);
     }
 
