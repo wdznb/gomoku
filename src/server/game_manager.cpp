@@ -85,9 +85,9 @@ bool GameManager::undo() {
     
     if (board_.move_count() == 0) {
         status_ = GameStatus::WAITING;
-    }
-    
-    if (status_ == GameStatus::GAME_OVER) {
+        winner_ = EMPTY;
+        game_over_reason_.clear();
+    } else if (status_ == GameStatus::GAME_OVER) {
         status_ = GameStatus::PLAYING;
         winner_ = EMPTY;
         game_over_reason_.clear();
