@@ -30,10 +30,13 @@ void GameManager::reset() {
     }
     search_thread_.reset();
     hint_thread_.reset();
-    board_.reset();
-    status_ = GameStatus::WAITING;
-    winner_ = EMPTY;
-    game_over_reason_.clear();
+    {
+        std::lock_guard<std::mutex> lock(thinking_mutex_);
+        board_.reset();
+        status_ = GameStatus::WAITING;
+        winner_ = EMPTY;
+        game_over_reason_.clear();
+    }
 }
 
 void GameManager::set_player_color(int color) {
@@ -172,9 +175,9 @@ void GameManager::stop_thinking() {
 void GameManager::ai_thinking_worker(int timeout_ms, int max_depth) {
     SearchResult result = engine_.search(board_, ai_color_, max_depth, timeout_ms, stop_flag_);
     
-    if (move_callback_ && !stop_flag_.load() && result.best_move.pos.is_valid()) {
+    if (move_callback_ && result.best_move.pos.is_valid()) {
         std::lock_guard<std::mutex> lock(thinking_mutex_);
-        if (board_.place_stone(result.best_move.pos, ai_color_)) {
+        if (!stop_flag_.load() && board_.place_stone(result.best_move.pos, ai_color_)) {
             move_callback_(result.best_move, result.score, result.elapsed_ms);
             
             check_game_over();
