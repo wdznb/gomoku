@@ -28,7 +28,7 @@ const TTEntry* TranspositionTable::lookup(uint64_t hash) const {
     size_t idx = index_for(hash);
     const TTEntry& entry = entries_[idx];
 
-    if (entry.hash == hash && entry.flag != TTFlag::NONE) {
+    if (entry.hash == hash && entry.flag != TTFlag::NONE && entry.age == current_age_) {
         return &entry;
     }
     return nullptr;
