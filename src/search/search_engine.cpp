@@ -1,0 +1,129 @@
+#include "search_engine.h"
+#include <chrono>
+
+namespace gomoku {
+
+SearchEngine::SearchEngine()
+    : vcf_enabled_(true), vct_enabled_(true), alphabeta_enabled_(true),
+      vcf_max_depth_(20), vct_max_depth_(12), alphabeta_max_depth_(8) {}
+
+SearchEngine::SearchEngine(const ThreatCoefficients& coeffs)
+    : evaluator_(coeffs), greedy_(coeffs),
+      vcf_enabled_(true), vct_enabled_(true), alphabeta_enabled_(true),
+      vcf_max_depth_(20), vct_max_depth_(12), alphabeta_max_depth_(8) {}
+
+void SearchEngine::set_coefficients(const ThreatCoefficients& coeffs) {
+    evaluator_.set_coefficients(coeffs);
+    greedy_.set_coefficients(coeffs);
+}
+
+SearchResult SearchEngine::search(const Board& board, int color,
+                                   int max_depth, int time_limit_ms,
+                                   std::atomic<bool>& stop_flag) {
+    auto start = std::chrono::high_resolution_clock::now();
+    SearchResult result;
+
+    auto root_moves = board.active_empty();
+    if (root_moves.empty()) {
+        result.best_move = Move(BOARD_SIZE / 2, BOARD_SIZE / 2, color);
+        result.method = "default";
+        return result;
+    }
+
+    if (root_moves.size() == 1) {
+        result.best_move = Move(root_moves[0], color);
+        result.method = "forced";
+        return result;
+    }
+
+    Move greedy_move = greedy_.search(board, color);
+
+    for (int d = 0; d < 4; ++d) {
+        PositionPattern pattern = PatternRecognizer::recognize_position(
+            board, greedy_move.pos.row, greedy_move.pos.col, color);
+        if (pattern.directions[d].type == PatternType::FIVE) {
+            result.best_move = greedy_move;
+            result.score = 100000;
+            result.method = "greedy_five";
+            return result;
+        }
+    }
+
+    int opp = opponent(color);
+    for (const auto& pos : root_moves) {
+        if (!board.is_empty(pos.row, pos.col)) continue;
+        PositionPattern pattern = PatternRecognizer::recognize_position(
+            board, pos.row, pos.col, opp);
+        for (int d = 0; d < 4; ++d) {
+            if (pattern.directions[d].type == PatternType::FIVE) {
+                result.best_move = Move(pos, color);
+                result.score = 99000;
+                result.method = "must_block";
+                return result;
+            }
+        }
+    }
+
+    if (vcf_enabled_ && !stop_flag.load()) {
+        VCFSearch vcf(evaluator_, tt_);
+        VCFMove vcf_result = vcf.search(board, color, vcf_max_depth_, stop_flag);
+        if (vcf_result.result == VCFResult::WIN) {
+            result.best_move = vcf_result.best_move;
+            result.score = 100000;
+            result.method = "vcf";
+            result.principal_variation = vcf_result.variation;
+            return result;
+        }
+
+        VCFMove vcf_opp = vcf.search(board, opp, vcf_max_depth_, stop_flag);
+        if (vcf_opp.result == VCFResult::WIN) {
+            result.best_move = greedy_move;
+            result.score = -50000;
+            result.method = "vcf_defense";
+        }
+    }
+
+    if (vct_enabled_ && !stop_flag.load()) {
+        VCTSearch vct(evaluator_, tt_);
+        VCTMove vct_result = vct.search(board, color, vct_max_depth_, stop_flag);
+        if (vct_result.result == VCTResult::WIN) {
+            result.best_move = vct_result.best_move;
+            result.score = 90000;
+            result.method = "vct";
+            result.principal_variation = vct_result.variation;
+            return result;
+        }
+    }
+
+    if (alphabeta_enabled_ && !stop_flag.load()) {
+        AlphaBetaSearch ab(evaluator_, tt_);
+        int remaining_time = time_limit_ms;
+        auto elapsed = std::chrono::high_resolution_clock::now() - start;
+        int used_ms = static_cast<int>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count());
+        remaining_time -= used_ms;
+        if (remaining_time < 100) remaining_time = 100;
+
+        int depth = (max_depth > 0) ? max_depth : alphabeta_max_depth_;
+        Move ab_move = ab.search(board, color, depth, remaining_time, stop_flag);
+
+        SearchInfo info = ab.last_search_info();
+        result.best_move = ab_move;
+        result.score = info.score;
+        result.depth = info.depth;
+        result.nodes_searched = info.nodes_searched;
+        result.method = "alphabeta";
+
+        if (progress_callback_) {
+            progress_callback_(info.depth, info.nodes_searched, info.elapsed_ms);
+        }
+
+        return result;
+    }
+
+    result.best_move = greedy_move;
+    result.method = "greedy";
+    return result;
+}
+
+}

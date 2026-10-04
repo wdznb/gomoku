@@ -25,6 +25,12 @@ set(GOMOKU_SOURCES
     src/core/pattern.cpp
     src/core/evaluator.cpp
     src/search/greedy.cpp
+    src/search/vcf.cpp
+    src/search/vct.cpp
+    src/search/alphabeta.cpp
+    src/search/search_engine.cpp
+    src/search/controller.cpp
+    src/optimization/transposition.cpp
     src/server/server.cpp
     src/server/game_manager.cpp
 )
@@ -82,3 +88,20 @@ add_executable(test_evaluator
 )
 target_include_directories(test_evaluator PRIVATE ${CMAKE_SOURCE_DIR}/src)
 add_test(NAME test_evaluator COMMAND test_evaluator)
+
+add_executable(test_search
+    tests/test_search.cpp
+    src/core/board.cpp
+    src/core/pattern.cpp
+    src/core/evaluator.cpp
+    src/search/greedy.cpp
+    src/search/vcf.cpp
+    src/search/vct.cpp
+    src/search/alphabeta.cpp
+    src/search/search_engine.cpp
+    src/search/controller.cpp
+    src/optimization/transposition.cpp
+)
+target_include_directories(test_search PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_search PRIVATE Threads::Threads)
+add_test(NAME test_search COMMAND test_search)

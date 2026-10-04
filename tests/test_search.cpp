@@ -1,0 +1,306 @@
+#include "core/board.h"
+#include "core/pattern.h"
+#include "core/evaluator.h"
+#include "search/greedy.h"
+#include "search/vcf.h"
+#include "search/vct.h"
+#include "search/alphabeta.h"
+#include "search/search_engine.h"
+#include "search/controller.h"
+#include "optimization/transposition.h"
+#include <iostream>
+#include <cassert>
+#include <atomic>
+#include <thread>
+#include <chrono>
+
+using namespace gomoku;
+
+void test_transposition_table() {
+    TranspositionTable tt(1024);
+    assert(tt.size() == 1024);
+
+    Move m(7, 7, BLACK);
+    tt.store(12345, 3, 500, m, TTFlag::EXACT);
+
+    const TTEntry* entry = tt.lookup(12345);
+    assert(entry != nullptr);
+    assert(entry->hash == 12345);
+    assert(entry->depth == 3);
+    assert(entry->value == 500);
+    assert(entry->flag == TTFlag::EXACT);
+
+    const TTEntry* miss = tt.lookup(99999);
+    assert(miss == nullptr);
+
+    std::cout << "test_transposition_table passed" << std::endl;
+}
+
+void test_transposition_aging() {
+    TranspositionTable tt(1024);
+
+    Move m1(7, 7, BLACK);
+    tt.store(100, 2, 300, m1, TTFlag::EXACT);
+    tt.new_search();
+
+    Move m2(7, 8, WHITE);
+    tt.store(100, 1, 200, m2, TTFlag::LOWERBOUND);
+
+    const TTEntry* entry = tt.lookup(100);
+    assert(entry != nullptr);
+    assert(entry->value == 200);
+    assert(entry->depth == 1);
+
+    std::cout << "test_transposition_aging passed" << std::endl;
+}
+
+void test_vcf_immediate_five() {
+    Board board;
+    Evaluator evaluator;
+    TranspositionTable tt;
+
+    board.place_stone(7, 3, BLACK);
+    board.place_stone(7, 4, BLACK);
+    board.place_stone(7, 5, BLACK);
+    board.place_stone(7, 6, BLACK);
+
+    VCFSearch vcf(evaluator, tt);
+    std::atomic<bool> stop(false);
+
+    VCFMove result = vcf.search(board, BLACK, 10, stop);
+    assert(result.result == VCFResult::WIN);
+    assert(result.best_move.pos.row == 7);
+    assert(result.best_move.pos.col == 2 || result.best_move.pos.col == 7);
+
+    std::cout << "test_vcf_immediate_five passed" << std::endl;
+}
+
+void test_vcf_no_win() {
+    Board board;
+    Evaluator evaluator;
+    TranspositionTable tt;
+
+    board.place_stone(7, 5, BLACK);
+    board.place_stone(7, 6, BLACK);
+
+    VCFSearch vcf(evaluator, tt);
+    vcf.set_node_limit(10000);
+    std::atomic<bool> stop(false);
+
+    VCFMove result = vcf.search(board, BLACK, 6, stop);
+    assert(result.result != VCFResult::WIN);
+
+    std::cout << "test_vcf_no_win passed" << std::endl;
+}
+
+void test_vct_immediate_win() {
+    Board board;
+    Evaluator evaluator;
+    TranspositionTable tt;
+
+    board.place_stone(7, 4, BLACK);
+    board.place_stone(7, 5, BLACK);
+    board.place_stone(7, 6, BLACK);
+
+    VCTSearch vct(evaluator, tt);
+    std::atomic<bool> stop(false);
+
+    VCTMove result = vct.search(board, BLACK, 6, stop);
+    assert(result.result == VCTResult::WIN);
+
+    std::cout << "test_vct_immediate_win passed" << std::endl;
+}
+
+void test_alphabeta_basic() {
+    Board board;
+    Evaluator evaluator;
+    TranspositionTable tt;
+
+    board.place_stone(7, 7, BLACK);
+
+    AlphaBetaSearch ab(evaluator, tt);
+    std::atomic<bool> stop(false);
+
+    Move result = ab.search(board, WHITE, 2, 3000, stop);
+    assert(result.pos.is_valid());
+    assert(board.is_empty(result.pos.row, result.pos.col));
+
+    SearchInfo info = ab.last_search_info();
+    assert(info.depth >= 1);
+    assert(info.nodes_searched > 0);
+
+    std::cout << "test_alphabeta_basic passed (depth: " << info.depth
+              << ", nodes: " << info.nodes_searched << ")" << std::endl;
+}
+
+void test_alphabeta_blocks_five() {
+    Board board;
+    Evaluator evaluator;
+    TranspositionTable tt;
+
+    board.place_stone(7, 3, BLACK);
+    board.place_stone(7, 4, BLACK);
+    board.place_stone(7, 5, BLACK);
+    board.place_stone(7, 6, BLACK);
+
+    AlphaBetaSearch ab(evaluator, tt);
+    std::atomic<bool> stop(false);
+
+    Move result = ab.search(board, WHITE, 2, 3000, stop);
+    assert(result.pos.row == 7);
+    assert(result.pos.col == 2 || result.pos.col == 7);
+
+    std::cout << "test_alphabeta_blocks_five passed" << std::endl;
+}
+
+void test_alphabeta_takes_winning() {
+    Board board;
+    Evaluator evaluator;
+    TranspositionTable tt;
+
+    board.place_stone(7, 3, WHITE);
+    board.place_stone(7, 4, WHITE);
+    board.place_stone(7, 5, WHITE);
+    board.place_stone(7, 6, WHITE);
+
+    AlphaBetaSearch ab(evaluator, tt);
+    std::atomic<bool> stop(false);
+
+    Move result = ab.search(board, WHITE, 2, 3000, stop);
+    assert(result.pos.row == 7);
+    assert(result.pos.col == 2 || result.pos.col == 7);
+
+    std::cout << "test_alphabeta_takes_winning passed" << std::endl;
+}
+
+void test_search_engine_layered() {
+    Board board;
+    SearchEngine engine;
+
+    board.place_stone(7, 7, BLACK);
+
+    std::atomic<bool> stop(false);
+    SearchResult result = engine.search(board, WHITE, 4, 3000, stop);
+
+    assert(result.best_move.pos.is_valid());
+    assert(!result.method.empty());
+
+    std::cout << "test_search_engine_layered passed (method: " << result.method << ")" << std::endl;
+}
+
+void test_search_engine_finds_five() {
+    Board board;
+    SearchEngine engine;
+
+    board.place_stone(7, 3, BLACK);
+    board.place_stone(7, 4, BLACK);
+    board.place_stone(7, 5, BLACK);
+    board.place_stone(7, 6, BLACK);
+
+    std::atomic<bool> stop(false);
+    SearchResult result = engine.search(board, BLACK, 4, 3000, stop);
+
+    assert(result.best_move.pos.row == 7);
+    assert(result.best_move.pos.col == 2 || result.best_move.pos.col == 7);
+    assert(result.score >= 99000);
+
+    std::cout << "test_search_engine_finds_five passed (method: " << result.method << ")" << std::endl;
+}
+
+void test_controller_async() {
+    Board board;
+    SearchController controller;
+
+    board.place_stone(7, 7, BLACK);
+
+    std::atomic<bool> done(false);
+    controller.set_completion_callback([&](SearchResult result) {
+        assert(result.best_move.pos.is_valid());
+        done.store(true);
+    });
+
+    controller.start_search(board, WHITE, 4, 2000);
+
+    int wait_count = 0;
+    while (!done.load() && wait_count < 50) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        wait_count++;
+    }
+
+    assert(done.load());
+    assert(!controller.is_thinking());
+
+    std::cout << "test_controller_async passed" << std::endl;
+}
+
+void test_controller_stop() {
+    Board board;
+    SearchController controller;
+
+    board.place_stone(7, 7, BLACK);
+    board.place_stone(7, 8, WHITE);
+    board.place_stone(6, 7, BLACK);
+
+    controller.start_search(board, WHITE, 10, 30000);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    controller.stop();
+
+    int wait_count = 0;
+    while (controller.is_thinking() && wait_count < 50) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        wait_count++;
+    }
+
+    assert(!controller.is_thinking());
+
+    std::cout << "test_controller_stop passed" << std::endl;
+}
+
+void test_forced_move() {
+    Board board;
+    SearchEngine engine;
+
+    board.place_stone(7, 7, BLACK);
+
+    for (int r = 0; r < BOARD_SIZE; ++r) {
+        for (int c = 0; c < BOARD_SIZE; ++c) {
+            if (board.is_empty(r, c)) {
+                int dist = std::abs(r - 7) + std::abs(c - 7);
+                if (dist > 2) {
+                    board.place_stone(r, c, (r + c) % 2 == 0 ? BLACK : WHITE);
+                }
+            }
+        }
+    }
+
+    std::atomic<bool> stop(false);
+    SearchResult result = engine.search(board, BLACK, 4, 3000, stop);
+
+    assert(result.best_move.pos.is_valid());
+
+    std::cout << "test_forced_move passed" << std::endl;
+}
+
+int main() {
+    std::cout << "Running search tests..." << std::endl;
+
+    PatternRecognizer::init();
+
+    test_transposition_table();
+    test_transposition_aging();
+    test_vcf_immediate_five();
+    test_vcf_no_win();
+    test_vct_immediate_win();
+    test_alphabeta_basic();
+    test_alphabeta_blocks_five();
+    test_alphabeta_takes_winning();
+    test_search_engine_layered();
+    test_search_engine_finds_five();
+    test_controller_async();
+    test_controller_stop();
+    test_forced_move();
+
+    std::cout << "All search tests passed!" << std::endl;
+    return 0;
+}

@@ -75,6 +75,12 @@ else
         ../src/core/pattern.cpp \
         ../src/core/evaluator.cpp \
         ../src/search/greedy.cpp \
+        ../src/search/vcf.cpp \
+        ../src/search/vct.cpp \
+        ../src/search/alphabeta.cpp \
+        ../src/search/search_engine.cpp \
+        ../src/search/controller.cpp \
+        ../src/optimization/transposition.cpp \
         ../src/server/server.cpp \
         ../src/server/game_manager.cpp \
         -o gomoku_server \
