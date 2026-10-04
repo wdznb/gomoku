@@ -52,6 +52,7 @@ std::vector<Move> VCTSearch::generate_defenses(const Board& board, int color,
 
     for (const auto& pos : candidates) {
         if (!board.is_empty(pos.row, pos.col)) continue;
+        if (opp == BLACK && PatternRecognizer::is_forbidden(board, pos.row, pos.col, opp)) continue;
 
         PositionPattern pattern = PatternRecognizer::recognize_position(board, pos.row, pos.col, opp);
         bool is_threat = false;
@@ -72,6 +73,7 @@ std::vector<Move> VCTSearch::generate_defenses(const Board& board, int color,
     if (scored_defenses.empty()) {
         for (const auto& pos : candidates) {
             if (!board.is_empty(pos.row, pos.col)) continue;
+            if (opp == BLACK && PatternRecognizer::is_forbidden(board, pos.row, pos.col, opp)) continue;
             int dist = std::abs(pos.row - attack_row) + std::abs(pos.col - attack_col);
             if (dist <= 4) {
                 int score = evaluator_.evaluate_position(board, pos.row, pos.col, opp);
@@ -100,7 +102,7 @@ int VCTSearch::vct_defend(Board& board, int color, int depth, int alpha, int bet
     auto attacks = generate_attacks(board, color);
     if (attacks.empty()) return 0;
 
-    int best_score = -INT_MAX;
+    int best_score = INT_MAX;
 
     for (const auto& move : attacks) {
         if (stop_flag.load()) break;
@@ -151,14 +153,14 @@ int VCTSearch::vct_defend(Board& board, int color, int depth, int alpha, int bet
             int score = vct_attack(board, color, depth - 1, alpha, beta, stop_flag);
             board.undo_last_move();
             worst_for_attacker = std::min(worst_for_attacker, score);
-            if (worst_for_attacker <= alpha) break;
+            if (worst_for_attacker <= -100000) break;
         }
 
         board.undo_last_move();
 
-        best_score = std::max(best_score, worst_for_attacker);
-        alpha = std::max(alpha, best_score);
-        if (alpha >= beta) break;
+        best_score = std::min(best_score, worst_for_attacker);
+        beta = std::min(beta, best_score);
+        if (beta <= alpha) break;
     }
 
     return best_score;
@@ -314,7 +316,7 @@ VCTMove VCTSearch::search(const Board& board, int color, int max_depth,
             }
             
             int score = vct_defend(mutable_board, color, max_depth - 1,
-                                   -INT_MAX, -best_score, stop_flag);
+                                   -INT_MAX, INT_MAX, stop_flag);
             mutable_board.undo_last_move();
             worst = std::min(worst, score);
         }

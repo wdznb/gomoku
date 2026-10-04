@@ -133,6 +133,11 @@ int VCFSearch::vcf_attack(Board& board, int color, int depth, int alpha, int bet
             continue;
         }
 
+        if (block.color == BLACK && PatternRecognizer::is_forbidden(board, block.pos.row, block.pos.col, block.color)) {
+            board.undo_last_move();
+            return 100000 + depth;
+        }
+
         board.place_stone(block.pos.row, block.pos.col, block.color);
 
         if (board.has_five_in_a_row(block.pos.row, block.pos.col, block.color)) {
@@ -219,6 +224,14 @@ VCFMove VCFSearch::search(const Board& board, int color, int max_depth,
         if (block.pos.row < 0) {
             mutable_board.undo_last_move();
             continue;
+        }
+
+        if (block.color == BLACK && PatternRecognizer::is_forbidden(mutable_board, block.pos.row, block.pos.col, block.color)) {
+            mutable_board.undo_last_move();
+            result.result = VCFResult::WIN;
+            result.best_move = move;
+            result.variation.push_back(move);
+            return result;
         }
 
         mutable_board.place_stone(block.pos.row, block.pos.col, block.color);
