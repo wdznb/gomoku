@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>五子棋 AI</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <h1>五子棋 AI 深度思考系统</h1>
+        
+        <div class="game-area">
+            <div class="board-container">
+                <canvas id="board" width="600" height="600"></canvas>
+            </div>
+            
+            <div class="controls">
+                <div class="status-panel">
+                    <div id="status" class="status">等待开始</div>
+                    <div id="turn-info" class="turn-info"></div>
+                    <div id="thinking-info" class="thinking-info"></div>
+                </div>
+                
+                <div class="button-group">
+                    <h3>选边</h3>
+                    <button id="btn-black" class="btn">执黑先行</button>
+                    <button id="btn-white" class="btn">执白后行</button>
+                </div>
+                
+                <div class="button-group">
+                    <h3>操作</h3>
+                    <button id="btn-undo" class="btn" disabled>悔棋</button>
+                    <button id="btn-hint" class="btn" disabled>求招</button>
+                    <button id="btn-resign" class="btn" disabled>认输</button>
+                    <button id="btn-stop" class="btn btn-danger" disabled>终止思考</button>
+                    <button id="btn-restart" class="btn" disabled>重新开始</button>
+                </div>
+                
+                <div class="button-group">
+                    <h3>AI 设置</h3>
+                    <label>
+                        超时时间 (毫秒):
+                        <input type="number" id="timeout" value="5000" min="1000" max="60000">
+                    </label>
+                    <label>
+                        搜索深度:
+                        <input type="number" id="depth" value="8" min="2" max="20">
+                    </label>
+                </div>
+                
+                <div class="move-history">
+                    <h3>落子记录</h3>
+                    <div id="move-list" class="move-list"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <script src="app.js"></script>
+</body>
+</html>
