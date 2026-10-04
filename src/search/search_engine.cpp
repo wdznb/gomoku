@@ -52,6 +52,7 @@ SearchResult SearchEngine::search(const Board& board, int color,
     int opp = opponent(color);
     for (const auto& pos : root_moves) {
         if (!board.is_empty(pos.row, pos.col)) continue;
+        if (color == BLACK && PatternRecognizer::is_forbidden(board, pos.row, pos.col, color)) continue;
         PositionPattern pattern = PatternRecognizer::recognize_position(
             board, pos.row, pos.col, opp);
         for (int d = 0; d < 4; ++d) {
