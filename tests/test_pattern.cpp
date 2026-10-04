@@ -99,14 +99,64 @@ void test_white_no_forbidden() {
     std::cout << "test_white_no_forbidden passed" << std::endl;
 }
 
+void test_recognize_live_three() {
+    Board board;
+    
+    board.place_stone(7, 5, BLACK);
+    board.place_stone(7, 6, BLACK);
+    board.place_stone(7, 7, BLACK);
+    
+    PositionPattern pattern = PatternRecognizer::recognize_position(board, 7, 4, BLACK);
+    
+    bool has_live_three = false;
+    for (int d = 0; d < 4; ++d) {
+        if (pattern.directions[d].type == PatternType::LIVE_THREE) {
+            has_live_three = true;
+            break;
+        }
+    }
+    
+    assert(has_live_three);
+    std::cout << "test_recognize_live_three passed" << std::endl;
+}
+
+void test_five_not_forbidden() {
+    Board board;
+    
+    board.place_stone(7, 3, BLACK);
+    board.place_stone(7, 4, BLACK);
+    board.place_stone(7, 5, BLACK);
+    board.place_stone(7, 6, BLACK);
+    
+    board.place_stone(5, 7, BLACK);
+    board.place_stone(6, 7, BLACK);
+    
+    bool is_forbidden = PatternRecognizer::is_forbidden(board, 7, 7, BLACK);
+    assert(!is_forbidden);
+    
+    PositionPattern pattern = PatternRecognizer::recognize_position(board, 7, 7, BLACK);
+    bool has_five = false;
+    for (int d = 0; d < 4; ++d) {
+        if (pattern.directions[d].type == PatternType::FIVE) {
+            has_five = true;
+            break;
+        }
+    }
+    assert(has_five);
+    
+    std::cout << "test_five_not_forbidden passed" << std::endl;
+}
+
 int main() {
     std::cout << "Running pattern tests..." << std::endl;
     
     test_pattern_init();
     test_recognize_five();
     test_recognize_live_four();
+    test_recognize_live_three();
     test_combined_pattern();
     test_forbidden();
+    test_five_not_forbidden();
     test_white_no_forbidden();
     
     std::cout << "All pattern tests passed!" << std::endl;

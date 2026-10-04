@@ -70,6 +70,7 @@ private:
     
     std::atomic<bool> ai_thinking_;
     std::atomic<bool> stop_flag_;
+    std::atomic<bool> hint_active_;
     std::unique_ptr<std::thread> search_thread_;
     std::mutex thinking_mutex_;
     

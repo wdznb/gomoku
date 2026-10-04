@@ -246,8 +246,6 @@ void GameServer::handle_make_move(std::shared_ptr<WebSocketSession> session, con
         response["winner"] = game->winner() == BLACK ? "black" : "white";
         response["reason"] = "five";
         send_message(session, response);
-    } else if (game->current_turn() == game->ai_color()) {
-        game->start_ai_thinking();
     }
 }
 
@@ -261,6 +259,13 @@ void GameServer::handle_undo(std::shared_ptr<WebSocketSession> session) {
         json response;
         response["type"] = "undo_success";
         response["move_count"] = game->board().move_count();
+        if (game->status() == GameStatus::GAME_OVER) {
+            response["game_status"] = "game_over";
+        } else if (game->status() == GameStatus::WAITING) {
+            response["game_status"] = "waiting";
+        } else {
+            response["game_status"] = "playing";
+        }
         send_message(session, response);
     } else {
         send_error(session, "Cannot undo");

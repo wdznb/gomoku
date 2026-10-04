@@ -6,7 +6,7 @@ namespace gomoku {
 GameManager::GameManager() 
     : player_color_(BLACK), ai_color_(WHITE),
       status_(GameStatus::WAITING), winner_(EMPTY),
-      ai_thinking_(false), stop_flag_(false),
+      ai_thinking_(false), stop_flag_(false), hint_active_(false),
       timeout_ms_(5000), max_depth_(8) {
 }
 
@@ -102,15 +102,21 @@ void GameManager::resign(int color) {
 }
 
 void GameManager::request_hint(int timeout_ms, int max_depth) {
-    if (ai_thinking_.load()) return;
+    if (ai_thinking_.load() || hint_active_.load()) return;
     
+    hint_active_.store(true);
     int turn = current_turn();
-    std::atomic<bool> dummy_stop(false);
-    SearchResult result = engine_.search(board_, turn, max_depth, timeout_ms, dummy_stop);
+    Board board_snapshot = board_;
     
-    if (move_callback_) {
-        move_callback_(result.best_move, result.score, 0);
-    }
+    std::thread([this, board_snapshot, turn, timeout_ms, max_depth]() mutable {
+        std::atomic<bool> dummy_stop(false);
+        SearchResult result = engine_.search(board_snapshot, turn, max_depth, timeout_ms, dummy_stop);
+        
+        if (move_callback_ && result.best_move.pos.is_valid()) {
+            move_callback_(result.best_move, result.score, 0);
+        }
+        hint_active_.store(false);
+    }).detach();
 }
 
 void GameManager::start_ai_thinking(int timeout_ms, int max_depth) {

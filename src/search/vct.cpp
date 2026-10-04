@@ -197,7 +197,7 @@ int VCTSearch::vct_attack(Board& board, int color, int depth, int alpha, int bet
         int worst_for_attacker = INT_MAX;
         for (const auto& def : defenses) {
             board.place_stone(def.pos.row, def.pos.col, def.color);
-            int score = vct_attack(board, color, depth - 1, alpha, beta, stop_flag);
+            int score = vct_defend(board, color, depth - 1, alpha, beta, stop_flag);
             board.undo_last_move();
             worst_for_attacker = std::min(worst_for_attacker, score);
             if (worst_for_attacker <= -100000) break;
@@ -274,7 +274,7 @@ VCTMove VCTSearch::search(const Board& board, int color, int max_depth,
         int worst = INT_MAX;
         for (const auto& def : defenses) {
             mutable_board.place_stone(def.pos.row, def.pos.col, def.color);
-            int score = vct_attack(mutable_board, color, max_depth - 1,
+            int score = vct_defend(mutable_board, color, max_depth - 1,
                                    -INT_MAX, -best_score, stop_flag);
             mutable_board.undo_last_move();
             worst = std::min(worst, score);

@@ -29,9 +29,7 @@ void PositionPattern::analyze() {
     for (int i = 0; i < 4; ++i) {
         PatternType t = directions[i].type;
         
-        if (t == PatternType::FIVE || t == PatternType::LONG_FIVE) {
-            four_count++;
-        } else if (t == PatternType::LIVE_FOUR) {
+        if (t == PatternType::LIVE_FOUR) {
             live_four_count++;
             four_count++;
         } else if (t == PatternType::RUSH_FOUR) {
@@ -137,8 +135,8 @@ PatternType PatternRecognizer::match_pattern(int window_code, bool /*is_center*/
     }
     
     if (total == 3) {
-        int left_pos = 4 - count_left;
-        int right_pos = 4 + count_right;
+        int left_pos = 4 - count_left - 1;
+        int right_pos = 4 + count_right + 1;
         
         bool has_left_space = (left_pos >= 0 && cells[left_pos] == 0);
         bool has_right_space = (right_pos <= 8 && cells[right_pos] == 0);
