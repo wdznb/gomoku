@@ -129,8 +129,10 @@ PatternType PatternRecognizer::match_pattern(int window_code, bool /*is_center*/
         
         if (left_end == 0 && right_end == 0) {
             return PatternType::LIVE_FOUR;
-        } else {
+        } else if (left_end == 0 || right_end == 0) {
             return PatternType::RUSH_FOUR;
+        } else {
+            return PatternType::NONE;
         }
     }
     

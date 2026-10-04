@@ -146,6 +146,30 @@ void test_five_not_forbidden() {
     std::cout << "test_five_not_forbidden passed" << std::endl;
 }
 
+void test_blocked_four_is_none() {
+    Board board;
+    
+    board.place_stone(7, 2, WHITE);
+    board.place_stone(7, 3, BLACK);
+    board.place_stone(7, 4, BLACK);
+    board.place_stone(7, 5, BLACK);
+    board.place_stone(7, 6, BLACK);
+    board.place_stone(7, 7, WHITE);
+    
+    PositionPattern pattern = PatternRecognizer::recognize_position(board, 7, 4, BLACK);
+    
+    bool is_none = true;
+    for (int d = 0; d < 4; ++d) {
+        if (pattern.directions[d].type != PatternType::NONE) {
+            is_none = false;
+            break;
+        }
+    }
+    
+    assert(is_none);
+    std::cout << "test_blocked_four_is_none passed" << std::endl;
+}
+
 int main() {
     std::cout << "Running pattern tests..." << std::endl;
     
@@ -157,6 +181,7 @@ int main() {
     test_forbidden();
     test_five_not_forbidden();
     test_white_no_forbidden();
+    test_blocked_four_is_none();
     
     std::cout << "All pattern tests passed!" << std::endl;
     return 0;
