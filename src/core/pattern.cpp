@@ -149,8 +149,6 @@ PatternType PatternRecognizer::match_pattern(int window_code, bool /*is_center*/
             
             if (left_open && right_open) {
                 return PatternType::LIVE_THREE;
-            } else if (left_open || right_open) {
-                return PatternType::LIVE_THREE;
             } else {
                 return PatternType::SLEEPY_THREE;
             }
