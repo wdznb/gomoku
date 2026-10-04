@@ -80,12 +80,12 @@ int AlphaBetaSearch::quiescence(Board& board, int alpha, int beta, int color,
         board.place_stone(move.pos.row, move.pos.col, color);
 
         if (board.has_five_in_a_row(move.pos.row, move.pos.col, color)) {
-            board.remove_stone(move.pos.row, move.pos.col);
+            board.undo_last_move();
             return 100000;
         }
 
         int score = -quiescence(board, -beta, -alpha, opponent(color), stop_flag);
-        board.remove_stone(move.pos.row, move.pos.col);
+        board.undo_last_move();
 
         if (score > alpha) {
             alpha = score;
@@ -136,7 +136,7 @@ int AlphaBetaSearch::alphabeta(Board& board, int depth, int alpha, int beta, int
 
         int score = -alphabeta(board, depth - 1, -beta, -alpha, opponent(color), stop_flag);
 
-        board.remove_stone(move.pos.row, move.pos.col);
+        board.undo_last_move();
 
         if (score > best_score) {
             best_score = score;
@@ -187,14 +187,16 @@ Move AlphaBetaSearch::search(const Board& board, int color, int max_depth,
         int depth_best_score = -INT_MAX;
         Move depth_best_move;
 
+        Board mutable_board = board;
         for (const auto& move : root_moves) {
             if (stop_flag.load() || is_timeout()) break;
 
-            Board mutable_board = board;
             mutable_board.place_stone(move.pos.row, move.pos.col, color);
 
             int score = -alphabeta(mutable_board, depth - 1, -beta, -alpha,
                                    opponent(color), stop_flag);
+
+            mutable_board.undo_last_move();
 
             if (score > depth_best_score) {
                 depth_best_score = score;

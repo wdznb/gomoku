@@ -100,7 +100,7 @@ int VCFSearch::vcf_attack(Board& board, int color, int depth, int alpha, int bet
         board.place_stone(move.pos.row, move.pos.col, color);
 
         if (board.has_five_in_a_row(move.pos.row, move.pos.col, color)) {
-            board.remove_stone(move.pos.row, move.pos.col);
+            board.undo_last_move();
             return 100000 + depth;
         }
 
@@ -115,13 +115,13 @@ int VCFSearch::vcf_attack(Board& board, int color, int depth, int alpha, int bet
         }
 
         if (has_live_four) {
-            board.remove_stone(move.pos.row, move.pos.col);
+            board.undo_last_move();
             return 100000 + depth;
         }
 
         Move block = find_block_move(board, move.pos.row, move.pos.col, color);
         if (block.pos.row < 0) {
-            board.remove_stone(move.pos.row, move.pos.col);
+            board.undo_last_move();
             continue;
         }
 
@@ -129,8 +129,8 @@ int VCFSearch::vcf_attack(Board& board, int color, int depth, int alpha, int bet
 
         int score = -vcf_attack(board, color, depth - 1, -beta, -alpha, stop_flag);
 
-        board.remove_stone(block.pos.row, block.pos.col);
-        board.remove_stone(move.pos.row, move.pos.col);
+        board.undo_last_move();
+        board.undo_last_move();
 
         if (score > best_score) {
             best_score = score;
@@ -168,7 +168,7 @@ VCFMove VCFSearch::search(const Board& board, int color, int max_depth,
         mutable_board.place_stone(move.pos.row, move.pos.col, color);
 
         if (mutable_board.has_five_in_a_row(move.pos.row, move.pos.col, color)) {
-            mutable_board.remove_stone(move.pos.row, move.pos.col);
+            mutable_board.undo_last_move();
             result.result = VCFResult::WIN;
             result.best_move = move;
             result.variation.push_back(move);
@@ -186,7 +186,7 @@ VCFMove VCFSearch::search(const Board& board, int color, int max_depth,
         }
 
         if (has_live_four) {
-            mutable_board.remove_stone(move.pos.row, move.pos.col);
+            mutable_board.undo_last_move();
             result.result = VCFResult::WIN;
             result.best_move = move;
             result.variation.push_back(move);
@@ -195,7 +195,7 @@ VCFMove VCFSearch::search(const Board& board, int color, int max_depth,
 
         Move block = find_block_move(mutable_board, move.pos.row, move.pos.col, color);
         if (block.pos.row < 0) {
-            mutable_board.remove_stone(move.pos.row, move.pos.col);
+            mutable_board.undo_last_move();
             continue;
         }
 
@@ -204,8 +204,8 @@ VCFMove VCFSearch::search(const Board& board, int color, int max_depth,
         int score = -vcf_attack(mutable_board, color, max_depth - 1,
                                 -INT_MAX, -best_score, stop_flag);
 
-        mutable_board.remove_stone(block.pos.row, block.pos.col);
-        mutable_board.remove_stone(move.pos.row, move.pos.col);
+        mutable_board.undo_last_move();
+        mutable_board.undo_last_move();
 
         if (score > best_score) {
             best_score = score;

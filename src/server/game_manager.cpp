@@ -10,8 +10,19 @@ GameManager::GameManager()
       timeout_ms_(5000), max_depth_(8) {
 }
 
+GameManager::~GameManager() {
+    stop_thinking();
+    if (search_thread_ && search_thread_->joinable()) {
+        search_thread_->join();
+    }
+}
+
 void GameManager::reset() {
     stop_thinking();
+    if (search_thread_ && search_thread_->joinable()) {
+        search_thread_->join();
+    }
+    search_thread_.reset();
     board_.reset();
     status_ = GameStatus::WAITING;
     winner_ = EMPTY;
@@ -56,7 +67,14 @@ bool GameManager::undo() {
     if (ai_thinking_.load()) return false;
     if (board_.move_count() == 0) return false;
     
-    board_.undo_last_move();
+    int undo_count = 1;
+    if (board_.move_count() >= 2 && current_turn() == player_color_) {
+        undo_count = 2;
+    }
+    
+    for (int i = 0; i < undo_count && board_.move_count() > 0; ++i) {
+        board_.undo_last_move();
+    }
     
     if (board_.move_count() == 0) {
         status_ = GameStatus::WAITING;
@@ -87,60 +105,50 @@ void GameManager::request_hint(int timeout_ms, int max_depth) {
     if (ai_thinking_.load()) return;
     
     int turn = current_turn();
-    Move hint = search_.search(board_, turn);
+    std::atomic<bool> dummy_stop(false);
+    SearchResult result = engine_.search(board_, turn, max_depth, timeout_ms, dummy_stop);
     
     if (move_callback_) {
-        move_callback_(hint, 0, 0);
+        move_callback_(result.best_move, result.score, 0);
     }
 }
 
 void GameManager::start_ai_thinking(int timeout_ms, int max_depth) {
     if (ai_thinking_.load()) return;
     
+    stop_thinking();
+    if (search_thread_ && search_thread_->joinable()) {
+        search_thread_->join();
+    }
+    
     stop_flag_.store(false);
     ai_thinking_.store(true);
     timeout_ms_ = timeout_ms;
     max_depth_ = max_depth;
     
-    thinking_future_ = std::async(std::launch::async, [this, timeout_ms, max_depth]() {
-        return search_.search(board_, ai_color_);
-    });
-    
-    std::thread([this, timeout_ms]() {
-        ai_thinking_worker(timeout_ms, max_depth_);
-    }).detach();
+    search_thread_ = std::make_unique<std::thread>(
+        &GameManager::ai_thinking_worker, this, timeout_ms, max_depth);
 }
 
 void GameManager::stop_thinking() {
     stop_flag_.store(true);
-    
-    if (thinking_future_.valid()) {
-        try {
-            thinking_future_.wait_for(std::chrono::milliseconds(100));
-        } catch (...) {}
-    }
-    
     ai_thinking_.store(false);
 }
 
 void GameManager::ai_thinking_worker(int timeout_ms, int max_depth) {
-    auto start = std::chrono::high_resolution_clock::now();
-    
-    Move best_move = search_.search(board_, ai_color_);
-    
-    auto end = std::chrono::high_resolution_clock::now();
-    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    SearchResult result = engine_.search(board_, ai_color_, max_depth, timeout_ms, stop_flag_);
     
     ai_thinking_.store(false);
     
-    if (move_callback_ && !stop_flag_.load()) {
-        board_.place_stone(best_move.pos, ai_color_);
-        move_callback_(best_move, 0, static_cast<int>(elapsed));
-        
-        check_game_over();
-        
-        if (status_ == GameStatus::PLAYING && current_turn() == ai_color_) {
-            start_ai_thinking(timeout_ms_, max_depth_);
+    if (move_callback_ && !stop_flag_.load() && result.best_move.pos.is_valid()) {
+        if (board_.place_stone(result.best_move.pos, ai_color_)) {
+            move_callback_(result.best_move, result.score, result.elapsed_ms);
+            
+            check_game_over();
+            
+            if (status_ == GameStatus::PLAYING && current_turn() == ai_color_) {
+                start_ai_thinking(timeout_ms_, max_depth_);
+            }
         }
     }
 }
@@ -171,7 +179,7 @@ void GameManager::check_game_over() {
 
 void GameManager::set_coefficients(const ThreatCoefficients& coeffs) {
     evaluator_.set_coefficients(coeffs);
-    search_.set_coefficients(coeffs);
+    engine_.set_coefficients(coeffs);
 }
 
 }

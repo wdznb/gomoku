@@ -77,9 +77,10 @@ SearchResult SearchEngine::search(const Board& board, int color,
 
         VCFMove vcf_opp = vcf.search(board, opp, vcf_max_depth_, stop_flag);
         if (vcf_opp.result == VCFResult::WIN) {
-            result.best_move = greedy_move;
+            result.best_move = Move(vcf_opp.best_move.pos, color);
             result.score = -50000;
             result.method = "vcf_defense";
+            return result;
         }
     }
 

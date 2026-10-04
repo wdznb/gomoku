@@ -100,7 +100,7 @@ int VCTSearch::vct_defend(Board& board, int color, int depth, int alpha, int bet
         board.place_stone(move.pos.row, move.pos.col, color);
 
         if (board.has_five_in_a_row(move.pos.row, move.pos.col, color)) {
-            board.remove_stone(move.pos.row, move.pos.col);
+            board.undo_last_move();
             return 100000 + depth;
         }
 
@@ -115,13 +115,13 @@ int VCTSearch::vct_defend(Board& board, int color, int depth, int alpha, int bet
         }
 
         if (has_live_four) {
-            board.remove_stone(move.pos.row, move.pos.col);
+            board.undo_last_move();
             return 100000 + depth;
         }
 
         auto defenses = generate_defenses(board, color, move.pos.row, move.pos.col);
         if (defenses.empty()) {
-            board.remove_stone(move.pos.row, move.pos.col);
+            board.undo_last_move();
             return 100000 + depth;
         }
 
@@ -129,13 +129,13 @@ int VCTSearch::vct_defend(Board& board, int color, int depth, int alpha, int bet
         for (const auto& def : defenses) {
             board.place_stone(def.pos.row, def.pos.col, def.color);
             int score = vct_attack(board, color, depth - 1, alpha, beta, stop_flag);
-            board.remove_stone(def.pos.row, def.pos.col);
+            board.undo_last_move();
             worst_for_attacker = std::min(worst_for_attacker, score);
             beta = std::min(beta, worst_for_attacker);
             if (alpha >= beta) break;
         }
 
-        board.remove_stone(move.pos.row, move.pos.col);
+        board.undo_last_move();
 
         best_score = std::max(best_score, worst_for_attacker);
         alpha = std::max(alpha, best_score);
@@ -162,7 +162,7 @@ int VCTSearch::vct_attack(Board& board, int color, int depth, int alpha, int bet
         board.place_stone(move.pos.row, move.pos.col, color);
 
         if (board.has_five_in_a_row(move.pos.row, move.pos.col, color)) {
-            board.remove_stone(move.pos.row, move.pos.col);
+            board.undo_last_move();
             return 100000 + depth;
         }
 
@@ -177,13 +177,13 @@ int VCTSearch::vct_attack(Board& board, int color, int depth, int alpha, int bet
         }
 
         if (has_live_four) {
-            board.remove_stone(move.pos.row, move.pos.col);
+            board.undo_last_move();
             return 100000 + depth;
         }
 
         auto defenses = generate_defenses(board, color, move.pos.row, move.pos.col);
         if (defenses.empty()) {
-            board.remove_stone(move.pos.row, move.pos.col);
+            board.undo_last_move();
             return 100000 + depth;
         }
 
@@ -191,12 +191,12 @@ int VCTSearch::vct_attack(Board& board, int color, int depth, int alpha, int bet
         for (const auto& def : defenses) {
             board.place_stone(def.pos.row, def.pos.col, def.color);
             int score = vct_attack(board, color, depth - 1, alpha, beta, stop_flag);
-            board.remove_stone(def.pos.row, def.pos.col);
+            board.undo_last_move();
             worst_for_attacker = std::min(worst_for_attacker, score);
             if (worst_for_attacker <= -100000) break;
         }
 
-        board.remove_stone(move.pos.row, move.pos.col);
+        board.undo_last_move();
 
         if (worst_for_attacker > best_score) {
             best_score = worst_for_attacker;
@@ -230,7 +230,7 @@ VCTMove VCTSearch::search(const Board& board, int color, int max_depth,
         mutable_board.place_stone(move.pos.row, move.pos.col, color);
 
         if (mutable_board.has_five_in_a_row(move.pos.row, move.pos.col, color)) {
-            mutable_board.remove_stone(move.pos.row, move.pos.col);
+            mutable_board.undo_last_move();
             result.result = VCTResult::WIN;
             result.best_move = move;
             result.variation.push_back(move);
@@ -248,7 +248,7 @@ VCTMove VCTSearch::search(const Board& board, int color, int max_depth,
         }
 
         if (has_live_four) {
-            mutable_board.remove_stone(move.pos.row, move.pos.col);
+            mutable_board.undo_last_move();
             result.result = VCTResult::WIN;
             result.best_move = move;
             result.variation.push_back(move);
@@ -257,7 +257,7 @@ VCTMove VCTSearch::search(const Board& board, int color, int max_depth,
 
         auto defenses = generate_defenses(mutable_board, color, move.pos.row, move.pos.col);
         if (defenses.empty()) {
-            mutable_board.remove_stone(move.pos.row, move.pos.col);
+            mutable_board.undo_last_move();
             result.result = VCTResult::WIN;
             result.best_move = move;
             result.variation.push_back(move);
@@ -269,11 +269,11 @@ VCTMove VCTSearch::search(const Board& board, int color, int max_depth,
             mutable_board.place_stone(def.pos.row, def.pos.col, def.color);
             int score = vct_attack(mutable_board, color, max_depth - 1,
                                    -INT_MAX, -best_score, stop_flag);
-            mutable_board.remove_stone(def.pos.row, def.pos.col);
+            mutable_board.undo_last_move();
             worst = std::min(worst, score);
         }
 
-        mutable_board.remove_stone(move.pos.row, move.pos.col);
+        mutable_board.undo_last_move();
 
         if (worst > best_score) {
             best_score = worst;

@@ -58,7 +58,7 @@ void WebSocketSession::do_read() {
 
 void WebSocketSession::send(const json& msg) {
     bool write_in_progress = !send_queue_.empty();
-    send_queue_.push(msg);
+    send_queue_.push(msg.dump());
     if (!write_in_progress) {
         do_write();
     }
@@ -71,10 +71,9 @@ void WebSocketSession::do_write() {
     }
     
     is_writing_ = true;
-    std::string text = send_queue_.front().dump();
     
     ws_.async_write(
-        net::buffer(text),
+        net::buffer(send_queue_.front()),
         [self = shared_from_this()](beast::error_code ec, std::size_t) {
             if (ec) {
                 std::cerr << "WebSocket write error: " << ec.message() << std::endl;

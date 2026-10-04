@@ -36,7 +36,7 @@ private:
     websocket::stream<beast::tcp_stream> ws_;
     std::string web_dir_;
     beast::flat_buffer buffer_;
-    std::queue<json> send_queue_;
+    std::queue<std::string> send_queue_;
     bool is_writing_ = false;
     
     void do_read();

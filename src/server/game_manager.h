@@ -3,11 +3,11 @@
 
 #include "../core/board.h"
 #include "../core/evaluator.h"
-#include "../search/greedy.h"
+#include "../search/search_engine.h"
 #include "protocol.h"
 #include <memory>
 #include <atomic>
-#include <future>
+#include <thread>
 #include <functional>
 #include <mutex>
 
@@ -26,6 +26,7 @@ public:
     using GameOverCallback = std::function<void(int winner, const std::string& reason)>;
     
     GameManager();
+    ~GameManager();
     
     void reset();
     
@@ -56,7 +57,7 @@ public:
     
 private:
     Board board_;
-    GreedySearch search_;
+    SearchEngine engine_;
     Evaluator evaluator_;
     
     int player_color_;
@@ -67,7 +68,7 @@ private:
     
     std::atomic<bool> ai_thinking_;
     std::atomic<bool> stop_flag_;
-    std::future<Move> thinking_future_;
+    std::unique_ptr<std::thread> search_thread_;
     std::mutex thinking_mutex_;
     
     int timeout_ms_;
