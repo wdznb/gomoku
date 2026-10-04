@@ -47,8 +47,8 @@ void PositionPattern::analyze() {
     has_rush_four = (rush_four_count > 0);
     has_live_three = (live_three_count > 0);
     has_four_four = (four_count >= 2);
-    has_four_three = (four_count >= 1 && three_count >= 1);
-    has_three_three = (three_count >= 2);
+    has_four_three = (four_count >= 1 && live_three_count >= 1);
+    has_three_three = (live_three_count >= 2);
 }
 
 void PatternRecognizer::init() {

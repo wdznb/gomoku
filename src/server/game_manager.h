@@ -72,6 +72,7 @@ private:
     std::atomic<bool> stop_flag_;
     std::atomic<bool> hint_active_;
     std::unique_ptr<std::thread> search_thread_;
+    std::unique_ptr<std::thread> hint_thread_;
     std::mutex thinking_mutex_;
     
     int timeout_ms_;

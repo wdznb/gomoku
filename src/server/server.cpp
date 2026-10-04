@@ -291,12 +291,6 @@ void GameServer::handle_resign(std::shared_ptr<WebSocketSession> session) {
     
     auto& game = it->second;
     game->resign(game->player_color());
-    
-    json response;
-    response["type"] = "game_over";
-    response["winner"] = game->ai_color() == BLACK ? "black" : "white";
-    response["reason"] = "resign";
-    send_message(session, response);
 }
 
 void GameServer::handle_stop_thinking(std::shared_ptr<WebSocketSession> session) {

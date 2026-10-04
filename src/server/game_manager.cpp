@@ -15,6 +15,9 @@ GameManager::~GameManager() {
     if (search_thread_ && search_thread_->joinable()) {
         search_thread_->join();
     }
+    if (hint_thread_ && hint_thread_->joinable()) {
+        hint_thread_->join();
+    }
 }
 
 void GameManager::reset() {
@@ -22,7 +25,11 @@ void GameManager::reset() {
     if (search_thread_ && search_thread_->joinable()) {
         search_thread_->join();
     }
+    if (hint_thread_ && hint_thread_->joinable()) {
+        hint_thread_->join();
+    }
     search_thread_.reset();
+    hint_thread_.reset();
     board_.reset();
     status_ = GameStatus::WAITING;
     winner_ = EMPTY;
@@ -104,19 +111,24 @@ void GameManager::resign(int color) {
 void GameManager::request_hint(int timeout_ms, int max_depth) {
     if (ai_thinking_.load() || hint_active_.load()) return;
     
+    if (hint_thread_ && hint_thread_->joinable()) {
+        hint_thread_->join();
+    }
+    
     hint_active_.store(true);
+    stop_flag_.store(false);
     int turn = current_turn();
     Board board_snapshot = board_;
     
-    std::thread([this, board_snapshot, turn, timeout_ms, max_depth]() mutable {
-        std::atomic<bool> dummy_stop(false);
-        SearchResult result = engine_.search(board_snapshot, turn, max_depth, timeout_ms, dummy_stop);
-        
-        if (move_callback_ && result.best_move.pos.is_valid()) {
-            move_callback_(result.best_move, result.score, 0);
-        }
-        hint_active_.store(false);
-    }).detach();
+    hint_thread_ = std::make_unique<std::thread>(
+        [this, board_snapshot, turn, timeout_ms, max_depth]() mutable {
+            SearchResult result = engine_.search(board_snapshot, turn, max_depth, timeout_ms, stop_flag_);
+            
+            if (move_callback_ && !stop_flag_.load() && result.best_move.pos.is_valid()) {
+                move_callback_(result.best_move, result.score, 0);
+            }
+            hint_active_.store(false);
+        });
 }
 
 void GameManager::start_ai_thinking(int timeout_ms, int max_depth) {
@@ -125,6 +137,9 @@ void GameManager::start_ai_thinking(int timeout_ms, int max_depth) {
     stop_thinking();
     if (search_thread_ && search_thread_->joinable()) {
         search_thread_->join();
+    }
+    if (hint_thread_ && hint_thread_->joinable()) {
+        hint_thread_->join();
     }
     
     stop_flag_.store(false);
