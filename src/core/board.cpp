@@ -175,6 +175,11 @@ int Board::count_direction(int row, int col, int dr, int dc, int color) const {
 void Board::update_active_empty(int row, int col) {
     Position new_pos(row, col);
     
+    if (move_count_ == 1) {
+        rebuild_active_empty();
+        return;
+    }
+    
     auto it = std::find(active_empty_.begin(), active_empty_.end(), new_pos);
     if (it != active_empty_.end()) {
         active_empty_.erase(it);

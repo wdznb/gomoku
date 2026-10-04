@@ -152,7 +152,10 @@ int AlphaBetaSearch::alphabeta(Board& board, int depth, int alpha, int beta, int
     TTFlag flag = TTFlag::UPPERBOUND;
 
     for (const auto& move : moves) {
-        if (stop_flag.load() || is_timeout()) break;
+        if (stop_flag.load() || is_timeout()) {
+            if (flag == TTFlag::EXACT) flag = TTFlag::LOWERBOUND;
+            break;
+        }
 
         board.place_stone(move.pos.row, move.pos.col, color);
 

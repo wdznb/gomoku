@@ -104,7 +104,6 @@ void test_recognize_live_three() {
     
     board.place_stone(7, 5, BLACK);
     board.place_stone(7, 6, BLACK);
-    board.place_stone(7, 7, BLACK);
     
     PositionPattern pattern = PatternRecognizer::recognize_position(board, 7, 4, BLACK);
     

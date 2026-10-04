@@ -159,8 +159,8 @@ void GameServer::on_message(std::shared_ptr<WebSocketSession> session, const jso
 }
 
 void GameServer::handle_message(std::shared_ptr<WebSocketSession> session, const json& msg) {
-    if (!msg.contains("type")) {
-        send_error(session, "Missing message type");
+    if (!msg.contains("type") || !msg["type"].is_string()) {
+        send_error(session, "Missing or invalid message type");
         return;
     }
     
