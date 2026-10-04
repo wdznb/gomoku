@@ -127,6 +127,11 @@ int VCTSearch::vct_defend(Board& board, int color, int depth, int alpha, int bet
             return 100000 + depth;
         }
 
+        if (pattern.four_count >= 2) {
+            board.undo_last_move();
+            return 100000 + depth;
+        }
+
         auto defenses = generate_defenses(board, color, move.pos.row, move.pos.col);
         if (defenses.empty()) {
             board.undo_last_move();
@@ -191,6 +196,11 @@ int VCTSearch::vct_attack(Board& board, int color, int depth, int alpha, int bet
         }
 
         if (has_live_four) {
+            board.undo_last_move();
+            return 100000 + depth;
+        }
+
+        if (pattern.four_count >= 2) {
             board.undo_last_move();
             return 100000 + depth;
         }
@@ -269,6 +279,14 @@ VCTMove VCTSearch::search(const Board& board, int color, int max_depth,
         }
 
         if (has_live_four) {
+            mutable_board.undo_last_move();
+            result.result = VCTResult::WIN;
+            result.best_move = move;
+            result.variation.push_back(move);
+            return result;
+        }
+
+        if (pattern.four_count >= 2) {
             mutable_board.undo_last_move();
             result.result = VCTResult::WIN;
             result.best_move = move;
