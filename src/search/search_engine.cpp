@@ -179,9 +179,15 @@ SearchResult SearchEngine::search(const Board& board, int color,
             // overshoot the per-move budget the client is waiting on.
             if (probe_budget_ms > 500) {
                 int usable_ms = probe_budget_ms - 200;
-                // Rough throughput ceiling for VCF nodes on this target.
-                int time_scaled_nodes = usable_ms * 400;
-                int probe_nodes = std::min(resign_node_limit_, time_scaled_nodes);
+                // Rough throughput ceiling for VCF nodes on this target. The
+                // product is computed in 64-bit: a large client timeout made
+                // usable_ms * 400 overflow int into a negative cap, which then
+                // tripped node_limit_ on the very first node and silently
+                // disabled resignation. resign_node_limit_ is the hard ceiling.
+                long long time_scaled_nodes =
+                    static_cast<long long>(usable_ms) * 400LL;
+                int probe_nodes = static_cast<int>(
+                    std::min<long long>(resign_node_limit_, time_scaled_nodes));
 
                 VCFSearch loss_probe(evaluator_, tt_alphabeta_);
                 loss_probe.set_node_limit(probe_nodes);

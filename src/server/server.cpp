@@ -334,13 +334,15 @@ void GameServer::handle_undo(std::shared_ptr<WebSocketSession> session) {
     if (it == games_.end()) return;
     
     auto& game = it->second;
-    if (game->undo()) {
+    int undo_move_count = 0;
+    GameStatus undo_status = GameStatus::WAITING;
+    if (game->undo(undo_move_count, undo_status)) {
         json response;
         response["type"] = "undo_success";
-        response["move_count"] = game->board().move_count();
-        if (game->status() == GameStatus::GAME_OVER) {
+        response["move_count"] = undo_move_count;
+        if (undo_status == GameStatus::GAME_OVER) {
             response["game_status"] = "game_over";
-        } else if (game->status() == GameStatus::WAITING) {
+        } else if (undo_status == GameStatus::WAITING) {
             response["game_status"] = "waiting";
         } else {
             response["game_status"] = "playing";

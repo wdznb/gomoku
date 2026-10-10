@@ -37,7 +37,10 @@ public:
     int current_turn() const;
     
     bool make_move(int row, int col);
-    bool undo();
+    // On success, out_move_count / out_status report the board state captured
+    // before the AI worker is re-armed, so the caller never reads board_/status_
+    // concurrently with that worker.
+    bool undo(int& out_move_count, GameStatus& out_status);
     void resign(int color);
     
     bool request_hint(int timeout_ms, int max_depth);

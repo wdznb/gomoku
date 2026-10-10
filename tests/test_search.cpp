@@ -695,6 +695,34 @@ void test_search_engine_resigns_on_proven_loss() {
               << result.best_move.pos.row << "," << result.best_move.pos.col << ")" << std::endl;
 }
 
+// The resign probe turns its time budget into a node cap via time*400. A large
+// client timeout made that product overflow a signed int into a negative cap,
+// tripping node_limit_ on the first node and silently disabling resignation -
+// so the AI kept playing provably-lost games. This uses a huge timeout (with the
+// slow main threat phases off, to bound runtime) and still requires a resign.
+void test_search_engine_resigns_with_large_timeout() {
+    Board board;
+
+    board.place_stone(7, 4, BLACK);
+    board.place_stone(7, 5, BLACK);
+    board.place_stone(7, 6, BLACK);
+    board.place_stone(5, 4, BLACK);
+    board.place_stone(6, 4, BLACK);
+    board.place_stone(0, 0, WHITE);
+    board.place_stone(1, 1, WHITE);
+
+    SearchEngine engine;
+    engine.set_vcf_enabled(false);
+    engine.set_vct_enabled(false);
+    std::atomic<bool> stop(false);
+    SearchResult result = engine.search(board, WHITE, 1, 6000000, stop);
+
+    assert(result.resigned);
+    assert(result.method == "resign");
+
+    std::cout << "test_search_engine_resigns_with_large_timeout passed" << std::endl;
+}
+
 void test_search_engine_no_false_resign() {
     Board board;
 

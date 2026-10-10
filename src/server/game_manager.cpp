@@ -4,6 +4,18 @@
 
 namespace gomoku {
 
+namespace {
+// timeout_ms is client-controlled (set_config / request_hint) and feeds the
+// search deadline, the resign-probe node budget and the worker's wait. An
+// unbounded value makes the AI search for effectively forever, and a huge one
+// also overflowed the probe-node arithmetic. Clamp to a sane wall-clock range.
+int clamp_timeout_ms(int timeout_ms) {
+    if (timeout_ms < 100) return 100;
+    if (timeout_ms > 30000) return 30000;
+    return timeout_ms;
+}
+}
+
 GameManager::GameManager() 
     : player_color_(BLACK), ai_color_(WHITE),
       status_(GameStatus::WAITING), winner_(EMPTY),
@@ -102,7 +114,7 @@ bool GameManager::make_move(int row, int col) {
     return true;
 }
 
-bool GameManager::undo() {
+bool GameManager::undo(int& out_move_count, GameStatus& out_status) {
     if (ai_thinking_.load()) return false;
     if (board_.move_count() == 0) return false;
     
@@ -125,6 +137,12 @@ bool GameManager::undo() {
         game_over_reason_.clear();
     }
     
+    // Capture the post-undo state now, before the worker is re-armed below.
+    // Once start_ai_thinking() runs, that worker writes board_/status_ under
+    // thinking_mutex_; reading them from the io thread afterwards would race.
+    out_move_count = board_.move_count();
+    out_status = status_;
+
     // Re-trigger AI if it is now AI's turn to move. Covers two cases:
     //  1) board still non-empty and it's AI's turn (player undid one move)
     //  2) board became empty and AI plays BLACK - the game must reopen
@@ -166,6 +184,7 @@ void GameManager::resign_now(int color) {
 
 bool GameManager::request_hint(int timeout_ms, int max_depth) {
     if (ai_thinking_.load() || hint_active_.load()) return false;
+    timeout_ms = clamp_timeout_ms(timeout_ms);
 
     if (hint_thread_ && hint_thread_->joinable()) {
         hint_thread_->join();
@@ -302,7 +321,7 @@ void GameManager::set_opening_book(const OpeningBook* book) {
 }
 
 void GameManager::set_config(int timeout_ms, int max_depth) {
-    timeout_ms_ = timeout_ms;
+    timeout_ms_ = clamp_timeout_ms(timeout_ms);
     max_depth_ = max_depth;
 }
 
