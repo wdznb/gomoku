@@ -128,6 +128,10 @@ class GomokuGame {
     
     stopThinking() {
         this.sendMessage({ type: 'stop_thinking' });
+        // Disarm immediately so a double-click cannot send a second stop or
+        // leave the control armed while the worker winds down.
+        this.aiThinking = false;
+        document.getElementById('btn-stop').disabled = true;
     }
     
     restart() {
@@ -249,10 +253,20 @@ class GomokuGame {
     
     handleThinkingProgress(msg) {
         this.updateThinkingInfo(`思考中... 深度: ${msg.depth}, 节点: ${msg.nodes}, 耗时: ${msg.elapsed_ms}ms`);
+        // thinking_progress is shared by the AI's move search and hint searches.
+        // Only treat it as "the AI is thinking" when it is actually the AI's
+        // turn; a hint runs on the player's turn, and setting aiThinking there
+        // would never be cleared (hints emit no ai_move) and would freeze the
+        // board. This is the sole place that arms the stop control.
+        if (this.gameStatus === 'playing' && this.currentTurn !== this.playerColor) {
+            this.aiThinking = true;
+            document.getElementById('btn-stop').disabled = false;
+        }
     }
     
     handleGameOver(msg) {
         this.gameStatus = 'game_over';
+        this.aiThinking = false;
         let statusText = '游戏结束 - ';
         if (msg.winner === 'draw') {
             statusText += '和棋';
