@@ -106,7 +106,7 @@ std::vector<Move> VCTSearch::generate_defenses(const Board& board, int color,
 int VCTSearch::vct_defend(Board& board, int color, int depth, int alpha, int beta,
                            std::atomic<bool>& stop_flag) {
     nodes_searched_++;
-    if (nodes_searched_ > node_limit_ || stop_flag.load()) return 0;
+    if (nodes_searched_ > node_limit_ || aborted(stop_flag)) return 0;
     if (depth <= 0) return 0;
 
     auto attacks = generate_attacks(board, color);
@@ -120,7 +120,7 @@ int VCTSearch::vct_defend(Board& board, int color, int depth, int alpha, int bet
     bool evaluated_any = false;
 
     for (const auto& move : attacks) {
-        if (stop_flag.load()) break;
+        if (aborted(stop_flag)) break;
         evaluated_any = true;
 
         board.place_stone(move.pos.row, move.pos.col, color);
@@ -210,7 +210,7 @@ int VCTSearch::vct_defend(Board& board, int color, int depth, int alpha, int bet
 int VCTSearch::vct_attack(Board& board, int color, int depth, int alpha, int beta,
                            std::atomic<bool>& stop_flag) {
     nodes_searched_++;
-    if (nodes_searched_ > node_limit_ || stop_flag.load()) return 0;
+    if (nodes_searched_ > node_limit_ || aborted(stop_flag)) return 0;
     if (depth <= 0) return 0;
 
     auto attacks = generate_attacks(board, color);
@@ -220,7 +220,7 @@ int VCTSearch::vct_attack(Board& board, int color, int depth, int alpha, int bet
     bool evaluated_any = false;
 
     for (const auto& move : attacks) {
-        if (stop_flag.load()) break;
+        if (aborted(stop_flag)) break;
         evaluated_any = true;
 
         board.place_stone(move.pos.row, move.pos.col, color);
@@ -322,7 +322,7 @@ VCTMove VCTSearch::search(const Board& board, int color, int max_depth,
     Move best_move;
 
     for (const auto& move : attacks) {
-        if (stop_flag.load()) break;
+        if (aborted(stop_flag)) break;
 
         mutable_board.place_stone(move.pos.row, move.pos.col, color);
 

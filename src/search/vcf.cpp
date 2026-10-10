@@ -93,7 +93,7 @@ Move VCFSearch::find_block_move(const Board& board, int row, int col, int color)
 int VCFSearch::vcf_attack(Board& board, int color, int depth, int alpha, int beta,
                            std::atomic<bool>& stop_flag) {
     nodes_searched_++;
-    if (nodes_searched_ > node_limit_ || stop_flag.load()) return 0;
+    if (nodes_searched_ > node_limit_ || aborted(stop_flag)) return 0;
     if (depth <= 0) return 0;
 
     auto rush_fours = generate_rush_fours(board, color);
@@ -102,7 +102,7 @@ int VCFSearch::vcf_attack(Board& board, int color, int depth, int alpha, int bet
     int best_score = -INT_MAX;
 
     for (const auto& move : rush_fours) {
-        if (stop_flag.load()) break;
+        if (aborted(stop_flag)) break;
 
         board.place_stone(move.pos.row, move.pos.col, color);
 
@@ -215,7 +215,7 @@ VCFMove VCFSearch::search_impl(const Board& board, int color, int max_depth,
     Move best_move;
 
     for (const auto& move : rush_fours) {
-        if (stop_flag.load()) break;
+        if (aborted(stop_flag)) break;
 
         mutable_board.place_stone(move.pos.row, move.pos.col, color);
 
@@ -374,7 +374,7 @@ DefenseResult VCFSearch::find_defense(const Board& board, int defender, int max_
 
         VCFMove attacker_result = search_impl(after, attacker, max_depth, stop_flag);
 
-        if (stop_flag.load() || nodes_searched_ > node_limit_) {
+        if (aborted(stop_flag) || nodes_searched_ > node_limit_) {
             return DefenseResult::UNKNOWN;
         }
 

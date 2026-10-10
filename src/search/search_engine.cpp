@@ -109,8 +109,17 @@ SearchResult SearchEngine::search(const Board& board, int color,
         }
     }
 
+    // One absolute wall-clock budget shared by the VCF, VCT and AlphaBeta
+    // phases. VCF/VCT otherwise bound work only by node_limit_ (1M / 500K), so
+    // they can overrun time_limit_ms by seconds before AlphaBeta even starts;
+    // anchoring them to a common deadline keeps the whole move within budget.
+    const bool has_deadline = (time_limit_ms > 0);
+    auto search_deadline = std::chrono::steady_clock::now()
+                           + std::chrono::milliseconds(has_deadline ? time_limit_ms : 0);
+
     if (vcf_enabled_ && !stop_flag.load()) {
         VCFSearch vcf(evaluator_, tt_alphabeta_);
+        if (has_deadline) vcf.set_deadline(search_deadline);
         VCFMove vcf_result = vcf.search(board, color, vcf_max_depth_, stop_flag);
         if (vcf_result.result == VCFResult::WIN) {
             result.best_move = vcf_result.best_move;
@@ -128,6 +137,7 @@ SearchResult SearchEngine::search(const Board& board, int color,
 
     if (vct_enabled_ && !stop_flag.load()) {
         VCTSearch vct(evaluator_, tt_alphabeta_);
+        if (has_deadline) vct.set_deadline(search_deadline);
         VCTMove vct_result = vct.search(board, color, vct_max_depth_, stop_flag);
         if (vct_result.result == VCTResult::WIN) {
             result.best_move = vct_result.best_move;
@@ -175,6 +185,7 @@ SearchResult SearchEngine::search(const Board& board, int color,
 
                 VCFSearch loss_probe(evaluator_, tt_alphabeta_);
                 loss_probe.set_node_limit(probe_nodes);
+                if (has_deadline) loss_probe.set_deadline(search_deadline);
 
                 Move defense;
                 DefenseResult dr = loss_probe.find_defense(board, color, vcf_max_depth_,

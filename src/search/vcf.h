@@ -6,6 +6,7 @@
 #include "../core/pattern.h"
 #include "../optimization/transposition.h"
 #include <atomic>
+#include <chrono>
 #include <vector>
 
 namespace gomoku {
@@ -45,11 +46,26 @@ public:
 
     void set_node_limit(int limit) { node_limit_ = limit; }
 
+    // Optional absolute wall-clock deadline shared with the rest of the search
+    // (see VCTSearch::set_deadline); without it VCF runs to node_limit_ and can
+    // overrun the caller's timeout_ms.
+    void set_deadline(std::chrono::steady_clock::time_point deadline) {
+        deadline_ = deadline;
+        has_deadline_ = true;
+    }
+
 private:
     const Evaluator& evaluator_;
     TranspositionTable& tt_;
     int node_limit_;
     int nodes_searched_;
+    std::chrono::steady_clock::time_point deadline_{};
+    bool has_deadline_ = false;
+
+    bool aborted(std::atomic<bool>& stop_flag) const {
+        return stop_flag.load() ||
+               (has_deadline_ && std::chrono::steady_clock::now() >= deadline_);
+    }
 
     int vcf_attack(Board& board, int color, int depth, int alpha, int beta,
                    std::atomic<bool>& stop_flag);

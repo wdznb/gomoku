@@ -145,6 +145,30 @@ void test_vct_diagonal_rush_four_is_not_a_win() {
     std::cout << "test_vct_diagonal_rush_four_is_not_a_win passed" << std::endl;
 }
 
+void test_vct_deadline_aborts_search() {
+    // Round 42 F2: VCT previously bounded work only by node_limit_ (500K),
+    // ignoring timeout_ms, so it could overrun the caller's per-move budget by
+    // seconds (and, joined on the single io thread, stall every session). With
+    // an already-expired deadline the search must bail immediately rather than
+    // grind out the forcing win it would otherwise find.
+    Board board;
+    Evaluator evaluator;
+    TranspositionTable tt;
+
+    board.place_stone(7, 4, BLACK);
+    board.place_stone(7, 5, BLACK);
+    board.place_stone(7, 6, BLACK);
+
+    VCTSearch vct(evaluator, tt);
+    vct.set_deadline(std::chrono::steady_clock::now() - std::chrono::seconds(1));
+    std::atomic<bool> stop(false);
+
+    VCTMove result = vct.search(board, BLACK, 6, stop);
+    assert(result.result != VCTResult::WIN);
+
+    std::cout << "test_vct_deadline_aborts_search passed" << std::endl;
+}
+
 void test_alphabeta_basic() {
     Board board;
     Evaluator evaluator;
@@ -826,6 +850,7 @@ int main() {
     test_vcf_no_win();
     test_vct_immediate_win();
     test_vct_diagonal_rush_four_is_not_a_win();
+    test_vct_deadline_aborts_search();
     test_alphabeta_basic();
     test_alphabeta_blocks_five();
     test_alphabeta_takes_winning();
