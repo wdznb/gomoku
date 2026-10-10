@@ -144,10 +144,34 @@ int VCFSearch::vcf_attack(Board& board, int color, int depth, int alpha, int bet
 
         board.place_stone(block.pos.row, block.pos.col, block.color);
 
+        // The block stone may hand the defender a decisive tempo of their own:
+        // a completed five wins outright; a live or rush four lets the defender
+        // finish their own attack before the attacker's VCF sequence matures.
+        // Because find_block_move returns the unique forced block, this outcome
+        // sinks only the current attacker candidate - other attacks may force a
+        // different block. Skip this branch and try the next.
+        bool defender_has_tempo = false;
         if (board.has_five_in_a_row(block.pos.row, block.pos.col, block.color)) {
+            defender_has_tempo = true;
+        } else {
+            PositionPattern block_pattern = PatternRecognizer::recognize_position(
+                board, block.pos.row, block.pos.col, block.color);
+            for (int d = 0; d < 4; ++d) {
+                PatternType t = block_pattern.directions[d].type;
+                if (t == PatternType::LIVE_FOUR || t == PatternType::RUSH_FOUR) {
+                    defender_has_tempo = true;
+                    break;
+                }
+            }
+            if (!defender_has_tempo && block_pattern.four_count >= 2) {
+                defender_has_tempo = true;
+            }
+        }
+
+        if (defender_has_tempo) {
             board.undo_last_move();
             board.undo_last_move();
-            return -100000 + depth;
+            continue;
         }
 
         int score = vcf_attack(board, color, depth - 1, alpha, beta, stop_flag);
@@ -245,7 +269,28 @@ VCFMove VCFSearch::search_impl(const Board& board, int color, int max_depth,
 
         mutable_board.place_stone(block.pos.row, block.pos.col, block.color);
 
+        // Same tempo check as vcf_attack: a block that hands the defender a
+        // five, a live four, a rush four, or a double-four invalidates this
+        // attacker candidate; skip and try the next attack.
+        bool defender_has_tempo = false;
         if (mutable_board.has_five_in_a_row(block.pos.row, block.pos.col, block.color)) {
+            defender_has_tempo = true;
+        } else {
+            PositionPattern block_pattern = PatternRecognizer::recognize_position(
+                mutable_board, block.pos.row, block.pos.col, block.color);
+            for (int d = 0; d < 4; ++d) {
+                PatternType t = block_pattern.directions[d].type;
+                if (t == PatternType::LIVE_FOUR || t == PatternType::RUSH_FOUR) {
+                    defender_has_tempo = true;
+                    break;
+                }
+            }
+            if (!defender_has_tempo && block_pattern.four_count >= 2) {
+                defender_has_tempo = true;
+            }
+        }
+
+        if (defender_has_tempo) {
             mutable_board.undo_last_move();
             mutable_board.undo_last_move();
             continue;

@@ -152,10 +152,9 @@ int AlphaBetaSearch::alphabeta(Board& board, int depth, int alpha, int beta, int
     TTFlag flag = TTFlag::UPPERBOUND;
 
     for (const auto& move : moves) {
-        if (stop_flag.load() || is_timeout()) {
-            // Some siblings went unsearched, so neither EXACT nor UPPERBOUND is
-            // sound. The value already searched is a lower bound on the true
-            // max over all moves; that's the only safe entry to keep.
+        if (stop_flag.load() || is_timeout() || nodes_searched_ > node_limit_) {
+            // Search aborted: siblings went unsearched, so only a LOWERBOUND
+            // on the true value is sound. Never store EXACT or UPPERBOUND here.
             flag = TTFlag::LOWERBOUND;
             break;
         }
@@ -219,7 +218,7 @@ Move AlphaBetaSearch::search(const Board& board, int color, int max_depth,
 
         Board mutable_board = board;
         for (const auto& move : root_moves) {
-            if (stop_flag.load() || is_timeout()) break;
+            if (stop_flag.load() || is_timeout() || nodes_searched_ > node_limit_) break;
 
             mutable_board.place_stone(move.pos.row, move.pos.col, color);
 
@@ -237,7 +236,7 @@ Move AlphaBetaSearch::search(const Board& board, int color, int max_depth,
             }
         }
 
-        if (!stop_flag.load() && !is_timeout()) {
+        if (!stop_flag.load() && !is_timeout() && nodes_searched_ <= node_limit_) {
             best_move = depth_best_move;
             best_score = depth_best_score;
             info_.depth = depth;

@@ -96,7 +96,11 @@ bool GameManager::undo() {
         game_over_reason_.clear();
     }
     
-    if (status_ == GameStatus::PLAYING && current_turn() == ai_color_) {
+    // Re-trigger AI if it is now AI's turn to move. Covers two cases:
+    //  1) board still non-empty and it's AI's turn (player undid one move)
+    //  2) board became empty and AI plays BLACK - the game must reopen
+    //     itself, mirroring what handle_choose_side does on empty boards.
+    if (current_turn() == ai_color_) {
         start_ai_thinking(timeout_ms_, max_depth_);
     }
     

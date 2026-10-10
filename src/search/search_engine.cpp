@@ -82,7 +82,7 @@ SearchResult SearchEngine::search(const Board& board, int color,
     }
 
     if (vcf_enabled_ && !stop_flag.load()) {
-        VCFSearch vcf(evaluator_, tt_vcf_);
+        VCFSearch vcf(evaluator_, tt_alphabeta_);
         VCFMove vcf_result = vcf.search(board, color, vcf_max_depth_, stop_flag);
         if (vcf_result.result == VCFResult::WIN) {
             result.best_move = vcf_result.best_move;
@@ -99,7 +99,7 @@ SearchResult SearchEngine::search(const Board& board, int color,
     }
 
     if (vct_enabled_ && !stop_flag.load()) {
-        VCTSearch vct(evaluator_, tt_vct_);
+        VCTSearch vct(evaluator_, tt_alphabeta_);
         VCTMove vct_result = vct.search(board, color, vct_max_depth_, stop_flag);
         if (vct_result.result == VCTResult::WIN) {
             result.best_move = vct_result.best_move;
@@ -134,7 +134,7 @@ SearchResult SearchEngine::search(const Board& board, int color,
             int total_used_ms = static_cast<int>(
                 std::chrono::duration_cast<std::chrono::milliseconds>(elapsed_after_ab).count());
             if (total_used_ms < time_limit_ms) {
-                VCFSearch loss_probe(evaluator_, tt_vcf_);
+                VCFSearch loss_probe(evaluator_, tt_alphabeta_);
                 loss_probe.set_node_limit(resign_node_limit_);
 
                 Move defense;

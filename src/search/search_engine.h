@@ -67,8 +67,9 @@ public:
 private:
     Evaluator evaluator_;
     GreedySearch greedy_;
-    TranspositionTable tt_vcf_;
-    TranspositionTable tt_vct_;
+    // VCF and VCT receive this table by reference but never read or write it;
+    // keeping a single instance avoids allocating ~64 MB per session that is
+    // never touched.
     TranspositionTable tt_alphabeta_;
     const OpeningBook* book_ = nullptr;
 

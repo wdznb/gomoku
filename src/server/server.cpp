@@ -20,6 +20,14 @@ void WebSocketSession::start() {
         [self = shared_from_this()](beast::error_code ec) {
             if (ec) {
                 std::cerr << "WebSocket accept error: " << ec.message() << std::endl;
+                // The GameManager was already registered in games_ before
+                // start() was invoked, so run the close callback here to
+                // erase it; otherwise plain TCP probes that never complete
+                // the WS handshake leak a session (and its ~96 MB of TTs)
+                // each time.
+                if (self->on_close) {
+                    self->on_close(self);
+                }
                 return;
             }
             self->do_read();
