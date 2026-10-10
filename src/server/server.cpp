@@ -91,8 +91,21 @@ void WebSocketSession::close() {
     ws_.close(websocket::close_code::normal, ec);
 }
 
-GameServer::GameServer(int port, const std::string& web_dir)
+GameServer::GameServer(int port, const std::string& web_dir,
+                       const std::string& book_path)
     : ioc_(), acceptor_(net::make_strand(ioc_)), web_dir_(web_dir) {
+    std::string error;
+    if (book_path.empty()) {
+        std::cout << "Opening book disabled" << std::endl;
+    } else if (book_.load(book_path, error)) {
+        std::cout << "Opening book loaded: " << book_path
+                  << " (" << book_.line_count() << " lines, "
+                  << book_.entry_count() << " entries)" << std::endl;
+    } else {
+        std::cout << "Opening book unavailable (" << error
+                  << "); search will handle all positions" << std::endl;
+    }
+
     tcp::endpoint endpoint(tcp::v4(), port);
     acceptor_.open(endpoint.protocol());
     acceptor_.set_option(net::socket_base::reuse_address(true));
@@ -138,6 +151,7 @@ void GameServer::on_connect(std::shared_ptr<WebSocketSession> session) {
     };
     
     auto game = std::make_shared<GameManager>();
+    game->set_opening_book(&book_);
     {
         std::lock_guard<std::mutex> lock(games_mutex_);
         games_[session.get()] = game;

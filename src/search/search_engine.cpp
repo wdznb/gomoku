@@ -4,11 +4,13 @@
 namespace gomoku {
 
 SearchEngine::SearchEngine()
-    : vcf_enabled_(true), vct_enabled_(true), alphabeta_enabled_(true),
+    : book_enabled_(true),
+      vcf_enabled_(true), vct_enabled_(true), alphabeta_enabled_(true),
       vcf_max_depth_(20), vct_max_depth_(12), alphabeta_max_depth_(8) {}
 
 SearchEngine::SearchEngine(const ThreatCoefficients& coeffs)
     : evaluator_(coeffs), greedy_(coeffs),
+      book_enabled_(true),
       vcf_enabled_(true), vct_enabled_(true), alphabeta_enabled_(true),
       vcf_max_depth_(20), vct_max_depth_(12), alphabeta_max_depth_(8) {}
 
@@ -62,6 +64,18 @@ SearchResult SearchEngine::search(const Board& board, int color,
                 result.method = "must_block";
                 return result;
             }
+        }
+    }
+
+    if (book_enabled_ && book_ != nullptr && !book_->empty() &&
+        board.move_count() <= book_->max_depth() && !stop_flag.load()) {
+        Move book_move;
+        if (book_->query(board, color, book_move)) {
+            result.best_move = book_move;
+            result.score = 0;
+            result.depth = 0;
+            result.method = "book";
+            return result;
         }
     }
 

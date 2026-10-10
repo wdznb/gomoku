@@ -56,6 +56,7 @@ public:
     
     void set_coefficients(const ThreatCoefficients& coeffs);
     void set_config(int timeout_ms, int max_depth);
+    void set_opening_book(const OpeningBook* book);
     
 private:
     Board board_;

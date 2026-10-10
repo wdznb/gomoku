@@ -2,6 +2,7 @@
 #define GOMOKU_SERVER_H
 
 #include "game_manager.h"
+#include "../optimization/opening_book.h"
 #include <boost/beast/core.hpp>
 #include <boost/beast/websocket.hpp>
 #include <boost/asio/ip/tcp.hpp>
@@ -49,15 +50,17 @@ private:
 
 class GameServer {
 public:
-    GameServer(int port = 8080, const std::string& web_dir = "web");
-    
+    GameServer(int port = 8080, const std::string& web_dir = "web",
+               const std::string& book_path = "data/opening_book.json");
+
     void start();
     void stop();
-    
+
 private:
     net::io_context ioc_;
     tcp::acceptor acceptor_;
     std::string web_dir_;
+    OpeningBook book_;
     std::map<WebSocketSession*, std::shared_ptr<GameManager>> games_;
     std::mutex games_mutex_;
     

@@ -8,6 +8,7 @@
 #include "../search/vct.h"
 #include "../search/alphabeta.h"
 #include "../optimization/transposition.h"
+#include "../optimization/opening_book.h"
 #include <atomic>
 #include <string>
 #include <functional>
@@ -47,6 +48,12 @@ public:
 
     void set_coefficients(const ThreatCoefficients& coeffs);
 
+    // The book is owned by the caller and must stay alive and unmodified
+    // while any search may be running against it.
+    void set_opening_book(const OpeningBook* book) { book_ = book; }
+    const OpeningBook* opening_book() const { return book_; }
+    void set_book_enabled(bool v) { book_enabled_ = v; }
+
     TranspositionTable& transposition_table() { return tt_alphabeta_; }
 
 private:
@@ -55,6 +62,9 @@ private:
     TranspositionTable tt_vcf_;
     TranspositionTable tt_vct_;
     TranspositionTable tt_alphabeta_;
+    const OpeningBook* book_ = nullptr;
+
+    bool book_enabled_;
 
     bool vcf_enabled_;
     bool vct_enabled_;

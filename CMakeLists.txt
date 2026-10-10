@@ -32,6 +32,7 @@ set(GOMOKU_SOURCES
     src/search/search_engine.cpp
     src/search/controller.cpp
     src/optimization/transposition.cpp
+    src/optimization/opening_book.cpp
     src/server/server.cpp
     src/server/game_manager.cpp
 )
@@ -62,6 +63,8 @@ endif()
 add_custom_command(TARGET gomoku_server POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory
     ${CMAKE_SOURCE_DIR}/web $<TARGET_FILE_DIR:gomoku_server>/web
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+    ${CMAKE_SOURCE_DIR}/data $<TARGET_FILE_DIR:gomoku_server>/data
 )
 
 enable_testing()
@@ -102,7 +105,10 @@ add_executable(test_search
     src/search/search_engine.cpp
     src/search/controller.cpp
     src/optimization/transposition.cpp
+    src/optimization/opening_book.cpp
 )
 target_include_directories(test_search PRIVATE ${CMAKE_SOURCE_DIR}/src)
-target_link_libraries(test_search PRIVATE Threads::Threads)
+target_compile_definitions(test_search PRIVATE
+    GOMOKU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+target_link_libraries(test_search PRIVATE Threads::Threads nlohmann_json::nlohmann_json)
 add_test(NAME test_search COMMAND test_search)

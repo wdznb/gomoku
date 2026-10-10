@@ -81,6 +81,7 @@ else
         ../src/search/search_engine.cpp \
         ../src/search/controller.cpp \
         ../src/optimization/transposition.cpp \
+        ../src/optimization/opening_book.cpp \
         ../src/server/server.cpp \
         ../src/server/game_manager.cpp \
         -o gomoku_server \
@@ -89,6 +90,7 @@ else
     # Copy web files
     echo "Copying web files..."
     cp -r ../web .
+    cp -r ../data .
     
     echo ""
     echo "Build complete!"

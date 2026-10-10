@@ -173,7 +173,13 @@ void GameManager::stop_thinking() {
 }
 
 void GameManager::ai_thinking_worker(int timeout_ms, int max_depth) {
-    SearchResult result = engine_.search(board_, ai_color_, max_depth, timeout_ms, stop_flag_);
+    Board snapshot;
+    {
+        std::lock_guard<std::mutex> lock(thinking_mutex_);
+        snapshot = board_;
+    }
+
+    SearchResult result = engine_.search(snapshot, ai_color_, max_depth, timeout_ms, stop_flag_);
     
     if (move_callback_ && result.best_move.pos.is_valid()) {
         std::lock_guard<std::mutex> lock(thinking_mutex_);
@@ -214,6 +220,10 @@ void GameManager::check_game_over() {
 void GameManager::set_coefficients(const ThreatCoefficients& coeffs) {
     evaluator_.set_coefficients(coeffs);
     engine_.set_coefficients(coeffs);
+}
+
+void GameManager::set_opening_book(const OpeningBook* book) {
+    engine_.set_opening_book(book);
 }
 
 void GameManager::set_config(int timeout_ms, int max_depth) {

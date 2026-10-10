@@ -1,0 +1,206 @@
+#include "opening_book.h"
+#include "../core/pattern.h"
+#include <nlohmann/json.hpp>
+#include <fstream>
+#include <algorithm>
+
+namespace gomoku {
+
+namespace {
+
+constexpr int VARIANT_COUNT = 8;
+
+}
+
+Position OpeningBook::apply_transform(Position p, int variant) {
+    constexpr int n = BOARD_SIZE;
+    int i = p.row;
+    int j = p.col;
+
+    if (variant & 4) std::swap(i, j);
+    if (variant & 1) i = n - 1 - i;
+    if (variant & 2) j = n - 1 - j;
+
+    return Position(i, j);
+}
+
+std::string OpeningBook::make_key(const std::vector<Position>& prefix) {
+    std::string key;
+    key.reserve(prefix.size() * 4);
+    for (const auto& p : prefix) {
+        if (!key.empty()) key += ',';
+        key += std::to_string(p.to_index());
+    }
+    return key;
+}
+
+bool OpeningBook::covers_position(const std::vector<Move>& history, Position pos) {
+    for (const auto& m : history) {
+        if (m.pos == pos) return true;
+    }
+    return false;
+}
+
+void OpeningBook::add_line(const std::vector<Position>& line, int weight,
+                           const std::string& name) {
+    if (line.size() < 2) return;
+
+    for (const auto& pos : line) {
+        if (!pos.is_valid()) return;
+    }
+
+    lines_.push_back(line);
+    max_depth_ = std::max(max_depth_, static_cast<int>(line.size()) - 1);
+
+    for (int variant = 0; variant < VARIANT_COUNT; ++variant) {
+        std::vector<Position> transformed;
+        transformed.reserve(line.size());
+        for (const auto& pos : line) {
+            transformed.push_back(apply_transform(pos, variant));
+        }
+
+        std::vector<Position> prefix;
+        prefix.reserve(transformed.size());
+        for (size_t ply = 1; ply < transformed.size(); ++ply) {
+            prefix.push_back(transformed[ply - 1]);
+            entries_[make_key(prefix)].emplace_back(transformed[ply], weight, name);
+        }
+    }
+}
+
+bool OpeningBook::load(const std::string& path, std::string& error) {
+    std::ifstream file(path);
+    if (!file.is_open()) {
+        error = "cannot open file: " + path;
+        return false;
+    }
+
+    nlohmann::json root;
+    try {
+        root = nlohmann::json::parse(file);
+    } catch (const nlohmann::json::exception& e) {
+        error = std::string("json parse error: ") + e.what();
+        return false;
+    }
+
+    if (!root.contains("lines") || !root["lines"].is_array()) {
+        error = "missing 'lines' array";
+        return false;
+    }
+
+    const nlohmann::json& lines = root["lines"];
+
+    for (const auto& entry : lines) {
+        if (!entry.contains("moves") || !entry["moves"].is_array()) continue;
+
+        std::vector<Position> line;
+        bool valid = true;
+        for (const auto& m : entry["moves"]) {
+            if (!m.is_array() || m.size() != 2 || !m[0].is_number() || !m[1].is_number()) {
+                valid = false;
+                break;
+            }
+            line.push_back(Position(m[0].get<int>(), m[1].get<int>()));
+        }
+
+        if (!valid || line.size() < 2) continue;
+
+        int weight = entry.contains("weight") && entry["weight"].is_number()
+                         ? entry["weight"].get<int>()
+                         : 1;
+        std::string name = entry.contains("name") && entry["name"].is_string()
+                               ? entry["name"].get<std::string>()
+                               : "";
+
+        add_line(line, weight, name);
+    }
+
+    if (lines_.empty()) {
+        error = "no valid lines in book";
+        return false;
+    }
+
+    return true;
+}
+
+bool OpeningBook::load_or_default(const std::string& path) {
+    std::string error;
+    if (load(path, error)) return true;
+
+    add_line({{7, 7}, {7, 8}, {8, 8}}, 10, "hua_yue");
+    add_line({{7, 7}, {7, 8}, {6, 8}}, 10, "pu_yue");
+    add_line({{7, 7}, {8, 8}, {6, 8}}, 8, "shu_xing");
+    return false;
+}
+
+void OpeningBook::clear() {
+    entries_.clear();
+    lines_.clear();
+    max_depth_ = 0;
+}
+
+bool OpeningBook::has_entry(const std::vector<Move>& history) const {
+    std::vector<Position> prefix;
+    prefix.reserve(history.size());
+    for (const auto& m : history) {
+        prefix.push_back(m.pos);
+    }
+    return entries_.find(make_key(prefix)) != entries_.end();
+}
+
+bool OpeningBook::query(const std::vector<Move>& history, int color, Move& out_move) const {
+    std::vector<Position> prefix;
+    prefix.reserve(history.size());
+    for (const auto& m : history) {
+        prefix.push_back(m.pos);
+    }
+
+    auto it = entries_.find(make_key(prefix));
+    if (it == entries_.end() || it->second.empty()) return false;
+
+    std::vector<BookEntry> candidates;
+    candidates.reserve(it->second.size());
+    for (const auto& entry : it->second) {
+        if (!entry.move.is_valid()) continue;
+        if (covers_position(history, entry.move)) continue;
+        candidates.push_back(entry);
+    }
+
+    if (candidates.empty()) return false;
+
+    int total_weight = 0;
+    for (const auto& c : candidates) {
+        total_weight += std::max(1, c.weight);
+    }
+
+    int pick;
+    {
+        std::lock_guard<std::mutex> lock(rng_mutex_);
+        std::uniform_int_distribution<int> dist(0, total_weight - 1);
+        pick = dist(rng_);
+    }
+
+    const BookEntry* chosen = &candidates.back();
+    for (const auto& c : candidates) {
+        pick -= std::max(1, c.weight);
+        if (pick < 0) {
+            chosen = &c;
+            break;
+        }
+    }
+
+    out_move = Move(chosen->move, color);
+    return true;
+}
+
+bool OpeningBook::query(const Board& board, int color, Move& out_move) const {
+    if (!query(board.move_history(), color, out_move)) return false;
+    if (!board.is_empty(out_move.pos.row, out_move.pos.col)) return false;
+    if (color == BLACK &&
+        PatternRecognizer::is_forbidden(board, out_move.pos.row, out_move.pos.col, BLACK)) {
+        return false;
+    }
+    return true;
+}
+
+}
