@@ -34,6 +34,26 @@ SearchResult SearchEngine::search(const Board& board, int color,
         return result;
     }
 
+    // Filter the candidate list once up front. The single-move fast path and
+    // the must_block scan below both consume root_moves; without this a BLACK
+    // player on a nearly-full board could be handed the last empty cell as
+    // "forced" even when it is a double-three / double-four / overline.
+    if (color == BLACK) {
+        std::vector<Position> legal;
+        legal.reserve(root_moves.size());
+        for (const auto& pos : root_moves) {
+            if (PatternRecognizer::is_forbidden(board, pos.row, pos.col, BLACK)) continue;
+            legal.push_back(pos);
+        }
+        root_moves.swap(legal);
+        if (root_moves.empty()) {
+            // Every remaining cell is illegal for BLACK; treat as resignation.
+            result.resigned = true;
+            result.method = "resign";
+            return result;
+        }
+    }
+
     if (root_moves.size() == 1) {
         result.best_move = Move(root_moves[0], color);
         result.method = "forced";
@@ -42,10 +62,10 @@ SearchResult SearchEngine::search(const Board& board, int color,
 
     Move greedy_move = greedy_.search(board, color);
 
+    PositionPattern greedy_pattern = PatternRecognizer::recognize_position(
+        board, greedy_move.pos.row, greedy_move.pos.col, color);
     for (int d = 0; d < 4; ++d) {
-        PositionPattern pattern = PatternRecognizer::recognize_position(
-            board, greedy_move.pos.row, greedy_move.pos.col, color);
-        if (pattern.directions[d].type == PatternType::FIVE) {
+        if (greedy_pattern.directions[d].type == PatternType::FIVE) {
             result.best_move = greedy_move;
             result.score = 100000;
             result.method = "greedy_five";

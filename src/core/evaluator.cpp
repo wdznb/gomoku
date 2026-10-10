@@ -35,7 +35,18 @@ int Evaluator::get_position_weight(int row, int col) const {
 
 int Evaluator::pattern_score(const PositionPattern& pattern) const {
     int score = 0;
-    
+
+    // FIVE is only counted here, not via has_live_four / four_count, so
+    // evaluate_board (which uses pattern_score directly) can see a
+    // candidate square that completes five for either side. Without this
+    // branch the stand-pat leaf value at every quiescence entry ignores
+    // one-ply mate threats and returns an over-optimistic score.
+    for (int d = 0; d < 4; ++d) {
+        if (pattern.directions[d].type == PatternType::FIVE) {
+            score += coeffs_.five;
+        }
+    }
+
     if (pattern.has_live_four) {
         score += coeffs_.live_four * pattern.live_four_count;
     }
