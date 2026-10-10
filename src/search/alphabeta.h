@@ -12,12 +12,12 @@
 namespace gomoku {
 
 struct SearchInfo {
-    int depth;
-    int nodes_searched;
-    int score;
+    int depth = 0;
+    int nodes_searched = 0;
+    int score = 0;
     Move best_move;
     std::vector<Move> principal_variation;
-    int elapsed_ms;
+    int elapsed_ms = 0;
 };
 
 class AlphaBetaSearch {

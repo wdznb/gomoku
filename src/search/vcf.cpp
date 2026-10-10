@@ -27,7 +27,7 @@ std::vector<Move> VCFSearch::generate_rush_fours(const Board& board, int color) 
         }
 
         if (has_four) {
-            int score = evaluator_.evaluate_position(board, pos.row, pos.col, color);
+            int score = evaluator_.evaluate_position_with_pattern(board, pos.row, pos.col, pattern);
             scored_moves.emplace_back(score, Move(pos.row, pos.col, color));
         }
     }

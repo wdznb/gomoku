@@ -156,6 +156,7 @@ SearchResult SearchEngine::search(const Board& board, int color,
         result.depth = info.depth;
         result.nodes_searched = info.nodes_searched;
         result.method = "alphabeta";
+        result.elapsed_ms = info.elapsed_ms;
 
         if (resign_detection_ && !stop_flag.load()) {
             auto elapsed_after_ab = std::chrono::high_resolution_clock::now() - start;

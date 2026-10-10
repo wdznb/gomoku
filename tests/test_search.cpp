@@ -293,6 +293,35 @@ void test_controller_restart_after_completion() {
     std::cout << "test_controller_restart_after_completion passed" << std::endl;
 }
 
+// Round 35 F1: SearchResult fields must be deterministically initialised.
+// The greedy_five / vcf / vct / forced / book return paths set only score (or
+// nothing) and leave depth/nodes_searched/elapsed_ms untouched; the server
+// callback reads score and elapsed_ms to build the ai_move message, so an
+// uninitialised read would publish indeterminate values.
+void test_search_result_fields_initialized_on_fast_paths() {
+    Board board;
+    SearchEngine engine;
+
+    // WHITE can complete an exact five immediately.
+    board.place_stone(7, 3, WHITE);
+    board.place_stone(7, 4, WHITE);
+    board.place_stone(7, 5, WHITE);
+    board.place_stone(7, 6, WHITE);
+    board.place_stone(9, 3, BLACK);
+
+    std::atomic<bool> stop(false);
+    SearchResult result = engine.search(board, WHITE, 4, 1000, stop);
+
+    // Own-win path: score is set, the timing fields default to 0 (not garbage).
+    assert(result.method == "greedy_five");
+    assert(result.score == 100000);
+    assert(result.elapsed_ms == 0);
+    assert(result.depth == 0);
+    assert(result.nodes_searched == 0);
+
+    std::cout << "test_search_result_fields_initialized_on_fast_paths passed" << std::endl;
+}
+
 void test_forced_move() {
     Board board;
     SearchEngine engine;
@@ -749,6 +778,7 @@ int main() {
     test_controller_stop();
     test_controller_restart_after_completion();
     test_forced_move();
+    test_search_result_fields_initialized_on_fast_paths();
     test_vcf_defense_proven_loss();
     test_vcf_defense_survives();
     test_vcf_defense_cut_short_is_unknown();

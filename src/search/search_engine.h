@@ -17,10 +17,14 @@ namespace gomoku {
 
 struct SearchResult {
     Move best_move;
-    int score;
-    int depth;
-    int nodes_searched;
-    int elapsed_ms;
+    // Default-initialised: the non-AlphaBeta return paths (default, forced,
+    // resign, book, vcf, vct, greedy) leave these untouched, and the server
+    // callback reads score/elapsed_ms to build the ai_move message. Unset,
+    // that read is of an indeterminate value and the client gets garbage.
+    int score = 0;
+    int depth = 0;
+    int nodes_searched = 0;
+    int elapsed_ms = 0;
     std::string method;
     std::vector<Move> principal_variation;
     bool resigned = false;

@@ -88,18 +88,25 @@ int Evaluator::pattern_score(const PositionPattern& pattern) const {
 
 int Evaluator::evaluate_position(const Board& board, int row, int col, int color) const {
     if (!board.is_empty(row, col)) return 0;
-    
+
     PositionPattern pattern = PatternRecognizer::recognize_position(board, row, col, color);
-    
+
+    return evaluate_position_with_pattern(board, row, col, pattern);
+}
+
+int Evaluator::evaluate_position_with_pattern(const Board& board, int row, int col,
+                                              const PositionPattern& pattern) const {
+    if (!board.is_empty(row, col)) return 0;
+
     for (int d = 0; d < 4; ++d) {
         if (pattern.directions[d].type == PatternType::FIVE) {
             return coeffs_.five;
         }
     }
-    
+
     int score = pattern_score(pattern);
     score += get_position_weight(row, col);
-    
+
     return score;
 }
 

@@ -95,7 +95,7 @@ int AlphaBetaSearch::quiescence(Board& board, int alpha, int beta, int color,
     if (stand_pat > alpha) alpha = stand_pat;
 
     const auto& candidates = board.active_empty();
-    std::vector<Move> threat_moves;
+    std::vector<std::pair<int, Move>> scored;
 
     for (const auto& pos : candidates) {
         if (!board.is_empty(pos.row, pos.col)) continue;
@@ -115,21 +115,17 @@ int AlphaBetaSearch::quiescence(Board& board, int alpha, int beta, int color,
             if (color == BLACK && PatternRecognizer::is_forbidden(board, pos.row, pos.col, color)) {
                 continue;
             }
-            threat_moves.push_back(Move(pos.row, pos.col, color));
+            // Score from the pattern we just recognized; calling
+            // evaluate_position here would re-run the same four scans.
+            int s = evaluator_.evaluate_position_with_pattern(board, pos.row, pos.col, pattern);
+            scored.emplace_back(s, Move(pos.row, pos.col, color));
         }
     }
 
-    if (threat_moves.empty()) return stand_pat;
+    if (scored.empty()) return stand_pat;
 
-    // Decorate-sort-undecorate: evaluate_position runs four pattern
-    // recognitions, so calling it inside the comparator made this O(n log n)
-    // full recognitions at every quiescence leaf. Score each move once.
-    std::vector<std::pair<int, Move>> scored;
-    scored.reserve(threat_moves.size());
-    for (const auto& move : threat_moves) {
-        int s = evaluator_.evaluate_position(board, move.pos.row, move.pos.col, color);
-        scored.emplace_back(s, move);
-    }
+    // Decorate-sort-undecorate: scores are already attached, so the sort does
+    // no pattern recognition.
     std::sort(scored.begin(), scored.end(),
               [](const auto& a, const auto& b) { return a.first > b.first; });
 
@@ -249,7 +245,16 @@ Move AlphaBetaSearch::search(const Board& board, int color, int max_depth,
                               int time_limit_ms, std::atomic<bool>& stop_flag) {
     move_time_limit_ms_ = time_limit_ms;
     nodes_searched_ = 0;
+    // Reset the reported info each search. An aborted or early-return search
+    // must not hand the caller the previous search's depth/score.
+    info_ = SearchInfo{};
     start_time_ = std::chrono::high_resolution_clock::now();
+    // Reset the reported info each search. If every iteration is aborted (a
+    // client-supplied timeout of 0 makes is_timeout() true immediately) or the
+    // single-move / empty-board fast paths return early, the caller still
+    // reads last_search_info(); without this it sees the previous search's
+    // depth/score or an indeterminate value on the first call.
+    info_ = SearchInfo{};
 
     tt_.new_search();
 
