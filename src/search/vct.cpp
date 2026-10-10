@@ -102,7 +102,11 @@ int VCTSearch::vct_defend(Board& board, int color, int depth, int alpha, int bet
     auto attacks = generate_attacks(board, color);
     if (attacks.empty()) return 0;
 
-    int best_score = INT_MAX;
+    // vct_defend is entered after the defender's reply: it is the attacker's
+    // turn again, so the outer loop must maximise over attacker candidates
+    // (the previous std::min made this node pretend the attacker was picking
+    // their worst move).
+    int best_score = -INT_MAX;
     bool evaluated_any = false;
 
     for (const auto& move : attacks) {
@@ -143,7 +147,6 @@ int VCTSearch::vct_defend(Board& board, int color, int depth, int alpha, int bet
         }
 
         int worst_for_attacker = INT_MAX;
-        bool defender_tempo_hit = false;
         for (const auto& def : defenses) {
             board.place_stone(def.pos.row, def.pos.col, def.color);
 
@@ -172,7 +175,6 @@ int VCTSearch::vct_defend(Board& board, int color, int depth, int alpha, int bet
             if (defender_has_tempo) {
                 board.undo_last_move();
                 worst_for_attacker = -100000 - depth;
-                defender_tempo_hit = true;
                 break;
             }
 
@@ -181,13 +183,14 @@ int VCTSearch::vct_defend(Board& board, int color, int depth, int alpha, int bet
             worst_for_attacker = std::min(worst_for_attacker, score);
             if (worst_for_attacker <= -100000) break;
         }
-        (void)defender_tempo_hit;
 
         board.undo_last_move();
 
-        best_score = std::min(best_score, worst_for_attacker);
-        beta = std::min(beta, best_score);
-        if (beta <= alpha) break;
+        if (worst_for_attacker > best_score) {
+            best_score = worst_for_attacker;
+        }
+        alpha = std::max(alpha, best_score);
+        if (alpha >= beta) break;
     }
 
     if (!evaluated_any) return 0;

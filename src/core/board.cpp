@@ -71,21 +71,6 @@ bool Board::place_stone(Position pos, int color) {
     return place_stone(pos.row, pos.col, color);
 }
 
-void Board::remove_stone(int row, int col) {
-    if (!is_valid(row, col) || is_empty(row, col)) {
-        return;
-    }
-    
-    int index = row * BOARD_SIZE + col;
-    int color = cells_[index];
-    cells_[index] = EMPTY;
-    zobrist_hash_ = ZobristHash::update_hash(zobrist_hash_, index, color);
-}
-
-void Board::remove_stone(Position pos) {
-    remove_stone(pos.row, pos.col);
-}
-
 void Board::undo_last_move() {
     if (move_count_ == 0) return;
     

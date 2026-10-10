@@ -79,7 +79,11 @@ int AlphaBetaSearch::quiescence(Board& board, int alpha, int beta, int color,
 
     int stand_pat = evaluator_.evaluate_board(board, color);
 
-    if (stand_pat >= beta) return beta;
+    // Fail-soft on the stand-pat cutoff: returning `beta` (the window edge)
+    // would let the parent store that bound as TTFlag::EXACT. Returning
+    // stand_pat is the node's true lower value and stays sound when the
+    // parent records it after any alpha/beta adjustment.
+    if (stand_pat >= beta) return stand_pat;
     if (stand_pat > alpha) alpha = stand_pat;
 
     const auto& candidates = board.active_empty();
@@ -131,7 +135,10 @@ int AlphaBetaSearch::quiescence(Board& board, int alpha, int beta, int color,
         if (score > alpha) {
             alpha = score;
         }
-        if (alpha >= beta) return beta;
+        // Fail-soft on the beta cutoff. Returning `alpha` (which now holds
+        // the best score seen) rather than `beta` avoids poisoning the TT
+        // with a value that is only a bound.
+        if (alpha >= beta) return alpha;
     }
 
     return alpha;

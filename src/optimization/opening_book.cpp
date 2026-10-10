@@ -149,6 +149,15 @@ bool OpeningBook::has_entry(const std::vector<Move>& history) const {
 }
 
 bool OpeningBook::query(const std::vector<Move>& history, int color, Move& out_move) const {
+    // The book is keyed by move sequence only; each stored slot implicitly
+    // alternates colors because Renju starts with BLACK. If the caller's
+    // (color, history.size()) pair disagrees with that alternation, we are
+    // being asked for the wrong player's reply and any returned slot would
+    // be stamped with the wrong color. Reject early rather than return a
+    // mismatched Move.
+    int expected = (history.size() % 2 == 0) ? BLACK : WHITE;
+    if (color != expected) return false;
+
     std::vector<Position> prefix;
     prefix.reserve(history.size());
     for (const auto& m : history) {

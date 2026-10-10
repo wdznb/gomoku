@@ -26,8 +26,6 @@ public:
     void reset();
     bool place_stone(int row, int col, int color);
     bool place_stone(Position pos, int color);
-    void remove_stone(int row, int col);
-    void remove_stone(Position pos);
     void undo_last_move();
     
     int get(int row, int col) const;

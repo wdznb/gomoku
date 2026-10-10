@@ -33,8 +33,13 @@ std::vector<ScoredMove> GreedySearch::search_ranked(const Board& board, int colo
             continue;
         }
         
-        int attack_score = evaluator_.evaluate_position_both(board, pos.row, pos.col, color);
-        int defense_score = evaluator_.evaluate_position_both(board, pos.row, pos.col, opp_color);
+        // evaluate_position_both already returns my_score + opp_score, so
+        // calling it once with `color` and once with `opp_color` produced
+        // identical values (their summands are just swapped). Compute each
+        // side separately with evaluate_position so attack_score and
+        // defense_score remain distinguishable.
+        int attack_score = evaluator_.evaluate_position(board, pos.row, pos.col, color);
+        int defense_score = evaluator_.evaluate_position(board, pos.row, pos.col, opp_color);
         
         int total_score = attack_score + defense_score;
         
