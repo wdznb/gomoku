@@ -103,9 +103,11 @@ int VCTSearch::vct_defend(Board& board, int color, int depth, int alpha, int bet
     if (attacks.empty()) return 0;
 
     int best_score = INT_MAX;
+    bool evaluated_any = false;
 
     for (const auto& move : attacks) {
         if (stop_flag.load()) break;
+        evaluated_any = true;
 
         board.place_stone(move.pos.row, move.pos.col, color);
 
@@ -141,13 +143,16 @@ int VCTSearch::vct_defend(Board& board, int color, int depth, int alpha, int bet
         }
 
         int worst_for_attacker = INT_MAX;
+        bool defender_tempo_hit = false;
         for (const auto& def : defenses) {
             board.place_stone(def.pos.row, def.pos.col, def.color);
 
             // A defense that hands the defender a five, a live four, a rush
             // four, or a double four takes the initiative back: the attacker
             // has to spend the next move answering rather than continuing the
-            // VCF sequence. Treat this branch as a loss for the attacker.
+            // VCF sequence. This sinks only the current attack candidate -
+            // other attacks may force a different block, so skip the whole
+            // attack rather than the node.
             bool defender_has_tempo =
                 board.has_five_in_a_row(def.pos.row, def.pos.col, def.color);
             if (!defender_has_tempo) {
@@ -166,8 +171,9 @@ int VCTSearch::vct_defend(Board& board, int color, int depth, int alpha, int bet
 
             if (defender_has_tempo) {
                 board.undo_last_move();
-                board.undo_last_move();
-                return -100000 - depth;
+                worst_for_attacker = -100000 - depth;
+                defender_tempo_hit = true;
+                break;
             }
 
             int score = vct_attack(board, color, depth - 1, alpha, beta, stop_flag);
@@ -175,6 +181,7 @@ int VCTSearch::vct_defend(Board& board, int color, int depth, int alpha, int bet
             worst_for_attacker = std::min(worst_for_attacker, score);
             if (worst_for_attacker <= -100000) break;
         }
+        (void)defender_tempo_hit;
 
         board.undo_last_move();
 
@@ -183,6 +190,7 @@ int VCTSearch::vct_defend(Board& board, int color, int depth, int alpha, int bet
         if (beta <= alpha) break;
     }
 
+    if (!evaluated_any) return 0;
     return best_score;
 }
 
@@ -196,9 +204,11 @@ int VCTSearch::vct_attack(Board& board, int color, int depth, int alpha, int bet
     if (attacks.empty()) return 0;
 
     int best_score = -INT_MAX;
+    bool evaluated_any = false;
 
     for (const auto& move : attacks) {
         if (stop_flag.load()) break;
+        evaluated_any = true;
 
         board.place_stone(move.pos.row, move.pos.col, color);
 
@@ -253,10 +263,14 @@ int VCTSearch::vct_attack(Board& board, int color, int depth, int alpha, int bet
                 }
             }
 
+            // Same rule as vct_defend: a defender tempo invalidates this
+            // specific attack move, not the whole node. Other attack
+            // candidates may force a different block. Break out of the
+            // defense loop, sink this attack, and continue the outer loop.
             if (defender_has_tempo) {
                 board.undo_last_move();
-                board.undo_last_move();
-                return -100000 - depth;
+                worst_for_attacker = -100000 - depth;
+                break;
             }
 
             int score = vct_defend(board, color, depth - 1, alpha, beta, stop_flag);
@@ -274,6 +288,7 @@ int VCTSearch::vct_attack(Board& board, int color, int depth, int alpha, int bet
         if (alpha >= beta) break;
     }
 
+    if (!evaluated_any) return 0;
     return best_score;
 }
 

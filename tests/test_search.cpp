@@ -626,6 +626,35 @@ void test_game_manager_rejects_move_on_ai_turn() {
     std::cout << "test_game_manager_rejects_move_on_ai_turn passed" << std::endl;
 }
 
+void test_game_manager_promotes_status_when_ai_opens() {
+    // Round 30: AI plays the first stone when the human chooses WHITE (or an
+    // undo empties the board while ai_color_ == BLACK). The worker's commit
+    // path is gated on status_ == PLAYING, so start_ai_thinking must promote
+    // WAITING -> PLAYING synchronously; otherwise the AI's opening stone is
+    // dropped and every later human move fails the turn guard.
+    GameManager game;
+    game.set_player_color(WHITE);
+    assert(game.status() == GameStatus::WAITING);
+
+    std::atomic<bool> got_move{false};
+    game.set_move_callback([&](const Move&, int, int) { got_move.store(true); });
+    game.set_config(500, 1);
+
+    game.start_ai_thinking(500, 1);
+    // Status must already be PLAYING before the search thread can commit.
+    assert(game.status() == GameStatus::PLAYING);
+
+    // Wait for the worker to finish and observe that it actually placed a
+    // stone (this is the end-to-end guarantee the fix provides).
+    for (int i = 0; i < 300 && !got_move.load(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    assert(got_move.load());
+    assert(game.board().move_count() == 1);
+
+    std::cout << "test_game_manager_promotes_status_when_ai_opens passed" << std::endl;
+}
+
 int main() {
     std::cout << "Running search tests..." << std::endl;
 
@@ -660,6 +689,7 @@ int main() {
     test_game_manager_resign_state();
     test_game_manager_rejects_forbidden_human_move();
     test_game_manager_rejects_move_on_ai_turn();
+    test_game_manager_promotes_status_when_ai_opens();
 
     std::cout << "All search tests passed!" << std::endl;
     return 0;

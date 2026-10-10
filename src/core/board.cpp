@@ -44,6 +44,8 @@ void Board::reset() {
     move_count_ = 0;
     zobrist_hash_ = 0;
     has_neighbor_.fill(false);
+    neighbor_count_.fill(0);
+    active_index_.fill(-1);
     active_empty_.clear();
     rebuild_active_empty();
 }
@@ -88,11 +90,56 @@ void Board::undo_last_move() {
     if (move_count_ == 0) return;
     
     const Move& last = moves_.back();
-    remove_stone(last.pos);
+    int row = last.pos.row, col = last.pos.col;
+    int removed_index = row * BOARD_SIZE + col;
+    int removed_color = cells_[removed_index];
+
+    // Undo bookkeeping in the exact reverse order of update_active_empty,
+    // so the state is consistent even if we bail out on a bad cell.
+    //
+    // 1) The removed stone was on the board, so its own active_empty_
+    //    membership was set to "occupied" (index -1). Restore it if any
+    //    neighbor is still present.
+    // 2) Every 5x5 cell around (row, col) that had its neighbor_count_
+    //    incremented at placement time must be decremented now; when a
+    //    cell's count reaches zero and it is empty, deactivate it.
+    // 3) The placed cell itself is not part of (2)'s increments (it was
+    //    occupied then); its count only reflects neighbors that existed
+    //    before placement. Do NOT decrement its own count.
+    cells_[removed_index] = EMPTY;
+    zobrist_hash_ = ZobristHash::update_hash(zobrist_hash_, removed_index, removed_color);
     moves_.pop_back();
     move_count_--;
-    
-    rebuild_active_empty();
+
+    if (move_count_ == 0) {
+        // Board just became empty: every cell is a candidate again.
+        rebuild_active_empty();
+        return;
+    }
+
+    for (int dr = -2; dr <= 2; ++dr) {
+        for (int dc = -2; dc <= 2; ++dc) {
+            int nr = row + dr;
+            int nc = col + dc;
+            if (!is_valid(nr, nc)) continue;
+            int nindex = nr * BOARD_SIZE + nc;
+            if (nindex == removed_index) continue;
+            if (cells_[nindex] != EMPTY) continue;
+            if (neighbor_count_[nindex] == 0) continue;
+            neighbor_count_[nindex]--;
+            if (neighbor_count_[nindex] == 0) {
+                has_neighbor_[nindex] = false;
+                deactivate(nindex);
+            }
+        }
+    }
+
+    if (neighbor_count_[removed_index] > 0) {
+        has_neighbor_[removed_index] = true;
+        activate(removed_index, row, col);
+    } else {
+        has_neighbor_[removed_index] = false;
+    }
 }
 
 int Board::get(int row, int col) const {
@@ -181,70 +228,87 @@ int Board::count_direction(int row, int col, int dr, int dc, int color) const {
 }
 
 void Board::update_active_empty(int row, int col) {
-    Position new_pos(row, col);
-    
+    int placed_index = row * BOARD_SIZE + col;
+
     if (move_count_ == 1) {
+        // First stone on an empty board: active_empty_ was seeded with all
+        // 225 cells. Rebuild the neighborhood view from scratch so cells
+        // outside the 5x5 box drop out and neighbor_count_ is correct.
         rebuild_active_empty();
         return;
     }
-    
-    auto it = std::find(active_empty_.begin(), active_empty_.end(), new_pos);
-    if (it != active_empty_.end()) {
-        active_empty_.erase(it);
-    }
-    
-    int neighbor_range = 2;
-    for (int dr = -neighbor_range; dr <= neighbor_range; ++dr) {
-        for (int dc = -neighbor_range; dc <= neighbor_range; ++dc) {
+
+    // The placed cell is no longer empty; drop it from active_empty_.
+    deactivate(placed_index);
+    has_neighbor_[placed_index] = false;
+
+    for (int dr = -2; dr <= 2; ++dr) {
+        for (int dc = -2; dc <= 2; ++dc) {
             int nr = row + dr;
             int nc = col + dc;
-            
             if (!is_valid(nr, nc)) continue;
-            
             int nindex = nr * BOARD_SIZE + nc;
             if (cells_[nindex] != EMPTY) continue;
-            
-            if (!has_neighbor_[nindex]) {
+            if (neighbor_count_[nindex]++ == 0) {
                 has_neighbor_[nindex] = true;
-                active_empty_.push_back(Position(nr, nc));
+                activate(nindex, nr, nc);
             }
         }
     }
 }
 
+void Board::activate(int index, int row, int col) {
+    if (active_index_[index] >= 0) return;
+    active_index_[index] = static_cast<int16_t>(active_empty_.size());
+    active_empty_.push_back(Position(row, col));
+}
+
+void Board::deactivate(int index) {
+    int16_t pos = active_index_[index];
+    if (pos < 0) return;
+    int last_i = static_cast<int>(active_empty_.size()) - 1;
+    if (pos != last_i) {
+        Position moved = active_empty_[last_i];
+        active_empty_[pos] = moved;
+        active_index_[moved.row * BOARD_SIZE + moved.col] = pos;
+    }
+    active_empty_.pop_back();
+    active_index_[index] = -1;
+}
+
 void Board::rebuild_active_empty() {
     has_neighbor_.fill(false);
+    neighbor_count_.fill(0);
+    active_index_.fill(-1);
     active_empty_.clear();
-    
-    for (int r = 0; r < BOARD_SIZE; ++r) {
-        for (int c = 0; c < BOARD_SIZE; ++c) {
-            int index = r * BOARD_SIZE + c;
-            if (cells_[index] != EMPTY) {
-                int neighbor_range = 2;
-                for (int dr = -neighbor_range; dr <= neighbor_range; ++dr) {
-                    for (int dc = -neighbor_range; dc <= neighbor_range; ++dc) {
-                        int nr = r + dr;
-                        int nc = c + dc;
-                        
-                        if (!is_valid(nr, nc)) continue;
-                        
-                        int nindex = nr * BOARD_SIZE + nc;
-                        if (cells_[nindex] != EMPTY) continue;
-                        
-                        if (!has_neighbor_[nindex]) {
-                            has_neighbor_[nindex] = true;
-                            active_empty_.push_back(Position(nr, nc));
-                        }
-                    }
-                }
-            }
-        }
-    }
-    
+
     if (move_count_ == 0) {
         for (int r = 0; r < BOARD_SIZE; ++r) {
             for (int c = 0; c < BOARD_SIZE; ++c) {
-                active_empty_.push_back(Position(r, c));
+                activate(r * BOARD_SIZE + c, r, c);
+            }
+        }
+        return;
+    }
+
+    for (int r = 0; r < BOARD_SIZE; ++r) {
+        for (int c = 0; c < BOARD_SIZE; ++c) {
+            int index = r * BOARD_SIZE + c;
+            if (cells_[index] != EMPTY) continue;
+            int count = 0;
+            for (int dr = -2; dr <= 2; ++dr) {
+                for (int dc = -2; dc <= 2; ++dc) {
+                    int nr = r + dr;
+                    int nc = c + dc;
+                    if (!is_valid(nr, nc)) continue;
+                    if (cells_[nr * BOARD_SIZE + nc] == EMPTY) continue;
+                    count++;
+                }
+            }
+            neighbor_count_[index] = static_cast<uint8_t>(count);
+            if (count > 0) {
+                has_neighbor_[index] = true;
+                activate(index, r, c);
             }
         }
     }

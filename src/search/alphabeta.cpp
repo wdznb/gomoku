@@ -141,9 +141,16 @@ int AlphaBetaSearch::alphabeta(Board& board, int depth, int alpha, int beta, int
                                 std::atomic<bool>& stop_flag) {
     nodes_searched_++;
     if (nodes_searched_ > node_limit_ || stop_flag.load() || is_timeout()) {
-        int winner = board.check_winner();
-        if (winner == color) return 100000 + depth;
-        if (winner == opponent(color)) return -100000 - depth;
+        // Only the last-placed stone can have produced a five; check_winner()
+        // would scan all 225 cells and then is_game_over() would scan them
+        // again. This abort path fires very frequently during iterative
+        // deepening, so the last-move check is important.
+        const Move& lm = board.last_move();
+        if (lm.pos.is_valid() &&
+            board.has_five_in_a_row(lm.pos.row, lm.pos.col, lm.color)) {
+            if (lm.color == color) return 100000 + depth;
+            return -100000 - depth;
+        }
         return evaluator_.evaluate_board(board, color);
     }
 
@@ -159,10 +166,14 @@ int AlphaBetaSearch::alphabeta(Board& board, int depth, int alpha, int beta, int
         tt_move = entry->best_move;
     }
 
-    int winner = board.check_winner();
-    if (winner == color) return 100000 + depth;
-    if (winner == opponent(color)) return -100000 - depth;
-    if (board.is_game_over()) return 0;
+    // Terminal check: only the last move can have produced a five.
+    const Move& lm = board.last_move();
+    if (lm.pos.is_valid() &&
+        board.has_five_in_a_row(lm.pos.row, lm.pos.col, lm.color)) {
+        if (lm.color == color) return 100000 + depth;
+        return -100000 - depth;
+    }
+    if (board.move_count() >= MAX_MOVES) return 0;
 
     if (depth <= 0) {
         return quiescence(board, alpha, beta, color, stop_flag);

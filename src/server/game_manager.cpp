@@ -183,6 +183,18 @@ void GameManager::start_ai_thinking(int timeout_ms, int max_depth) {
         hint_thread_->join();
     }
     
+    // If the game is being opened by the AI (human picked WHITE, or an undo
+    // emptied the board while ai_color_ == BLACK), status_ is still WAITING.
+    // The worker's commit path checks status_ == PLAYING, so without this
+    // promotion the AI's first stone is silently dropped and the human's
+    // next make_move is rejected by the turn guard - session lockup.
+    {
+        std::lock_guard<std::mutex> lock(thinking_mutex_);
+        if (status_ == GameStatus::WAITING) {
+            status_ = GameStatus::PLAYING;
+        }
+    }
+
     stop_flag_.store(false);
     discard_pending_.store(false);
     ai_thinking_.store(true);

@@ -60,9 +60,19 @@ private:
     
     std::array<bool, BOARD_SIZE * BOARD_SIZE> has_neighbor_;
     std::vector<Position> active_empty_;
+    // Incremental bookkeeping for the active_empty_ set. neighbor_count_[i]
+    // counts non-empty stones within Chebyshev distance 2 of cell i (never
+    // including i itself); active_index_[i] is the position of cell i inside
+    // active_empty_, or -1 when absent. Together they let undo_last_move
+    // restore the candidate list in O(25) via swap-remove instead of a full
+    // 225-cell rebuild at every ply.
+    std::array<uint8_t, BOARD_SIZE * BOARD_SIZE> neighbor_count_;
+    std::array<int16_t, BOARD_SIZE * BOARD_SIZE> active_index_;
     
     int count_direction(int row, int col, int dr, int dc, int color) const;
     void rebuild_active_empty();
+    void activate(int index, int row, int col);
+    void deactivate(int index);
 };
 
 }
