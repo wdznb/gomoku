@@ -143,13 +143,33 @@ int VCTSearch::vct_defend(Board& board, int color, int depth, int alpha, int bet
         int worst_for_attacker = INT_MAX;
         for (const auto& def : defenses) {
             board.place_stone(def.pos.row, def.pos.col, def.color);
-            
-            if (board.has_five_in_a_row(def.pos.row, def.pos.col, def.color)) {
+
+            // A defense that hands the defender a five, a live four, a rush
+            // four, or a double four takes the initiative back: the attacker
+            // has to spend the next move answering rather than continuing the
+            // VCF sequence. Treat this branch as a loss for the attacker.
+            bool defender_has_tempo =
+                board.has_five_in_a_row(def.pos.row, def.pos.col, def.color);
+            if (!defender_has_tempo) {
+                PositionPattern def_pattern = PatternRecognizer::recognize_position(
+                    board, def.pos.row, def.pos.col, def.color);
+                for (int d = 0; d < 4 && !defender_has_tempo; ++d) {
+                    PatternType t = def_pattern.directions[d].type;
+                    if (t == PatternType::LIVE_FOUR || t == PatternType::RUSH_FOUR) {
+                        defender_has_tempo = true;
+                    }
+                }
+                if (!defender_has_tempo && def_pattern.four_count >= 2) {
+                    defender_has_tempo = true;
+                }
+            }
+
+            if (defender_has_tempo) {
                 board.undo_last_move();
                 board.undo_last_move();
                 return -100000 - depth;
             }
-            
+
             int score = vct_attack(board, color, depth - 1, alpha, beta, stop_flag);
             board.undo_last_move();
             worst_for_attacker = std::min(worst_for_attacker, score);
@@ -216,13 +236,29 @@ int VCTSearch::vct_attack(Board& board, int color, int depth, int alpha, int bet
         int worst_for_attacker = INT_MAX;
         for (const auto& def : defenses) {
             board.place_stone(def.pos.row, def.pos.col, def.color);
-            
-            if (board.has_five_in_a_row(def.pos.row, def.pos.col, def.color)) {
+
+            bool defender_has_tempo =
+                board.has_five_in_a_row(def.pos.row, def.pos.col, def.color);
+            if (!defender_has_tempo) {
+                PositionPattern def_pattern = PatternRecognizer::recognize_position(
+                    board, def.pos.row, def.pos.col, def.color);
+                for (int d = 0; d < 4 && !defender_has_tempo; ++d) {
+                    PatternType t = def_pattern.directions[d].type;
+                    if (t == PatternType::LIVE_FOUR || t == PatternType::RUSH_FOUR) {
+                        defender_has_tempo = true;
+                    }
+                }
+                if (!defender_has_tempo && def_pattern.four_count >= 2) {
+                    defender_has_tempo = true;
+                }
+            }
+
+            if (defender_has_tempo) {
                 board.undo_last_move();
                 board.undo_last_move();
                 return -100000 - depth;
             }
-            
+
             int score = vct_defend(board, color, depth - 1, alpha, beta, stop_flag);
             board.undo_last_move();
             worst_for_attacker = std::min(worst_for_attacker, score);
@@ -308,13 +344,33 @@ VCTMove VCTSearch::search(const Board& board, int color, int max_depth,
         int worst = INT_MAX;
         for (const auto& def : defenses) {
             mutable_board.place_stone(def.pos.row, def.pos.col, def.color);
-            
-            if (mutable_board.has_five_in_a_row(def.pos.row, def.pos.col, def.color)) {
+
+            // Same counter-threat check as vct_attack/vct_defend: if the
+            // defense gives the defender a five, a live four, a rush four,
+            // or a double four the attacker has lost the initiative and this
+            // VCT candidate is invalid.
+            bool defender_has_tempo =
+                mutable_board.has_five_in_a_row(def.pos.row, def.pos.col, def.color);
+            if (!defender_has_tempo) {
+                PositionPattern def_pattern = PatternRecognizer::recognize_position(
+                    mutable_board, def.pos.row, def.pos.col, def.color);
+                for (int d = 0; d < 4 && !defender_has_tempo; ++d) {
+                    PatternType t = def_pattern.directions[d].type;
+                    if (t == PatternType::LIVE_FOUR || t == PatternType::RUSH_FOUR) {
+                        defender_has_tempo = true;
+                    }
+                }
+                if (!defender_has_tempo && def_pattern.four_count >= 2) {
+                    defender_has_tempo = true;
+                }
+            }
+
+            if (defender_has_tempo) {
                 mutable_board.undo_last_move();
                 worst = -100000 - max_depth;
                 break;
             }
-            
+
             int score = vct_defend(mutable_board, color, max_depth - 1,
                                    -INT_MAX, INT_MAX, stop_flag);
             mutable_board.undo_last_move();

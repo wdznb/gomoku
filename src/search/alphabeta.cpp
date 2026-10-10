@@ -41,12 +41,29 @@ void AlphaBetaSearch::sort_moves(std::vector<Move>& moves, const Board& board, i
         }
     }
 
-    std::sort(moves.begin() + (tt_swapped ? 1 : 0), moves.end(),
-              [&](const Move& a, const Move& b) {
-        int sa = evaluator_.evaluate_position_both(board, a.pos.row, a.pos.col, color);
-        int sb = evaluator_.evaluate_position_both(board, b.pos.row, b.pos.col, color);
-        return sa > sb;
-    });
+    // evaluate_position_both runs four pattern recognitions per call; the
+    // comparator used to invoke it O(n log n) times per node. Score once up
+    // front and sort the pairs instead.
+    int start = tt_swapped ? 1 : 0;
+    int count = static_cast<int>(moves.size()) - start;
+    if (count <= 1) return;
+
+    std::vector<std::pair<int, size_t>> scored;
+    scored.reserve(count);
+    for (int i = 0; i < count; ++i) {
+        const Move& m = moves[start + i];
+        int s = evaluator_.evaluate_position_both(board, m.pos.row, m.pos.col, color);
+        scored.emplace_back(s, static_cast<size_t>(start + i));
+    }
+    std::sort(scored.begin(), scored.end(),
+              [](const auto& a, const auto& b) { return a.first > b.first; });
+
+    std::vector<Move> reordered(moves.size());
+    for (size_t i = 0; i < static_cast<size_t>(start); ++i) reordered[i] = moves[i];
+    for (size_t i = 0; i < scored.size(); ++i) {
+        reordered[start + i] = moves[scored[i].second];
+    }
+    moves = std::move(reordered);
 }
 
 int AlphaBetaSearch::quiescence(Board& board, int alpha, int beta, int color,

@@ -590,6 +590,42 @@ void test_game_manager_resign_state() {
     std::cout << "test_game_manager_resign_state passed" << std::endl;
 }
 
+void test_game_manager_rejects_forbidden_human_move() {
+    // Human BLACK cannot execute a double-three; Renju forbids it, and every
+    // AI VCF/resign proof assumes the opponent is bound by the same rules.
+    // Build the setup shape on a raw board and confirm the predicate that
+    // make_move now consults actually fires.
+    Board probe;
+    probe.place_stone(7, 5, BLACK);
+    probe.place_stone(7, 6, BLACK);
+    probe.place_stone(5, 7, BLACK);
+    probe.place_stone(6, 7, BLACK);
+    assert(PatternRecognizer::is_forbidden(probe, 7, 7, BLACK));
+
+    // Overline: six-in-a-row is also forbidden for BLACK and is caught by
+    // the extended run walk added to recognize_direction.
+    Board overline;
+    for (int c = 3; c <= 7; ++c) overline.place_stone(7, c, BLACK);
+    assert(PatternRecognizer::is_forbidden(overline, 7, 8, BLACK));
+
+    std::cout << "test_game_manager_rejects_forbidden_human_move passed" << std::endl;
+}
+
+void test_game_manager_rejects_move_on_ai_turn() {
+    // When current_turn is not player_color, make_move must reject the call
+    // so a stray click cannot commit a stone on the AI's behalf.
+    GameManager game;
+    game.set_player_color(WHITE);
+    // Board is empty; current_turn() is BLACK, which is the AI's colour.
+    assert(game.current_turn() == BLACK);
+    assert(game.current_turn() != game.player_color());
+    bool ok = game.make_move(7, 7);
+    assert(!ok);
+    assert(game.board().move_count() == 0);
+
+    std::cout << "test_game_manager_rejects_move_on_ai_turn passed" << std::endl;
+}
+
 int main() {
     std::cout << "Running search tests..." << std::endl;
 
@@ -622,6 +658,8 @@ int main() {
     test_search_engine_resigns_on_proven_loss();
     test_search_engine_no_false_resign();
     test_game_manager_resign_state();
+    test_game_manager_rejects_forbidden_human_move();
+    test_game_manager_rejects_move_on_ai_turn();
 
     std::cout << "All search tests passed!" << std::endl;
     return 0;

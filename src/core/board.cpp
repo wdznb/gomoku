@@ -153,7 +153,15 @@ bool Board::has_five_in_a_row(int row, int col, int color) const {
         count += count_direction(row, col, dr, dc, color);
         count += count_direction(row, col, -dr, -dc, color);
         
-        if (count >= 5) return true;
+        // Renju: BLACK must form exactly five stones to win - an overline of
+        // six or more is an illegal shape (already rejected by is_forbidden),
+        // and treating it as a win would give BLACK two ways to win.
+        // WHITE has no forbidden rules and wins on any run of five or more.
+        if (color == BLACK) {
+            if (count == 5) return true;
+        } else {
+            if (count >= 5) return true;
+        }
     }
     return false;
 }
