@@ -113,6 +113,38 @@ void test_vct_immediate_win() {
     std::cout << "test_vct_immediate_win passed" << std::endl;
 }
 
+void test_vct_diagonal_rush_four_is_not_a_win() {
+    // Round 42: generate_defenses' fallback used a Manhattan <= 4 window, so a
+    // diagonal four whose unique completion cell is 4 diagonal steps from the
+    // attack stone (Manhattan 8) was never offered as a block. With no defense
+    // listed, vct_defend/vct_attack returned 100000+depth, and search_engine
+    // committed the move as a forced win without AlphaBeta - a fabricated win.
+    //
+    // BLACK has a diagonal three (6,6),(7,7),(8,8). Its only extensions are at
+    // (5,5) or (9,9); playing either makes a RUSH four (the opposite outer end
+    // is blocked by WHITE), completable only at the far diagonal cell - exactly
+    // Chebyshev 4 / Manhattan 8 from the stone just played. WHITE has those
+    // blocks, so this is NOT a forced win. Fixed filter uses Chebyshev <= 4.
+    Board board;
+    Evaluator evaluator;
+    TranspositionTable tt;
+
+    board.place_stone(6, 6, BLACK);
+    board.place_stone(7, 7, BLACK);
+    board.place_stone(8, 8, BLACK);
+    board.place_stone(4, 4, WHITE);   // blocks the (5,5)-four's near end
+    board.place_stone(10, 10, WHITE); // blocks the (9,9)-four's near end
+    board.place_stone(0, 0, WHITE);   // parity filler: BLACK to move
+
+    VCTSearch vct(evaluator, tt);
+    std::atomic<bool> stop(false);
+
+    VCTMove result = vct.search(board, BLACK, 8, stop);
+    assert(result.result != VCTResult::WIN);
+
+    std::cout << "test_vct_diagonal_rush_four_is_not_a_win passed" << std::endl;
+}
+
 void test_alphabeta_basic() {
     Board board;
     Evaluator evaluator;
@@ -793,6 +825,7 @@ int main() {
     test_vcf_immediate_five();
     test_vcf_no_win();
     test_vct_immediate_win();
+    test_vct_diagonal_rush_four_is_not_a_win();
     test_alphabeta_basic();
     test_alphabeta_blocks_five();
     test_alphabeta_takes_winning();

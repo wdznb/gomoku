@@ -74,7 +74,17 @@ std::vector<Move> VCTSearch::generate_defenses(const Board& board, int color,
         for (const auto& pos : candidates) {
             if (!board.is_empty(pos.row, pos.col)) continue;
             if (opp == BLACK && PatternRecognizer::is_forbidden(board, pos.row, pos.col, opp)) continue;
-            int dist = std::abs(pos.row - attack_row) + std::abs(pos.col - attack_col);
+            // Chebyshev, not Manhattan: the unique completion cell of a four the
+            // attacker just threatens is at most 4 steps ALONG the line, and a
+            // diagonal line puts that cell at Manhattan distance 8 (e.g. 4 diagonal
+            // steps). A Manhattan <= 4 filter drops those diagonal blocks, leaving
+            // defenses empty, which vct_defend/vct_attack read as "no defense" and
+            // return a 100000+depth win that search_engine then commits without
+            // AlphaBeta - a fabricated forced win. Chebyshev <= 4 covers every
+            // direction's completion cell while only ever ADDING candidate blocks
+            // (monotone-safe: strictly reduces false wins, never invents one).
+            int dist = std::max(std::abs(pos.row - attack_row),
+                                std::abs(pos.col - attack_col));
             if (dist <= 4) {
                 int score = evaluator_.evaluate_position(board, pos.row, pos.col, opp);
                 scored_defenses.emplace_back(score, Move(pos.row, pos.col, opp));
