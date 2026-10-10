@@ -56,6 +56,11 @@ bool GameManager::make_move(int row, int col) {
     if (ai_thinking_.load()) return false;
     
     int turn = current_turn();
+    // Only the human side may call make_move. If stop_thinking aborted the AI
+    // worker before it placed a stone, the board still shows AI's color to
+    // move; without this guard the human's next make_move would silently
+    // commit a stone for ai_color_ and corrupt the Zobrist parity.
+    if (turn != player_color_) return false;
     if (!board_.place_stone(row, col, turn)) {
         return false;
     }

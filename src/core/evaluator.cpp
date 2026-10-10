@@ -105,8 +105,8 @@ int Evaluator::evaluate_position_both(const Board& board, int row, int col, int 
 
 int Evaluator::evaluate_board(const Board& board, int my_color) const {
     int opp_color = opponent(my_color);
-    int my_total = 0;
-    int opp_total = 0;
+    long long my_total = 0;
+    long long opp_total = 0;
     
     const auto& candidates = board.active_empty();
     
@@ -118,7 +118,15 @@ int Evaluator::evaluate_board(const Board& board, int my_color) const {
         opp_total += pattern_score(opp_pattern);
     }
     
-    return my_total - opp_total;
+    long long diff = my_total - opp_total;
+    // Summing pattern scores over hundreds of candidate squares can exceed the
+    // mate threshold (100000) that AlphaBeta uses to detect forced wins and
+    // terminate iterative deepening. Static evaluation must never reach a mate
+    // score or the root will break early on what is really just a busy board.
+    long long cap = static_cast<long long>(coeffs_.five) - 1;
+    if (diff > cap) diff = cap;
+    if (diff < -cap) diff = -cap;
+    return static_cast<int>(diff);
 }
 
 }
