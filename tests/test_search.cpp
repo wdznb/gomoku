@@ -522,6 +522,28 @@ void test_opening_book_rejects_occupied() {
     std::cout << "test_opening_book_rejects_occupied passed" << std::endl;
 }
 
+void test_opening_book_large_weight_no_overflow() {
+    // Two candidates share one key, each with a weight near 2^31. The old code
+    // summed them into a signed int, overflowing into UB and a negative
+    // uniform_int_distribution range. The pick must be computed in 64-bit and
+    // still return one of the two legal replies.
+    OpeningBook book;
+    const int big = 2000000000;
+    book.add_line({{7, 7}, {8, 8}, {6, 6}}, big, "a");
+    book.add_line({{7, 7}, {8, 8}, {6, 7}}, big, "b");
+
+    Board board;
+    board.place_stone(7, 7, BLACK);
+    board.place_stone(8, 8, WHITE);
+
+    Move response;
+    assert(book.query(board.move_history(), BLACK, response));
+    bool ok = (response.pos.row == 6 && (response.pos.col == 6 || response.pos.col == 7));
+    assert(ok);
+
+    std::cout << "test_opening_book_large_weight_no_overflow passed" << std::endl;
+}
+
 void test_search_engine_uses_book() {
     OpeningBook book;
     std::string path = std::string(GOMOKU_SOURCE_DIR) + "/data/opening_book.json";
@@ -887,6 +909,7 @@ int main() {
     test_opening_book_miss();
     test_opening_book_load_json();
     test_opening_book_rejects_occupied();
+    test_opening_book_large_weight_no_overflow();
     test_search_engine_uses_book();
     test_search_engine_ignores_book_midgame();
     test_search_engine_layered();

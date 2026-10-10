@@ -5,10 +5,12 @@
 #include "../optimization/opening_book.h"
 #include <boost/beast/core.hpp>
 #include <boost/beast/websocket.hpp>
+#include <boost/beast/http.hpp>
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/strand.hpp>
 #include <boost/asio/signal_set.hpp>
 #include <nlohmann/json.hpp>
+#include <filesystem>
 #include <memory>
 #include <map>
 #include <mutex>
@@ -20,6 +22,7 @@ namespace gomoku {
 namespace beast = boost::beast;
 namespace websocket = beast::websocket;
 namespace net = boost::asio;
+namespace http = beast::http;
 using tcp = net::ip::tcp;
 using json = nlohmann::json;
 
@@ -33,20 +36,30 @@ public:
     
     std::function<void(std::shared_ptr<WebSocketSession>, const json&)> on_message;
     std::function<void(std::shared_ptr<WebSocketSession>)> on_close;
+    // Invoked only after a successful WebSocket handshake, so a plain HTTP
+    // request (a page or asset load) never creates a game/engine.
+    std::function<void(std::shared_ptr<WebSocketSession>)> on_open;
     
 private:
     websocket::stream<beast::tcp_stream> ws_;
     std::string web_dir_;
     beast::flat_buffer buffer_;
+    http::request<http::string_body> req_;
+    std::shared_ptr<http::response<http::string_body>> res_;
     // Queue access and write initiation all run on ws_'s executor (posted
     // from send()), so no separate mutex is needed.
     std::queue<std::string> send_queue_;
     
     void do_read();
     void do_write();
-    void handle_http_request(beast::http::request<beast::http::string_body>& req);
+    void on_http_read(beast::error_code ec, std::size_t bytes);
+    void run_websocket();
+    void handle_http_request();
+    void send_http_response();
+    // Resolve a request target to a regular file strictly inside web_dir_.
+    // Returns an empty path on any traversal / miss so the caller sends 404.
+    std::filesystem::path resolve_file(const std::string& target);
     std::string get_content_type(const std::string& path);
-    std::string load_file(const std::string& path);
 };
 
 class GameServer {
@@ -68,6 +81,7 @@ private:
     
     void do_accept();
     void on_connect(std::shared_ptr<WebSocketSession> session);
+    void on_open(std::shared_ptr<WebSocketSession> session);
     void on_disconnect(WebSocketSession* session);
     void on_message(std::shared_ptr<WebSocketSession> session, const json& msg);
     

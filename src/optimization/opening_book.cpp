@@ -105,9 +105,13 @@ bool OpeningBook::load(const std::string& path, std::string& error) {
 
         if (!valid || line.size() < 2) continue;
 
+        // Clamp the per-entry weight: a malformed book with a huge weight would
+        // otherwise overflow the int total_weight sum in query() into UB.
         int weight = entry.contains("weight") && entry["weight"].is_number()
                          ? entry["weight"].get<int>()
                          : 1;
+        if (weight < 1) weight = 1;
+        if (weight > 1000000) weight = 1000000;
         std::string name = entry.contains("name") && entry["name"].is_string()
                                ? entry["name"].get<std::string>()
                                : "";
@@ -177,15 +181,18 @@ bool OpeningBook::query(const std::vector<Move>& history, int color, Move& out_m
 
     if (candidates.empty()) return false;
 
-    int total_weight = 0;
+    // Accumulate in 64-bit so even a pathological number of entries sharing a
+    // key cannot overflow the total the distribution is built from.
+    long long total_weight = 0;
     for (const auto& c : candidates) {
         total_weight += std::max(1, c.weight);
     }
+    if (total_weight <= 0) return false;
 
-    int pick;
+    long long pick;
     {
         std::lock_guard<std::mutex> lock(rng_mutex_);
-        std::uniform_int_distribution<int> dist(0, total_weight - 1);
+        std::uniform_int_distribution<long long> dist(0, total_weight - 1);
         pick = dist(rng_);
     }
 

@@ -3,6 +3,8 @@
 #include <fstream>
 #include <sstream>
 #include <csignal>
+#include <chrono>
+#include <cctype>
 
 namespace gomoku {
 
@@ -24,25 +26,56 @@ WebSocketSession::WebSocketSession(tcp::socket&& socket, const std::string& web_
 }
 
 void WebSocketSession::start() {
+    // The server multiplexes one port: a browser first issues a plain GET for
+    // index.html/app.js/style.css (served from web_dir_), then opens the
+    // WebSocket on the same origin. Read the HTTP request headers before
+    // deciding which path to take; the WebSocket handshake reuses the request
+    // we just parsed, so nothing is consumed twice.
+    ws_.next_layer().expires_after(std::chrono::seconds(60));
+    http::async_read(
+        ws_.next_layer(), buffer_, req_,
+        [self = shared_from_this()](beast::error_code ec, std::size_t bytes) {
+            self->on_http_read(ec, bytes);
+        });
+}
+
+void WebSocketSession::on_http_read(beast::error_code ec, std::size_t) {
+    if (ec) {
+        // Not a well-formed HTTP request (e.g. a raw TCP probe); drop it. The
+        // game was never created, so there is nothing to unregister.
+        beast::error_code ignored;
+        ws_.next_layer().socket().close(ignored);
+        return;
+    }
+
+    if (websocket::is_upgrade(req_)) {
+        run_websocket();
+    } else {
+        handle_http_request();
+    }
+}
+
+void WebSocketSession::run_websocket() {
     ws_.set_option(websocket::stream_base::timeout::suggested(beast::role_type::server));
     ws_.set_option(websocket::stream_base::decorator(
         [](websocket::response_type& res) {
             res.set(boost::beast::http::field::server, "GomokuAI");
         }));
-    
+
     ws_.async_accept(
+        req_,
         [self = shared_from_this()](beast::error_code ec) {
             if (ec) {
                 std::cerr << "WebSocket accept error: " << ec.message() << std::endl;
-                // The GameManager was already registered in games_ before
-                // start() was invoked, so run the close callback here to
-                // erase it; otherwise plain TCP probes that never complete
-                // the WS handshake leak a session (and its ~96 MB of TTs)
-                // each time.
                 if (self->on_close) {
                     self->on_close(self);
                 }
                 return;
+            }
+            // The handshake succeeded, so this session is a real game
+            // connection; only now does the server build its GameManager.
+            if (self->on_open) {
+                self->on_open(self);
             }
             self->do_read();
         });
@@ -120,6 +153,103 @@ void WebSocketSession::close() {
     ws_.close(websocket::close_code::normal, ec);
 }
 
+// Resolve a request target to a regular file that lives strictly under
+// web_dir_. weakly_canonical folds any ".." lexically and resolves symlinks on
+// existing prefixes, and the final string-prefix check drops every path that
+// escapes the root, so "/../../etc/passwd" and percent-encoded variants return
+// empty (-> 404). Absolute targets, backslashes, '%' and duplicate slashes are
+// rejected up front as defense in depth.
+std::filesystem::path WebSocketSession::resolve_file(const std::string& target) {
+    namespace fs = std::filesystem;
+
+    std::string p = target;
+    auto frag = p.find_first_of("?#");
+    if (frag != std::string::npos) p = p.substr(0, frag);
+    if (p.empty() || p == "/") p = "/index.html";
+
+    if (p.front() != '/' ||
+        p.find('\\') != std::string::npos ||
+        p.find('%') != std::string::npos ||
+        p.find("//") != std::string::npos) {
+        return {};
+    }
+
+    std::string rel = p.substr(1);
+    size_t start = 0;
+    while (start <= rel.size()) {
+        size_t slash = rel.find('/', start);
+        std::string part = rel.substr(start,
+            slash == std::string::npos ? std::string::npos : slash - start);
+        if (part == ".." || part == ".") return {};
+        if (slash == std::string::npos) break;
+        start = slash + 1;
+    }
+
+    std::error_code ec;
+    fs::path root = fs::weakly_canonical(web_dir_, ec);
+    if (ec) return {};
+    fs::path full = fs::weakly_canonical(root / rel, ec);
+    if (ec) return {};
+
+    std::string rs = root.string();
+    if (!rs.empty() && rs.back() != '/') rs.push_back('/');
+    if (full.string().rfind(rs, 0) != 0) return {};
+
+    if (!fs::is_regular_file(full, ec) || ec) return {};
+    return full;
+}
+
+std::string WebSocketSession::get_content_type(const std::string& path) {
+    auto dot = path.find_last_of('.');
+    std::string ext = (dot == std::string::npos)
+        ? std::string() : path.substr(dot + 1);
+    for (char& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (ext == "html") return "text/html; charset=utf-8";
+    if (ext == "css")  return "text/css; charset=utf-8";
+    if (ext == "js")   return "application/javascript; charset=utf-8";
+    if (ext == "json") return "application/json";
+    if (ext == "ico")  return "image/x-icon";
+    if (ext == "png")  return "image/png";
+    if (ext == "jpg" || ext == "jpeg") return "image/jpeg";
+    if (ext == "svg")  return "image/svg+xml";
+    return "application/octet-stream";
+}
+
+void WebSocketSession::handle_http_request() {
+    res_ = std::make_shared<http::response<http::string_body>>();
+
+    std::filesystem::path file = resolve_file(std::string(req_.target()));
+    std::ifstream in(file, std::ios::binary);
+    if (!file.empty() && in) {
+        std::ostringstream ss;
+        ss << in.rdbuf();
+        res_->body() = ss.str();
+        res_->result(http::status::ok);
+        res_->set(http::field::content_type, get_content_type(file.string()));
+    } else {
+        res_->result(http::status::not_found);
+        res_->set(http::field::content_type, "text/plain; charset=utf-8");
+        res_->body() = "Not found";
+    }
+
+    res_->version(req_.version());
+    res_->set(http::field::server, "GomokuAI");
+    res_->set(http::field::connection, "close");
+    res_->prepare_payload();
+
+    send_http_response();
+}
+
+void WebSocketSession::send_http_response() {
+    http::async_write(
+        ws_.next_layer(), *res_,
+        [self = shared_from_this()](beast::error_code, std::size_t) {
+            beast::error_code ec;
+            self->ws_.next_layer().socket().shutdown(tcp::socket::shutdown_both, ec);
+            self->ws_.next_layer().socket().close(ec);
+        });
+}
+
 GameServer::GameServer(int port, const std::string& web_dir,
                        const std::string& book_path)
     : ioc_(), acceptor_(net::make_strand(ioc_)),
@@ -193,7 +323,15 @@ void GameServer::on_connect(std::shared_ptr<WebSocketSession> session) {
     session->on_close = [this](std::shared_ptr<WebSocketSession> s) {
         on_disconnect(s.get());
     };
-    
+    // A plain HTTP request never reaches this callback, so static asset loads
+    // (index.html/app.js/style.css, plus favicon probes) do not each allocate
+    // a GameManager and its multi-tens-of-MB transposition table.
+    session->on_open = [this](std::shared_ptr<WebSocketSession> s) {
+        on_open(s);
+    };
+}
+
+void GameServer::on_open(std::shared_ptr<WebSocketSession> session) {
     auto game = std::make_shared<GameManager>();
     game->set_opening_book(&book_);
     {
@@ -274,11 +412,17 @@ void GameServer::handle_choose_side(std::shared_ptr<WebSocketSession> session, c
     if (game->status() == GameStatus::GAME_OVER) {
         game->reset();
     }
-    // Defensive read: a present-but-non-string "color" would otherwise throw
-    // out of this handler with no reply. Default to black.
-    std::string color_str = (msg.contains("color") && msg["color"].is_string())
-                                ? msg["color"].get<std::string>()
-                                : std::string("black");
+    // A malformed or unknown color must not silently mean WHITE: the client
+    // would get a "playing" state_sync with inverted board colors and no error.
+    if (!msg.contains("color") || !msg["color"].is_string()) {
+        send_error(session, "choose_side requires a \"color\" of \"black\" or \"white\"");
+        return;
+    }
+    std::string color_str = msg["color"].get<std::string>();
+    if (color_str != "black" && color_str != "white") {
+        send_error(session, "Invalid color: " + color_str);
+        return;
+    }
     int color = (color_str == "black") ? BLACK : WHITE;
     
     game->set_player_color(color);
