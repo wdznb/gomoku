@@ -106,6 +106,7 @@ add_executable(test_search
     src/search/controller.cpp
     src/optimization/transposition.cpp
     src/optimization/opening_book.cpp
+    src/server/game_manager.cpp
 )
 target_include_directories(test_search PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_definitions(test_search PRIVATE

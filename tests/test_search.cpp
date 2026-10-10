@@ -9,6 +9,7 @@
 #include "search/controller.h"
 #include "optimization/transposition.h"
 #include "optimization/opening_book.h"
+#include "server/game_manager.h"
 #include <iostream>
 #include <cassert>
 #include <atomic>
@@ -421,6 +422,174 @@ void test_search_engine_ignores_book_midgame() {
               << result.method << ")" << std::endl;
 }
 
+void test_vcf_defense_proven_loss() {
+    Board board;
+    Evaluator evaluator;
+    TranspositionTable tt;
+
+    board.place_stone(7, 3, BLACK);
+    board.place_stone(7, 4, BLACK);
+    board.place_stone(7, 5, BLACK);
+    board.place_stone(7, 6, BLACK);
+    board.place_stone(0, 0, WHITE);
+    board.place_stone(0, 1, WHITE);
+    board.place_stone(1, 0, WHITE);
+
+    VCFSearch vcf(evaluator, tt);
+    std::atomic<bool> stop(false);
+
+    Move defense;
+    DefenseResult dr = vcf.find_defense(board, WHITE, 10, stop, defense);
+    assert(dr == DefenseResult::PROVEN_LOSS);
+
+    std::cout << "test_vcf_defense_proven_loss passed" << std::endl;
+}
+
+void test_vcf_defense_survives() {
+    Board board;
+    Evaluator evaluator;
+    TranspositionTable tt;
+
+    board.place_stone(7, 4, BLACK);
+    board.place_stone(7, 5, BLACK);
+    board.place_stone(7, 6, BLACK);
+    board.place_stone(0, 0, WHITE);
+    board.place_stone(1, 1, WHITE);
+
+    VCFSearch vcf(evaluator, tt);
+    std::atomic<bool> stop(false);
+
+    Move defense;
+    DefenseResult dr = vcf.find_defense(board, WHITE, 10, stop, defense);
+    assert(dr == DefenseResult::SURVIVES);
+    assert(defense.color == WHITE);
+    assert(board.is_empty(defense.pos.row, defense.pos.col));
+
+    std::cout << "test_vcf_defense_survives passed (defense: "
+              << defense.pos.row << "," << defense.pos.col << ")" << std::endl;
+}
+
+void test_vcf_defense_cut_short_is_unknown() {
+    Board board;
+    Evaluator evaluator;
+    TranspositionTable tt;
+
+    board.place_stone(7, 3, BLACK);
+    board.place_stone(7, 4, BLACK);
+    board.place_stone(7, 5, BLACK);
+    board.place_stone(7, 6, BLACK);
+    board.place_stone(0, 0, WHITE);
+    board.place_stone(0, 1, WHITE);
+
+    VCFSearch vcf(evaluator, tt);
+    std::atomic<bool> stop(true);
+
+    Move defense;
+    DefenseResult dr = vcf.find_defense(board, WHITE, 10, stop, defense);
+    assert(dr == DefenseResult::UNKNOWN);
+
+    std::cout << "test_vcf_defense_cut_short_is_unknown passed" << std::endl;
+}
+
+void test_vcf_defense_own_live_four_survives() {
+    Board board;
+    Evaluator evaluator;
+    TranspositionTable tt;
+
+    board.place_stone(7, 3, BLACK);
+    board.place_stone(7, 4, BLACK);
+    board.place_stone(7, 5, BLACK);
+    board.place_stone(7, 6, BLACK);
+    board.place_stone(10, 4, WHITE);
+    board.place_stone(10, 5, WHITE);
+    board.place_stone(10, 6, WHITE);
+
+    VCFSearch vcf(evaluator, tt);
+    std::atomic<bool> stop(false);
+
+    Move defense;
+    DefenseResult dr = vcf.find_defense(board, WHITE, 10, stop, defense);
+    assert(dr == DefenseResult::SURVIVES);
+    assert(defense.pos.row == 10 && (defense.pos.col == 3 || defense.pos.col == 7));
+
+    std::cout << "test_vcf_defense_own_live_four_survives passed" << std::endl;
+}
+
+void test_search_engine_resigns_on_proven_loss() {
+    Board board;
+
+    board.place_stone(7, 4, BLACK);
+    board.place_stone(7, 5, BLACK);
+    board.place_stone(7, 6, BLACK);
+    board.place_stone(5, 4, BLACK);
+    board.place_stone(6, 4, BLACK);
+    board.place_stone(0, 0, WHITE);
+    board.place_stone(1, 1, WHITE);
+
+    SearchEngine engine;
+    std::atomic<bool> stop(false);
+    SearchResult result = engine.search(board, WHITE, 2, 2000, stop);
+
+    assert(result.resigned);
+    assert(result.method == "resign");
+    assert(result.best_move.pos.is_valid());
+
+    engine.set_resign_detection(false);
+    SearchResult continued = engine.search(board, WHITE, 2, 2000, stop);
+    assert(!continued.resigned);
+
+    std::cout << "test_search_engine_resigns_on_proven_loss passed (move: "
+              << result.best_move.pos.row << "," << result.best_move.pos.col << ")" << std::endl;
+}
+
+void test_search_engine_no_false_resign() {
+    Board board;
+
+    board.place_stone(7, 7, BLACK);
+    board.place_stone(7, 8, WHITE);
+    board.place_stone(8, 8, BLACK);
+    board.place_stone(6, 6, WHITE);
+
+    SearchEngine engine;
+    std::atomic<bool> stop(false);
+    SearchResult result = engine.search(board, BLACK, 2, 2000, stop);
+
+    assert(!result.resigned);
+    assert(result.method != "resign");
+    assert(result.best_move.pos.is_valid());
+    assert(board.is_empty(result.best_move.pos.row, result.best_move.pos.col));
+
+    std::cout << "test_search_engine_no_false_resign passed (method: "
+              << result.method << ")" << std::endl;
+}
+
+void test_game_manager_resign_state() {
+    GameManager game;
+    game.set_player_color(BLACK);
+
+    std::string reason;
+    int winner = EMPTY;
+    int callbacks = 0;
+    game.set_game_over_callback([&](int w, const std::string& r) {
+        winner = w;
+        reason = r;
+        callbacks++;
+    });
+
+    game.resign(BLACK);
+    assert(game.status() == GameStatus::GAME_OVER);
+    assert(winner == WHITE);
+    assert(game.winner() == WHITE);
+    assert(reason == "resign");
+    assert(callbacks == 1);
+
+    game.resign(WHITE);
+    assert(callbacks == 1);
+    assert(game.winner() == WHITE);
+
+    std::cout << "test_game_manager_resign_state passed" << std::endl;
+}
+
 int main() {
     std::cout << "Running search tests..." << std::endl;
 
@@ -446,6 +615,13 @@ int main() {
     test_controller_async();
     test_controller_stop();
     test_forced_move();
+    test_vcf_defense_proven_loss();
+    test_vcf_defense_survives();
+    test_vcf_defense_cut_short_is_unknown();
+    test_vcf_defense_own_live_four_survives();
+    test_search_engine_resigns_on_proven_loss();
+    test_search_engine_no_false_resign();
+    test_game_manager_resign_state();
 
     std::cout << "All search tests passed!" << std::endl;
     return 0;

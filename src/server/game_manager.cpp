@@ -114,10 +114,16 @@ void GameManager::resign(int color) {
         hint_thread_->join();
     }
     
+    resign_now(color);
+}
+
+void GameManager::resign_now(int color) {
+    if (status_ == GameStatus::GAME_OVER) return;
+
     winner_ = opponent(color);
     game_over_reason_ = "resign";
     status_ = GameStatus::GAME_OVER;
-    
+
     if (game_over_callback_) {
         game_over_callback_(winner_, game_over_reason_);
     }
@@ -180,7 +186,16 @@ void GameManager::ai_thinking_worker(int timeout_ms, int max_depth) {
     }
 
     SearchResult result = engine_.search(snapshot, ai_color_, max_depth, timeout_ms, stop_flag_);
-    
+
+    if (result.resigned) {
+        std::lock_guard<std::mutex> lock(thinking_mutex_);
+        if (!stop_flag_.load() && status_ == GameStatus::PLAYING) {
+            resign_now(ai_color_);
+        }
+        ai_thinking_.store(false);
+        return;
+    }
+
     if (move_callback_ && result.best_move.pos.is_valid()) {
         std::lock_guard<std::mutex> lock(thinking_mutex_);
         if (!stop_flag_.load() && board_.place_stone(result.best_move.pos, ai_color_)) {

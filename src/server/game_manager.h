@@ -85,6 +85,9 @@ private:
     
     void check_game_over();
     void ai_thinking_worker(int timeout_ms, int max_depth);
+    // Sets game-over state without joining the search threads, so it is safe to
+    // call from ai_thinking_worker itself.
+    void resign_now(int color);
 };
 
 }

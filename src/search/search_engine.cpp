@@ -6,13 +6,15 @@ namespace gomoku {
 SearchEngine::SearchEngine()
     : book_enabled_(true),
       vcf_enabled_(true), vct_enabled_(true), alphabeta_enabled_(true),
-      vcf_max_depth_(20), vct_max_depth_(12), alphabeta_max_depth_(8) {}
+      vcf_max_depth_(20), vct_max_depth_(12), alphabeta_max_depth_(8),
+      resign_detection_(true), resign_node_limit_(400000) {}
 
 SearchEngine::SearchEngine(const ThreatCoefficients& coeffs)
     : evaluator_(coeffs), greedy_(coeffs),
       book_enabled_(true),
       vcf_enabled_(true), vct_enabled_(true), alphabeta_enabled_(true),
-      vcf_max_depth_(20), vct_max_depth_(12), alphabeta_max_depth_(8) {}
+      vcf_max_depth_(20), vct_max_depth_(12), alphabeta_max_depth_(8),
+      resign_detection_(true), resign_node_limit_(400000) {}
 
 void SearchEngine::set_coefficients(const ThreatCoefficients& coeffs) {
     evaluator_.set_coefficients(coeffs);
@@ -126,6 +128,19 @@ SearchResult SearchEngine::search(const Board& board, int color,
         result.depth = info.depth;
         result.nodes_searched = info.nodes_searched;
         result.method = "alphabeta";
+
+        if (resign_detection_ && !stop_flag.load()) {
+            VCFSearch loss_probe(evaluator_, tt_vcf_);
+            loss_probe.set_node_limit(resign_node_limit_);
+
+            Move defense;
+            DefenseResult dr = loss_probe.find_defense(board, color, vcf_max_depth_,
+                                                        stop_flag, defense);
+            if (dr == DefenseResult::PROVEN_LOSS) {
+                result.resigned = true;
+                result.method = "resign";
+            }
+        }
 
         if (progress_callback_) {
             progress_callback_(info.depth, info.nodes_searched, info.elapsed_ms);

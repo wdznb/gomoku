@@ -23,6 +23,7 @@ struct SearchResult {
     int elapsed_ms;
     std::string method;
     std::vector<Move> principal_variation;
+    bool resigned = false;
 };
 
 using ProgressCallback = std::function<void(int depth, int nodes, int elapsed_ms)>;
@@ -54,6 +55,13 @@ public:
     const OpeningBook* opening_book() const { return book_; }
     void set_book_enabled(bool v) { book_enabled_ = v; }
 
+    // Proves the position lost by exhausting every reply against the opponent's
+    // forced VCF. Returns quickly on the first reply that survives, so the cost
+    // only grows in positions that are genuinely lost. Only ever sets
+    // SearchResult.resigned; failing to prove a loss keeps the AI playing.
+    void set_resign_detection(bool v) { resign_detection_ = v; }
+    void set_resign_node_limit(int n) { resign_node_limit_ = n; }
+
     TranspositionTable& transposition_table() { return tt_alphabeta_; }
 
 private:
@@ -73,6 +81,9 @@ private:
     int vcf_max_depth_;
     int vct_max_depth_;
     int alphabeta_max_depth_;
+
+    bool resign_detection_;
+    int resign_node_limit_;
 
     ProgressCallback progress_callback_;
 };

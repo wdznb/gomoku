@@ -171,8 +171,13 @@ int VCFSearch::vcf_attack(Board& board, int color, int depth, int alpha, int bet
 
 VCFMove VCFSearch::search(const Board& board, int color, int max_depth,
                            std::atomic<bool>& stop_flag) {
-    VCFMove result;
     nodes_searched_ = 0;
+    return search_impl(board, color, max_depth, stop_flag);
+}
+
+VCFMove VCFSearch::search_impl(const Board& board, int color, int max_depth,
+                                std::atomic<bool>& stop_flag) {
+    VCFMove result;
 
     Board mutable_board = board;
 
@@ -266,6 +271,70 @@ VCFMove VCFSearch::search(const Board& board, int color, int max_depth,
     }
 
     return result;
+}
+
+bool VCFSearch::has_decisive_tempo(const Board& board, int row, int col, int color) const {
+    if (color == BLACK && PatternRecognizer::is_forbidden(board, row, col, color)) {
+        return false;
+    }
+
+    PositionPattern pattern = PatternRecognizer::recognize_position(board, row, col, color);
+    for (int d = 0; d < 4; ++d) {
+        PatternType t = pattern.directions[d].type;
+        if (t == PatternType::FIVE || t == PatternType::LIVE_FOUR) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+DefenseResult VCFSearch::find_defense(const Board& board, int defender, int max_depth,
+                                      std::atomic<bool>& stop_flag, Move& defense_move) {
+    nodes_searched_ = 0;
+    defense_move = Move();
+
+    int attacker = opponent(defender);
+    int legal_moves = 0;
+
+    for (const auto& pos : board.active_empty()) {
+        if (!board.is_empty(pos.row, pos.col)) continue;
+        if (defender == BLACK &&
+            PatternRecognizer::is_forbidden(board, pos.row, pos.col, defender)) {
+            continue;
+        }
+
+        legal_moves++;
+
+        // Making five wins outright; making a live four forces the attacker to
+        // answer it, which invalidates a win proof built on them keeping the
+        // initiative. Reporting SURVIVES here is the safe direction: the cost of
+        // being wrong is a missed resignation, not a bad resignation.
+        if (has_decisive_tempo(board, pos.row, pos.col, defender)) {
+            defense_move = Move(pos, defender);
+            return DefenseResult::SURVIVES;
+        }
+
+        Board after = board;
+        after.place_stone(pos.row, pos.col, defender);
+
+        VCFMove attacker_result = search_impl(after, attacker, max_depth, stop_flag);
+
+        if (stop_flag.load() || nodes_searched_ > node_limit_) {
+            return DefenseResult::UNKNOWN;
+        }
+
+        if (attacker_result.result != VCFResult::WIN) {
+            defense_move = Move(pos, defender);
+            return DefenseResult::SURVIVES;
+        }
+    }
+
+    if (legal_moves == 0) {
+        return DefenseResult::UNKNOWN;
+    }
+
+    return DefenseResult::PROVEN_LOSS;
 }
 
 }
