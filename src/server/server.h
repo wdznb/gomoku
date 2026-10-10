@@ -7,6 +7,7 @@
 #include <boost/beast/websocket.hpp>
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/strand.hpp>
+#include <boost/asio/signal_set.hpp>
 #include <nlohmann/json.hpp>
 #include <memory>
 #include <map>
@@ -59,6 +60,7 @@ public:
 private:
     net::io_context ioc_;
     tcp::acceptor acceptor_;
+    net::signal_set signals_;
     std::string web_dir_;
     OpeningBook book_;
     std::map<WebSocketSession*, std::shared_ptr<GameManager>> games_;

@@ -1,15 +1,6 @@
 #include "server/server.h"
 #include <iostream>
-#include <csignal>
-
-gomoku::GameServer* g_server = nullptr;
-
-void signal_handler(int signal) {
-    if (g_server) {
-        std::cout << "\nShutting down..." << std::endl;
-        g_server->stop();
-    }
-}
+#include <string>
 
 int main(int argc, char* argv[]) {
     int port = 8080;
@@ -42,12 +33,11 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    std::signal(SIGINT, signal_handler);
-    std::signal(SIGTERM, signal_handler);
-
+    // GameServer installs SIGINT/SIGTERM through Asio's signal_set inside
+    // start(), so the io thread performs the shutdown. A raw std::signal
+    // handler here would conflict with it and is not async-signal-safe.
     try {
         gomoku::GameServer server(port, web_dir, book_path);
-        g_server = &server;
         server.start();
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;

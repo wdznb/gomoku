@@ -2,6 +2,7 @@
 #include <iostream>
 #include <fstream>
 #include <sstream>
+#include <csignal>
 
 namespace gomoku {
 
@@ -121,7 +122,8 @@ void WebSocketSession::close() {
 
 GameServer::GameServer(int port, const std::string& web_dir,
                        const std::string& book_path)
-    : ioc_(), acceptor_(net::make_strand(ioc_)), web_dir_(web_dir) {
+    : ioc_(), acceptor_(net::make_strand(ioc_)),
+      signals_(ioc_, SIGINT, SIGTERM), web_dir_(web_dir) {
     std::string error;
     if (book_path.empty()) {
         std::cout << "Opening book disabled" << std::endl;
@@ -144,12 +146,26 @@ GameServer::GameServer(int port, const std::string& web_dir,
 void GameServer::start() {
     std::cout << "Server started on port " << acceptor_.local_endpoint().port() << std::endl;
     std::cout << "Open http://localhost:" << acceptor_.local_endpoint().port() << " in your browser" << std::endl;
+
+    // SIGINT/SIGTERM are handled on the io thread instead of a raw std::signal
+    // handler, which cannot safely touch server state (and whose handler would
+    // race with ioc_.run()). Stopping the acceptor rejects new connections and
+    // ioc_.stop() releases run() even with a client still connected.
+    signals_.async_wait([this](const beast::error_code& ec, int) {
+        if (ec) return;
+        std::cout << "\nShutting down..." << std::endl;
+        stop();
+    });
+
     do_accept();
     ioc_.run();
 }
 
 void GameServer::stop() {
-    acceptor_.close();
+    beast::error_code ec;
+    acceptor_.close(ec);
+    signals_.cancel();
+    ioc_.stop();
 }
 
 void GameServer::do_accept() {
