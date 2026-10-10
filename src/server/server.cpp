@@ -344,7 +344,9 @@ void GameServer::handle_request_hint(std::shared_ptr<WebSocketSession> session, 
     int timeout_ms = get_int(msg, "timeout_ms", 5000);
     int max_depth = get_int(msg, "max_depth", 6);
     
-    game->request_hint(timeout_ms, max_depth);
+    if (!game->request_hint(timeout_ms, max_depth)) {
+        send_error(session, "No hint available");
+    }
 }
 
 void GameServer::handle_resign(std::shared_ptr<WebSocketSession> session) {
@@ -385,9 +387,12 @@ void GameServer::handle_restart(std::shared_ptr<WebSocketSession> session) {
     game->reset();
     
     json response;
-    response["type"] = "state_sync";
-    response["board"] = board_to_json(game->board());
-    response["current_turn"] = "black";
+    // Emit game_restarted, not state_sync: the client routes state_sync to
+    // handleStateSync, which hard-codes gameStatus='playing' and would clobber
+    // the reset. game_restarted drives resetGame() (side buttons re-enabled,
+    // waiting state); the next choose_side re-arms the AI, so a BLACK-AI
+    // restart does not need an inline start_ai_thinking here.
+    response["type"] = "game_restarted";
     response["game_status"] = "waiting";
     send_message(session, response);
 }
@@ -460,10 +465,15 @@ void GameServer::setup_game_callbacks(std::shared_ptr<WebSocketSession> session,
     
     game.set_hint_callback([this, session](const Move& move, int score) {
         json msg;
-        msg["type"] = "hint_result";
-        msg["row"] = move.pos.row;
-        msg["col"] = move.pos.col;
-        msg["score"] = score;
+        if (move.pos.is_valid()) {
+            msg["type"] = "hint_result";
+            msg["row"] = move.pos.row;
+            msg["col"] = move.pos.col;
+            msg["score"] = score;
+        } else {
+            msg["type"] = "error";
+            msg["message"] = "No hint available";
+        }
         send_message(session, msg);
     });
 

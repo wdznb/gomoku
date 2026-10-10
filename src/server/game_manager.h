@@ -40,7 +40,7 @@ public:
     bool undo();
     void resign(int color);
     
-    void request_hint(int timeout_ms, int max_depth);
+    bool request_hint(int timeout_ms, int max_depth);
     void start_ai_thinking(int timeout_ms, int max_depth);
     void start_ai_thinking();
     void stop_thinking();

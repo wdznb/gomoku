@@ -216,15 +216,31 @@ class GomokuGame {
     }
     
     handleUndoSuccess(msg) {
-        if (this.moveHistory.length > 0) {
-            const lastMove = this.moveHistory.pop();
-            this.board[lastMove.row][lastMove.col] = EMPTY;
-            this.currentTurn = this.currentTurn === BLACK ? WHITE : BLACK;
-            this.lastMove = this.moveHistory.length > 0 ? this.moveHistory[this.moveHistory.length - 1] : null;
-            this.updateMoveList();
-            this.updateTurnInfo();
-            this.drawBoard();
+        // The server may remove 1 or 2 stones (its own reply plus the human's,
+        // so a single undo reverts a full round). Reconcile to the authoritative
+        // server move_count instead of assuming one pop, and take the turn from
+        // parity (BLACK always opens) rather than a local flip.
+        const target = Number.isInteger(msg.move_count)
+            ? msg.move_count
+            : Math.max(0, this.moveHistory.length - 1);
+        while (this.moveHistory.length > target) {
+            const m = this.moveHistory.pop();
+            this.board[m.row][m.col] = EMPTY;
         }
+        this.currentTurn = (target % 2 === 0) ? BLACK : WHITE;
+        this.lastMove = this.moveHistory.length > 0
+            ? this.moveHistory[this.moveHistory.length - 1]
+            : null;
+        if (msg.game_status === 'waiting') {
+            this.gameStatus = 'waiting';
+        } else if (msg.game_status === 'game_over') {
+            this.gameStatus = 'game_over';
+        } else {
+            this.gameStatus = 'playing';
+        }
+        this.updateMoveList();
+        this.updateTurnInfo();
+        this.drawBoard();
     }
     
     handleHintResult(msg) {

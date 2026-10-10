@@ -164,27 +164,31 @@ void GameManager::resign_now(int color) {
     }
 }
 
-void GameManager::request_hint(int timeout_ms, int max_depth) {
-    if (ai_thinking_.load() || hint_active_.load()) return;
-    
+bool GameManager::request_hint(int timeout_ms, int max_depth) {
+    if (ai_thinking_.load() || hint_active_.load()) return false;
+
     if (hint_thread_ && hint_thread_->joinable()) {
         hint_thread_->join();
     }
-    
+
     hint_active_.store(true);
     stop_flag_.store(false);
     int turn = current_turn();
     Board board_snapshot = board_;
-    
+
     hint_thread_ = std::make_unique<std::thread>(
         [this, board_snapshot, turn, timeout_ms, max_depth]() mutable {
             SearchResult result = engine_.search(board_snapshot, turn, max_depth, timeout_ms, stop_flag_);
-            
-            if (hint_callback_ && !stop_flag_.load() && result.best_move.pos.is_valid()) {
+
+            if (!stop_flag_.load() && hint_callback_) {
+                // Deliver even when best_move is invalid (timeout with no PV):
+                // the server distinguishes valid (hint_result) from invalid
+                // (error) so the client is never left waiting on silence.
                 hint_callback_(result.best_move, result.score);
             }
             hint_active_.store(false);
         });
+    return true;
 }
 
 void GameManager::start_ai_thinking(int timeout_ms, int max_depth) {
