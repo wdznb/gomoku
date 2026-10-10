@@ -284,6 +284,40 @@ void test_forced_move() {
     std::cout << "test_forced_move passed" << std::endl;
 }
 
+// Round 33 F1: winning your own five must take priority over blocking the
+// opponent's. Greedy ranks by attack + defense, so a defensive square can
+// outrank an outright winning five; before the fix the must_block branch
+// fired first and threw away a guaranteed win.
+void test_search_engine_prefers_own_five_over_block() {
+    Board board;
+    SearchEngine engine;
+
+    // BLACK has an unfinished four in row 7 that will become five next turn
+    // if not blocked.
+    board.place_stone(7, 3, BLACK);
+    board.place_stone(7, 4, BLACK);
+    board.place_stone(7, 5, BLACK);
+    board.place_stone(7, 6, BLACK);
+
+    // WHITE has a matching four in row 9; playing (9,2) or (9,7) is an
+    // immediate win.
+    board.place_stone(9, 3, WHITE);
+    board.place_stone(9, 4, WHITE);
+    board.place_stone(9, 5, WHITE);
+    board.place_stone(9, 6, WHITE);
+
+    std::atomic<bool> stop(false);
+    SearchResult result = engine.search(board, WHITE, 4, 3000, stop);
+
+    // Must complete WHITE's own five, not defend against BLACK.
+    assert(result.best_move.color == WHITE);
+    assert(result.best_move.pos.row == 9);
+    assert(result.best_move.pos.col == 2 || result.best_move.pos.col == 7);
+    assert(result.method == "greedy_five");
+
+    std::cout << "test_search_engine_prefers_own_five_over_block passed" << std::endl;
+}
+
 void test_opening_book_prefix_expansion() {
     OpeningBook book;
     book.add_line({{7, 7}, {7, 8}, {6, 8}}, 10, "pu_yue");
@@ -690,6 +724,7 @@ int main() {
     test_game_manager_rejects_forbidden_human_move();
     test_game_manager_rejects_move_on_ai_turn();
     test_game_manager_promotes_status_when_ai_opens();
+    test_search_engine_prefers_own_five_over_block();
 
     std::cout << "All search tests passed!" << std::endl;
     return 0;

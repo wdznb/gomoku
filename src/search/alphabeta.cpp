@@ -44,6 +44,13 @@ void AlphaBetaSearch::sort_moves(std::vector<Move>& moves, const Board& board, i
     // evaluate_position_both runs four pattern recognitions per call; the
     // comparator used to invoke it O(n log n) times per node. Score once up
     // front and sort the pairs instead.
+    //
+    // Callers pass a move list that generate_moves has already filtered
+    // against is_forbidden for BLACK, so calling evaluate_position_both here
+    // would rerun is_forbidden (which does a second recognize_combined) on
+    // every node of every ply. Score both sides directly and skip that
+    // redundant work.
+    int opp = opponent(color);
     int start = tt_swapped ? 1 : 0;
     int count = static_cast<int>(moves.size()) - start;
     if (count <= 1) return;
@@ -52,7 +59,8 @@ void AlphaBetaSearch::sort_moves(std::vector<Move>& moves, const Board& board, i
     scored.reserve(count);
     for (int i = 0; i < count; ++i) {
         const Move& m = moves[start + i];
-        int s = evaluator_.evaluate_position_both(board, m.pos.row, m.pos.col, color);
+        int s = evaluator_.evaluate_position(board, m.pos.row, m.pos.col, color) +
+                evaluator_.evaluate_position(board, m.pos.row, m.pos.col, opp);
         scored.emplace_back(s, static_cast<size_t>(start + i));
     }
     std::sort(scored.begin(), scored.end(),
@@ -286,6 +294,20 @@ Move AlphaBetaSearch::search(const Board& board, int color, int max_depth,
             info_.depth = depth;
             info_.score = best_score;
             info_.best_move = best_move;
+
+            // Feed the shallow iteration's winner back into the root order so
+            // deeper iterations inherit the cutoff / TT-move effect that makes
+            // iterative deepening worth the extra work.
+            if (depth_best_move.pos.is_valid()) {
+                auto it = std::find_if(root_moves.begin(), root_moves.end(),
+                    [&](const Move& m) {
+                        return m.pos.row == depth_best_move.pos.row &&
+                               m.pos.col == depth_best_move.pos.col;
+                    });
+                if (it != root_moves.begin() && it != root_moves.end()) {
+                    std::iter_swap(root_moves.begin(), it);
+                }
+            }
         }
 
         if (best_score >= 100000 || best_score <= -100000) break;

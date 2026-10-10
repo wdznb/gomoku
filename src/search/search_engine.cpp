@@ -62,14 +62,22 @@ SearchResult SearchEngine::search(const Board& board, int color,
 
     Move greedy_move = greedy_.search(board, color);
 
-    PositionPattern greedy_pattern = PatternRecognizer::recognize_position(
-        board, greedy_move.pos.row, greedy_move.pos.col, color);
-    for (int d = 0; d < 4; ++d) {
-        if (greedy_pattern.directions[d].type == PatternType::FIVE) {
-            result.best_move = greedy_move;
-            result.score = 100000;
-            result.method = "greedy_five";
-            return result;
+    // Own-win must be checked across every legal root candidate, not just the
+    // top greedy move. Greedy ranks by attack + defense, so a purely
+    // defensive square (blocking an opponent live-four, say) can score higher
+    // than an outright winning five. Without this scan the must_block branch
+    // below fires first and the AI throws away a guaranteed win.
+    for (const auto& pos : root_moves) {
+        if (!board.is_empty(pos.row, pos.col)) continue;
+        PositionPattern pattern = PatternRecognizer::recognize_position(
+            board, pos.row, pos.col, color);
+        for (int d = 0; d < 4; ++d) {
+            if (pattern.directions[d].type == PatternType::FIVE) {
+                result.best_move = Move(pos, color);
+                result.score = 100000;
+                result.method = "greedy_five";
+                return result;
+            }
         }
     }
 
@@ -153,9 +161,19 @@ SearchResult SearchEngine::search(const Board& board, int color,
             auto elapsed_after_ab = std::chrono::high_resolution_clock::now() - start;
             int total_used_ms = static_cast<int>(
                 std::chrono::duration_cast<std::chrono::milliseconds>(elapsed_after_ab).count());
-            if (total_used_ms < time_limit_ms) {
+            int probe_budget_ms = time_limit_ms - total_used_ms;
+            // Reserve enough time for the callback / network commit; without
+            // this the resign probe (VCF depth 20, node cap 400k) can run for
+            // many additional seconds whenever AlphaBeta finished early and
+            // overshoot the per-move budget the client is waiting on.
+            if (probe_budget_ms > 500) {
+                int usable_ms = probe_budget_ms - 200;
+                // Rough throughput ceiling for VCF nodes on this target.
+                int time_scaled_nodes = usable_ms * 400;
+                int probe_nodes = std::min(resign_node_limit_, time_scaled_nodes);
+
                 VCFSearch loss_probe(evaluator_, tt_alphabeta_);
-                loss_probe.set_node_limit(resign_node_limit_);
+                loss_probe.set_node_limit(probe_nodes);
 
                 Move defense;
                 DefenseResult dr = loss_probe.find_defense(board, color, vcf_max_depth_,

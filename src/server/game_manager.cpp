@@ -65,6 +65,11 @@ bool GameManager::make_move(int row, int col) {
     // move; without this guard the human's next make_move would silently
     // commit a stone for ai_color_ and corrupt the Zobrist parity.
     if (turn != player_color_) return false;
+    // Explicit occupancy check before the forbidden scan. is_forbidden on an
+    // occupied square early-returns a clean pattern (no stone to test), so
+    // the previous path silently reached place_stone with an occupied cell
+    // and reported the same generic failure via an unintended branch.
+    if (!board_.is_empty(row, col)) return false;
     // Renju forbids BLACK from creating double-three, double-four, or an
     // overline. Every AI search path already rejects these; the human must
     // be bound by the same rules or VCF/resign proofs of the form
