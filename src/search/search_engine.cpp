@@ -130,15 +130,20 @@ SearchResult SearchEngine::search(const Board& board, int color,
         result.method = "alphabeta";
 
         if (resign_detection_ && !stop_flag.load()) {
-            VCFSearch loss_probe(evaluator_, tt_vcf_);
-            loss_probe.set_node_limit(resign_node_limit_);
+            auto elapsed_after_ab = std::chrono::high_resolution_clock::now() - start;
+            int total_used_ms = static_cast<int>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(elapsed_after_ab).count());
+            if (total_used_ms < time_limit_ms) {
+                VCFSearch loss_probe(evaluator_, tt_vcf_);
+                loss_probe.set_node_limit(resign_node_limit_);
 
-            Move defense;
-            DefenseResult dr = loss_probe.find_defense(board, color, vcf_max_depth_,
-                                                        stop_flag, defense);
-            if (dr == DefenseResult::PROVEN_LOSS) {
-                result.resigned = true;
-                result.method = "resign";
+                Move defense;
+                DefenseResult dr = loss_probe.find_defense(board, color, vcf_max_depth_,
+                                                            stop_flag, defense);
+                if (dr == DefenseResult::PROVEN_LOSS) {
+                    result.resigned = true;
+                    result.method = "resign";
+                }
             }
         }
 

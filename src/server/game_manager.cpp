@@ -104,8 +104,6 @@ bool GameManager::undo() {
 }
 
 void GameManager::resign(int color) {
-    if (status_ == GameStatus::GAME_OVER) return;
-    
     stop_thinking();
     if (search_thread_ && search_thread_->joinable()) {
         search_thread_->join();
@@ -113,6 +111,9 @@ void GameManager::resign(int color) {
     if (hint_thread_ && hint_thread_->joinable()) {
         hint_thread_->join();
     }
+    
+    std::lock_guard<std::mutex> lock(thinking_mutex_);
+    if (status_ == GameStatus::GAME_OVER) return;
     
     resign_now(color);
 }

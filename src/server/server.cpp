@@ -218,6 +218,10 @@ void GameServer::handle_choose_side(std::shared_ptr<WebSocketSession> session, c
     if (it == games_.end()) return;
     
     auto& game = it->second;
+    if (game->is_ai_thinking() || game->board().move_count() > 0) {
+        send_error(session, "Cannot choose side after the game has started");
+        return;
+    }
     std::string color_str = msg.value("color", "black");
     int color = (color_str == "black") ? BLACK : WHITE;
     

@@ -281,7 +281,8 @@ bool VCFSearch::has_decisive_tempo(const Board& board, int row, int col, int col
     PositionPattern pattern = PatternRecognizer::recognize_position(board, row, col, color);
     for (int d = 0; d < 4; ++d) {
         PatternType t = pattern.directions[d].type;
-        if (t == PatternType::FIVE || t == PatternType::LIVE_FOUR) {
+        if (t == PatternType::FIVE || t == PatternType::LIVE_FOUR ||
+            t == PatternType::RUSH_FOUR) {
             return true;
         }
     }
@@ -308,8 +309,11 @@ DefenseResult VCFSearch::find_defense(const Board& board, int defender, int max_
 
         // Making five wins outright; making a live four forces the attacker to
         // answer it, which invalidates a win proof built on them keeping the
-        // initiative. Reporting SURVIVES here is the safe direction: the cost of
-        // being wrong is a missed resignation, not a bad resignation.
+        // initiative. A rush four also grants a winning tempo because the
+        // defender can complete the five on their next turn unless the attacker
+        // spends a move blocking it. Reporting SURVIVES here is the safe
+        // direction: the cost of being wrong is a missed resignation, not a
+        // false one.
         if (has_decisive_tempo(board, pos.row, pos.col, defender)) {
             defense_move = Move(pos, defender);
             return DefenseResult::SURVIVES;

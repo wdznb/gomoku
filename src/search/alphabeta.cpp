@@ -153,7 +153,10 @@ int AlphaBetaSearch::alphabeta(Board& board, int depth, int alpha, int beta, int
 
     for (const auto& move : moves) {
         if (stop_flag.load() || is_timeout()) {
-            if (flag == TTFlag::EXACT) flag = TTFlag::LOWERBOUND;
+            // Some siblings went unsearched, so neither EXACT nor UPPERBOUND is
+            // sound. The value already searched is a lower bound on the true
+            // max over all moves; that's the only safe entry to keep.
+            flag = TTFlag::LOWERBOUND;
             break;
         }
 
