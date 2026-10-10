@@ -8,10 +8,12 @@ GameManager::GameManager()
     : player_color_(BLACK), ai_color_(WHITE),
       status_(GameStatus::WAITING), winner_(EMPTY),
       ai_thinking_(false), stop_flag_(false), hint_active_(false),
+      discard_pending_(false),
       timeout_ms_(5000), max_depth_(8) {
 }
 
 GameManager::~GameManager() {
+    discard_pending_.store(true);
     stop_thinking();
     if (search_thread_ && search_thread_->joinable()) {
         search_thread_->join();
@@ -22,6 +24,7 @@ GameManager::~GameManager() {
 }
 
 void GameManager::reset() {
+    discard_pending_.store(true);
     stop_thinking();
     if (search_thread_ && search_thread_->joinable()) {
         search_thread_->join();
@@ -121,6 +124,7 @@ bool GameManager::undo() {
 }
 
 void GameManager::resign(int color) {
+    discard_pending_.store(true);
     stop_thinking();
     if (search_thread_ && search_thread_->joinable()) {
         search_thread_->join();
@@ -180,6 +184,7 @@ void GameManager::start_ai_thinking(int timeout_ms, int max_depth) {
     }
     
     stop_flag_.store(false);
+    discard_pending_.store(false);
     ai_thinking_.store(true);
     timeout_ms_ = timeout_ms;
     max_depth_ = max_depth;
@@ -207,7 +212,7 @@ void GameManager::ai_thinking_worker(int timeout_ms, int max_depth) {
 
     if (result.resigned) {
         std::lock_guard<std::mutex> lock(thinking_mutex_);
-        if (!stop_flag_.load() && status_ == GameStatus::PLAYING) {
+        if (!discard_pending_.load() && !stop_flag_.load() && status_ == GameStatus::PLAYING) {
             resign_now(ai_color_);
         }
         ai_thinking_.store(false);
@@ -216,9 +221,17 @@ void GameManager::ai_thinking_worker(int timeout_ms, int max_depth) {
 
     if (move_callback_ && result.best_move.pos.is_valid()) {
         std::lock_guard<std::mutex> lock(thinking_mutex_);
-        if (!stop_flag_.load() && board_.place_stone(result.best_move.pos, ai_color_)) {
+        // A user stop_thinking sets stop_flag_ but leaves discard_pending_
+        // false: the worker still commits its last completed best move so
+        // the game does not get stuck with ai_color_ to move and no re-arm.
+        // reset / resign / destructor set discard_pending_ first, so those
+        // paths never see a stale AI stone.
+        if (!discard_pending_.load() &&
+            status_ == GameStatus::PLAYING &&
+            current_turn() == ai_color_ &&
+            board_.place_stone(result.best_move.pos, ai_color_)) {
             move_callback_(result.best_move, result.score, result.elapsed_ms);
-            
+
             check_game_over();
         }
     }

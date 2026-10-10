@@ -72,6 +72,12 @@ private:
     std::atomic<bool> ai_thinking_;
     std::atomic<bool> stop_flag_;
     std::atomic<bool> hint_active_;
+    // Hard abort: reset / resign / destructor paths flip this before joining
+    // the worker. The worker must discard its in-flight best move. Plain
+    // stop_thinking leaves it false so the aborted worker still commits the
+    // last completed best move and the game does not get stuck with ai_color_
+    // to move and no re-arm.
+    std::atomic<bool> discard_pending_;
     std::unique_ptr<std::thread> search_thread_;
     std::unique_ptr<std::thread> hint_thread_;
     std::mutex thinking_mutex_;
