@@ -293,7 +293,12 @@ void GameServer::handle_make_move(std::shared_ptr<WebSocketSession> session, con
         return;
     }
 
-    int placed_color = game->current_turn();
+    // make_move only ever commits a stone for player_color_ (it rejects any
+    // call when current_turn() != player_color_). Reading player_color_ avoids
+    // touching board state here: current_turn() would read move_count on the
+    // io thread outside make_move's ai_thinking_ handshake, racing the AI
+    // worker's board write under thinking_mutex_.
+    int placed_color = game->player_color();
     if (!game->make_move(row, col)) {
         send_error(session, "Invalid move");
         return;
