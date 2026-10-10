@@ -230,6 +230,14 @@ void GameServer::handle_choose_side(std::shared_ptr<WebSocketSession> session, c
         send_error(session, "Cannot choose side after the game has started");
         return;
     }
+    // An empty board can still be in GAME_OVER status if the previous game
+    // was resigned before any move was made. Without clearing that status
+    // here, make_move would reject every subsequent player move (its status
+    // guard short-circuits first) and the AI worker would also refuse to
+    // commit its move, so the session would lock up immediately.
+    if (game->status() == GameStatus::GAME_OVER) {
+        game->reset();
+    }
     std::string color_str = msg.value("color", "black");
     int color = (color_str == "black") ? BLACK : WHITE;
     

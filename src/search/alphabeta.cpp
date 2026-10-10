@@ -68,6 +68,15 @@ void AlphaBetaSearch::sort_moves(std::vector<Move>& moves, const Board& board, i
 
 int AlphaBetaSearch::quiescence(Board& board, int alpha, int beta, int color,
                                  std::atomic<bool>& stop_flag) {
+    // Quiescence can recurse for tens of moves on a still-live position. Without
+    // a node increment here, node_limit_ only bounds the alphabeta tree and a
+    // timeout or abort flag set at a shallow depth can still be trapped inside
+    // an unbounded quiescence subtree.
+    nodes_searched_++;
+    if (nodes_searched_ > node_limit_ || stop_flag.load() || is_timeout()) {
+        return evaluator_.evaluate_board(board, color);
+    }
+
     int stand_pat = evaluator_.evaluate_board(board, color);
 
     if (stand_pat >= beta) return beta;

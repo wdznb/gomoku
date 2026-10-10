@@ -183,14 +183,24 @@ DirectionPattern PatternRecognizer::recognize_direction(const Board& board, int 
     int window = extract_window(board, row, col, color, dir);
     PatternType type = match_pattern(window, true);
 
+    // match_pattern is color-blind and calls any 6+ run inside the 9-cell
+    // window LONG_FIVE. Under Renju that is only true for BLACK (overline is
+    // forbidden and does not win). WHITE wins on any run of five or more, so
+    // the LONG_FIVE label hides WHITE's gap-split winning completions
+    // (XXXX_X, XXX_XXX, ...) from must_block, generate_attacks,
+    // has_decisive_tempo and the evaluator's five-bonus. Demote those back
+    // to FIVE for WHITE.
+    if (color == WHITE && type == PatternType::LONG_FIVE) {
+        type = PatternType::FIVE;
+    }
+
     // Renju: BLACK wins on exactly five and forbids overlines; WHITE wins on
     // any run of five or more. The window only spans +/-4 cells around the
     // placed stone, so a stone played at the end of an existing five fits
     // inside the window and looks like a FIVE when it is really a 6-stone
     // overline. Walk the board directly for BLACK only - reclassifying a
     // WHITE overline as LONG_FIVE would hide WHITE's winning threat from
-    // every branch that matches on PatternType::FIVE (must_block, quiescence
-    // threats, has_decisive_tempo, generate_defenses).
+    // every branch that matches on PatternType::FIVE.
     if (type == PatternType::FIVE && color == BLACK) {
         int dr = DIRECTIONS[dir][0];
         int dc = DIRECTIONS[dir][1];

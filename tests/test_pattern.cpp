@@ -234,6 +234,55 @@ void test_overline_is_win_for_white() {
     std::cout << "test_overline_is_win_for_white passed" << std::endl;
 }
 
+void test_white_gap_split_is_five() {
+    // WHITE: XXXX_X. Filling the gap yields six-in-a-row, which is a WIN for
+    // WHITE under Renju (WHITE is not subject to overline rules). The 9-cell
+    // window's match_pattern labels any 6+ run as LONG_FIVE, but recognize_
+    // direction must demote WHITE's LONG_FIVE back to FIVE or must_block,
+    // has_decisive_tempo and the evaluator all miss the winning threat.
+    Board board;
+
+    board.place_stone(7, 3, WHITE);
+    board.place_stone(7, 4, WHITE);
+    board.place_stone(7, 5, WHITE);
+    board.place_stone(7, 6, WHITE);
+    // col 7 left empty (the gap)
+    board.place_stone(7, 8, WHITE);
+
+    PositionPattern pattern = PatternRecognizer::recognize_position(board, 7, 7, WHITE);
+
+    bool has_five = false;
+    bool has_long_five = false;
+    for (int d = 0; d < 4; ++d) {
+        if (pattern.directions[d].type == PatternType::FIVE) has_five = true;
+        if (pattern.directions[d].type == PatternType::LONG_FIVE) has_long_five = true;
+    }
+    assert(has_five);
+    assert(!has_long_five);
+
+    // BLACK must not be reported as forbidden for filling this shape; and
+    // the same shape for BLACK at the gap must be labeled LONG_FIVE (overline).
+    assert(!PatternRecognizer::is_forbidden(board, 7, 7, WHITE));
+
+    Board bboard;
+    bboard.place_stone(7, 3, BLACK);
+    bboard.place_stone(7, 4, BLACK);
+    bboard.place_stone(7, 5, BLACK);
+    bboard.place_stone(7, 6, BLACK);
+    bboard.place_stone(7, 8, BLACK);
+    PositionPattern bpattern = PatternRecognizer::recognize_position(bboard, 7, 7, BLACK);
+    bool b_has_long = false;
+    bool b_has_plain_five = false;
+    for (int d = 0; d < 4; ++d) {
+        if (bpattern.directions[d].type == PatternType::LONG_FIVE) b_has_long = true;
+        if (bpattern.directions[d].type == PatternType::FIVE) b_has_plain_five = true;
+    }
+    assert(b_has_long);
+    assert(!b_has_plain_five);
+
+    std::cout << "test_white_gap_split_is_five passed" << std::endl;
+}
+
 int main() {
     std::cout << "Running pattern tests..." << std::endl;
     
@@ -249,6 +298,7 @@ int main() {
     test_overline_at_window_edge();
     test_overline_not_win_for_black();
     test_overline_is_win_for_white();
+    test_white_gap_split_is_five();
     
     std::cout << "All pattern tests passed!" << std::endl;
     return 0;
