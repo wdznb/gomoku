@@ -70,6 +70,11 @@ void WebSocketSession::run_websocket() {
                 if (self->on_close) {
                     self->on_close(self);
                 }
+                // No game was created (on_open only runs on success), so close
+                // the socket here rather than rely on the destructor's timing,
+                // matching the malformed-request path in on_http_read.
+                beast::error_code ignored;
+                self->ws_.next_layer().socket().close(ignored);
                 return;
             }
             // The handshake succeeded, so this session is a real game
@@ -192,7 +197,8 @@ std::filesystem::path WebSocketSession::resolve_file(const std::string& target) 
     if (ec) return {};
 
     std::string rs = root.string();
-    if (!rs.empty() && rs.back() != '/') rs.push_back('/');
+    const char sep = static_cast<char>(fs::path::preferred_separator);
+    if (!rs.empty() && rs.back() != sep) rs.push_back(sep);
     if (full.string().rfind(rs, 0) != 0) return {};
 
     if (!fs::is_regular_file(full, ec) || ec) return {};
