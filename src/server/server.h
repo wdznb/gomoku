@@ -37,9 +37,9 @@ private:
     websocket::stream<beast::tcp_stream> ws_;
     std::string web_dir_;
     beast::flat_buffer buffer_;
+    // Queue access and write initiation all run on ws_'s executor (posted
+    // from send()), so no separate mutex is needed.
     std::queue<std::string> send_queue_;
-    bool is_writing_ = false;
-    std::mutex send_mutex_;
     
     void do_read();
     void do_write();

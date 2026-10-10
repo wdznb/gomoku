@@ -5,6 +5,19 @@
 
 namespace gomoku {
 
+namespace {
+// json::value(key, default) only falls back to the default when the key is
+// absent; a present-but-wrong-type value (e.g. {"row":"7"}) throws
+// type_error, which unwinds past the handler's own validation into do_read's
+// generic catch and leaves the client with no reply. Read integers defensively
+// so a malformed field is treated as the default and the handler still
+// validates and responds.
+int get_int(const json& msg, const char* key, int fallback) {
+    if (!msg.contains(key) || !msg[key].is_number_integer()) return fallback;
+    return msg[key].get<int>();
+}
+}
+
 WebSocketSession::WebSocketSession(tcp::socket&& socket, const std::string& web_dir)
     : ws_(std::move(socket)), web_dir_(web_dir) {
 }
@@ -65,22 +78,30 @@ void WebSocketSession::do_read() {
 }
 
 void WebSocketSession::send(const json& msg) {
-    std::lock_guard<std::mutex> lock(send_mutex_);
-    bool write_in_progress = !send_queue_.empty();
-    send_queue_.push(msg.dump());
-    if (!write_in_progress) {
-        do_write();
-    }
+    std::string payload = msg.dump();
+    // send() is called from the AI search worker and hint threads (via the
+    // GameManager move / game-over / progress callbacks) as well as the io
+    // thread. websocket::stream is not thread-safe and must have every
+    // operation, including async_write initiation, run on its executor;
+    // calling do_write() inline here would start a write on the worker thread
+    // concurrently with the io thread's outstanding async_read. Post onto the
+    // stream executor so enqueue + write are serialized with the read side.
+    net::post(
+        ws_.get_executor(),
+        [self = shared_from_this(), payload = std::move(payload)]() mutable {
+            bool write_in_progress = !self->send_queue_.empty();
+            self->send_queue_.push(std::move(payload));
+            if (!write_in_progress) {
+                self->do_write();
+            }
+        });
 }
 
 void WebSocketSession::do_write() {
     if (send_queue_.empty()) {
-        is_writing_ = false;
         return;
     }
-    
-    is_writing_ = true;
-    
+
     ws_.async_write(
         net::buffer(send_queue_.front()),
         [self = shared_from_this()](beast::error_code ec, std::size_t) {
@@ -88,7 +109,6 @@ void WebSocketSession::do_write() {
                 std::cerr << "WebSocket write error: " << ec.message() << std::endl;
                 return;
             }
-            std::lock_guard<std::mutex> lock(self->send_mutex_);
             self->send_queue_.pop();
             self->do_write();
         });
@@ -238,7 +258,11 @@ void GameServer::handle_choose_side(std::shared_ptr<WebSocketSession> session, c
     if (game->status() == GameStatus::GAME_OVER) {
         game->reset();
     }
-    std::string color_str = msg.value("color", "black");
+    // Defensive read: a present-but-non-string "color" would otherwise throw
+    // out of this handler with no reply. Default to black.
+    std::string color_str = (msg.contains("color") && msg["color"].is_string())
+                                ? msg["color"].get<std::string>()
+                                : std::string("black");
     int color = (color_str == "black") ? BLACK : WHITE;
     
     game->set_player_color(color);
@@ -261,8 +285,8 @@ void GameServer::handle_make_move(std::shared_ptr<WebSocketSession> session, con
     if (it == games_.end()) return;
     
     auto& game = it->second;
-    int row = msg.value("row", -1);
-    int col = msg.value("col", -1);
+    int row = get_int(msg, "row", -1);
+    int col = get_int(msg, "col", -1);
     
     if (row < 0 || row >= 15 || col < 0 || col >= 15) {
         send_error(session, "Invalid move position");
@@ -304,8 +328,8 @@ void GameServer::handle_request_hint(std::shared_ptr<WebSocketSession> session, 
     if (it == games_.end()) return;
     
     auto& game = it->second;
-    int timeout_ms = msg.value("timeout_ms", 5000);
-    int max_depth = msg.value("max_depth", 6);
+    int timeout_ms = get_int(msg, "timeout_ms", 5000);
+    int max_depth = get_int(msg, "max_depth", 6);
     
     game->request_hint(timeout_ms, max_depth);
 }
@@ -333,8 +357,8 @@ void GameServer::handle_set_config(std::shared_ptr<WebSocketSession> session, co
     if (it == games_.end()) return;
     
     auto& game = it->second;
-    int timeout_ms = msg.value("timeout_ms", 5000);
-    int max_depth = msg.value("max_depth", 8);
+    int timeout_ms = get_int(msg, "timeout_ms", 5000);
+    int max_depth = get_int(msg, "max_depth", 8);
     game->set_config(timeout_ms, max_depth);
 }
 
