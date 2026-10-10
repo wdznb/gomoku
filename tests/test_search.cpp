@@ -259,6 +259,40 @@ void test_controller_stop() {
     std::cout << "test_controller_stop passed" << std::endl;
 }
 
+// Round 34 F2: starting a second search after the first completed previously
+// reset the unique_ptr over a still-joinable std::thread, calling
+// std::terminate. start_search must join the finished worker unconditionally.
+void test_controller_restart_after_completion() {
+    Board board;
+    SearchController controller;
+    board.place_stone(7, 7, BLACK);
+
+    std::atomic<int> completed(0);
+    controller.set_completion_callback([&](SearchResult result) {
+        if (result.best_move.pos.is_valid()) completed.fetch_add(1);
+    });
+
+    controller.start_search(board, WHITE, 3, 1500);
+    int wait_count = 0;
+    while (controller.is_thinking() && wait_count < 50) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        wait_count++;
+    }
+
+    board.place_stone(7, 8, WHITE);
+    controller.start_search(board, BLACK, 3, 1500);
+    wait_count = 0;
+    while (controller.is_thinking() && wait_count < 50) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        wait_count++;
+    }
+
+    assert(!controller.is_thinking());
+    assert(completed.load() >= 1);
+
+    std::cout << "test_controller_restart_after_completion passed" << std::endl;
+}
+
 void test_forced_move() {
     Board board;
     SearchEngine engine;
@@ -713,6 +747,7 @@ int main() {
     test_search_engine_finds_five();
     test_controller_async();
     test_controller_stop();
+    test_controller_restart_after_completion();
     test_forced_move();
     test_vcf_defense_proven_loss();
     test_vcf_defense_survives();

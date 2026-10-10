@@ -14,6 +14,10 @@ Evaluator::Evaluator(const ThreatCoefficients& coeffs) : coeffs_(coeffs) {
 
 void Evaluator::set_coefficients(const ThreatCoefficients& coeffs) {
     coeffs_ = coeffs;
+    // position_weights_ are built from coeffs_.position_weight_scale at
+    // construction; without a rebuild a runtime coefficient change leaves the
+    // center-bias table stale and move ordering dominated by old weights.
+    init_position_weights();
 }
 
 void Evaluator::init_position_weights() {

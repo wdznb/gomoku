@@ -121,13 +121,20 @@ int AlphaBetaSearch::quiescence(Board& board, int alpha, int beta, int color,
 
     if (threat_moves.empty()) return stand_pat;
 
-    std::sort(threat_moves.begin(), threat_moves.end(), [&](const Move& a, const Move& b) {
-        int sa = evaluator_.evaluate_position(board, a.pos.row, a.pos.col, color);
-        int sb = evaluator_.evaluate_position(board, b.pos.row, b.pos.col, color);
-        return sa > sb;
-    });
-
+    // Decorate-sort-undecorate: evaluate_position runs four pattern
+    // recognitions, so calling it inside the comparator made this O(n log n)
+    // full recognitions at every quiescence leaf. Score each move once.
+    std::vector<std::pair<int, Move>> scored;
+    scored.reserve(threat_moves.size());
     for (const auto& move : threat_moves) {
+        int s = evaluator_.evaluate_position(board, move.pos.row, move.pos.col, color);
+        scored.emplace_back(s, move);
+    }
+    std::sort(scored.begin(), scored.end(),
+              [](const auto& a, const auto& b) { return a.first > b.first; });
+
+    for (const auto& entry : scored) {
+        const Move& move = entry.second;
         if (stop_flag.load() || is_timeout()) break;
 
         board.place_stone(move.pos.row, move.pos.col, color);

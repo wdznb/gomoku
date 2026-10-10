@@ -18,9 +18,13 @@ void SearchController::start_search(const Board& board, int color,
                                      int max_depth, int time_limit_ms) {
     if (thinking_.load()) {
         stop();
-        if (search_thread_ && search_thread_->joinable()) {
-            search_thread_->join();
-        }
+    }
+    // Join unconditionally before reassigning search_thread_. The previous
+    // worker may have finished (thinking_ == false) while the std::thread is
+    // still joinable; resetting the unique_ptr over a joinable thread calls
+    // std::terminate. Joining an already-finished thread is cheap.
+    if (search_thread_ && search_thread_->joinable()) {
+        search_thread_->join();
     }
 
     stop_flag_.store(false);

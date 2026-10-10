@@ -136,6 +136,24 @@ void test_evaluate_board_sees_mate_one() {
               << eval_white_threat << " vs " << eval_no_threat << ")" << std::endl;
 }
 
+void test_set_coefficients_rebuilds_position_weights() {
+    // Round 34 F5: set_coefficients must rebuild position_weights_, which are
+    // derived from coeffs_.position_weight_scale at construction. Without the
+    // rebuild a runtime coefficient change leaves the center-bias table stale.
+    ThreatCoefficients base;
+    Evaluator evaluator(base);
+    int center_before = evaluator.get_position_weight(7, 7);
+
+    ThreatCoefficients scaled = base;
+    scaled.position_weight_scale = base.position_weight_scale * 3;
+    evaluator.set_coefficients(scaled);
+
+    int center_after = evaluator.get_position_weight(7, 7);
+    assert(center_after == center_before * 3);
+
+    std::cout << "test_set_coefficients_rebuilds_position_weights passed" << std::endl;
+}
+
 int main() {
     std::cout << "Running evaluator tests..." << std::endl;
     
@@ -148,6 +166,7 @@ int main() {
     test_custom_coefficients();
     test_pattern_score_includes_five();
     test_evaluate_board_sees_mate_one();
+    test_set_coefficients_rebuilds_position_weights();
     
     std::cout << "All evaluator tests passed!" << std::endl;
     return 0;
