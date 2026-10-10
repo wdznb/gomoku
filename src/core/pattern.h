@@ -66,6 +66,12 @@ public:
     static CombinedPattern recognize_combined(const Board& board, int row, int col, int color);
     
     static bool is_forbidden(const Board& board, int row, int col, int color);
+
+    // Forbidden decision given an ALREADY-recognized BLACK pattern (the caller
+    // has run recognize_position for BLACK and wants to reuse it instead of
+    // paying a second 4-direction scan). Encodes the same tests as
+    // is_forbidden so there is a single source of truth.
+    static bool is_forbidden_from_pattern(const PositionPattern& black_pattern);
     
     static DirectionPattern recognize_direction(const Board& board, int row, int col, 
                                                  int color, int dir);

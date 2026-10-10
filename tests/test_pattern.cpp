@@ -283,6 +283,54 @@ void test_white_gap_split_is_five() {
     std::cout << "test_white_gap_split_is_five passed" << std::endl;
 }
 
+void test_forbidden_from_pattern_equivalence() {
+    // Round 41: is_forbidden was refactored to delegate its decision to
+    // is_forbidden_from_pattern, letting hot paths (VCF has_decisive_tempo)
+    // reuse an already-recognized BLACK pattern instead of scanning twice.
+    // Lock in that both entry points agree across the four cases that matter:
+    // double-three (forbidden), overline (forbidden), exact five (legal),
+    // and a legal four-three (must NOT be forbidden).
+    struct Case { const char* name; bool expect_forbidden; void (*setup)(Board&); };
+
+    auto double_three = [](Board& b) {
+        b.place_stone(7, 5, BLACK); b.place_stone(7, 6, BLACK);
+        b.place_stone(5, 7, BLACK); b.place_stone(6, 7, BLACK);
+    };
+    auto overline = [](Board& b) {
+        // Leave (7,7) empty; filling it makes cols 5-10 = six in a row (overline).
+        for (int c = 5; c <= 10; ++c) if (c != 7) b.place_stone(7, c, BLACK);
+    };
+    auto exact_five = [](Board& b) {
+        b.place_stone(7, 5, BLACK); b.place_stone(7, 6, BLACK);
+        b.place_stone(7, 8, BLACK); b.place_stone(7, 9, BLACK);
+        // filling col 7 makes an exact five - legal, not forbidden
+    };
+    auto four_three = [](Board& b) {
+        // Legal BLACK winning shape (four + three). Must not be forbidden.
+        b.place_stone(7, 5, BLACK); b.place_stone(7, 6, BLACK); b.place_stone(7, 8, BLACK);
+        b.place_stone(5, 7, BLACK); b.place_stone(6, 7, BLACK);
+    };
+
+    Case cases[] = {
+        {"double_three", true,  double_three},
+        {"overline",     true,  overline},
+        {"exact_five",   false, exact_five},
+        {"four_three",   false, four_three},
+    };
+
+    for (const auto& c : cases) {
+        Board b;
+        c.setup(b);
+        bool via_board    = PatternRecognizer::is_forbidden(b, 7, 7, BLACK);
+        PositionPattern p = PatternRecognizer::recognize_position(b, 7, 7, BLACK);
+        bool via_pattern  = PatternRecognizer::is_forbidden_from_pattern(p);
+        assert(via_board == via_pattern);
+        assert(via_board == c.expect_forbidden);
+    }
+
+    std::cout << "test_forbidden_from_pattern_equivalence passed" << std::endl;
+}
+
 int main() {
     std::cout << "Running pattern tests..." << std::endl;
     
@@ -299,6 +347,7 @@ int main() {
     test_overline_not_win_for_black();
     test_overline_is_win_for_white();
     test_white_gap_split_is_five();
+    test_forbidden_from_pattern_equivalence();
     
     std::cout << "All pattern tests passed!" << std::endl;
     return 0;

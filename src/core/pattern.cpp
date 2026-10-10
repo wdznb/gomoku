@@ -281,13 +281,13 @@ bool PatternRecognizer::is_forbidden(const Board& board, int row, int col, int c
     if (!board.is_empty(row, col)) return false;
 
     // The forbidden flag is derived exclusively from BLACK's own pattern (the
-    // double-three / double-four / overline tests below). Recognize_combined
-    // also computes the full WHITE pattern to fill the cross-color four_four /
-    // three_three fields, but those are not consulted here. This filter runs on
-    // every candidate of every VCF/VCT/alphabeta node, so halving the scans is
-    // significant. Behaviour is identical to reading combined.forbidden.
+    // double-three / double-four / overline tests in is_forbidden_from_pattern).
+    // This filter runs on every candidate of every VCF/VCT/alphabeta node.
     PositionPattern black_pattern = recognize_position(board, row, col, BLACK);
+    return is_forbidden_from_pattern(black_pattern);
+}
 
+bool PatternRecognizer::is_forbidden_from_pattern(const PositionPattern& black_pattern) {
     bool has_exact_five = false;
     for (int d = 0; d < 4; ++d) {
         if (black_pattern.directions[d].type == PatternType::FIVE) {

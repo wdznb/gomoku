@@ -319,11 +319,16 @@ VCFMove VCFSearch::search_impl(const Board& board, int color, int max_depth,
 }
 
 bool VCFSearch::has_decisive_tempo(const Board& board, int row, int col, int color) const {
-    if (color == BLACK && PatternRecognizer::is_forbidden(board, row, col, color)) {
+    // Recognize once and reuse: the forbidden test and the tempo loop below
+    // both consume the same 4-direction pattern. The old path ran
+    // is_forbidden (a full recognize_position) and then recognize_position
+    // again for BLACK - two identical scans per candidate.
+    PositionPattern pattern = PatternRecognizer::recognize_position(board, row, col, color);
+
+    if (color == BLACK && PatternRecognizer::is_forbidden_from_pattern(pattern)) {
         return false;
     }
 
-    PositionPattern pattern = PatternRecognizer::recognize_position(board, row, col, color);
     for (int d = 0; d < 4; ++d) {
         PatternType t = pattern.directions[d].type;
         if (t == PatternType::FIVE || t == PatternType::LIVE_FOUR ||
