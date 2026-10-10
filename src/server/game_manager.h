@@ -23,6 +23,7 @@ class GameManager {
 public:
     using ProgressCallback = std::function<void(int depth, int nodes, int elapsed_ms)>;
     using MoveCallback = std::function<void(const Move& move, int score, int thinking_time_ms)>;
+    using HintCallback = std::function<void(const Move& move, int score)>;
     using GameOverCallback = std::function<void(int winner, const std::string& reason)>;
     
     GameManager();
@@ -48,6 +49,7 @@ public:
     
     void set_progress_callback(ProgressCallback cb) { progress_callback_ = cb; }
     void set_move_callback(MoveCallback cb) { move_callback_ = cb; }
+    void set_hint_callback(HintCallback cb) { hint_callback_ = cb; }
     void set_game_over_callback(GameOverCallback cb) { game_over_callback_ = cb; }
     
     const Board& board() const { return board_; }
@@ -87,6 +89,7 @@ private:
     
     ProgressCallback progress_callback_;
     MoveCallback move_callback_;
+    HintCallback hint_callback_;
     GameOverCallback game_over_callback_;
     
     void check_game_over();

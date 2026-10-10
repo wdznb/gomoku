@@ -292,11 +292,19 @@ void GameServer::handle_make_move(std::shared_ptr<WebSocketSession> session, con
         send_error(session, "Invalid move position");
         return;
     }
-    
+
+    int placed_color = game->current_turn();
     if (!game->make_move(row, col)) {
         send_error(session, "Invalid move");
         return;
     }
+
+    json response;
+    response["type"] = "move_made";
+    response["row"] = row;
+    response["col"] = col;
+    response["color"] = placed_color == BLACK ? "black" : "white";
+    send_message(session, response);
 }
 
 void GameServer::handle_undo(std::shared_ptr<WebSocketSession> session) {
@@ -445,6 +453,15 @@ void GameServer::setup_game_callbacks(std::shared_ptr<WebSocketSession> session,
         send_message(session, msg);
     });
     
+    game.set_hint_callback([this, session](const Move& move, int score) {
+        json msg;
+        msg["type"] = "hint_result";
+        msg["row"] = move.pos.row;
+        msg["col"] = move.pos.col;
+        msg["score"] = score;
+        send_message(session, msg);
+    });
+
     game.set_game_over_callback([this, session](int winner, const std::string& reason) {
         json msg;
         msg["type"] = "game_over";

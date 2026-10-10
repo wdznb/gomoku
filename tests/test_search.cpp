@@ -752,6 +752,37 @@ void test_game_manager_promotes_status_when_ai_opens() {
     std::cout << "test_game_manager_promotes_status_when_ai_opens passed" << std::endl;
 }
 
+void test_game_manager_hint_uses_hint_callback() {
+    // Round 37 F1: a hint must NOT be delivered through move_callback_, which
+    // the server maps to "ai_move". The client's ai_move handler places a stone
+    // and flips the turn, so routing a hint there lets a single "hint" request
+    // desync the board. Hints belong on hint_callback_ ("hint_result"), which
+    // the client only highlights.
+    GameManager game;
+    game.set_player_color(BLACK);
+
+    std::atomic<bool> hint_fired{false};
+    std::atomic<bool> move_fired{false};
+    game.set_hint_callback([&](const Move& m, int) {
+        assert(m.pos.is_valid());
+        hint_fired.store(true);
+    });
+    game.set_move_callback([&](const Move&, int, int) { move_fired.store(true); });
+    game.set_config(500, 1);
+
+    game.request_hint(500, 1);
+    for (int i = 0; i < 300 && !hint_fired.load(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+
+    assert(hint_fired.load());
+    assert(!move_fired.load());
+    // A hint is advisory only: it must never commit a stone to the board.
+    assert(game.board().move_count() == 0);
+
+    std::cout << "test_game_manager_hint_uses_hint_callback passed" << std::endl;
+}
+
 int main() {
     std::cout << "Running search tests..." << std::endl;
 
@@ -789,6 +820,7 @@ int main() {
     test_game_manager_rejects_forbidden_human_move();
     test_game_manager_rejects_move_on_ai_turn();
     test_game_manager_promotes_status_when_ai_opens();
+    test_game_manager_hint_uses_hint_callback();
     test_search_engine_prefers_own_five_over_block();
 
     std::cout << "All search tests passed!" << std::endl;

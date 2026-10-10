@@ -10,6 +10,14 @@ GameManager::GameManager()
       ai_thinking_(false), stop_flag_(false), hint_active_(false),
       discard_pending_(false),
       timeout_ms_(5000), max_depth_(8) {
+    // The engine only fires its own progress hook; forward it to whichever
+    // consumer installed a GameManager progress_callback_ so the client's
+    // "thinking_progress" messages actually flow.
+    engine_.set_progress_callback([this](int depth, int nodes, int elapsed_ms) {
+        if (progress_callback_) {
+            progress_callback_(depth, nodes, elapsed_ms);
+        }
+    });
 }
 
 GameManager::~GameManager() {
@@ -172,8 +180,8 @@ void GameManager::request_hint(int timeout_ms, int max_depth) {
         [this, board_snapshot, turn, timeout_ms, max_depth]() mutable {
             SearchResult result = engine_.search(board_snapshot, turn, max_depth, timeout_ms, stop_flag_);
             
-            if (move_callback_ && !stop_flag_.load() && result.best_move.pos.is_valid()) {
-                move_callback_(result.best_move, result.score, 0);
+            if (hint_callback_ && !stop_flag_.load() && result.best_move.pos.is_valid()) {
+                hint_callback_(result.best_move, result.score);
             }
             hint_active_.store(false);
         });
