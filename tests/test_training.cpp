@@ -1020,6 +1020,77 @@ void test_trainer_rejects_bad_checkpoint() {
     std::cout << "test_trainer_rejects_bad_checkpoint passed" << std::endl;
 }
 
+// --seed takes a full 64-bit unsigned, so a checkpoint can carry a seed above
+// 2^63-1; the counters around it must round-trip and stay sane.
+void test_trainer_checkpoint_seed_and_counters() {
+    TrainingConfig config = fast_training_config();
+    config.seed = 0xFFFFFFFFFFFFFFFFull;
+    Trainer trainer(ThreatCoefficients(), config);
+
+    const std::filesystem::path path = temp_path("seed_checkpoint.json");
+    std::string error;
+    assert(trainer.save_checkpoint(path.string(), error));
+
+    Trainer resumed(ThreatCoefficients(), config);
+    assert(resumed.load_checkpoint(path.string(), error));
+    assert(resumed.config().seed == config.seed);
+    assert(resumed.versions().size() == 1);
+
+    // Impossible counters are rejected, and a rejected checkpoint must not leave
+    // the trainer running on that file's versions.
+    {
+        std::ofstream file(path);
+        file << "{\"versions\":["
+             << CoefficientVector::to_json_string(ThreatCoefficients()) << ","
+             << CoefficientVector::to_json_string(ThreatCoefficients())
+             << "],\"rounds_completed\":-2}";
+    }
+    assert(!resumed.load_checkpoint(path.string(), error));
+    assert(error.find("negative") != std::string::npos);
+    assert(resumed.rounds_completed() == 0);
+    assert(resumed.versions().size() == 1);
+
+    std::cout << "test_trainer_checkpoint_seed_and_counters passed" << std::endl;
+}
+
+// JSON stores integers far wider than int and get<int> only casts, so a reader
+// must either refuse the value or fall back — never accept a truncated one.
+void test_readers_reject_out_of_range_numbers() {
+    std::string error;
+
+    ThreatCoefficients coefficients;
+    assert(!CoefficientVector::from_json_string(
+        "{\"coefficients\":{\"five\":99999999999}}", coefficients, error));
+    assert(error.find("32-bit") != std::string::npos);
+
+    // Coordinates decide the position, so an unusable one rejects the whole record
+    // instead of replaying whatever the low half of the number points at.
+    GameRecord record;
+    assert(!GameRecord::from_json(
+        "{\"moves\":[{\"row\":99999999999,\"col\":3,\"color\":\"black\"}]}", record, error));
+    assert(error.find("off the board") != std::string::npos);
+
+    TrainingSample sample;
+    assert(!TrainingSample::from_json(
+        "{\"features\":[],\"move\":{\"row\":4294967299,\"col\":3,\"color\":\"black\"}}",
+        sample, error));
+    assert(error.find("range") != std::string::npos);
+    assert(!TrainingSample::from_json(
+        "{\"features\":[],\"move\":{\"row\":99,\"col\":3,\"color\":\"black\"}}", sample, error));
+    assert(error.find("off the board") != std::string::npos);
+
+    // Metadata decides nothing, so it falls back to its default instead.
+    GameRecord metadata;
+    assert(GameRecord::from_json("{\"moves\":[],\"total_nodes\":99999999999}", metadata, error));
+    assert(metadata.total_nodes == 0);
+
+    EloSystem elo;
+    assert(elo.load_json("{\"players\":[{\"name\":\"v0\",\"games\":99999999999}]}", error));
+    assert(elo.player(0).games == 0);
+
+    std::cout << "test_readers_reject_out_of_range_numbers passed" << std::endl;
+}
+
 int main() {
     std::cout << "Running training tests..." << std::endl;
 
@@ -1045,6 +1116,8 @@ int main() {
     test_trainer_round_rejects_regression();
     test_trainer_genetic_round_and_status();
     test_trainer_rejects_bad_checkpoint();
+    test_trainer_checkpoint_seed_and_counters();
+    test_readers_reject_out_of_range_numbers();
 
     std::cout << "All training tests passed" << std::endl;
     return 0;

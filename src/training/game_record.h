@@ -36,13 +36,16 @@ struct GameRecord {
     int total_nodes = 0;
     int max_depth = 0;
 
+    // A record that cannot be replayed carries no readable result, even if a
+    // winner survived in the file, so nothing downstream can score it.
     bool is_decisive() const {
-        return winner != EMPTY && reason != GameEndReason::MOVE_LIMIT;
+        return winner != EMPTY && reason != GameEndReason::MOVE_LIMIT &&
+               reason != GameEndReason::INVALID;
     }
 
     // Outcome seen by `color`: +1 won, -1 lost, 0 undecided.
     float outcome_for(int color) const {
-        if (winner == EMPTY) return 0.0f;
+        if (!is_decisive()) return 0.0f;
         return winner == color ? 1.0f : -1.0f;
     }
 

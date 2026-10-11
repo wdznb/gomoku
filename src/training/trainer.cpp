@@ -1,4 +1,5 @@
 #include "trainer.h"
+#include "json_int.h"
 #include "self_play.h"
 #include "transforms.h"
 #include <nlohmann/json.hpp>
@@ -182,7 +183,6 @@ int Trainer::generate_data_games(int games, int threads) {
                     if (!explorer.explore(record, nullptr)) break;
                 }
 
-                games_played_++;
                 local.records.push_back(record);
                 if (record.reason == GameEndReason::INVALID) continue;
 
@@ -201,6 +201,9 @@ int Trainer::generate_data_games(int games, int threads) {
         for (auto& record : local.records) records.push_back(std::move(record));
         for (auto& sample : local.samples) samples.push_back(std::move(sample));
     }
+    // Counted from the merged records instead of inside the workers: a shared
+    // non-atomic counter touched by several threads at once is a data race.
+    games_played_ += static_cast<int>(records.size());
     samples_collected_ += samples.size();
 
     std::string error;
@@ -399,9 +402,14 @@ bool Trainer::load_checkpoint(const std::string& path, std::string& error) {
         restored_versions.push_back(coefficients);
     }
 
-    const long long best = root.contains("best_version") && root["best_version"].is_number_integer()
-                               ? root["best_version"].get<long long>() : 0;
-    if (best < 0 || best >= static_cast<long long>(restored_versions.size())) {
+    // Every counter is range-checked: get<int> only casts, so a checkpoint holding
+    // a value wider than the field would resume the run on a truncated total.
+    int best = 0;
+    if (root.contains("best_version") && !read_json_int(root["best_version"], best)) {
+        error = "checkpoint champion index is out of range";
+        return false;
+    }
+    if (best < 0 || best >= static_cast<int>(restored_versions.size())) {
         error = "checkpoint champion index is out of range";
         return false;
     }
@@ -422,23 +430,42 @@ bool Trainer::load_checkpoint(const std::string& path, std::string& error) {
         return false;
     }
 
+    // Everything is read into locals and only assigned once the whole file
+    // validates, so a checkpoint rejected halfway cannot leave this trainer
+    // running on another run's versions and ratings.
+    int restored_rounds = 0;
+    int restored_games = 0;
+    uint64_t restored_samples = 0;
+    uint64_t restored_seed = config_.seed;
+    auto read_int = [&root](const char* key, int& out) {
+        return !root.contains(key) || read_json_int(root[key], out);
+    };
+    if (!read_int("rounds_completed", restored_rounds) ||
+        !read_int("games_played", restored_games)) {
+        error = "checkpoint counters are out of range";
+        return false;
+    }
+    if (restored_rounds < 0 || restored_games < 0) {
+        error = "checkpoint counters must not be negative";
+        return false;
+    }
+    if (root.contains("samples_collected") &&
+        !read_json_uint(root["samples_collected"], restored_samples)) {
+        error = "checkpoint sample total is out of range";
+        return false;
+    }
+    if (root.contains("seed") && !read_json_uint(root["seed"], restored_seed)) {
+        error = "checkpoint seed is out of range";
+        return false;
+    }
+
     versions_ = restored_versions;
     elo_ = restored_elo;
     best_version_ = static_cast<size_t>(best);
-    rounds_completed_ = root.contains("rounds_completed") &&
-                                root["rounds_completed"].is_number_integer()
-                            ? root["rounds_completed"].get<int>()
-                            : 0;
-    games_played_ = root.contains("games_played") && root["games_played"].is_number_integer()
-                        ? root["games_played"].get<int>()
-                        : 0;
-    samples_collected_ = root.contains("samples_collected") &&
-                                 root["samples_collected"].is_number_integer()
-                             ? static_cast<size_t>(root["samples_collected"].get<long long>())
-                             : 0;
-    if (root.contains("seed") && root["seed"].is_number_integer()) {
-        config_.seed = static_cast<uint64_t>(root["seed"].get<long long>());
-    }
+    rounds_completed_ = restored_rounds;
+    games_played_ = restored_games;
+    samples_collected_ = static_cast<size_t>(restored_samples);
+    config_.seed = restored_seed;
     return true;
 }
 

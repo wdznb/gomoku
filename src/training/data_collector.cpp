@@ -1,5 +1,6 @@
 #include "data_collector.h"
 #include "../core/pattern.h"
+#include "json_int.h"
 #include "transforms.h"
 #include <nlohmann/json.hpp>
 #include <fstream>
@@ -180,6 +181,11 @@ bool TrainingSample::from_json(const std::string& text, TrainingSample& out, std
     }
 
     TrainingSample sample;
+    auto read_int = [&root](const char* key, int fallback) {
+        int value = fallback;
+        return root.contains(key) && read_json_int(root[key], value) ? value : fallback;
+    };
+
     for (const auto& value : root["features"]) {
         if (!value.is_number()) {
             error = "sample features must be numbers";
@@ -188,18 +194,12 @@ bool TrainingSample::from_json(const std::string& text, TrainingSample& out, std
         sample.features.push_back(value.get<float>());
     }
     if (root.contains("value") && root["value"].is_number()) sample.value = root["value"].get<float>();
-    if (root.contains("search_score") && root["search_score"].is_number_integer()) {
-        sample.search_score = root["search_score"].get<int>();
-    }
-    if (root.contains("search_depth") && root["search_depth"].is_number_integer()) {
-        sample.search_depth = root["search_depth"].get<int>();
-    }
-    if (root.contains("nodes") && root["nodes"].is_number_integer()) sample.nodes = root["nodes"].get<int>();
+    sample.search_score = read_int("search_score", sample.search_score);
+    sample.search_depth = read_int("search_depth", sample.search_depth);
+    sample.nodes = read_int("nodes", sample.nodes);
     if (root.contains("weight") && root["weight"].is_number()) sample.weight = root["weight"].get<float>();
-    if (root.contains("game_id") && root["game_id"].is_number_integer()) sample.game_id = root["game_id"].get<int>();
-    if (root.contains("move_index") && root["move_index"].is_number_integer()) {
-        sample.move_index = root["move_index"].get<int>();
-    }
+    sample.game_id = read_int("game_id", sample.game_id);
+    sample.move_index = read_int("move_index", sample.move_index);
     if (root.contains("move") && root["move"].is_object()) {
         const json& move = root["move"];
         // Validated rather than defaulted: a file with a malformed move would
@@ -211,8 +211,17 @@ bool TrainingSample::from_json(const std::string& text, TrainingSample& out, std
             error = "sample move needs integer row/col and a color string";
             return false;
         }
-        sample.move = Move(move["row"].get<int>(), move["col"].get<int>(),
-                           move["color"].get<std::string>() == "black" ? BLACK : WHITE);
+        int row = 0;
+        int col = 0;
+        if (!read_json_int(move["row"], row) || !read_json_int(move["col"], col)) {
+            error = "sample move coordinates are outside the supported range";
+            return false;
+        }
+        sample.move = Move(row, col, move["color"].get<std::string>() == "black" ? BLACK : WHITE);
+        if (!sample.move.pos.is_valid()) {
+            error = "sample move is off the board";
+            return false;
+        }
     }
 
     out = sample;

@@ -1,4 +1,5 @@
 #include "game_record.h"
+#include "json_int.h"
 #include <nlohmann/json.hpp>
 #include <fstream>
 
@@ -94,18 +95,14 @@ bool GameRecord::from_json(const std::string& text, GameRecord& out, std::string
     if (root.contains("reason") && root["reason"].is_string()) {
         record.reason = reason_from_name(root["reason"].get<std::string>());
     }
-    if (root.contains("black_profile") && root["black_profile"].is_number_integer()) {
-        record.black_profile = root["black_profile"].get<int>();
-    }
-    if (root.contains("white_profile") && root["white_profile"].is_number_integer()) {
-        record.white_profile = root["white_profile"].get<int>();
-    }
-    if (root.contains("total_nodes") && root["total_nodes"].is_number_integer()) {
-        record.total_nodes = root["total_nodes"].get<int>();
-    }
-    if (root.contains("max_depth") && root["max_depth"].is_number_integer()) {
-        record.max_depth = root["max_depth"].get<int>();
-    }
+    auto read_metadata = [&root](const char* key, int fallback) {
+        int value = fallback;
+        return root.contains(key) && read_json_int(root[key], value) ? value : fallback;
+    };
+    record.black_profile = read_metadata("black_profile", record.black_profile);
+    record.white_profile = read_metadata("white_profile", record.white_profile);
+    record.total_nodes = read_metadata("total_nodes", record.total_nodes);
+    record.max_depth = read_metadata("max_depth", record.max_depth);
 
     for (const auto& entry : root["moves"]) {
         if (!entry.is_object()) {
@@ -113,11 +110,13 @@ bool GameRecord::from_json(const std::string& text, GameRecord& out, std::string
             return false;
         }
         auto read_int = [&entry](const char* key, int fallback) {
-            return entry.contains(key) && entry[key].is_number_integer()
-                       ? entry[key].get<int>() : fallback;
+            int value = fallback;
+            return entry.contains(key) && read_json_int(entry[key], value) ? value : fallback;
         };
 
         MoveRecord move_record;
+        // Unusable coordinates fall back to -1 and are rejected below, rather than
+        // being truncated into some other square on the board.
         move_record.move = Move(read_int("row", -1), read_int("col", -1), EMPTY);
         if (!move_record.move.pos.is_valid()) {
             error = "game record move is off the board";

@@ -1,4 +1,5 @@
 #include "params.h"
+#include "json_int.h"
 #include <nlohmann/json.hpp>
 #include <fstream>
 #include <sstream>
@@ -159,7 +160,14 @@ bool CoefficientVector::from_json_string(const std::string& text, ThreatCoeffici
             error = std::string(names[i]) + " must be an integer";
             return false;
         }
-        *fields[i] = value.get<int>();
+        // Cast-not-throw: an integer wider than 32 bits must be rejected, because
+        // the truncated low half would be a value the file never stated.
+        int parsed = 0;
+        if (!read_json_int(value, parsed)) {
+            error = std::string(names[i]) + " is outside the range of a 32-bit integer";
+            return false;
+        }
+        *fields[i] = parsed;
     }
 
     // `five` is load-bearing for mate detection, so a file that moves it above the

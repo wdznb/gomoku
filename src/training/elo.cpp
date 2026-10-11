@@ -1,4 +1,5 @@
 #include "elo.h"
+#include "json_int.h"
 #include <nlohmann/json.hpp>
 #include <fstream>
 #include <algorithm>
@@ -139,14 +140,16 @@ bool EloSystem::load_json(const std::string& text, std::string& error) {
         restored.base_k_ = root["base_k"].get<double>();
     }
 
+    // Counters decide only the K-factor bracket, so an unusable one falls back to
+    // zero instead of truncating; the names and ratings themselves are what matter.
     for (const auto& entry : root["players"]) {
         if (!entry.is_object() || !entry.contains("name") || !entry["name"].is_string()) {
             error = "elo player entry needs a name";
             return false;
         }
         auto read_int = [&entry](const char* key) {
-            return entry.contains(key) && entry[key].is_number_integer()
-                       ? entry[key].get<int>() : 0;
+            int value = 0;
+            return entry.contains(key) && read_json_int(entry[key], value) ? value : 0;
         };
         Player subject;
         subject.name = entry["name"].get<std::string>();
