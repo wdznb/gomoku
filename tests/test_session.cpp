@@ -282,6 +282,50 @@ void test_session_config_validation() {
     std::cout << "test_session_config_validation passed" << std::endl;
 }
 
+// Round 73, delete_session: a real failure on the main file must come back as
+// false with a message. The old code shared one error_code between the main
+// remove and the .tmp sweep, so an absent .tmp cleared the error and a session
+// that was still on disk was reported deleted.
+void test_delete_session_reports_main_failure() {
+    const auto dir = scratch_dir("delete_failure");
+    std::string error;
+
+    SessionSnapshot snap = sample("beef");
+    assert(save_session(dir.string(), snap, error));
+
+    // The session file is a non-empty directory: the main remove() genuinely
+    // fails, and the sweep of the .tmp (which does not exist) must not mask it.
+    std::error_code ec;
+    std::filesystem::remove(dir / "beef.json", ec);
+    assert(std::filesystem::create_directory(dir / "beef.json", ec));
+    { std::ofstream(dir / "beef.json" / "keeper.txt") << "inside"; }
+
+    error.clear();
+    assert(!delete_session(dir.string(), "beef", error));
+    assert(!error.empty());
+    assert(std::filesystem::exists(dir / "beef.json"));
+
+    // A retry reports the same failure instead of succeeding by absence of the
+    // temporary.
+    error.clear();
+    assert(!delete_session(dir.string(), "beef", error));
+    assert(!error.empty());
+    assert(std::filesystem::exists(dir / "beef.json"));
+
+    // With the obstruction gone the old semantics are intact: deleting what is
+    // there succeeds, and deleting what is not there is still success.
+    std::filesystem::remove_all(dir / "beef.json", ec);
+    error.clear();
+    assert(delete_session(dir.string(), "beef", error));
+    assert(error.empty());
+    assert(!std::filesystem::exists(dir / "beef.json"));
+    assert(delete_session(dir.string(), "beef", error));
+    assert(error.empty());
+
+    std::filesystem::remove_all(dir, ec);
+    std::cout << "test_delete_session_reports_main_failure passed" << std::endl;
+}
+
 }  // namespace
 
 int main() {
@@ -291,6 +335,7 @@ int main() {
     test_files_are_written_atomically();
     test_listing_and_corrupt_files();
     test_delete_session_is_idempotent();
+    test_delete_session_reports_main_failure();
     test_session_config_validation();
     std::cout << "All session store tests passed!" << std::endl;
     return 0;

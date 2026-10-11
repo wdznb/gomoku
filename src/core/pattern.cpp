@@ -189,7 +189,11 @@ PatternType match_contiguous_run(const int* cells, int count_left, int count_rig
             bool left_open = (left_pos - 1 >= 0 && cells[left_pos - 1] == 0);
             bool right_open = (right_pos + 1 <= 8 && cells[right_pos + 1] == 0);
 
-            if (left_open && right_open) {
+            // Either side suffices: the far end is ALREADY empty (has_*_space),
+            // so one more stone on the open side makes a four with both ends
+            // free - a live four. `XXXX_X` is only a rush four for the same
+            // reason in reverse: the closed side cannot be reopened for free.
+            if (left_open || right_open) {
                 return PatternType::LIVE_THREE;
             } else {
                 return PatternType::SLEEPY_THREE;

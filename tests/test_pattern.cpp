@@ -575,6 +575,77 @@ void test_bitboard_matches_scalar() {
     std::cout << "test_bitboard_matches_scalar passed (" << checked << " windows)" << std::endl;
 }
 
+// Asymmetric live three: _BBB_. with ONE outer end blocked is still a live
+// three, because the free end can grow a four with both ends free. The old
+// matcher demanded both outer cells empty and demoted these to SLEEPY_THREE,
+// which also hid the three-three forbidden point built from two such shapes.
+void test_asymmetric_live_three() {
+    // Black (7,5)(7,6), white (7,9), probe (7,7): the right outer end (7,9) is
+    // blocked but (7,3)(7,4) is free - the three can still become a live four.
+    Board right_blocked;
+    right_blocked.place_stone(7, 5, BLACK);
+    right_blocked.place_stone(7, 6, BLACK);
+    right_blocked.place_stone(7, 9, WHITE);
+    assert(PatternRecognizer::recognize_direction(right_blocked, 7, 7, BLACK, 0).type ==
+           PatternType::LIVE_THREE);
+
+    // Mirror image: white blocks (7,3) and the right side is free.
+    Board left_blocked;
+    left_blocked.place_stone(7, 5, BLACK);
+    left_blocked.place_stone(7, 6, BLACK);
+    left_blocked.place_stone(7, 3, WHITE);
+    assert(PatternRecognizer::recognize_direction(left_blocked, 7, 7, BLACK, 0).type ==
+           PatternType::LIVE_THREE);
+
+    // Both outer ends blocked: filling either space makes a four that is dead
+    // at both ends, so this must stay a sleepy three.
+    Board both_blocked;
+    both_blocked.place_stone(7, 5, BLACK);
+    both_blocked.place_stone(7, 6, BLACK);
+    both_blocked.place_stone(7, 3, WHITE);
+    both_blocked.place_stone(7, 9, WHITE);
+    assert(PatternRecognizer::recognize_direction(both_blocked, 7, 7, BLACK, 0).type ==
+           PatternType::SLEEPY_THREE);
+
+    // Two such asymmetric live threes meeting on one point are a double-three:
+    // under the old matcher neither counted as a live three and the point was
+    // not forbidden for BLACK.
+    Board double_three;
+    double_three.place_stone(7, 5, BLACK);
+    double_three.place_stone(7, 6, BLACK);
+    double_three.place_stone(5, 7, BLACK);
+    double_three.place_stone(6, 7, BLACK);
+    double_three.place_stone(7, 9, WHITE);
+    double_three.place_stone(3, 7, WHITE);
+    const PositionPattern pattern =
+        PatternRecognizer::recognize_position(double_three, 7, 7, BLACK);
+    int live_threes = 0;
+    for (int d = 0; d < 4; ++d) {
+        if (pattern.directions[d].type == PatternType::LIVE_THREE) ++live_threes;
+    }
+    assert(live_threes >= 2);
+    assert(pattern.has_three_three);
+    assert(PatternRecognizer::is_forbidden(double_three, 7, 7, BLACK));
+    // The same point as WHITE partakes in no forbidden shape.
+    assert(!PatternRecognizer::is_forbidden(double_three, 7, 7, WHITE));
+
+    // The hole-split three through the probe (X_XX) keeps its own label and its
+    // one-blocked variant stays sleepy - match_gapped_run is untouched.
+    Board gapped;
+    gapped.place_stone(7, 5, BLACK);
+    gapped.place_stone(7, 6, BLACK);
+    assert(PatternRecognizer::recognize_direction(gapped, 7, 8, BLACK, 0).type ==
+           PatternType::LIVE_THREE);
+    Board gapped_blocked;
+    gapped_blocked.place_stone(7, 5, BLACK);
+    gapped_blocked.place_stone(7, 6, BLACK);
+    gapped_blocked.place_stone(7, 9, WHITE);
+    assert(PatternRecognizer::recognize_direction(gapped_blocked, 7, 8, BLACK, 0).type ==
+           PatternType::SLEEPY_THREE);
+
+    std::cout << "test_asymmetric_live_three passed" << std::endl;
+}
+
 int main() {
     std::cout << "Running pattern tests..." << std::endl;
     
@@ -596,6 +667,7 @@ int main() {
     test_forbidden_from_pattern_equivalence();
     test_recognize_position_both_matches_pair();
     test_bitboard_matches_scalar();
+    test_asymmetric_live_three();
     
     std::cout << "All pattern tests passed!" << std::endl;
     return 0;

@@ -1021,3 +1021,66 @@ atomic-write cases. `ctest` 8/8 on an assert-live build; the R3 INVALID half is 
 healthy engine cannot produce one. One process note: a `RelWithDebInfo` reconfigure had quietly defined
 `NDEBUG` and made an earlier "green" meaningless — the build directory is back to plain `cmake ..`.
 
+
+## 轮次73 活三判定与持久化重试 — bugfix round 73 (phase5-bugfix)
+
+**Found.** Four audit domains surfaced twenty candidates; seven were refuted or deferred and fifteen
+were dispatched. The headliner is a rule bug, not a plumbing one: `match_contiguous_run` demanded
+`left_open && right_open` before calling a contiguous three live. Both adjacent cells are already empty
+in that branch, so a single open cell one step further out is enough — playing that side yields a four
+with both ends free. A real 活三 was being scored as 眠三, which under-counts 400 points in the
+evaluator, hides the threat from `generate_attacks`, weakens the alphabeta static extension, and
+silently misses 三三 forbidden (README:27-29). The rest were bookkeeping: `check_position` ran through
+`ensure_attached` and so manufactured a fresh session for what README:517 calls a dry run, handing the
+client a new token and losing the game it was about to set a position in; `flush_entry` committed
+`saved_payload` before appending to `records.jsonl`, so a failed append was remembered as done and the
+export was lost forever (round 72 had fixed only the file-write half); `delete_session` shared one
+`error_code` across two `remove` calls, and the second — deleting a `.tmp` that usually does not exist —
+reset it to success, so a real failure on `<token>.json` returned true and round 72's
+"commit the stamp only when the delete worked" was bypassed. Front end: a resumed session frame during
+摆棋 rewrote `this.board` behind a `displayView` that still rendered the working copy, leaving the user
+looking at stones the server never had, with 确认 stuck and the replay buttons lit on a board that was
+not the game's; cancelling 摆棋 dropped back into a stale replay view; undo-to-empty latched
+`gameStatus='waiting'` while the server kept accepting moves, locking the client out; `chooseSide`
+applied its optimistic state before checking that the frame left the socket; `requestHint` sent `null`
+for a cleared timeout/depth box and silently ran 5000ms/depth 6. Trainer: the rewind explorer accepted a
+branch point at `prefix == max_moves`, producing games where the engine never decided a single ply —
+every move `method:"replay"`, still counted and still exported; a data round ran in full with no
+`--records`/`--samples` target to write to; `game_id_base` was derived from `rounds_completed_`, which
+is checkpointed *after* the data append, so a kill in between re-issued an overlapping id range;
+`--fitness-games`/`--verification-games` rounded down, contradicting both the header comment and
+README:191-192; and every write failure warning was gated on `log_`, so `--quiet` swallowed them.
+Memory: each `SearchEngine` owns a 33MB transposition table, three concurrent sessions already break
+README:611's <100MB target.
+
+**Fixed.** `||` in the contiguous-three branch (the gapped-run AND stays — filling its hole makes a
+contiguous four, so both ends genuinely must be free; README:29's `XXXX_X` rush-four is the same
+argument). `check_position` joins `ping` on the no-session-needed list. `saved_payload` is committed
+after the export block. `delete_session` gets two error slots and reports only the main file's failure.
+`handleSession` exits 摆棋 unconditionally on a resumed frame before applying the authoritative board,
+`refreshReplayControls` gained `|| this.setup.active`, and `enterSetup` clears `replayIndex`. Undo
+promotes `waiting` to `playing` when a side is already chosen, mirroring `game_manager.cpp`.
+`chooseSide` and `requestHint` check the send and the inputs respectively. `RetryExplorer` requires
+`ply + 3 <= max_moves`; `generate_data_games` returns 0 with no output paths; `game_id_base` reads
+`games_played_ + 1 + t * 1000`; pairs round up via `(games + 1) / 2`; write failures go to `std::cerr`
+regardless of `--quiet`. Default TT size dropped to `1 << 18` (~8.4MB/table).
+
+**Not defects / deliberately left.** Unbounded `cold_sessions_` growth is the design README:542-543
+describes; `--resume` overriding `--seed` is reproducible-continuation semantics; the second-tab
+takeover loop is specified behaviour (README:544-545) with no reliable client signal to guard on;
+`match_gapped_run`'s `lo_open && hi_open` is correct as argued above; clicking a move in the record list
+while the AI thinks is real but low-value, deferred.
+
+**Verified.** Test session (WSL) added `test_asymmetric_live_three` (A1) and confirmed the gapped-run
+cases at `tests/test_pattern.cpp:367-383` still behave, `test_transposition_default_size` (A2, RSS delta
+8316 KiB for one engine), `test_check_position_skips_session_creation` and
+`test_failed_export_retries_records_append` in `tests/test_server.cpp`,
+`test_delete_session_reports_main_failure` (A5), the five training cases `test_retry_rewind_keeps_engine_decisions`,
+`test_generate_data_games_requires_outputs`, `test_data_game_ids_unique_across_batches`,
+`test_play_match_rounds_up_to_even`, `test_write_failures_report_to_stderr`, and a new Node harness
+`tests/web_frontend_check.js` covering A6-A10 (5/5, with the A6 control confirmed to FAIL once the fix is
+removed). A13's original assertion was wrong on its own terms — the eight-fold symmetric augmentation
+repeats `move_index` inside a game by design — so it asserts `game_id` non-reuse with a real checkpoint
+round-trip instead of weakening the fix. Main session re-ran the whole gate independently: plain
+`cmake ..` (asserts live, `CMAKE_BUILD_TYPE` empty), `make -j4` clean apart from the known
+`server_reason_of` warning, `ctest` 8/8, `node tests/web_frontend_check.js` 5/5.

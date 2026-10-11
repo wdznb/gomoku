@@ -595,10 +595,13 @@ void GameServer::handle_message(std::shared_ptr<WebSocketSession> session, const
         handle_resume(session, msg);
         return;
     }
-    if (type != "ping") {
+    if (type != "ping" && type != "check_position") {
         // Every game message is played in a session: the socket's own if it
         // already has one, a new one otherwise. `ping` is excluded because a
         // keepalive is not a player, and `resume` because it brings its own.
+        // `check_position` is excluded because it is a dry run: opening a
+        // session for it would hand the client a fresh token and lose the
+        // game it was about to set a position in.
         if (!ensure_attached(session)) return;
     }
 
@@ -1307,7 +1310,6 @@ void GameServer::flush_entry(const std::shared_ptr<TrackedGame>& entry) {
         std::cerr << "会话 " << entry->token << " 落盘失败: " << error << std::endl;
         return;
     }
-    entry->saved_payload = payload;
     // Only a game that started from an empty board is a training record on its
     // own: one that began from a hand-set position needs its `base` stones too,
     // which the trainer's reader has no way to place. So those stay in the
@@ -1321,6 +1323,10 @@ void GameServer::flush_entry(const std::shared_ptr<TrackedGame>& entry) {
         }
         entry->exported = true;
     }
+    // Commit the dedup stamp only once both the file write and the export are
+    // done: committing it before the append meant a failed records.jsonl write
+    // was never retried, and the game vanished from the training stream.
+    entry->saved_payload = payload;
 }
 
 void GameServer::flush_all() {

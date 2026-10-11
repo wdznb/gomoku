@@ -336,6 +336,125 @@ void test_failed_flush_retries_and_keeps_dedup() {
     std::cout << "test_failed_flush_retries_and_keeps_dedup passed" << std::endl;
 }
 
+// Round 73, handle_message: check_position is a dry run and must not open a
+// session for the socket that asks. The old code ran ensure_attached for every
+// non-ping message, which answered a preview probe with a fresh session token
+// and burned an engine; any other game message must still attach.
+void test_check_position_skips_session_creation() {
+    const auto dir = scratch("preview_sessions");
+    {
+        GameServer server(0, std::string(), std::string(), nullptr, dir.string(),
+                          std::string());
+        auto socket =
+            std::make_shared<WebSocketSession>(tcp::socket(server.ioc_), std::string());
+        const json preview = {{"type", "check_position"},
+                              {"position", {{"version", 1}, {"moves", json::array()}}}};
+        server.handle_message(socket, preview);
+        for (int i = 0; i < 8; ++i) {
+            if (server.ioc_.poll() == 0) break;
+        }
+
+        // No session, no game, no token binding: the probe was answered without
+        // anyone being handed a new game.
+        assert(server.games_.empty());
+        assert(server.sessions_.empty());
+        assert(server.socket_tokens_.empty());
+        assert(socket->send_queue_.size() == 1);
+        const json reply = json::parse(socket->send_queue_.front());
+        assert(reply["type"] == "position_preview");
+        assert(reply["ok"] == true);
+        assert(reply.contains("board"));
+
+        // The control: any other game message still attaches on demand, and the
+        // attach announces itself with the session frame.
+        server.handle_message(socket, json{{"type", "undo"}});
+        // asio marks the context stopped once a poll() drains it, so the sends
+        // posted by the undo path only run after an explicit restart().
+        server.ioc_.restart();
+        for (int i = 0; i < 8; ++i) {
+            if (server.ioc_.poll() == 0) break;
+        }
+        assert(server.sessions_.size() == 1);
+        assert(server.games_.size() == 1);
+        assert(server.socket_tokens_.size() == 1);
+        bool saw_session_frame = false;
+        std::queue<std::string> frames = socket->send_queue_;
+        while (!frames.empty()) {
+            if (json::parse(frames.front())["type"] == "session") saw_session_frame = true;
+            frames.pop();
+        }
+        assert(saw_session_frame);
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    std::cout << "test_check_position_skips_session_creation passed" << std::endl;
+}
+
+// Round 73, flush_entry: a failed records.jsonl append must leave saved_payload
+// where it was, or the dedup check reads the finished game as already written
+// and it is lost from the training stream forever. The session file itself
+// keeps working: the completed game is on disk, and the retry appends exactly
+// one line without rewriting or corrupting the session file.
+void test_failed_export_retries_records_append() {
+    const auto dir = scratch("export_sessions");
+    const auto records = scratch("export_records.jsonl");
+    const auto blocker = scratch("export_blocker");
+    std::error_code ec;
+    {
+        std::ofstream file(blocker);
+        file << "not a directory";
+    }
+    {
+        Harness h(dir, records);
+        assert(h.entry->game->restore_game(five_restore(BLACK)));
+        h.server.flush_entry(h.entry);
+        assert(records_lines(records) == 1);
+        assert(h.entry->exported);
+
+        // A second decisive game on the same token: undo reopens the export,
+        // then black finishes with a different stone.
+        h.server.handle_undo(h.socket);
+        assert(!h.entry->exported);
+        h.server.flush_entry(h.entry);
+        const std::string stamped = h.entry->saved_payload;
+        assert(!stamped.empty());
+        h.server.handle_make_move(h.socket, json{{"row", 7}, {"col", 2}});
+        assert(h.entry->game->status() == GameStatus::GAME_OVER);
+
+        // The records path now points through a regular file, so the append
+        // fails after the session file was already written.
+        h.server.records_path_ = (blocker / "records.jsonl").string();
+        h.server.flush_entry(h.entry);
+        assert(h.entry->saved_payload == stamped);
+        assert(!h.entry->exported);
+        assert(records_lines(records) == 1);
+
+        // The failed attempt still left a loadable session file holding the
+        // finished game: nothing about the session bookkeeping was corrupted.
+        SessionSnapshot on_disk;
+        std::string error;
+        assert(load_session(dir.string(), h.entry->token, on_disk, error));
+        assert(on_disk.record.moves.size() == 9);
+        assert(on_disk.record.is_decisive());
+
+        // Restored: the retry appends exactly the one owed line, and a further
+        // flush must not duplicate it.
+        h.server.records_path_ = records.string();
+        h.server.flush_entry(h.entry);
+        assert(records_lines(records) == 2);
+        assert(h.entry->exported);
+        assert(h.entry->saved_payload != stamped);
+        h.server.flush_entry(h.entry);
+        assert(records_lines(records) == 2);
+        assert(load_session(dir.string(), h.entry->token, on_disk, error));
+        assert(on_disk.record.moves.size() == 9);
+    }
+    std::filesystem::remove_all(dir, ec);
+    std::filesystem::remove(records, ec);
+    std::filesystem::remove(blocker, ec);
+    std::cout << "test_failed_export_retries_records_append passed" << std::endl;
+}
+
 }  // namespace
 
 int main() {
@@ -347,6 +466,8 @@ int main() {
     test_set_position_reopens_export();
     test_emptied_board_deletes_residue();
     test_failed_flush_retries_and_keeps_dedup();
+    test_check_position_skips_session_creation();
+    test_failed_export_retries_records_append();
 
     std::cout << "All server tests passed!" << std::endl;
     return 0;

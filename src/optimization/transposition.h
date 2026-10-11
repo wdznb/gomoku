@@ -27,7 +27,10 @@ struct TTEntry {
 
 class TranspositionTable {
 public:
-    explicit TranspositionTable(size_t num_entries = 1 << 20);
+    // 2^18 x 32B ~= 8.4MB per table. Every GameManager owns an engine and its
+    // table, and sessions are unbounded: the old 2^20 default blew the <100MB
+    // memory target with three concurrent games.
+    explicit TranspositionTable(size_t num_entries = 1 << 18);
 
     void store(uint64_t hash, int depth, int value, Move best_move, TTFlag flag);
     const TTEntry* lookup(uint64_t hash) const;

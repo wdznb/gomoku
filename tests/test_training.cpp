@@ -20,6 +20,7 @@
 #include <map>
 #include <random>
 #include <set>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -1210,6 +1211,227 @@ void test_checkpoint_save_replaces_atomically() {
     std::cout << "test_checkpoint_save_replaces_atomically passed" << std::endl;
 }
 
+// Round 73, rewind_to_next_branch: a branch point one ply short of the move cap
+// replays the whole game and lets the engine decide nothing, so the rewind must
+// skip such plies. Every explored game keeps at least one engine-decided ply,
+// and the cap itself still produces MOVE_LIMIT endings rather than an error.
+void test_retry_rewind_keeps_engine_decisions() {
+    SearchEngine black;
+    SearchEngine white;
+    black.set_resign_detection(false);
+    white.set_resign_detection(false);
+    SelfPlayConfig settings = quick_play_config();
+    settings.max_moves = 5;
+
+    RetryExplorer explorer(black, white, settings);
+    std::vector<Move> opening;
+    opening.emplace_back(7, 7, BLACK);
+    explorer.set_start_line(opening);
+
+    int explored = 0;
+    for (int i = 0; i < 6; ++i) {
+        GameRecord record;
+        if (!explorer.explore(record, nullptr)) break;
+        int engine_moves = 0;
+        for (const auto& entry : record.moves) {
+            if (entry.method != "replay") ++engine_moves;
+        }
+        assert(engine_moves >= 1);
+        // Five plies cannot finish a five, so the cap is what ends every game.
+        assert(record.reason == GameEndReason::MOVE_LIMIT);
+        assert(record.winner == EMPTY);
+        assert_playable(record);
+        ++explored;
+    }
+    assert(explored >= 3);
+    assert(explorer.games_played() == explored);
+
+    std::cout << "test_retry_rewind_keeps_engine_decisions passed" << std::endl;
+}
+
+// Round 73, generate_data_games: with neither --records nor --samples there is
+// nothing to write, so no game may be played at all. The old code paid the full
+// self-play cost and dropped every result at merge. One output path restores
+// the collection.
+void test_generate_data_games_requires_outputs() {
+    TrainingConfig config = fast_training_config();
+    config.search_depth = 2;
+    config.timeout_ms = 120;
+    config.max_moves = 8;
+    config.data_opening_plies = 2;
+    config.data_threads = 2;
+    config.seed = 98765;
+    config.records_path.clear();
+    config.samples_path.clear();
+
+    Trainer trainer(ThreatCoefficients(), config);
+    assert(trainer.games_played() == 0);
+    assert(trainer.generate_data_games(2, 2) == 0);
+    assert(trainer.games_played() == 0);
+    assert(trainer.samples_collected() == 0);
+
+    // With the records path present the games are played, counted and appended.
+    const std::filesystem::path records = temp_path("data_records.jsonl");
+    trainer.config_.records_path = records.string();
+    assert(trainer.generate_data_games(2, 2) > 0);
+    assert(trainer.games_played() >= 2);
+    std::ifstream records_file(records);
+    std::string line;
+    int record_lines = 0;
+    while (std::getline(records_file, line)) {
+        if (!line.empty()) ++record_lines;
+    }
+    assert(record_lines >= 2);
+
+    std::cout << "test_generate_data_games_requires_outputs passed" << std::endl;
+}
+
+// Round 73, game_id_base: ids follow the games_played_ high-water mark, so a
+// second batch - in the same run or after a kill and resume - can never reissue
+// a game_id the first batch already used. The old rounds_completed_-based base
+// repeated ids whenever a batch was collected again in the same round, exactly
+// what a resume after a kill does, and two different games then shared one
+// (game_id, move_index) identity in samples.jsonl. Note move_index alone cannot
+// name a row: collection augments every ply into SYMMETRY_COUNT oriented
+// variants that share the ply's index, so the identity under test is the
+// game_id itself.
+void test_data_game_ids_unique_across_batches() {
+    TrainingConfig config = fast_training_config();
+    config.search_depth = 2;
+    config.timeout_ms = 120;
+    config.max_moves = 8;
+    config.data_opening_plies = 2;
+    config.seed = 24680;
+    config.records_path.clear();
+    const std::filesystem::path samples = temp_path("ids_samples.jsonl");
+    config.samples_path = samples.string();
+    config.checkpoint_path = temp_path("ids_checkpoint.json").string();
+
+    Trainer trainer(ThreatCoefficients(), config);
+    assert(trainer.generate_data_games(2, 1) > 0);
+    assert(trainer.games_played() >= 2);
+
+    std::vector<TrainingSample> first;
+    std::string error;
+    assert(DataCollector::read_jsonl(samples.string(), first, error));
+    assert(!first.empty());
+    std::set<int> first_ids;
+    for (const auto& sample : first) first_ids.insert(sample.game_id);
+    assert(first_ids.size() >= 2);
+
+    // The second batch is collected by a trainer resumed from the checkpoint,
+    // the shape a run killed between the data append and the next round takes.
+    assert(trainer.save_checkpoint(config.checkpoint_path, error));
+    Trainer resumed(ThreatCoefficients(), config);
+    assert(resumed.load_checkpoint(config.checkpoint_path, error));
+    assert(resumed.games_played() == trainer.games_played());
+    assert(resumed.generate_data_games(2, 1) > 0);
+
+    std::vector<TrainingSample> all;
+    assert(DataCollector::read_jsonl(samples.string(), all, error));
+    assert(all.size() > first.size());
+
+    // Every id in the file is either from the first batch or fresh; the old
+    // code would have collapsed the second batch back onto the first ids and
+    // left fresh_ids empty.
+    std::set<int> all_ids;
+    for (const auto& sample : all) all_ids.insert(sample.game_id);
+    std::set<int> fresh_ids;
+    for (int id : all_ids) {
+        if (first_ids.count(id) == 0) fresh_ids.insert(id);
+    }
+    assert(fresh_ids.size() == first_ids.size());
+    assert(*fresh_ids.begin() > *first_ids.rbegin());
+    assert(all_ids.size() == first_ids.size() + fresh_ids.size());
+
+    std::cout << "test_data_game_ids_unique_across_batches passed" << std::endl;
+}
+
+// Round 73, play_match: an odd game request rounds UP to the next even count -
+// every pairing plays both colours - and the score is normalised by the games
+// actually played: --fitness-games 3 means four games, not two.
+void test_play_match_rounds_up_to_even() {
+    TrainingConfig config = fast_training_config();
+    config.search_depth = 2;
+    config.timeout_ms = 120;
+    config.max_moves = 8;
+    config.resign_enabled = false;
+
+    Trainer trainer(ThreatCoefficients(), config);
+    const int before = trainer.games_played();
+    const double score = trainer.play_match(ThreatCoefficients(), target_coefficients(), 3);
+    assert(trainer.games_played() - before == 4);
+    // Eight plies cannot finish a five, so every game is a MOVE_LIMIT draw:
+    // four halves over four games pins the normalisation to exactly 0.5.
+    assert(std::abs(score - 0.5) < 1e-12);
+
+    const int before_single = trainer.games_played();
+    trainer.play_match(ThreatCoefficients(), target_coefficients(), 1);
+    assert(trainer.games_played() - before_single == 2);
+
+    std::cout << "test_play_match_rounds_up_to_even passed" << std::endl;
+}
+
+// Round 73: write failures on params, checkpoint, records and samples must
+// reach std::cerr even with no log callback installed. --quiet only silences
+// progress lines; data loss has to stay visible.
+void test_write_failures_report_to_stderr() {
+    const std::filesystem::path blocker = temp_path("stderr_blocker");
+    {
+        std::ofstream file(blocker);
+        file << "not a directory";
+    }
+
+    // run_round: an accepted candidate whose params and checkpoint live under a
+    // regular file reports both failed saves.
+    TrainingConfig config = fast_training_config();
+    config.accept_score = 0.0;
+    config.params_path = (blocker / "params.json").string();
+    config.checkpoint_path = (blocker / "checkpoint.json").string();
+    Trainer trainer(ThreatCoefficients(), config);
+    trainer.set_fitness_override([](const ThreatCoefficients&) { return 0.5; });
+    std::ostringstream round_log;
+    std::streambuf* previous = std::cerr.rdbuf(round_log.rdbuf());
+    const TrainerRound round = trainer.run_round();
+    std::cerr.rdbuf(previous);
+    assert(round.accepted);
+    assert(round_log.str().find("could not save parameters") != std::string::npos);
+    assert(round_log.str().find("could not save checkpoint") != std::string::npos);
+
+    // Data collection: an unwritable records path reports the failed append,
+    // and the samples the round did produce are still returned.
+    TrainingConfig record_config = fast_training_config();
+    record_config.search_depth = 2;
+    record_config.timeout_ms = 120;
+    record_config.max_moves = 8;
+    record_config.seed = 13579;
+    record_config.records_path = (blocker / "records.jsonl").string();
+    record_config.samples_path.clear();
+    Trainer record_trainer(ThreatCoefficients(), record_config);
+    std::ostringstream record_log;
+    previous = std::cerr.rdbuf(record_log.rdbuf());
+    const int record_samples = record_trainer.generate_data_games(2, 1);
+    std::cerr.rdbuf(previous);
+    assert(record_samples > 0);
+    assert(record_log.str().find("could not append record") != std::string::npos);
+
+    // ... and an unwritable samples path reports its own failure.
+    TrainingConfig sample_config = record_config;
+    sample_config.records_path.clear();
+    sample_config.samples_path = (blocker / "samples.jsonl").string();
+    Trainer sample_trainer(ThreatCoefficients(), sample_config);
+    std::ostringstream sample_log;
+    previous = std::cerr.rdbuf(sample_log.rdbuf());
+    const int sample_samples = sample_trainer.generate_data_games(2, 1);
+    std::cerr.rdbuf(previous);
+    assert(sample_samples > 0);
+    assert(sample_log.str().find("could not append samples") != std::string::npos);
+
+    std::error_code ec;
+    std::filesystem::remove(blocker, ec);
+    std::cout << "test_write_failures_report_to_stderr passed" << std::endl;
+}
+
 int main() {
     std::cout << "Running training tests..." << std::endl;
 
@@ -1240,6 +1462,11 @@ int main() {
     test_play_game_counts_only_valid_games();
     test_parameter_save_replaces_atomically();
     test_checkpoint_save_replaces_atomically();
+    test_retry_rewind_keeps_engine_decisions();
+    test_generate_data_games_requires_outputs();
+    test_data_game_ids_unique_across_batches();
+    test_play_match_rounds_up_to_even();
+    test_write_failures_report_to_stderr();
 
     std::cout << "All training tests passed" << std::endl;
     return 0;

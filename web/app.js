@@ -195,6 +195,13 @@ class GomokuGame {
             if (asked) this.updateStatus('上一局找不回来了，已开新局', 'warn');
             return;
         }
+        // A resume that landed while 摆棋 was open (typically a server restart
+        // before the 确认 reply arrived) carries the authoritative board: leave
+        // the setup first, unconditionally - the working copy is dropped, no
+        // set_position is sent, confirmInFlight and the button bar are released
+        // - or the page would keep painting and guarding a position the server
+        // no longer has.
+        if (this.setup.active) this.exitSetup(false);
         this.playerColor = msg.player_color === 'black' ? BLACK
                          : msg.player_color === 'white' ? WHITE : null;
         this.gameStatus = msg.game_status || 'waiting';
@@ -692,8 +699,10 @@ class GomokuGame {
                      'btn-replay-next', 'btn-replay-last'];
         for (const id of nav) {
             const el = document.getElementById(id);
-            // While the AI is thinking, the live board is the thing to watch.
-            el.disabled = !hasMoves || this.aiThinking;
+            // While the AI is thinking, the live board is the thing to watch;
+            // while 摆棋 is open, the replay cluster belongs to the game, not
+            // the working copy on screen.
+            el.disabled = !hasMoves || this.aiThinking || this.setup.active;
         }
         document.getElementById('btn-replay-exit').disabled = this.replayIndex === null;
         // Re-enable when the record is behind the game: a move played after the
@@ -707,7 +716,7 @@ class GomokuGame {
         // says clears it, not this button.
         const unclaimedSetup = this.gameStatus === 'waiting' && this.playerColor === null;
         document.getElementById('btn-replay').disabled =
-            !hasMoves || this.aiThinking || !stale || unclaimedSetup;
+            !hasMoves || this.aiThinking || !stale || unclaimedSetup || this.setup.active;
     }
 
     // One engine verdict, formatted. The non-AlphaBeta paths (book / vcf / vct /
@@ -837,15 +846,20 @@ class GomokuGame {
     }
     
     chooseSide(color) {
-        this.playerColor = color === 'black' ? BLACK : WHITE;
-        // If the AI opens the game (human picks WHITE) its first search starts
-        // before any later control change could reach the server.
+        // The config goes out first: if the AI opens the game (human picks
+        // WHITE) its first search starts before any later control change could
+        // reach the server.
         this.sendConfig();
-        this.sendMessage({
+        // Only claim the side once the choose_side actually left this socket.
+        // A click in a disconnect window otherwise paints the optimistic state
+        // over a server that never heard it, dead-ending the side buttons until
+        // a refresh - the same rollback as the 确认 button.
+        if (!this.sendMessage({
             type: 'choose_side',
             color: color
-        });
-        
+        })) return;
+
+        this.playerColor = color === 'black' ? BLACK : WHITE;
         document.getElementById('btn-black').disabled = true;
         document.getElementById('btn-white').disabled = true;
         document.getElementById('btn-undo').disabled = false;
@@ -869,6 +883,13 @@ class GomokuGame {
     requestHint() {
         const timeout = parseInt(document.getElementById('timeout').value, 10);
         const depth = parseInt(document.getElementById('depth').value, 10);
+        // Same finite guard as sendConfig: an emptied box would serialise to
+        // null, and the server would silently run its own 5000ms/depth-6
+        // default instead of the settings the player thinks they asked for.
+        if (!Number.isFinite(timeout) || !Number.isFinite(depth)) {
+            this.updateStatus('超时和深度需要先填好数字', 'warn');
+            return;
+        }
         this.sendMessage({
             type: 'request_hint',
             timeout_ms: timeout * 1000,
@@ -930,6 +951,11 @@ class GomokuGame {
             document.getElementById(id).disabled = true;
         }
         this.stopReplayAuto();
+        // A setup opened on a historical view would leave that view in place on
+        // the way out, so 取消 would restore a replay position instead of the
+        // game's current board. Same unconditional exit as an undo.
+        this.replayIndex = null;
+        this.updateReplayInfo();
         this.renderSetupPanel();
         this.drawBoard();
         this.updateStatus('摆棋中：点击棋盘任意位置后依次标记为 黑 / 白 / 空，'
@@ -1541,7 +1567,14 @@ class GomokuGame {
             this.drawEvalGraph();
         }
         if (msg.game_status === 'waiting') {
-            this.gameStatus = 'waiting';
+            // The server treats a WAITING board with a chosen side as playable
+            // (make_move promotes and commits), so mirroring that promotion is
+            // what keeps an undo-to-empty-board from locking the player out of
+            // a game the server still lets them play in.
+            this.gameStatus = this.playerColor !== null ? 'playing' : 'waiting';
+            if (this.playerColor !== null) {
+                this.updateStatus(`已悔至空盘：轮到${this.currentTurn === BLACK ? '黑' : '白'}方，继续落子`, 'ok');
+            }
         } else if (msg.game_status === 'game_over') {
             this.gameStatus = 'game_over';
         } else {

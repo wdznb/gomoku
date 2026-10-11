@@ -14,10 +14,57 @@
 #include <iostream>
 #include <cassert>
 #include <atomic>
+#include <fstream>
 #include <thread>
 #include <chrono>
 
 using namespace gomoku;
+
+namespace {
+
+// Resident set size in KiB, for pinning the default table's real footprint.
+bool read_rss_kb(long long& kb) {
+#if defined(_WIN32)
+    (void)kb;
+    return false;
+#else
+    std::ifstream file("/proc/self/statm");
+    long long total_pages = 0;
+    long long resident_pages = 0;
+    if (!(file >> total_pages >> resident_pages)) return false;
+    kb = resident_pages * 4;  // statm counts 4 KiB pages
+    return true;
+#endif
+}
+
+}  // namespace
+
+// The default table is 2^18 entries (~8 MiB); the old 2^20 default cost ~32 MiB
+// per engine, and every session owns an engine. Run before any other table is
+// built so the delta reflects this table alone: 32 MiB would break the upper
+// bound and a shrunk table would break the lower one.
+void test_transposition_default_size() {
+    long long before_kb = 0;
+    const bool have_rss = read_rss_kb(before_kb);
+    long long delta_kb = 0;
+    bool measured = false;
+    {
+        TranspositionTable tt;
+        assert(tt.size() == (1u << 18));
+        long long after_kb = 0;
+        if (have_rss && read_rss_kb(after_kb)) {
+            measured = true;
+            delta_kb = after_kb - before_kb;
+        }
+    }
+    if (measured) {
+        assert(delta_kb >= 4096 && delta_kb <= 20480);
+        std::cout << "test_transposition_default_size passed (rss delta " << delta_kb << " KiB)"
+                  << std::endl;
+    } else {
+        std::cout << "test_transposition_default_size passed (rss unavailable)" << std::endl;
+    }
+}
 
 void test_transposition_table() {
     TranspositionTable tt(1024);
@@ -1189,6 +1236,7 @@ int main() {
 
     PatternRecognizer::init();
 
+    test_transposition_default_size();
     test_transposition_table();
     test_transposition_aging();
     test_vcf_immediate_five();

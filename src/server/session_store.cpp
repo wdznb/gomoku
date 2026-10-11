@@ -243,13 +243,19 @@ bool delete_session(const std::string& dir, const std::string& token, std::strin
         error = "非法 token";
         return false;
     }
-    std::error_code ec;
-    std::filesystem::remove(path, ec);
-    std::filesystem::remove(path + kTmpSuffix, ec);
-    if (ec) {
-        error = "无法删除 " + path + ": " + ec.message();
+    // Separate error slots: remove() resets ec for a file that is simply
+    // absent, so one shared code let the .tmp sweep overwrite a real failure
+    // on the main file and report success with the session still on disk.
+    std::error_code main_ec;
+    std::filesystem::remove(path, main_ec);
+    if (main_ec) {
+        error = "无法删除 " + path + ": " + main_ec.message();
         return false;
     }
+    // The stray .tmp is best-effort: its absence is not an error, and neither
+    // is failing to sweep it.
+    std::error_code tmp_ec;
+    std::filesystem::remove(path + kTmpSuffix, tmp_ec);
     return true;
 }
 

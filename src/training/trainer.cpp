@@ -5,6 +5,7 @@
 #include <nlohmann/json.hpp>
 #include <fstream>
 #include <filesystem>
+#include <iostream>
 #include <sstream>
 #include <map>
 #include <thread>
@@ -89,8 +90,9 @@ double Trainer::play_match(const ThreatCoefficients& candidate,
     prepare(reference_engine);
 
     // Every pairing runs twice with the colours swapped, so a candidate cannot
-    // pass on the strength of having the first move.
-    const int pairs = std::max(1, games / 2);
+    // pass on the strength of having the first move. Odd requests round UP to
+    // the next even count, as the config comment promises.
+    const int pairs = std::max(1, (games + 1) / 2);
     double score = 0.0;
     for (int i = 0; i < pairs; ++i) {
         score += play_game(candidate_engine, reference_engine, 1);
@@ -140,6 +142,9 @@ std::vector<Move> Trainer::random_opening_line(int plies, uint64_t seed) {
 
 int Trainer::generate_data_games(int games, int threads) {
     if (games <= 0 || fitness_override_) return 0;
+    // Nothing to write means nothing to play for: without either output path
+    // the games would only burn the round's budget and be dropped at merge.
+    if (config_.records_path.empty() && config_.samples_path.empty()) return 0;
 
     const int worker_count = std::max(1, std::min(threads, games));
     const int per_worker = games / worker_count;
@@ -178,7 +183,13 @@ int Trainer::generate_data_games(int games, int threads) {
             explorer.set_start_line(random_opening_line(config_.data_opening_plies, seed));
 
             const int count = per_worker + (t < remainder ? 1 : 0);
-            const int game_id_base = rounds_completed_ * 100000 + t * 1000;
+            // Base the ids on the games_played_ high-water mark (persisted with
+            // the checkpoint) rather than rounds_completed_: a kill between the
+            // data append and the checkpoint would otherwise make the resumed
+            // run reissue this round's ids and duplicate (game_id, move_index)
+            // rows in samples.jsonl. Workers only read it; it advances after
+            // join. Still 1000 apart per worker.
+            const int game_id_base = games_played_ + 1 + t * 1000;
             for (int i = 0; i < count; ++i) {
                 GameRecord record;
                 if (!explorer.explore(record, nullptr)) {
@@ -215,15 +226,17 @@ int Trainer::generate_data_games(int games, int threads) {
     std::string error;
     if (!config_.records_path.empty() && !records.empty()) {
         for (const auto& record : records) {
-            if (!record.append_to_jsonl(config_.records_path, error) && log_) {
-                log_("could not append record: " + error);
+            // Write failures go to stderr regardless of --quiet: silence is
+            // for progress lines, not for lost data.
+            if (!record.append_to_jsonl(config_.records_path, error)) {
+                std::cerr << "could not append record: " << error << std::endl;
                 break;
             }
         }
     }
     if (!config_.samples_path.empty() && !samples.empty()) {
-        if (!collector.write_jsonl(samples, config_.samples_path, error) && log_) {
-            log_("could not append samples: " + error);
+        if (!collector.write_jsonl(samples, config_.samples_path, error)) {
+            std::cerr << "could not append samples: " << error << std::endl;
         }
     }
 
@@ -292,8 +305,8 @@ TrainerRound Trainer::run_round() {
         best_version_ = candidate_index;
         if (!config_.params_path.empty()) {
             std::string error;
-            if (!CoefficientVector::save(config_.params_path, champion(), error) && log_) {
-                log_("could not save parameters: " + error);
+            if (!CoefficientVector::save(config_.params_path, champion(), error)) {
+                std::cerr << "could not save parameters: " << error << std::endl;
             }
         }
     }
@@ -323,8 +336,8 @@ TrainerRound Trainer::run_round() {
         if (save_checkpoint(config_.checkpoint_path, error)) {
             if (log_) log_("round " + std::to_string(result.round) +
                            ": checkpoint saved to " + config_.checkpoint_path);
-        } else if (log_) {
-            log_("could not save checkpoint: " + error);
+        } else {
+            std::cerr << "could not save checkpoint: " << error << std::endl;
         }
     }
 
