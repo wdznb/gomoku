@@ -792,6 +792,9 @@ void GameServer::handle_set_position(std::shared_ptr<WebSocketSession> session, 
         // the session file would resume the player into a colour they no longer
         // hold.
         entry->side_chosen = false;
+        // Same for the export stamp: the game that was appended to
+        // records.jsonl is over, and the position starts a fresh one.
+        entry->exported = false;
     }
     json reply;
     reply["type"] = "position_set";
@@ -850,6 +853,10 @@ void GameServer::handle_undo(std::shared_ptr<WebSocketSession> session) {
     int undo_move_count = 0;
     GameStatus undo_status = GameStatus::WAITING;
     if (game->undo(undo_move_count, undo_status)) {
+        // The exported flag describes the game that just gave back a stone:
+        // whatever follows this board is a new game, and a second finished
+        // game on the same token owes records.jsonl a second export.
+        if (auto entry = entry_locked(session.get())) entry->exported = false;
         json response;
         response["type"] = "undo_success";
         response["move_count"] = undo_move_count;
@@ -1270,11 +1277,23 @@ void GameServer::flush_entry(const std::shared_ptr<TrackedGame>& entry) {
     probe.updated_ms = 0;
     const std::string payload = session_to_json(probe);
     if (payload == entry->saved_payload) return;
-    entry->saved_payload = payload;
     // Content decides: a game with no stone anywhere - base or played - is not
     // kept, even if a side was chosen and the game resigned at move zero. A
     // settled previous game on restart always has stones, so it still lands.
-    if (snap.base.empty() && snap.record.moves.empty()) return;
+    if (snap.base.empty() && snap.record.moves.empty()) {
+        // And a file from an earlier game on this token must not outlive the
+        // wipe: undo back to an empty board deletes the residue, or a restart
+        // would resurrect the undone game. Only commit the dedup stamp once the
+        // delete actually succeeded, so a failure retries on the next tick.
+        std::string remove_error;
+        if (!delete_session(sessions_dir_, entry->token, remove_error)) {
+            std::cerr << "会话 " << entry->token << " 残留文件删除失败: "
+                      << remove_error << std::endl;
+            return;
+        }
+        entry->saved_payload = payload;
+        return;
+    }
 
     SessionSnapshot to_write = snap;
     to_write.created_ms = entry->created_ms;
@@ -1283,9 +1302,12 @@ void GameServer::flush_entry(const std::shared_ptr<TrackedGame>& entry) {
 
     std::string error;
     if (!save_session(sessions_dir_, to_write, error)) {
+        // saved_payload keeps its old value: the next tick sees the difference
+        // and retries, instead of treating a failed write as saved forever.
         std::cerr << "会话 " << entry->token << " 落盘失败: " << error << std::endl;
         return;
     }
+    entry->saved_payload = payload;
     // Only a game that started from an empty board is a training record on its
     // own: one that began from a hand-set position needs its `base` stones too,
     // which the trainer's reader has no way to place. So those stay in the

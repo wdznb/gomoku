@@ -4,6 +4,7 @@
 #include "../core/transforms.h"
 #include <nlohmann/json.hpp>
 #include <fstream>
+#include <filesystem>
 #include <sstream>
 #include <map>
 #include <thread>
@@ -54,7 +55,9 @@ double Trainer::play_game(SearchEngine& black, SearchEngine& white, int black_ow
 
     SelfPlay play(black, white, settings);
     GameRecord record = play.run(std::vector<Move>(), nullptr, nullptr);
-    games_played_++;
+    // Same yardstick as the data side: an INVALID game is discarded, so it
+    // must not inflate games_played_ in the checkpoint or the progress line.
+    if (record.reason != GameEndReason::INVALID) games_played_++;
 
     if (record.winner == EMPTY) {
         // Unfinished or discarded games score half: they must not hand either
@@ -360,14 +363,27 @@ bool Trainer::save_checkpoint(const std::string& path, std::string& error) const
     root["versions"] = entries;
     root["elo"] = json::parse(elo_.to_json());
 
-    std::ofstream file(path, std::ios::trunc);
-    if (!file.is_open()) {
-        error = "cannot write " + path;
-        return false;
+    // Write-then-rename, mirroring save_session: a kill or power loss mid-write
+    // must leave the previous checkpoint intact, not a truncated file that
+    // load_checkpoint cannot parse.
+    const std::string tmp = path + ".tmp";
+    {
+        std::ofstream file(tmp, std::ios::trunc);
+        if (!file.is_open()) {
+            error = "cannot write " + tmp;
+            return false;
+        }
+        file << root.dump(2);
+        if (!file.good()) {
+            error = "failed while writing " + tmp;
+            return false;
+        }
     }
-    file << root.dump(2);
-    if (!file.good()) {
-        error = "failed while writing " + path;
+    std::error_code ec;
+    std::filesystem::rename(tmp, path, ec);
+    if (ec) {
+        std::filesystem::remove(tmp);
+        error = "cannot replace " + path + ": " + ec.message();
         return false;
     }
     return true;

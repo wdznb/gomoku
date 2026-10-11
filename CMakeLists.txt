@@ -207,6 +207,38 @@ else()
 endif()
 add_test(NAME test_session COMMAND test_session)
 
+# The server's session lifecycle - re-armed exports, zero-stone cleanup, retried
+# flushes - lives behind private handlers, so this target drives GameServer
+# directly with the white-box macro rather than opening sockets.
+add_executable(test_server
+    tests/test_server.cpp
+    ${GOMOKU_CORE_SOURCES}
+    src/training/params.cpp
+    src/training/game_record.cpp
+    src/server/server.cpp
+    src/server/game_manager.cpp
+    src/server/position_json.cpp
+    src/server/session_store.cpp
+)
+target_include_directories(test_server PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${Boost_INCLUDE_DIRS}
+)
+target_link_libraries(test_server PRIVATE
+    ${Boost_LIBRARIES}
+    Threads::Threads
+    nlohmann_json::nlohmann_json
+)
+if(UNIX)
+    target_link_libraries(test_server PRIVATE pthread)
+endif()
+if(MSVC)
+    target_compile_options(test_server PRIVATE /W4)
+else()
+    target_compile_options(test_server PRIVATE -Wall -Wextra -Wno-template-body -Wno-template-id-cdtor)
+endif()
+add_test(NAME test_server COMMAND test_server)
+
 add_executable(test_training
     tests/test_training.cpp
     ${GOMOKU_CORE_SOURCES}

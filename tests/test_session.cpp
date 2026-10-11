@@ -219,6 +219,38 @@ void test_listing_and_corrupt_files() {
     std::cout << "test_listing_and_corrupt_files passed" << std::endl;
 }
 
+// Round 72, flush_entry's empty-board branch calls delete_session on every tick
+// of a zero-stone session. A missing file is the normal state and must come back
+// as success with no error, or every tick would log a failure and never commit
+// its dedup stamp.
+void test_delete_session_is_idempotent() {
+    const auto dir = scratch_dir("delete");
+    std::string error;
+
+    // Neither the directory nor the file exists: nothing to delete is success.
+    assert(delete_session(dir.string(), "beef", error));
+    assert(error.empty());
+
+    SessionSnapshot snap = sample("beef");
+    assert(save_session(dir.string(), snap, error));
+    // A stale temporary from an interrupted write goes with the file.
+    { std::ofstream(dir / "beef.json.tmp") << "half written"; }
+    assert(delete_session(dir.string(), "beef", error));
+    assert(error.empty());
+    assert(!std::filesystem::exists(dir / "beef.json"));
+    assert(!std::filesystem::exists(dir / "beef.json.tmp"));
+
+    // Deleting again is the state after the first tick, not an error.
+    assert(delete_session(dir.string(), "beef", error));
+    assert(error.empty());
+    assert(!delete_session(dir.string(), "../escape", error));
+    assert(!error.empty());
+
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    std::cout << "test_delete_session_is_idempotent passed" << std::endl;
+}
+
 // Defect 1: Unvalidated timeout_ms/max_depth in session restore (session_store.cpp:121-122)
 // A corrupted session file with negative or extreme values should be rejected
 // rather than loaded without validation.
@@ -258,6 +290,7 @@ int main() {
     test_rejects_damaged_files();
     test_files_are_written_atomically();
     test_listing_and_corrupt_files();
+    test_delete_session_is_idempotent();
     test_session_config_validation();
     std::cout << "All session store tests passed!" << std::endl;
     return 0;

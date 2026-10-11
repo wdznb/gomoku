@@ -10,17 +10,25 @@
 #include "training/data_collector.h"
 #include "training/genetic.h"
 #include "training/hill_climbing.h"
-#include "training/trainer.h"
 #include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <map>
+#include <random>
 #include <set>
 #include <string>
 #include <vector>
+
+// Trainer::play_game() is private, and the games_played counter can only be
+// observed first-hand by playing one. Every header trainer.h pulls in is
+// included above, so the macro rewrites trainer.h's class body and nothing else.
+#define private public
+#include "training/trainer.h"
+#undef private
 
 using namespace gomoku;
 
@@ -1091,6 +1099,117 @@ void test_readers_reject_out_of_range_numbers() {
     std::cout << "test_readers_reject_out_of_range_numbers passed" << std::endl;
 }
 
+// Round 72: play_game() discards an INVALID game, and the discarded game must
+// not inflate games_played_ - every checkpoint and status line would otherwise
+// overstate the work done. The counter is private and only alive through
+// play_game(), so the test drives it directly and pins the ordinary counting.
+void test_play_game_counts_only_valid_games() {
+    TrainingConfig config = fast_training_config();
+    config.search_depth = 1;
+    config.timeout_ms = 100;
+    config.max_moves = 1;
+
+    Trainer trainer(ThreatCoefficients(), config);
+    SearchEngine black;
+    SearchEngine white;
+
+    // One stone then the move cap: a MOVE_LIMIT game, not INVALID, so it counts
+    // once, and an unfinished game scores half.
+    assert(trainer.games_played() == 0);
+    assert(trainer.play_game(black, white, 1) == 0.5);
+    assert(trainer.games_played() == 1);
+    SearchEngine black_b;
+    SearchEngine white_b;
+    assert(trainer.play_game(black_b, white_b, 2) == 0.5);
+    assert(trainer.games_played() == 2);
+
+    std::cout << "test_play_game_counts_only_valid_games passed" << std::endl;
+}
+
+// Round 72: CoefficientVector::save() writes a temporary and renames it over
+// the target, so a failed save must not destroy the parameters already on disk
+// and a successful one must replace them wholesale.
+void test_parameter_save_replaces_atomically() {
+    const std::filesystem::path path = temp_path("atomic_params.json");
+    const std::string tmp = path.string() + ".tmp";
+    std::error_code ec;
+    std::filesystem::remove_all(tmp, ec);
+    std::string error;
+
+    // A successful save leaves the target in place and no temporary behind.
+    assert(CoefficientVector::save(path.string(), target_coefficients(), error));
+    assert(error.empty());
+    assert(std::filesystem::exists(path));
+    assert(!std::filesystem::exists(tmp));
+
+    // A second save replaces the first outright: the reader sees the second
+    // content, never a half-rewritten mixture under the old name.
+    const ThreatCoefficients second;
+    assert(CoefficientVector::save(path.string(), second, error));
+    assert(!std::filesystem::exists(tmp));
+    ThreatCoefficients loaded;
+    assert(CoefficientVector::load(path.string(), loaded, error));
+    assert(CoefficientVector::to_vector(loaded) == CoefficientVector::to_vector(second));
+
+    // A temporary that cannot be created aborts the save before the rename, so
+    // the previous file survives the failure instead of being truncated.
+    std::filesystem::create_directory(tmp, ec);
+    assert(!ec);
+    assert(!CoefficientVector::save(path.string(), target_coefficients(), error));
+    assert(!error.empty());
+    ThreatCoefficients still;
+    assert(CoefficientVector::load(path.string(), still, error));
+    assert(CoefficientVector::to_vector(still) == CoefficientVector::to_vector(second));
+
+    std::filesystem::remove_all(tmp, ec);
+    std::filesystem::remove(path, ec);
+    std::cout << "test_parameter_save_replaces_atomically passed" << std::endl;
+}
+
+// Round 72: Trainer::save_checkpoint() gets the same write-then-rename
+// treatment, because a truncated checkpoint is what load_checkpoint refuses.
+void test_checkpoint_save_replaces_atomically() {
+    TrainingConfig config = fast_training_config();
+    config.params_path = temp_path("atomic_ckpt_params.json").string();
+
+    const std::filesystem::path path = temp_path("atomic_checkpoint.json");
+    const std::string tmp = path.string() + ".tmp";
+    std::error_code ec;
+    std::filesystem::remove_all(tmp, ec);
+    std::string error;
+
+    Trainer first(ThreatCoefficients(), config);
+    assert(first.save_checkpoint(path.string(), error));
+    assert(error.empty());
+    assert(!std::filesystem::exists(tmp));
+
+    // A second trainer with a different champion overwrites the checkpoint; a
+    // resume reads the second state, not a mixture of the two.
+    Trainer second(target_coefficients(), config);
+    assert(second.save_checkpoint(path.string(), error));
+    assert(!std::filesystem::exists(tmp));
+    Trainer resumed(ThreatCoefficients(), config);
+    assert(resumed.load_checkpoint(path.string(), error));
+    assert(CoefficientVector::to_vector(resumed.champion()) ==
+           CoefficientVector::to_vector(second.champion()));
+
+    // A blocked temporary makes the save fail before the rename, so the old
+    // checkpoint stays loadable instead of being left half-written.
+    std::filesystem::create_directory(tmp, ec);
+    assert(!ec);
+    Trainer third(target_coefficients(), config);
+    assert(!third.save_checkpoint(path.string(), error));
+    assert(!error.empty());
+    Trainer again(ThreatCoefficients(), config);
+    assert(again.load_checkpoint(path.string(), error));
+    assert(CoefficientVector::to_vector(again.champion()) ==
+           CoefficientVector::to_vector(second.champion()));
+
+    std::filesystem::remove_all(tmp, ec);
+    std::filesystem::remove(path, ec);
+    std::cout << "test_checkpoint_save_replaces_atomically passed" << std::endl;
+}
+
 int main() {
     std::cout << "Running training tests..." << std::endl;
 
@@ -1118,6 +1237,9 @@ int main() {
     test_trainer_rejects_bad_checkpoint();
     test_trainer_checkpoint_seed_and_counters();
     test_readers_reject_out_of_range_numbers();
+    test_play_game_counts_only_valid_games();
+    test_parameter_save_replaces_atomically();
+    test_checkpoint_save_replaces_atomically();
 
     std::cout << "All training tests passed" << std::endl;
     return 0;

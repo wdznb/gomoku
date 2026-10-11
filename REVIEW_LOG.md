@@ -988,3 +988,36 @@ expectations above, `ctest` 7/7 with only the pre-existing `server_reason_of` wa
 T2 case budgets 300 ms wall-clock and aborted once while a CPU-saturating fuzzer ran beside it — green
 on an idle machine; keep it in mind if it ever flakes under load.
 
+## 轮次72 会话导出与落盘健壮性 — bugfix round 72 (phase5-bugfix)
+
+**Found.** Round 71's guards closed the individual holes but left the bookkeeping around them inverted in
+five places. `exported` was a one-way stamp: once a token's game appended a line to `records.jsonl`, any
+later game on that same token — after 悔棋 back to the middle of the board, or after 摆棋 replaced it —
+was never exported again, silently starving the training stream. The same 悔棋 path showed the other face
+of round 71's 一子未落的空会话不写 rule: `flush_entry` skipped the write but left the previous game's file
+on disk, so a restart resurrected a board the player had just erased. `saved_payload` was committed
+*before* `save_session` ran, so a failed write was remembered as a success and the next tick's content
+comparison skipped the retry forever. On the trainer side `games_played_` still counted the discarded
+INVALID verifications that round 71 had removed from the data, inflating the checkpoint's game tally, and
+both `save_checkpoint` and `CoefficientVector::save` wrote with `ofstream(trunc)` in place — one kill or
+power loss mid-write and 断点续训 could no longer parse its own checkpoint.
+
+**Fixed.**  Undo that pops a stone and `set_position` both clear `exported`; the resume path in
+`open_session` keeps deriving it from the restored record. The empty-board branch of `flush_entry` now
+deletes the residue via `delete_session` and only commits the dedup stamp when that delete succeeds, so a
+failure retries on the next tick; the write branch commits `saved_payload` after `save_session` returns
+true. `games_played_` increments only for `reason != INVALID`, matching the data side. Both trainer writes
+mirror `save_session`: full payload to `<path>.tmp`, then `std::filesystem::rename`, with the temp removed
+if the rename fails — the previous file survives any interruption intact.
+
+**Verified.** Test session added `tests/test_server.cpp` (a white-box target that un-privates
+`GameServer` for one translation unit and calls the handlers with no io thread):
+`test_undo_reopens_export` and `test_set_position_reopens_export` assert `records.jsonl` reaches 2 lines
+after a second decisive game; `test_emptied_board_deletes_residue` blocks the sessions directory with a
+regular file to prove the stamp holds and the retry deletes; `test_failed_flush_retries_and_keeps_dedup`
+does the same for the write branch and re-checks round 71's no-rewrite-on-identical-content.
+`test_session` gained `test_delete_session_is_idempotent`, `test_training` gained the count and the two
+atomic-write cases. `ctest` 8/8 on an assert-live build; the R3 INVALID half is NOT-COVERED because a
+healthy engine cannot produce one. One process note: a `RelWithDebInfo` reconfigure had quietly defined
+`NDEBUG` and made an earlier "green" meaningless — the build directory is back to plain `cmake ..`.
+

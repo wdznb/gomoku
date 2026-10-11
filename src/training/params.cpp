@@ -2,6 +2,7 @@
 #include "json_int.h"
 #include <nlohmann/json.hpp>
 #include <fstream>
+#include <filesystem>
 #include <sstream>
 #include <algorithm>
 
@@ -195,14 +196,27 @@ bool CoefficientVector::load(const std::string& path, ThreatCoefficients& out, s
 
 bool CoefficientVector::save(const std::string& path, const ThreatCoefficients& coeffs,
                              std::string& error) {
-    std::ofstream file(path, std::ios::trunc);
-    if (!file.is_open()) {
-        error = "cannot write " + path;
-        return false;
+    // Write-then-rename, mirroring save_session: the trained parameters are
+    // only replaced once the whole new file is on disk, so an interrupted
+    // write cannot leave a half-written params file behind.
+    const std::string tmp = path + ".tmp";
+    {
+        std::ofstream file(tmp, std::ios::trunc);
+        if (!file.is_open()) {
+            error = "cannot write " + tmp;
+            return false;
+        }
+        file << json::parse(to_json_string(coeffs)).dump(2);
+        if (!file.good()) {
+            error = "failed while writing " + tmp;
+            return false;
+        }
     }
-    file << json::parse(to_json_string(coeffs)).dump(2);
-    if (!file.good()) {
-        error = "failed while writing " + path;
+    std::error_code ec;
+    std::filesystem::rename(tmp, path, ec);
+    if (ec) {
+        std::filesystem::remove(tmp);
+        error = "cannot replace " + path + ": " + ec.message();
         return false;
     }
     return true;
