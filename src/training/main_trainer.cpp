@@ -34,7 +34,7 @@ void print_usage(const char* program) {
         "  --fitness-games N           Games used to score one candidate (2)\n"
         "  --verification-games N      Games a candidate must beat the champion\n"
         "                              over before promotion (8)\n"
-        "  --accept-score X            Promotion threshold, 0.5-1.0 (0.56)\n"
+        "  --accept-score X            Promotion threshold, >0.5 and <=1.0 (0.56)\n"
         "  --data-games N              Self-play games kept as training data (4)\n"
         "  --threads N                 Parallel data-collection workers (2)\n"
         "  --no-data                   Collect no self-play data (search only)\n"
@@ -204,8 +204,9 @@ int main(int argc, char** argv) {
     }
     // 0.5 is a draw score, so anything at or below it would promote a candidate
     // that merely survived.
-    if (config.accept_score < 0.5 || config.accept_score > 1.0) {
-        std::cerr << "Error: --accept-score must be between 0.5 and 1.0" << std::endl;
+    if (config.accept_score <= 0.5 || config.accept_score > 1.0) {
+        std::cerr << "Error: --accept-score must be greater than 0.5 and at most 1.0"
+                  << std::endl;
         return 1;
     }
     if (config.search_depth < 1 || config.timeout_ms < 1 || config.max_moves < 2) {

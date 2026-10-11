@@ -1064,6 +1064,126 @@ void test_alphabeta_node_limit_api() {
     std::cout << "test_alphabeta_node_limit_api passed" << std::endl;
 }
 
+// Round 43 T1: generate_defenses used to return ONLY the defender's counter-
+// threat squares whenever any existed anywhere on the board (the proximity
+// fallback was gated on that list being empty), so the squares that actually
+// answer the four the attacker just made were dropped from the defense set and
+// vct_defend/vct_attack minned over an incomplete set. The fix merges the
+// Chebyshev <= 4 candidates in unconditionally.
+//
+// WHITE's three at (5,4)-(5,6) is closed on the left by BLACK (5,3), so every
+// extension is a RUSH four whose only answer is (5,8). BLACK also keeps a rush
+// four in the distance at (10,10)-(10,13) (five point (10,9), (10,14) holds the
+// other end): a counter-threat square far from the attack - exactly what the old
+// guard used to exclude the (5,8) block. WHITE has no forced win here, so VCT
+// must not claim one.
+void test_vct_far_counter_does_not_fabricate_win() {
+    Board board;
+    Evaluator evaluator;
+    TranspositionTable tt;
+
+    board.place_stone(5, 3, BLACK);
+    board.place_stone(5, 4, WHITE);
+    board.place_stone(5, 5, WHITE);
+    board.place_stone(5, 6, WHITE);
+    board.place_stone(10, 10, BLACK);
+    board.place_stone(10, 11, BLACK);
+    board.place_stone(10, 12, BLACK);
+    board.place_stone(10, 13, BLACK);
+    board.place_stone(10, 14, WHITE);
+
+    VCTSearch vct(evaluator, tt);
+    std::atomic<bool> stop(false);
+
+    VCTMove result = vct.search(board, WHITE, 8, stop);
+    assert(result.result != VCTResult::WIN);
+
+    // Control: a concrete forced sequence (the gap-four chain) must still be
+    // proven, so merging the blocks did not turn the prover silent.
+    Board forced;
+    forced.place_stone(7, 1, WHITE);
+    forced.place_stone(7, 2, BLACK);
+    forced.place_stone(7, 3, BLACK);
+    forced.place_stone(7, 5, BLACK);
+    forced.place_stone(5, 6, BLACK);
+    forced.place_stone(6, 6, BLACK);
+
+    VCTMove won = vct.search(forced, BLACK, 10, stop);
+    assert(won.result == VCTResult::WIN);
+    assert(won.best_move.pos.row == 7 && won.best_move.pos.col == 6);
+
+    std::cout << "test_vct_far_counter_does_not_fabricate_win passed" << std::endl;
+}
+
+// Round 43 T2: resign detection used to rely on the VCF loss probe alone, and
+// that probe is gated on probe_budget_ms > 500 (time_limit_ms minus what
+// AlphaBeta already spent), so a small per-move budget silently disabled
+// resignation even when AlphaBeta itself had proven the loss (its mate score
+// reaches the +/-(100000+depth) threshold). The fix resigns straight off a
+// proven mate score. WHITE is lost to BLACK's double live three; 300 ms is far
+// below the 500 ms probe gate, so only the new AlphaBeta path can trigger.
+void test_search_engine_resigns_when_alphabeta_proves_mate() {
+    Board board;
+    board.place_stone(7, 4, BLACK);
+    board.place_stone(7, 5, BLACK);
+    board.place_stone(7, 6, BLACK);
+    board.place_stone(5, 4, BLACK);
+    board.place_stone(6, 4, BLACK);
+    board.place_stone(0, 0, WHITE);
+    board.place_stone(1, 1, WHITE);
+
+    SearchEngine engine;
+    std::atomic<bool> stop(false);
+    SearchResult result = engine.search(board, WHITE, 4, 300, stop);
+
+    assert(result.resigned);
+    assert(result.method == "resign");
+    assert(result.best_move.pos.is_valid());
+
+    // Control: the same budget on a normal position must keep playing.
+    Board quiet;
+    quiet.place_stone(7, 7, BLACK);
+    quiet.place_stone(7, 8, WHITE);
+    quiet.place_stone(8, 8, BLACK);
+    quiet.place_stone(6, 6, WHITE);
+    SearchResult continued = engine.search(quiet, BLACK, 2, 300, stop);
+    assert(!continued.resigned);
+    assert(continued.method != "resign");
+    assert(continued.best_move.pos.is_valid());
+
+    std::cout << "test_search_engine_resigns_when_alphabeta_proves_mate passed" << std::endl;
+}
+
+// Round 43 T7: the AlphaBeta node budget is remaining_time * 200. A huge client
+// timeout multiplied in int overflowed - 1500000000 * 200 wraps negative - which
+// tripped node_limit_ before the first node: AlphaBeta returned no depth and no
+// nodes and search_engine fell back to root_moves[0]. The fix multiplies in
+// 64-bit and clamps to INT_MAX, so both huge budgets search normally.
+void test_alphabeta_huge_timeout_does_not_overflow_node_budget() {
+    Board board;
+    board.place_stone(7, 7, BLACK);
+    board.place_stone(7, 8, WHITE);
+    board.place_stone(8, 8, BLACK);
+
+    const int huge_times[] = {2000000000, 1500000000};
+    for (int huge : huge_times) {
+        SearchEngine engine;
+        engine.set_vcf_enabled(false);
+        engine.set_vct_enabled(false);
+        std::atomic<bool> stop(false);
+        SearchResult result = engine.search(board, BLACK, 3, huge, stop);
+
+        assert(result.method == "alphabeta");
+        assert(result.depth >= 1);
+        assert(result.nodes_searched > 0);
+        assert(result.best_move.pos.is_valid());
+        assert(board.is_empty(result.best_move.pos.row, result.best_move.pos.col));
+        assert(!result.resigned);
+    }
+
+    std::cout << "test_alphabeta_huge_timeout_does_not_overflow_node_budget passed" << std::endl;
+}
+
 int main() {
     std::cout << "Running search tests..." << std::endl;
 
@@ -1110,6 +1230,9 @@ int main() {
     test_root_symmetry_dedup();
     test_search_engine_prefers_own_five_over_block();
     test_alphabeta_node_limit_api();
+    test_vct_far_counter_does_not_fabricate_win();
+    test_search_engine_resigns_when_alphabeta_proves_mate();
+    test_alphabeta_huge_timeout_does_not_overflow_node_budget();
 
     std::cout << "All search tests passed!" << std::endl;
     return 0;

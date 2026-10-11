@@ -660,16 +660,10 @@ void GameServer::handle_choose_side(std::shared_ptr<WebSocketSession> session, c
         send_error(session, "Cannot choose side after the game has started");
         return;
     }
-    // An empty board can still be in GAME_OVER status if the previous game
-    // was resigned before any move was made. Without clearing that status
-    // here, make_move would reject every subsequent player move (its status
-    // guard short-circuits first) and the AI worker would also refuse to
-    // commit its move, so the session would lock up immediately.
-    if (game->status() == GameStatus::GAME_OVER) {
-        game->reset();
-    }
     // A malformed or unknown color must not silently mean WHITE: the client
     // would get a "playing" state_sync with inverted board colors and no error.
+    // And it must not touch the board either: validating before the reset below
+    // keeps a rejected "red" from wiping a finished game's state.
     if (!msg.contains("color") || !msg["color"].is_string()) {
         send_error(session, "choose_side requires a \"color\" of \"black\" or \"white\"");
         return;
@@ -678,6 +672,14 @@ void GameServer::handle_choose_side(std::shared_ptr<WebSocketSession> session, c
     if (color_str != "black" && color_str != "white") {
         send_error(session, "Invalid color: " + color_str);
         return;
+    }
+    // An empty board can still be in GAME_OVER status if the previous game
+    // was resigned before any move was made. Without clearing that status
+    // here, make_move would reject every subsequent player move (its status
+    // guard short-circuits first) and the AI worker would also refuse to
+    // commit its move, so the session would lock up immediately.
+    if (game->status() == GameStatus::GAME_OVER) {
+        game->reset();
     }
     int color = (color_str == "black") ? BLACK : WHITE;
     
@@ -773,6 +775,10 @@ void GameServer::handle_set_position(std::shared_ptr<WebSocketSession> session, 
         send_error(session, "AI 正在思考，请先停止再摆棋");
         return;
     }
+    // Settle the previous game before this position wipes it: the 10s tick and
+    // the detach may both land after the reset, losing the finished game from
+    // the session file and from records.jsonl.
+    if (auto entry = entry_locked(session.get())) flush_entry(entry);
     if (!game->set_position(result.board)) {
         send_error(session, "无法摆上此局面");
         return;
@@ -822,6 +828,10 @@ void GameServer::handle_make_move(std::shared_ptr<WebSocketSession> session, con
         send_error(session, "Invalid move");
         return;
     }
+    // A played stone claims a side even without choose_side: resume/takeover
+    // guards and snapshots key off side_chosen, and a game the AI is actually
+    // playing in must be re-armed after a reconnect.
+    if (auto entry = entry_locked(session.get())) entry->side_chosen = true;
 
     json response;
     response["type"] = "move_made";
@@ -1261,8 +1271,10 @@ void GameServer::flush_entry(const std::shared_ptr<TrackedGame>& entry) {
     const std::string payload = session_to_json(probe);
     if (payload == entry->saved_payload) return;
     entry->saved_payload = payload;
-    // A socket that connected and never started anything has no game to keep.
-    if (snap.base.empty() && snap.record.moves.empty() && !entry->side_chosen) return;
+    // Content decides: a game with no stone anywhere - base or played - is not
+    // kept, even if a side was chosen and the game resigned at move zero. A
+    // settled previous game on restart always has stones, so it still lands.
+    if (snap.base.empty() && snap.record.moves.empty()) return;
 
     SessionSnapshot to_write = snap;
     to_write.created_ms = entry->created_ms;
@@ -1391,6 +1403,17 @@ void GameServer::setup_game_callbacks(std::shared_ptr<WebSocketSession> session,
         }
         msg["reason"] = reason;
         send_message(session, msg);
+        // Settle the game the moment it ends, not at the next 10s tick or a
+        // detach: a set_position in between would otherwise wipe the result
+        // from both the session file and records.jsonl. This callback can run
+        // while the worker holds thinking_mutex_ (or, on resign, while the io
+        // thread holds games_mutex_), so the flush is posted to the io thread
+        // where games_mutex_ is taken first. flush_entry is content-deduped and
+        // respects the exported flag, so tick/detach stay cheap.
+        net::post(ioc_, [this, session] {
+            std::lock_guard<std::mutex> lock(games_mutex_);
+            if (auto entry = entry_locked(session.get())) flush_entry(entry);
+        });
     });
 }
 

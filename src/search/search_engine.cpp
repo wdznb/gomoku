@@ -1,5 +1,6 @@
 #include "search_engine.h"
 #include <chrono>
+#include <climits>
 
 namespace gomoku {
 
@@ -161,8 +162,12 @@ SearchResult SearchEngine::search(const Board& board, int color,
         // timeout actually buys more search. Empirical throughput on this
         // target is roughly 100k–250k nodes/s, so 200 nodes/ms is a safe
         // middle ground: a 30 s move gets up to 6 M nodes, while a 4 s move
-        // still has 800 k — far above the old hard-coded 2 M cap.
-        ab.set_node_limit(remaining_time * 200);
+        // still has 800 k — far above the old hard-coded 2 M cap. The product
+        // is computed in 64-bit and clamped: a huge trainer --timeout-ms made
+        // remaining_time * 200 overflow int negative, tripping node_limit_ on
+        // the very first node and silently falling back to root_moves[0].
+        ab.set_node_limit(static_cast<int>(std::min<long long>(
+            static_cast<long long>(remaining_time) * 200LL, INT_MAX)));
 
         int depth = (max_depth > 0) ? max_depth : alphabeta_max_depth_;
         Move ab_move = ab.search(board, color, depth, remaining_time, stop_flag);
@@ -174,6 +179,15 @@ SearchResult SearchEngine::search(const Board& board, int color,
         result.nodes_searched = info.nodes_searched;
         result.method = "alphabeta";
         result.elapsed_ms = info.elapsed_ms;
+
+        // AlphaBeta proved the loss itself (mate threshold, side-to-move
+        // perspective): resign without waiting for the budget-gated probe
+        // below, which rarely fires in real games because AlphaBeta almost
+        // always consumes the whole time limit. Non-mate scores are untouched.
+        if (resign_detection_ && !stop_flag.load() && info.score <= -100000) {
+            result.resigned = true;
+            result.method = "resign";
+        }
 
         if (resign_detection_ && !stop_flag.load()) {
             auto elapsed_after_ab = std::chrono::high_resolution_clock::now() - start;

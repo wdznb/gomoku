@@ -701,8 +701,13 @@ class GomokuGame {
         // not in the loaded summary either.
         const stale = this.analysis.length < this.moveHistory.length ||
             (this.gameStatus === 'game_over' && !this.analysisEnded);
+        // A hand-set position that nobody has claimed a side for: the server's
+        // replay is all base stones and no moves, and loading it here would
+        // wipe 落子记录 before 选择执子颜色 — which is the action the README
+        // says clears it, not this button.
+        const unclaimedSetup = this.gameStatus === 'waiting' && this.playerColor === null;
         document.getElementById('btn-replay').disabled =
-            !hasMoves || this.aiThinking || !stale;
+            !hasMoves || this.aiThinking || !stale || unclaimedSetup;
     }
 
     // One engine verdict, formatted. The non-AlphaBeta paths (book / vcf / vct /
@@ -1090,12 +1095,19 @@ class GomokuGame {
         // in between; holding them would only have to be undone on the way out.
         setup.confirmInFlight = true;
         this.refreshSetupControls();
-        this.sendMessage({
+        const sent = this.sendMessage({
             type: 'set_position',
             position: { version: 1, type: 'gomoku_position',
                         encoding: { black: 1, white: 2, empty: 0 },
                         board: setup.board.map((row) => row.slice()) },
         });
+        // Nothing left this socket never has to come back: no set_position was
+        // sent, so no position_set/error will ever arrive to release 确认.
+        // Roll it back so the player can retry after reconnecting.
+        if (!sent) {
+            setup.confirmInFlight = false;
+            this.refreshSetupControls();
+        }
     }
 
     handlePositionSet(msg) {
@@ -1379,11 +1391,14 @@ class GomokuGame {
     sendMessage(msg) {
         if (this.ws && this.ws.readyState === WebSocket.OPEN) {
             this.ws.send(JSON.stringify(msg));
-        } else if (msg.type !== 'ping') {
+            return true;
+        }
+        if (msg.type !== 'ping') {
             // Say it out loud: a click that quietly vanished reads as the AI
             // ignoring the player.
             this.updateStatus('连接已断开，正在重连：消息未发出', 'warn');
         }
+        return false;
     }
     
     handleServerMessage(msg) {
@@ -1515,13 +1530,14 @@ class GomokuGame {
             : null;
         // The popped plies shift every analysis index after them, and a replay
         // position that no longer exists is worse than no replay at all, so the
-        // loaded record is dropped and has to be requested again.
+        // view exits unconditionally; the loaded record itself is dropped only
+        // when it actually covers the popped plies.
+        this.stopReplayAuto();
+        this.replayIndex = null;
+        this.updateReplayInfo();
         if (this.analysis.length > played) {
-            this.stopReplayAuto();
             this.analysis = [];
             this.analysisEnded = false;
-            this.replayIndex = null;
-            this.updateReplayInfo();
             this.drawEvalGraph();
         }
         if (msg.game_status === 'waiting') {

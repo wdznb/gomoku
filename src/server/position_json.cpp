@@ -72,6 +72,12 @@ bool word_of(const json& value, uint64_t& out, std::string& error) {
     }
     if (value.is_string()) {
         const std::string text = value.get<std::string>();
+        // Same rule as the numeric path: a negative is an error, never a
+        // silent wrap — std::stoull("-1") returns 2^64-1.
+        if (text.find('-') != std::string::npos) {
+            error = "位棋盘的字不能为负";
+            return false;
+        }
         try {
             size_t consumed = 0;
             out = std::stoull(text, &consumed, 0);

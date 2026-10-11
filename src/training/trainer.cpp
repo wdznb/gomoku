@@ -183,8 +183,11 @@ int Trainer::generate_data_games(int games, int threads) {
                     if (!explorer.explore(record, nullptr)) break;
                 }
 
-                local.records.push_back(record);
+                // INVALID games are junk: keep them out of local.records too, so
+                // neither games_played_ nor the JSONL stream counts or writes a
+                // discarded game.
                 if (record.reason == GameEndReason::INVALID) continue;
+                local.records.push_back(record);
 
                 std::vector<TrainingSample> samples =
                     collector.collect(record, game_id_base + i, true);
