@@ -86,7 +86,10 @@ The last two rounds surfaced only a portability nit on a non-supported native-Wi
 - ~~Engine perf refactors: `sort_moves` pattern threading, `find_defense` board copy (R41 F1/F2)~~ —
   done in round 55. Incremental whole-board evaluation (R41 F3) was measured there and rejected: a
   make/undo delta costs about as much as the re-scan it replaces.
-- Blocking worker join on the io thread (R42 F3)
+- ~~Blocking worker join on the io thread (R42 F3)~~ — measured in round 56 and closed without a
+  code change: the wait is bounded by one search node (worst observed 314 µs at depth 32 / 30 s),
+  it cannot deadlock because the callbacks post to the session executor, and removing it would
+  require per-worker transposition tables plus detached-thread lifetime management.
 - Verified false positive: VCF/VCT live-four early win (R43 F1) — correct because
   `find_block_move` returns the unique forced block
 
@@ -381,4 +384,72 @@ the bookkeeping for candidates entering and leaving the set. Not implemented.
 
 - Rebuilt warning-free, `ctest` 5/5 (now 6 pattern binaries' worth of cases including the new
   differential test), and the pre/post fingerprint diff identical, after each accepted step.
+
+## Deferred item (round 42) — joining the AI worker on the io thread
+
+### Round 56 — what the blocking join actually costs
+
+R42 F3 flagged that every abort path in `GameManager` (`reset`, `resign`,
+`request_hint`, `start_ai_thinking`'s re-arm of a running worker, the destructor) `join()`s
+the AI worker thread on the caller's thread — and in the server that caller is the single io
+thread, which holds `games_mutex_` while it does so. A slow join would therefore stall every
+session, not only the one being reset. It was deferred because sizing it needed a threaded
+harness. `build/joinprobe.cpp` (scratch, not built by CMake) is that harness: it arms a worker
+at a given depth/budget, waits, and times the aborting call itself.
+
+**The wait is bounded by one search node, not by the search budget**, and the numbers show it
+rather than argue it. Every search loop re-reads `stop_flag_` per node
+(`alphabeta.cpp:83/133/160/209/291/306`, `vcf.cpp:121/130/244/407`, `vct.cpp:109/123/213/223/325`)
+and `SearchEngine::search` re-checks it between the book / VCF / VCT / AlphaBeta / resign-probe
+phases (`search_engine.cpp:101/120/138/151/171`), so an aborting caller waits for the node
+already in flight and nothing more. Latency is flat across a 300× budget range, which is exactly
+what that bound predicts:
+
+| root | depth | timeout | worst of the four join sites | samples provably mid-search |
+| --- | --- | --- | --- | --- |
+| empty (225 candidates) | 4 | 100 ms | 260 µs (hint) | 15/15 |
+| empty | 8 | 30 s | 247 µs (resign) | 15/15 |
+| empty | 16 | 30 s | 274 µs (restart) | 12/12 |
+| empty | 24 | 30 s | 251 µs (resign) | 18/18 |
+| empty | 32 | 30 s | 314 µs (restart) | 15/15 |
+
+Depth 32 / 30 s is far past anything a client can ask for (`clamp_timeout_ms` caps the deadline
+at 30 s regardless of what `set_config` or `request_hint` sends), and the join still costs a
+third of a millisecond. The four sites — `resign`, `reset`, re-arming over a running worker, and
+`start_ai_thinking` joining a live hint worker — agree with each other to within the noise.
+
+**Two measurement traps had to be removed before these numbers meant anything.** (i) The engine's
+transposition table belongs to the `GameManager` and survives `reset()`, so repeating one position
+let the depth-16 search finish *before* the abort landed; the probe then timed `join()` on an
+already-exited thread and reported 1–10 µs — a measurement of nothing, and reassuringly wrong.
+Varying the stone layout per rep and printing the mid-search sample fraction is what exposed it.
+(ii) A 12-stone warm-up walk completes a five, and on a finished game the worker returns
+immediately: same false reading, different cause. Even at live 8-stone positions the abort landed
+inside the search in only 6 of 12 samples, because those dense fill patterns are solved by the
+threat searches almost at once. The empty board is the widest root the engine really sees, is
+reliably mid-search, and is therefore the pessimistic case — reported above.
+
+**There is no deadlock and no second thread hiding behind the join.** All four `GameManager`
+callbacks funnel into `WebSocketSession::send`, which does `net::post(ws_.get_executor(), …)`
+(`server.cpp:128-129`): the worker queues its messages for the io thread instead of running them
+inline, so the io thread never waits on a send and the worker never needs the io thread to make
+progress — which is the cycle a blocking join could deadlock on. `SearchController`
+(`src/search/controller.cpp`), which owns a worker thread of its own, is referenced only by
+`tests/test_search.cpp`; the server path is one thread per session, so this join has no
+transitive chain.
+
+**Not implemented, and what implementing it would actually cost.** Dropping the join means an
+aborted worker must become incapable of touching shared state once the caller moves on. Two
+concrete obstacles, both real: `engine_` is one object per session holding `tt_alphabeta_` and the
+sub-searches' `nodes_searched_` / deadline state, so an old worker and its replacement searching
+concurrently would write the same `std::vector<TTEntry>` (a benign-looking race, but `lookup`
+returns a `const TTEntry*` into it while `insert` writes it) and corrupt each other's counters —
+giving each worker its own engine costs the ~64 MB table per session that
+`search_engine.h:74-77` deliberately avoids allocating twice; and a detached worker outliving
+`GameManager` needs the committed state (`board_`, `analyses_`, `status_`) moved into a
+reference-counted block that every call site then has to respect. That is a restructure of the
+session's concurrency model, with a new class of shared-engine bugs to prove the absence of, to
+save ~0.3 ms of io-thread time on a user-initiated abort while that client is already waiting for
+the AI. Closed on the measurement; the deferred list is now empty apart from the recorded false
+positive (R43 F1).
 
