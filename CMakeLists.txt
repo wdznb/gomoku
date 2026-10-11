@@ -55,9 +55,13 @@ set(GOMOKU_SOURCES
     # Only the parameter file reader: the server plays with trained coefficients,
     # it does not train them.
     src/training/params.cpp
+    # Sessions persist in the training record format, so the server owns that
+    # reader/writer rather than keeping a second schema for the same moves.
+    src/training/game_record.cpp
     src/server/server.cpp
     src/server/game_manager.cpp
     src/server/position_json.cpp
+    src/server/session_store.cpp
 )
 
 add_executable(gomoku_server ${GOMOKU_SOURCES})
@@ -186,6 +190,22 @@ else()
     target_compile_options(test_position PRIVATE -Wall -Wextra -Wno-template-body -Wno-template-id-cdtor)
 endif()
 add_test(NAME test_position COMMAND test_position)
+
+# The session store is file I/O over one record schema, so it is tested against a
+# real temporary directory rather than a mock.
+add_executable(test_session
+    tests/test_session.cpp
+    src/server/session_store.cpp
+    src/training/game_record.cpp
+)
+target_include_directories(test_session PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_session PRIVATE nlohmann_json::nlohmann_json)
+if(MSVC)
+    target_compile_options(test_session PRIVATE /W4)
+else()
+    target_compile_options(test_session PRIVATE -Wall -Wextra -Wno-template-body -Wno-template-id-cdtor)
+endif()
+add_test(NAME test_session COMMAND test_session)
 
 add_executable(test_training
     tests/test_training.cpp

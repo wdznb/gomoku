@@ -32,12 +32,36 @@ struct MoveAnalysis {
 };
 
 // Everything the replay view needs, captured in one lock so the move list and
-// the ending cannot disagree.
+// the ending cannot disagree. `move_count` is the board's stone count read in
+// that same lock: the session flush compares it against what it last wrote, and
+// reading board_ from the io thread outside this snapshot would race the worker.
 struct ReplaySnapshot {
     std::vector<MoveAnalysis> moves;
     int winner = EMPTY;
     std::string reason;
-    bool game_over = false;
+    GameStatus status = GameStatus::WAITING;
+    int move_count = 0;
+    // The stones a hand-set position laid down and that are still on the board,
+    // i.e. everything the board holds that `moves` did not play. Empty for a
+    // game that started from an empty board, which is also what makes such a
+    // record replayable on its own.
+    std::vector<Move> base;
+};
+
+// A whole session as the store holds it, handed back to restore_game. `base` are
+// the stones a hand-set position laid down (ReplaySnapshot::base) and `moves` the
+// stones played after them, so the two together rebuild the board exactly. The
+// split is what keeps the engine numbers of a played move distinguishable from
+// pre-set stones.
+struct GameRestore {
+    std::vector<Move> base;
+    std::vector<MoveAnalysis> moves;
+    // EMPTY leaves the current side assignment alone.
+    int player_color = EMPTY;
+    GameStatus status = GameStatus::WAITING;
+    int winner = EMPTY;
+    std::string reason;
+    bool position_pending = false;
 };
 
 class GameManager {
@@ -63,8 +87,23 @@ public:
     // are recorded, and no AI search is armed. The session then sits in
     // `position_pending()` until the player picks a side or plays, which is
     // what keeps choose_side usable on a board that is not empty.
+    // The installed stones become base_stones(), which is what a persisted
+    // session writes alongside the played moves.
     bool set_position(const Board& board);
     bool position_pending() const { return position_pending_; }
+
+    // Rebuild a session from its persisted record: the board, the per-move engine
+    // numbers, who plays which side, and how it ended. No callback fires and no
+    // AI search is armed - the caller decides whether the side to move needs one.
+    // A move that does not land on an empty square rejects the whole restore, so a
+    // half-readable record can never become a playable board.
+    bool restore_game(const GameRestore& restore);
+
+    // Stop and join both search workers, discarding any in-flight best move. A
+    // socket being detached has to use this before its callbacks are cleared: a
+    // worker outliving the socket it writes into would either post onto a closed
+    // stream or call through a dangling callback.
+    void halt_search();
     
     bool make_move(int row, int col);
     // On success, out_move_count / out_status report the board state captured
@@ -94,6 +133,8 @@ public:
     
     void set_coefficients(const ThreatCoefficients& coeffs);
     void set_config(int timeout_ms, int max_depth);
+    int timeout_ms() const { return timeout_ms_; }
+    int max_depth() const { return max_depth_; }
     void set_opening_book(const OpeningBook* book);
     
 private:

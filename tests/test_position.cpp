@@ -511,6 +511,170 @@ void test_game_manager_position() {
     std::cout << "test_game_manager_position passed" << std::endl;
 }
 
+MoveAnalysis analysis(int row, int col, int color, int score = 0,
+                      const char* method = "alphabeta") {
+    MoveAnalysis entry;
+    entry.move = Move(row, col, color);
+    entry.score = score;
+    entry.depth = 6;
+    entry.nodes = 1234;
+    entry.elapsed_ms = 5;
+    entry.method = method;
+    return entry;
+}
+
+void test_restore_game() {
+    GameManager gm;
+    gm.set_config(300, 4);
+
+    // An empty record rebuilds an empty board but keeps the side choice, so a
+    // session that was interrupted before the first stone still resumes as a
+    // game rather than as a hand-set position.
+    GameRestore opened;
+    opened.player_color = BLACK;
+    opened.status = GameStatus::PLAYING;
+    assert(gm.restore_game(opened));
+    assert(gm.player_color() == BLACK && gm.ai_color() == WHITE);
+    assert(gm.board().move_count() == 0);
+    assert(gm.status() == GameStatus::PLAYING);
+    assert(!gm.position_pending());
+
+    const std::vector<MoveAnalysis> moves{
+        analysis(7, 7, BLACK, 120),
+        analysis(8, 8, WHITE, -120, "book"),
+        analysis(6, 6, BLACK, 180),
+    };
+
+    GameRestore plain;
+    plain.moves = moves;
+    plain.player_color = BLACK;
+    plain.status = GameStatus::PLAYING;
+    assert(gm.restore_game(plain));
+    assert(gm.board().move_count() == 3);
+    assert(gm.board().get(7, 7) == BLACK);
+    assert(gm.board().get(8, 8) == WHITE);
+    assert(gm.current_turn() == WHITE);
+    // The replay numbers come back with the stones, so a resumed game still has
+    // a curve to show.
+    ReplaySnapshot snap = gm.replay_snapshot();
+    assert(snap.moves.size() == 3);
+    assert(snap.moves[1].method == "book" && snap.moves[1].score == -120);
+    assert(snap.moves[0].depth == 6 && snap.moves[0].nodes == 1234);
+    assert(snap.status != GameStatus::GAME_OVER && snap.winner == EMPTY);
+    // A game that started from nothing has a self-contained record.
+    assert(snap.base.empty() && snap.move_count == 3);
+    // Restoring never arms a search on its own.
+    assert(!gm.is_ai_thinking());
+
+    // A finished game keeps its ending.
+    GameRestore over = plain;
+    over.status = GameStatus::GAME_OVER;
+    over.winner = BLACK;
+    over.reason = "five";
+    assert(gm.restore_game(over));
+    assert(gm.status() == GameStatus::GAME_OVER);
+    assert(gm.winner() == BLACK);
+    snap = gm.replay_snapshot();
+    assert(snap.status == GameStatus::GAME_OVER && snap.winner == BLACK && snap.reason == "five");
+    assert(snap.moves.size() == 3);
+
+    // An empty player colour leaves the earlier choice alone: a session saved
+    // before anyone picked a side keeps whichever side the process already had.
+    gm.reset();
+    gm.set_player_color(WHITE);
+    GameRestore unchosen = plain;
+    unchosen.player_color = EMPTY;
+    assert(gm.restore_game(unchosen));
+    assert(gm.player_color() == WHITE);
+
+    // Records that cannot be replayed are refused, and the board from the
+    // previous restore survives them.
+    GameRestore overlap = plain;
+    overlap.moves = {analysis(7, 7, BLACK), analysis(7, 7, WHITE)};
+    assert(!gm.restore_game(overlap));
+    assert(gm.board().move_count() == 3);
+    GameRestore no_colour = plain;
+    no_colour.moves = {analysis(9, 9, EMPTY)};
+    assert(!gm.restore_game(no_colour));
+    GameRestore off_board = plain;
+    off_board.moves = {analysis(BOARD_SIZE, 0, BLACK)};
+    assert(!gm.restore_game(off_board));
+    GameRestore bad_base = plain;
+    bad_base.base = {Move(7, 7, BLACK)};
+    assert(!gm.restore_game(bad_base));
+    assert(gm.board().move_count() == 3);
+
+    // A pending position rebuilds as pending, so choose_side stays usable.
+    GameRestore pending = plain;
+    pending.player_color = EMPTY;
+    pending.status = GameStatus::WAITING;
+    pending.position_pending = true;
+    assert(gm.restore_game(pending));
+    assert(gm.position_pending());
+    assert(gm.status() == GameStatus::WAITING);
+
+    std::cout << "test_restore_game passed" << std::endl;
+}
+
+// The save side of the same contract: what a session writes has to be enough to
+// rebuild the board, including the stones a hand-set position laid down that no
+// played move accounts for.
+void test_snapshot_round_trip() {
+    GameManager gm;
+    SetupResult pos = position_from_text(grid_text(kBlack, kWhite, "1", "2", "0", ","));
+    assert(pos.ok());
+    assert(gm.set_position(pos.board));
+
+    ReplaySnapshot snap = gm.replay_snapshot();
+    assert(snap.move_count == 5);
+    // Nothing has been played, so every stone on the board is a base stone.
+    assert(snap.moves.empty() && snap.base.size() == 5);
+
+    // The player took the position up as BLACK and the AI answered one stone, so
+    // the session is five installed stones plus one played move - and only the
+    // played move carries engine numbers.
+    GameRestore restored;
+    restored.base = snap.base;
+    restored.moves = {analysis(5, 5, WHITE, 42, "alphabeta")};
+    restored.player_color = BLACK;
+    restored.status = GameStatus::PLAYING;
+    GameManager second;
+    assert(second.restore_game(restored));
+    assert(second.board().move_count() == 6);
+    assert(second.board().get(5, 5) == WHITE);
+    assert(second.board().get(9, 9) == BLACK);
+    snap = second.replay_snapshot();
+    assert(snap.move_count == 6);
+    assert(snap.moves.size() == 1 && snap.base.size() == 5);
+
+    // Undo walks the played stone and then a base stone off the board, and the
+    // split follows it: two rounds take back the AI answer and one installed
+    // stone, so the record of the undone session rebuilds four stones, not the
+    // five that were installed.
+    int move_count = -1;
+    GameStatus status = GameStatus::PLAYING;
+    assert(second.undo(move_count, status));
+    assert(move_count == 4 && !second.is_ai_thinking());
+    snap = second.replay_snapshot();
+    assert(snap.move_count == 4);
+    assert(snap.moves.empty() && snap.base.size() == 4);
+    for (const Move& stone : snap.base) {
+        assert(second.board().get(stone.pos.row, stone.pos.col) == stone.color);
+    }
+    // Feeding that record back in rebuilds exactly the board it came from.
+    GameRestore again;
+    again.base = snap.base;
+    again.moves = snap.moves;
+    again.player_color = BLACK;
+    GameManager third;
+    assert(third.restore_game(again));
+    assert(third.board().move_count() == 4);
+    assert(third.board().get(5, 5) == EMPTY);
+    assert(third.replay_snapshot().base.size() == 4);
+
+    std::cout << "test_snapshot_round_trip passed" << std::endl;
+}
+
 int main() {
     std::cout << "Running position setup tests..." << std::endl;
     test_grid_parsing();
@@ -522,6 +686,8 @@ int main() {
     test_canonical_document();
     test_shipped_templates();
     test_game_manager_position();
+    test_restore_game();
+    test_snapshot_round_trip();
     std::cout << "All position setup tests passed!" << std::endl;
     return 0;
 }

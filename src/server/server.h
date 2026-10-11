@@ -2,12 +2,14 @@
 #define GOMOKU_SERVER_H
 
 #include "game_manager.h"
+#include "session_store.h"
 #include "../optimization/opening_book.h"
 #include <boost/beast/core.hpp>
 #include <boost/beast/websocket.hpp>
 #include <boost/beast/http.hpp>
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/strand.hpp>
+#include <boost/asio/steady_timer.hpp>
 #include <boost/asio/signal_set.hpp>
 #include <nlohmann/json.hpp>
 #include <filesystem>
@@ -16,6 +18,7 @@
 #include <mutex>
 #include <queue>
 #include <string>
+#include <vector>
 
 namespace gomoku {
 
@@ -70,14 +73,46 @@ class GameServer {
 public:
     // `coefficients`, when non-null, replaces the built-in threat values for every
     // game. Only read during construction, so a temporary from main() is safe.
+    // `sessions_dir` is where each session's own file lives and `records_path` the
+    // JSONL the finished games are appended to for the trainer; both may be empty
+    // to run without persistence.
     GameServer(int port = 8080, const std::string& web_dir = "web",
                const std::string& book_path = "data/opening_book.json",
-               const ThreatCoefficients* coefficients = nullptr);
+               const ThreatCoefficients* coefficients = nullptr,
+               const std::string& sessions_dir = "data/sessions",
+               const std::string& records_path = "data/training/records.jsonl");
 
     void start();
     void stop();
 
 private:
+    // A game plus what the server needs to hand it back after its socket went
+    // away. The game outlives the WebSocket it was played on: `attached` is null
+    // while nobody holds it, and the entry itself stays until a client resumes
+    // the token or the reattach window closes.
+    struct TrackedGame {
+        std::string token;
+        std::shared_ptr<GameManager> game;
+        WebSocketSession* attached = nullptr;
+        long long created_ms = 0;
+        long long updated_ms = 0;
+        // Zero while attached. How long the socket has been gone decides when the
+        // entry is dropped back to disk.
+        long long detached_ms = 0;
+        // The player picked a side, so the session has one rather than the
+        // default. Only a chosen side is written as player_color.
+        bool side_chosen = false;
+        // This session was rebuilt from a saved record rather than opened empty,
+        // which is what makes a `resume` answer `true` instead of a new token.
+        bool rebuilt = false;
+        // Already appended to records_path, so a resumed game does not export a
+        // second copy of the same ending.
+        bool exported = false;
+        // The last flushed payload with its timestamps zeroed: unchanged means
+        // nothing to write, which is what keeps a quiet session off the disk.
+        std::string saved_payload;
+    };
+
     net::io_context ioc_;
     tcp::acceptor acceptor_;
     net::signal_set signals_;
@@ -88,6 +123,18 @@ private:
     ThreatCoefficients coefficients_;
     bool use_loaded_coefficients_ = false;
     std::map<WebSocketSession*, std::shared_ptr<GameManager>> games_;
+    std::map<std::string, std::shared_ptr<TrackedGame>> sessions_;
+    std::map<WebSocketSession*, std::string> socket_tokens_;
+    // Sessions read from disk that no socket has claimed yet. Kept as snapshots,
+    // not GameManagers, because each engine carries its own transposition table:
+    // a restarted server can therefore remember every game it saved without
+    // paying for a board per game.
+    std::map<std::string, SessionSnapshot> cold_sessions_;
+    std::string sessions_dir_;
+    std::string records_path_;
+    net::steady_timer flush_timer_;
+    // Guards every map above. The io thread is the only thread that touches them
+    // today, so the lock is the record of that rule rather than a requirement.
     std::mutex games_mutex_;
     
     void do_accept();
@@ -111,10 +158,39 @@ private:
     void handle_stop_thinking(std::shared_ptr<WebSocketSession> session);
     void handle_set_config(std::shared_ptr<WebSocketSession> session, const json& msg);
     void handle_restart(std::shared_ptr<WebSocketSession> session);
+    void handle_resume(std::shared_ptr<WebSocketSession> session, const json& msg);
     
     json board_to_json(const Board& board);
     
     void setup_game_callbacks(std::shared_ptr<WebSocketSession> session, GameManager& game);
+    static void clear_game_callbacks(GameManager& game);
+
+    // Sessions on disk the process has not been told about yet.
+    void load_saved_sessions();
+    // Give the socket a game to play in, opening a new session if it has not
+    // resumed one. Returns null only if the socket is already gone.
+    std::shared_ptr<TrackedGame> ensure_attached(std::shared_ptr<WebSocketSession> session);
+    // The session this socket plays in, or null. games_mutex_ must already be
+    // held: every handler takes it for its whole body, and the flush tick holds it
+    // while it walks the table.
+    std::shared_ptr<TrackedGame> entry_locked(WebSocketSession* session);
+    std::shared_ptr<TrackedGame> open_session(const SessionSnapshot* from);
+    void attach_socket(const std::shared_ptr<WebSocketSession>& session,
+                       const std::shared_ptr<TrackedGame>& entry);
+    void send_session_state(const std::shared_ptr<WebSocketSession>& session,
+                            const std::shared_ptr<TrackedGame>& entry, bool resumed);
+
+    SessionSnapshot snapshot_of(const TrackedGame& entry) const;
+    // Writes the session file when the game changed, and appends the record once
+    // the game is over and replayable on its own.
+    void flush_entry(const std::shared_ptr<TrackedGame>& entry);
+    void flush_all();
+    // Releases a game its socket no longer holds, keeping it in memory until the
+    // reattach window runs out. games_mutex_ must already be held; on_disconnect
+    // takes it.
+    void detach_socket(WebSocketSession* session);
+    void schedule_flush();
+    void on_flush_tick();
 };
 
 }

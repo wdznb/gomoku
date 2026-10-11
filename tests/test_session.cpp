@@ -1,0 +1,232 @@
+// Session store: the envelope that lets a game outlive its socket, and the files
+// it lives in. Tested against a real temporary directory because the properties
+// that matter (atomic overwrite, listing, refusing a corrupt file) are file
+// properties.
+#include "server/session_store.h"
+
+#include <cassert>
+#include <chrono>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <string>
+#include <vector>
+
+using namespace gomoku;
+
+namespace {
+
+std::filesystem::path scratch_dir(const char* name) {
+    const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+    auto path = std::filesystem::temp_directory_path() /
+                ("gomoku_session_" + std::string(name) + "_" + std::to_string(stamp));
+    std::filesystem::remove_all(path);
+    return path;
+}
+
+MoveRecord ply(int row, int col, int color, int score, const char* method) {
+    MoveRecord record;
+    record.move = Move(row, col, color);
+    record.score = score;
+    record.depth = 4;
+    record.nodes = 1234;
+    record.elapsed_ms = 56;
+    record.method = method;
+    return record;
+}
+
+SessionSnapshot sample(const std::string& token) {
+    SessionSnapshot snap;
+    snap.token = token;
+    snap.created_ms = 1000;
+    snap.updated_ms = 2000;
+    snap.player_color = "black";
+    snap.status = "playing";
+    snap.position_pending = false;
+    snap.timeout_ms = 1000;
+    snap.max_depth = 4;
+    snap.record.moves = {ply(7, 7, BLACK, 0, "book"), ply(8, 8, WHITE, 42, "alphabeta")};
+    snap.record.winner = EMPTY;
+    snap.record.reason = GameEndReason::INVALID;
+    snap.record.total_nodes = 1234;
+    snap.record.max_depth = 4;
+    return snap;
+}
+
+void test_token_and_path() {
+    assert(valid_token("0123456789abcdef"));
+    assert(valid_token(std::string(64, 'a')));
+    assert(!valid_token(""));
+    assert(!valid_token(std::string(65, 'a')));
+    assert(!valid_token("ABCDEF"));          // upper case is not a hex token
+    assert(!valid_token("../../etc/passwd"));
+    assert(!valid_token("a/../../b"));
+    assert(!valid_token("a\\b"));
+    assert(!valid_token("a b"));
+    assert(!valid_token("a.json"));
+    assert(session_path("data/sessions", "beef") == "data/sessions/beef.json");
+    assert(session_path("data/sessions", "../x").empty());
+    std::cout << "test_token_and_path passed" << std::endl;
+}
+
+void test_envelope_round_trip() {
+    const SessionSnapshot snap = sample("deadbeef");
+    const std::string text = session_to_json(snap);
+    assert(text.find("\"gomoku_session\"") != std::string::npos);
+    // The record is embedded in the shape the trainer already reads, so a saved
+    // session is also a training record with no conversion.
+    assert(text.find("\"elapsed_ms\"") != std::string::npos);
+
+    SessionSnapshot back;
+    std::string error;
+    assert(session_from_json(text, back, error) && error.empty());
+    assert(back.token == "deadbeef");
+    assert(back.created_ms == 1000 && back.updated_ms == 2000);
+    assert(back.player_color == "black" && back.status == "playing");
+    assert(back.timeout_ms == 1000 && back.max_depth == 4);
+    assert(!back.position_pending);
+    assert(back.record.moves.size() == 2);
+    assert(back.record.moves[0].move == Move(7, 7, BLACK));
+    assert(back.record.moves[1].score == 42);
+    assert(back.record.moves[1].method == "alphabeta");
+    assert(back.record.moves[1].nodes == 1234);
+    assert(back.record.total_nodes == 1234);
+    // A game that started from an empty board has no base stones, and that is
+    // what makes its record replayable on its own.
+    assert(back.base.empty());
+
+    SessionSnapshot setup = sample("cafe0000");
+    setup.position_pending = true;
+    setup.status = "waiting";
+    setup.player_color.clear();
+    setup.base = {Move(7, 7, BLACK), Move(6, 6, WHITE), Move(14, 0, BLACK)};
+    SessionSnapshot setup_back;
+    assert(session_from_json(session_to_json(setup), setup_back, error) && error.empty());
+    assert(setup_back.position_pending && setup_back.player_color.empty());
+    assert(setup_back.base.size() == 3);
+    assert(setup_back.base[0] == Move(7, 7, BLACK));
+    assert(setup_back.base[1] == Move(6, 6, WHITE));
+    assert(setup_back.base[2] == Move(14, 0, BLACK));
+    std::cout << "test_envelope_round_trip passed" << std::endl;
+}
+
+void test_rejects_damaged_files() {
+    SessionSnapshot out;
+    std::string error;
+
+    assert(!session_from_json("", out, error));
+    assert(!session_from_json("[1,2,3]", out, error));
+    assert(!session_from_json("   ", out, error));
+    assert(!session_from_json(R"({"version":2,"token":"ab","record":{}})", out, error));
+    assert(!session_from_json(R"({"version":1,"token":"AB","record":{}})", out, error));
+    assert(!session_from_json(R"({"version":1,"token":"ab"})", out, error));
+    assert(!session_from_json(R"({"version":1,"token":"ab","record":{}})", out, error));
+    assert(error.find("record") != std::string::npos);
+    assert(!session_from_json(
+               R"({"version":1,"token":"ab","status":"paused","record":{"moves":[]}})", out, error));
+    assert(error.find("状态") != std::string::npos);
+
+    // Base stones are what makes a hand-set position resumable, so a file whose
+    // base cannot be read exactly is refused instead of resuming the player into
+    // a position they never left.
+    const char* skeleton = R"({"version":1,"token":"ab","status":"playing","record":{"moves":[]},)";
+    const std::string ok_base = std::string(skeleton) + R"("base":[{"row":0,"col":14,"color":"black"}]})";
+    assert(session_from_json(ok_base, out, error));
+    assert(out.base.size() == 1 && out.base[0] == Move(0, 14, BLACK));
+    for (const char* bad : {R"({"version":1,"token":"ab","status":"playing","record":{"moves":[]},"base":{}})",
+                            R"({"version":1,"token":"ab","status":"playing","record":{"moves":[]},"base":"7,7"})",
+                            R"({"version":1,"token":"ab","status":"playing","record":{"moves":[]},"base":[{"row":15,"col":0,"color":"black"}]})",
+                            R"({"version":1,"token":"ab","status":"playing","record":{"moves":[]},"base":[{"row":0,"color":"black"}]})",
+                            R"({"version":1,"token":"ab","status":"playing","record":{"moves":[]},"base":[{"row":0,"col":0,"color":"purple"}]})",
+                            R"({"version":1,"token":"ab","status":"playing","record":{"moves":[]},"base":[{"row":0,"col":0}]})",
+                            R"({"version":1,"token":"ab","status":"playing","record":{"moves":[]},"base":[null]})"}) {
+        assert(!session_from_json(bad, out, error));
+    }
+    // Absent is not damaged: a game from an empty board simply has none.
+    assert(session_from_json(
+               R"({"version":1,"token":"ab","status":"playing","record":{"moves":[]}})", out, error));
+    assert(out.base.empty());
+
+    // A finished session keeps its ending; the record owns winner and reason.
+    SessionSnapshot done = sample("ab");
+    done.status = "game_over";
+    done.winner = "white";
+    done.reason = "five";
+    done.record.winner = WHITE;
+    done.record.reason = GameEndReason::FIVE;
+    assert(session_from_json(session_to_json(done), out, error));
+    assert(out.status == "game_over" && out.winner == "white");
+    assert(out.record.is_decisive() && out.record.outcome_for(WHITE) > 0.0f);
+    std::cout << "test_rejects_damaged_files passed" << std::endl;
+}
+
+void test_files_are_written_atomically() {
+    const auto dir = scratch_dir("atomic");
+    std::string error;
+
+    // The directory does not exist yet: saving creates it.
+    SessionSnapshot snap = sample("cafe1234");
+    assert(save_session(dir.string(), snap, error));
+    assert(error.empty());
+    assert(std::filesystem::exists(dir / "cafe1234.json"));
+    // No temporary file survives a successful write.
+    assert(!std::filesystem::exists(dir / "cafe1234.json.tmp"));
+
+    snap.updated_ms = 3000;
+    snap.status = "game_over";
+    assert(save_session(dir.string(), snap, error));
+    SessionSnapshot back;
+    assert(load_session(dir.string(), "cafe1234", back, error));
+    assert(back.updated_ms == 3000 && back.status == "game_over");
+
+    // An illegal token never reaches the filesystem.
+    assert(!save_session(dir.string(), sample("../escape"), error));
+    assert(!std::filesystem::exists(std::filesystem::temp_directory_path() / "escape.json"));
+
+    std::error_code ec;
+    assert(list_sessions(dir.string()).size() == 1);
+    assert(delete_session(dir.string(), "cafe1234", error));
+    assert(!std::filesystem::exists(dir / "cafe1234.json"));
+    std::filesystem::remove_all(dir, ec);
+    std::cout << "test_files_are_written_atomically passed" << std::endl;
+}
+
+void test_listing_and_corrupt_files() {
+    const auto dir = scratch_dir("listing");
+    std::string error;
+
+    assert(save_session(dir.string(), sample("aaaa"), error));
+    assert(save_session(dir.string(), sample("bbbb"), error));
+    {
+        std::ofstream(dir / "notes.txt") << "not a session";
+        std::ofstream(dir / "cccc.json.tmp") << "half written";
+    }
+
+    const auto found = list_sessions(dir.string());
+    assert(found.size() == 2);
+    assert(found[0].find("aaaa.json") != std::string::npos);
+    assert(found[1].find("bbbb.json") != std::string::npos);
+
+    // A session file that was truncated by a crash is refused, not half-read.
+    { std::ofstream(dir / "dddd.json") << R"({"version":1,"token":"dd)"; }
+    SessionSnapshot out;
+    assert(!load_session(dir.string(), "dddd", out, error));
+    assert(!load_session(dir.string(), "nope", out, error));
+    assert(!load_session(dir.string(), "../outside", out, error));
+
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    std::cout << "test_listing_and_corrupt_files passed" << std::endl;
+}
+
+}  // namespace
+
+int main() {
+    test_token_and_path();
+    test_envelope_round_trip();
+    test_rejects_damaged_files();
+    test_files_are_written_atomically();
+    test_listing_and_corrupt_files();
+    std::cout << "All session store tests passed!" << std::endl;
+    return 0;
+}

@@ -37,6 +37,7 @@ _deps/
 data/*.bin
 data/training/
 data/checkpoints/
+data/sessions/
 
 # Logs
 *.log

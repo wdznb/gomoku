@@ -7,6 +7,8 @@ int main(int argc, char* argv[]) {
     int port = 8080;
     std::string web_dir = "web";
     std::string book_path = "data/opening_book.json";
+    std::string sessions_dir = "data/sessions";
+    std::string records_path = "data/training/records.jsonl";
     std::string params_path;
 
     try {
@@ -20,6 +22,13 @@ int main(int argc, char* argv[]) {
                 book_path = argv[++i];
             } else if (arg == "--no-book") {
                 book_path.clear();
+            } else if (arg == "--sessions" && i + 1 < argc) {
+                sessions_dir = argv[++i];
+            } else if (arg == "--no-sessions") {
+                sessions_dir.clear();
+                records_path.clear();
+            } else if (arg == "--records" && i + 1 < argc) {
+                records_path = argv[++i];
             } else if (arg == "--params" && i + 1 < argc) {
                 params_path = argv[++i];
             }
@@ -55,7 +64,8 @@ int main(int argc, char* argv[]) {
     // handler here would conflict with it and is not async-signal-safe.
     try {
         gomoku::GameServer server(port, web_dir, book_path,
-                                  params_path.empty() ? nullptr : &coefficients);
+                                  params_path.empty() ? nullptr : &coefficients,
+                                  sessions_dir, records_path);
         server.start();
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;

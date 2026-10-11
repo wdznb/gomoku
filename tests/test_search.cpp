@@ -961,7 +961,7 @@ void test_game_manager_replay_snapshot() {
     assert(snap.moves[0].move.color == BLACK);
     assert(snap.moves[0].move.pos.row == 7 && snap.moves[0].move.pos.col == 7);
     assert(snap.moves[1].move.color == WHITE);
-    assert(!snap.game_over);
+    assert(snap.status != GameStatus::GAME_OVER);
     assert(snap.winner == EMPTY);
 
     // Both stones come back, so both entries must leave the list.
@@ -978,7 +978,7 @@ void test_game_manager_replay_snapshot() {
     game.resign(BLACK);
 
     snap = game.replay_snapshot();
-    assert(snap.game_over);
+    assert(snap.status == GameStatus::GAME_OVER);
     assert(snap.winner == WHITE);
     assert(snap.reason == "resign");
     assert(snap.moves.size() == game.board().move_count());

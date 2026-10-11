@@ -33,17 +33,13 @@ GameManager::GameManager()
 }
 
 GameManager::~GameManager() {
-    discard_pending_.store(true);
-    stop_thinking();
-    if (search_thread_ && search_thread_->joinable()) {
-        search_thread_->join();
-    }
-    if (hint_thread_ && hint_thread_->joinable()) {
-        hint_thread_->join();
-    }
+    halt_search();
 }
 
-void GameManager::reset() {
+// Hard abort then join, so no thread is running when this returns. Must be
+// called without thinking_mutex_: the worker takes that lock to commit a stone,
+// and joining while holding it would deadlock against the thread being joined.
+void GameManager::halt_search() {
     discard_pending_.store(true);
     stop_thinking();
     if (search_thread_ && search_thread_->joinable()) {
@@ -54,15 +50,17 @@ void GameManager::reset() {
     }
     search_thread_.reset();
     hint_thread_.reset();
-    {
-        std::lock_guard<std::mutex> lock(thinking_mutex_);
-        board_.reset();
-        status_ = GameStatus::WAITING;
-        winner_ = EMPTY;
-        game_over_reason_.clear();
-        analyses_.clear();
-        position_pending_ = false;
-    }
+}
+
+void GameManager::reset() {
+    halt_search();
+    std::lock_guard<std::mutex> lock(thinking_mutex_);
+    board_.reset();
+    status_ = GameStatus::WAITING;
+    winner_ = EMPTY;
+    game_over_reason_.clear();
+    analyses_.clear();
+    position_pending_ = false;
 }
 
 bool GameManager::set_position(const Board& board) {
@@ -74,16 +72,7 @@ bool GameManager::set_position(const Board& board) {
 
     // Same hard-abort sequence as reset(): the in-flight worker must not commit
     // a stone onto the board that replaces the one it searched.
-    discard_pending_.store(true);
-    stop_thinking();
-    if (search_thread_ && search_thread_->joinable()) {
-        search_thread_->join();
-    }
-    if (hint_thread_ && hint_thread_->joinable()) {
-        hint_thread_->join();
-    }
-    search_thread_.reset();
-    hint_thread_.reset();
+    halt_search();
 
     std::lock_guard<std::mutex> lock(thinking_mutex_);
     board_ = board;
@@ -92,6 +81,40 @@ bool GameManager::set_position(const Board& board) {
     game_over_reason_.clear();
     analyses_.clear();
     position_pending_ = true;
+    return true;
+}
+
+bool GameManager::restore_game(const GameRestore& restore) {
+    // Same hard-abort sequence as set_position: a worker still searching would
+    // commit its stone onto the board being rebuilt.
+    halt_search();
+
+    std::lock_guard<std::mutex> lock(thinking_mutex_);
+    // Rebuilt on a scratch board so a record that goes illegal half way leaves
+    // the session's own board untouched and the caller can fall back to a
+    // fresh game.
+    Board fresh;
+    for (const Move& stone : restore.base) {
+        if (stone.color != BLACK && stone.color != WHITE) return false;
+        if (!fresh.place_stone(stone.pos.row, stone.pos.col, stone.color)) return false;
+    }
+    std::vector<MoveAnalysis> fresh_analyses;
+    for (const MoveAnalysis& entry : restore.moves) {
+        const Move& move = entry.move;
+        if (move.color != BLACK && move.color != WHITE) return false;
+        if (!fresh.place_stone(move.pos.row, move.pos.col, move.color)) return false;
+        fresh_analyses.push_back(entry);
+    }
+    board_ = fresh;
+    analyses_ = std::move(fresh_analyses);
+    if (restore.player_color == BLACK || restore.player_color == WHITE) {
+        player_color_ = restore.player_color;
+        ai_color_ = opponent(restore.player_color);
+    }
+    status_ = restore.status;
+    winner_ = restore.status == GameStatus::GAME_OVER ? restore.winner : EMPTY;
+    game_over_reason_ = restore.status == GameStatus::GAME_OVER ? restore.reason : std::string();
+    position_pending_ = restore.position_pending;
     return true;
 }
 
@@ -204,20 +227,22 @@ ReplaySnapshot GameManager::replay_snapshot() {
     snapshot.moves = analyses_;
     snapshot.winner = winner_;
     snapshot.reason = game_over_reason_;
-    snapshot.game_over = status_ == GameStatus::GAME_OVER;
+    snapshot.status = status_;
+    snapshot.move_count = board_.move_count();
+    // The board's own stack is base stones then played stones, so whatever the
+    // stack holds beyond the analysis list is what a hand-set position put there
+    // and no undo has taken back off yet.
+    const std::vector<Move>& history = board_.move_history();
+    const size_t played = analyses_.size();
+    if (history.size() > played) {
+        snapshot.base.assign(history.begin(), history.end() - static_cast<std::ptrdiff_t>(played));
+    }
     return snapshot;
 }
 
 void GameManager::resign(int color) {
-    discard_pending_.store(true);
-    stop_thinking();
-    if (search_thread_ && search_thread_->joinable()) {
-        search_thread_->join();
-    }
-    if (hint_thread_ && hint_thread_->joinable()) {
-        hint_thread_->join();
-    }
-    
+    halt_search();
+
     std::lock_guard<std::mutex> lock(thinking_mutex_);
     if (status_ == GameStatus::GAME_OVER) return;
     
