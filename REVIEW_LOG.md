@@ -143,3 +143,46 @@ strength-harness work listed under "Deliberately deferred" above.
 `ctest` is 5/5 (`test_board`, `test_pattern`, `test_evaluator`, `test_search`, `test_training`),
 `make -j4` is warning-free, and the round-50 run exercised the full pipeline end to end
 (records, samples, checkpoint, promoted champion file, `--params` load into `gomoku_server`).
+
+## Phase 4 — optimization (`98a85e3`, `dfa90a6`)
+
+### Round 51 — audit of the bitboard recognizer and the root dedup
+
+**The rewrite had to be proven equal, not argued equal.** Shape semantics cannot be re-typed by hand
+and kept honest, so the 2^18 lookup table is *generated* by running every `(own << 9) | blocked` key
+through the untouched window decoder — the table is the old matcher by construction, and the scalar
+path survives only as a test oracle. On top of that: `test_bitboard_matches_scalar` compares both
+paths over all 225 squares × 4 directions × both colours on 60 random boards plus structured
+edge/corner/diagonal boards (111,600 windows), `test_line_bitboard_tracks_cells` replays 600
+interleaved place/undo steps and checks that every stone's bit lives only in its own colour's line
+words in all four families (copy-construct and `reset()` included), and `test_run_length_matches_walk`
+diffs `run_length` against an independent `get()`-based walk 108,000 times. `run_length` needed its
+own oracle because `finish_direction` — the Renju demotion of WHITE `LONG_FIVE` and the promotion of a
+BLACK `FIVE` whose real run is ≥ 6 — is shared by both recognizer paths, so a differential test alone
+could not see a `run_length` bug.
+
+- Verified: identical search output before and after (559 nodes, same best move, same score, same
+  evaluator sinks); measured 216 → 48 ns per direction, 29.5 → 5.2 µs per `evaluate_board`,
+  35k → 207k root nodes/s. Table build costs 4.7 ms once and 256 KB of a static member.
+
+**Colour became an array index.** With per-colour line words, a stray colour value stopped being a
+no-op and became out-of-bounds read/write, so `set_stone_bits`, `run_length` and `recognize_direction`
+now reject anything outside BLACK/WHITE (and `recognize_direction` also rejects an out-of-range
+direction family). The wall bits outside a line's 15 real cells are never set by a legal stone, which
+is what lets off-board window cells come from the precomputed mask instead of per-cell bounds tests.
+
+**Root dedup must not change the answer.** Only mirror-equivalent candidates are dropped — one
+lowest-index cell per orbit under the position's own D4 self-symmetries — and the identity variant is
+always in that set, so a non-empty root never empties. The evaluator's position weights
+(`|r-7|+|c-7|`) and the pattern recognizer are D4-equivariant, and the Zobrist keys are not, so
+mirrored branches cannot cross-talk through the transposition table. Positions with no self-symmetry
+skip the pass entirely; measured on a symmetric position: 14,838 → 5,241 nodes at identical move and
+score. `test_root_symmetry_dedup` checks the 8-variant empty board yields exactly 36 orbit
+representatives (Burnside), that the chosen move is always a representative, and that a horizontal and
+a vertical mirror position score alike.
+
+### Phase 4 status
+
+4.1 (bitboard) and 4.2 (search-side symmetry dedup) are done and released as `v0.4.0-phase4`.
+4.3 (frontend) and 4.4 (replay analysis) are the remaining work of the phase.
+
