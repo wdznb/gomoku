@@ -332,6 +332,110 @@ void test_forbidden_from_pattern_equivalence() {
     std::cout << "test_forbidden_from_pattern_equivalence passed" << std::endl;
 }
 
+void test_gap_shapes() {
+    // R34 F3: the contiguous scan only counted the run through the placed
+    // stone, so every single-hole shape was read one or two grades too weak.
+    Board board;
+
+    // XX_XX with the probe closing the right pair: four stones around one hole,
+    // so the hole is the only five point - a rush four, not a two.
+    Board a;
+    a.place_stone(7, 3, BLACK);
+    a.place_stone(7, 4, BLACK);
+    a.place_stone(7, 6, BLACK);
+    assert(PatternRecognizer::recognize_direction(a, 7, 7, BLACK, 0).type == PatternType::RUSH_FOUR);
+
+    // X_XXX with the probe as the lone stone on the far side of the hole.
+    Board b;
+    b.place_stone(7, 5, BLACK);
+    b.place_stone(7, 6, BLACK);
+    b.place_stone(7, 7, BLACK);
+    assert(PatternRecognizer::recognize_direction(b, 7, 9, BLACK, 0).type == PatternType::RUSH_FOUR);
+
+    // A gap four stays a four even when both outer ends are blocked: the hole
+    // completion is unaffected by what sits outside the shape.
+    Board c;
+    c.place_stone(7, 4, WHITE);
+    c.place_stone(7, 5, BLACK);
+    c.place_stone(7, 6, BLACK);
+    c.place_stone(7, 8, BLACK);
+    c.place_stone(7, 10, WHITE);
+    PositionPattern blocked = PatternRecognizer::recognize_position(c, 7, 9, BLACK);
+    assert(blocked.directions[0].type == PatternType::RUSH_FOUR);
+    assert(blocked.rush_four_count == 1 && blocked.has_rush_four);
+
+    // X_XX with room on both sides: filling the hole makes a live four, so this
+    // is a live three (the Renju double-three forbidden counts these shapes).
+    Board d;
+    d.place_stone(7, 5, BLACK);
+    d.place_stone(7, 6, BLACK);
+    PositionPattern open_three = PatternRecognizer::recognize_position(d, 7, 8, BLACK);
+    assert(open_three.directions[0].type == PatternType::LIVE_THREE);
+    assert(open_three.live_three_count == 1);
+
+    // Same shape with the far end taken away: the hole fill would only make a
+    // blocked four, so it drops to a sleepy three.
+    Board e;
+    e.place_stone(7, 5, BLACK);
+    e.place_stone(7, 6, BLACK);
+    e.place_stone(7, 9, WHITE);
+    assert(PatternRecognizer::recognize_position(e, 7, 8, BLACK).directions[0].type ==
+           PatternType::SLEEPY_THREE);
+
+    // Two stones around a hole are deliberately out of scope: X_X is only worth
+    // a three after the hole is filled, so no label is claimed for it.
+    Board f;
+    f.place_stone(7, 6, BLACK);
+    assert(PatternRecognizer::recognize_direction(f, 7, 8, BLACK, 0).type == PatternType::NONE);
+
+    std::cout << "test_gap_shapes passed" << std::endl;
+}
+
+void test_overline_locked_four() {
+    // R35 F3: for BLACK a four counts only if some completion point makes
+    // EXACTLY five. Both cases below look like a four to the window matcher and
+    // are not, once the fills are measured on the board.
+    Board board;
+
+    // X_XXXX with the probe at the right end of the run: filling left overruns
+    // (3,4,5,6,7,8), filling right makes exactly five, so this is a rush four.
+    board.place_stone(7, 3, BLACK);
+    board.place_stone(7, 5, BLACK);
+    board.place_stone(7, 6, BLACK);
+    board.place_stone(7, 7, BLACK);
+    assert(PatternRecognizer::recognize_direction(board, 7, 8, BLACK, 0).type ==
+           PatternType::RUSH_FOUR);
+    // WHITE has no overline rule, so the same shape is a live four for it.
+    Board w;
+    w.place_stone(7, 3, WHITE);
+    w.place_stone(7, 5, WHITE);
+    w.place_stone(7, 6, WHITE);
+    w.place_stone(7, 7, WHITE);
+    assert(PatternRecognizer::recognize_direction(w, 7, 8, WHITE, 0).type ==
+           PatternType::LIVE_FOUR);
+
+    // X_XXXX_X: every fill makes six, so BLACK holds no four here at all.
+    Board locked;
+    locked.place_stone(7, 3, BLACK);
+    locked.place_stone(7, 5, BLACK);
+    locked.place_stone(7, 6, BLACK);
+    locked.place_stone(7, 7, BLACK);
+    locked.place_stone(7, 10, BLACK);
+    PositionPattern pattern = PatternRecognizer::recognize_position(locked, 7, 8, BLACK);
+    assert(pattern.directions[0].type == PatternType::NONE);
+    assert(pattern.four_count == 0);
+
+    // A plain live four has two real five points and keeps its label.
+    Board live;
+    live.place_stone(7, 5, BLACK);
+    live.place_stone(7, 6, BLACK);
+    live.place_stone(7, 7, BLACK);
+    assert(PatternRecognizer::recognize_direction(live, 7, 8, BLACK, 0).type ==
+           PatternType::LIVE_FOUR);
+
+    std::cout << "test_overline_locked_four passed" << std::endl;
+}
+
 void test_bitboard_matches_scalar() {
     // Phase 4.1 replaced the per-cell base-3 window scan with bitboard line
     // words plus an 18-bit pattern table. The table is generated from
@@ -409,6 +513,8 @@ int main() {
     test_overline_not_win_for_black();
     test_overline_is_win_for_white();
     test_white_gap_split_is_five();
+    test_gap_shapes();
+    test_overline_locked_four();
     test_forbidden_from_pattern_equivalence();
     test_bitboard_matches_scalar();
     

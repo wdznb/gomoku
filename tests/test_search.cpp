@@ -96,6 +96,34 @@ void test_vcf_no_win() {
     std::cout << "test_vcf_no_win passed" << std::endl;
 }
 
+void test_vcf_gap_four_sequence_wins() {
+    // A VCF whose only win begins with a gap four. BLACK (7,6) makes XX_XX across
+    // the hole at (7,4): the hole is the sole five point, so the forced block is
+    // that cell and the follow-up (8,6) makes a live four. Before the matcher saw
+    // holes this candidate was not even generated, and the contiguous line
+    // 1.(7,4) is a dead end because (7,1) blocks it, so this fails without the
+    // gap support rather than merely taking a different route to a win.
+    Board board;
+    Evaluator evaluator;
+    TranspositionTable tt;
+
+    board.place_stone(7, 1, WHITE);
+    board.place_stone(7, 2, BLACK);
+    board.place_stone(7, 3, BLACK);
+    board.place_stone(7, 5, BLACK);
+    board.place_stone(5, 6, BLACK);
+    board.place_stone(6, 6, BLACK);
+
+    VCFSearch vcf(evaluator, tt);
+    std::atomic<bool> stop(false);
+
+    VCFMove result = vcf.search(board, BLACK, 10, stop);
+    assert(result.result == VCFResult::WIN);
+    assert(result.best_move.pos.row == 7 && result.best_move.pos.col == 6);
+
+    std::cout << "test_vcf_gap_four_sequence_wins passed" << std::endl;
+}
+
 void test_vct_immediate_win() {
     Board board;
     Evaluator evaluator;
@@ -686,7 +714,23 @@ void test_vcf_defense_own_live_four_survives() {
     Move defense;
     DefenseResult dr = vcf.find_defense(board, WHITE, 10, stop, defense);
     assert(dr == DefenseResult::SURVIVES);
-    assert(defense.pos.row == 10 && (defense.pos.col == 3 || defense.pos.col == 7));
+    // Which cell comes back depends on the active-empty iteration order, and
+    // with gap shapes recognised (10,2) and (10,8) join (10,3) and (10,7) as
+    // decisive tempi - a four whose only hole still makes exactly five is a
+    // winning tempo too. What must hold is that WHITE answers with its own
+    // four-or-better instead of a passive block.
+    assert(defense.pos.row == 10);
+    PositionPattern tempo = PatternRecognizer::recognize_position(
+        board, defense.pos.row, defense.pos.col, WHITE);
+    bool has_tempo = false;
+    for (int d = 0; d < 4; ++d) {
+        PatternType t = tempo.directions[d].type;
+        if (t == PatternType::FIVE || t == PatternType::LIVE_FOUR ||
+            t == PatternType::RUSH_FOUR) {
+            has_tempo = true;
+        }
+    }
+    assert(has_tempo);
 
     std::cout << "test_vcf_defense_own_live_four_survives passed" << std::endl;
 }
@@ -1011,6 +1055,7 @@ int main() {
     test_transposition_aging();
     test_vcf_immediate_five();
     test_vcf_no_win();
+    test_vcf_gap_four_sequence_wins();
     test_vct_immediate_win();
     test_vct_diagonal_rush_four_is_not_a_win();
     test_vct_deadline_aborts_search();

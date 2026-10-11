@@ -160,6 +160,117 @@ int PatternRecognizer::extract_window(const Board& board, int row, int col,
     return window;
 }
 
+namespace {
+
+// The run through the placed stone, with no hole inside it. `total` is its
+// stone count (the centre included), already known to be below five.
+PatternType match_contiguous_run(const int* cells, int count_left, int count_right, int total) {
+    if (total == 4) {
+        int left_end = (4 - count_left - 1 >= 0) ? cells[4 - count_left - 1] : 2;
+        int right_end = (4 + count_right + 1 <= 8) ? cells[4 + count_right + 1] : 2;
+
+        if (left_end == 0 && right_end == 0) {
+            return PatternType::LIVE_FOUR;
+        } else if (left_end == 0 || right_end == 0) {
+            return PatternType::RUSH_FOUR;
+        } else {
+            return PatternType::NONE;
+        }
+    }
+
+    if (total == 3) {
+        int left_pos = 4 - count_left - 1;
+        int right_pos = 4 + count_right + 1;
+
+        bool has_left_space = (left_pos >= 0 && cells[left_pos] == 0);
+        bool has_right_space = (right_pos <= 8 && cells[right_pos] == 0);
+
+        if (has_left_space && has_right_space) {
+            bool left_open = (left_pos - 1 >= 0 && cells[left_pos - 1] == 0);
+            bool right_open = (right_pos + 1 <= 8 && cells[right_pos + 1] == 0);
+
+            if (left_open && right_open) {
+                return PatternType::LIVE_THREE;
+            } else {
+                return PatternType::SLEEPY_THREE;
+            }
+        } else {
+            return PatternType::SLEEPY_THREE;
+        }
+    }
+
+    if (total == 2) {
+        int left_pos = 4 - count_left - 1;
+        int right_pos = 4 + count_right + 1;
+
+        bool left_open = (left_pos >= 0 && cells[left_pos] == 0 &&
+                          left_pos - 1 >= 0 && cells[left_pos - 1] == 0);
+        bool right_open = (right_pos <= 8 && cells[right_pos] == 0 &&
+                           right_pos + 1 <= 8 && cells[right_pos + 1] == 0);
+
+        if (left_open && right_open) {
+            return PatternType::LIVE_TWO;
+        } else if (left_open || right_open) {
+            return PatternType::SLEEPY_TWO;
+        } else {
+            return PatternType::NONE;
+        }
+    }
+
+    return PatternType::NONE;
+}
+
+// One empty cell sitting directly against the run, with own stones beyond it:
+// XXX_X, XX_XX, X_XXX (four stones around a hole) and XX_X, X_XX (three).
+// Filling the hole makes a contiguous run of `stones + 1`, so a four-stone gap
+// shape is a rush four - the hole is its only five point, which is exactly what
+// the contiguous scan above misses - and a three-stone one is a broken three,
+// live only when the hole fill would yield a live four.
+//
+// Shapes holding five or more stones are deliberately left to the contiguous
+// label: X_XXXX is a four (two completion points, one of them checked by
+// finish_direction), not a hole story, and relabelling it would hide that.
+PatternType match_gapped_run(const int* cells, int count_left, int count_right, int total) {
+    PatternType best = PatternType::NONE;
+
+    for (int side = 0; side < 2; ++side) {
+        const bool low = side == 0;
+        const int outer = low ? 4 - count_left : 4 + count_right;
+
+        // One empty cell, then the group beyond it. `stop` ends on the first
+        // cell outside that group, so it is also the far end cell of the shape.
+        const int hole = low ? outer - 1 : outer + 1;
+        if (hole < 0 || hole > 8 || cells[hole] != 0) continue;
+
+        int stop = low ? hole - 1 : hole + 1;
+        int extra = 0;
+        while (stop >= 0 && stop <= 8 && cells[stop] == 1) {
+            ++extra;
+            stop += low ? -1 : 1;
+        }
+        if (extra == 0) continue;
+
+        const int stones = total + extra;
+        if (stones == 4) {
+            best = std::max(best, PatternType::RUSH_FOUR);
+        } else if (stones == 3) {
+            // The two cells outside the whole shape once the hole is filled:
+            // `stop` is already the far end on the hole side, and the run's own
+            // end cell is one step beyond its outermost stone.
+            const int low_end = low ? stop : 4 - count_left - 1;
+            const int high_end = low ? 4 + count_right + 1 : stop;
+            const bool lo_open = low_end >= 0 && low_end <= 8 && cells[low_end] == 0;
+            const bool hi_open = high_end >= 0 && high_end <= 8 && cells[high_end] == 0;
+            best = std::max(best, (lo_open && hi_open) ? PatternType::LIVE_THREE
+                                                       : PatternType::SLEEPY_THREE);
+        }
+    }
+
+    return best;
+}
+
+}
+
 PatternType PatternRecognizer::match_pattern(int window_code, bool /*is_center*/) {
     int cells[9];
     int temp = window_code;
@@ -194,60 +305,12 @@ PatternType PatternRecognizer::match_pattern(int window_code, bool /*is_center*/
     if (total == 5) {
         return PatternType::FIVE;
     }
-    
-    if (total == 4) {
-        int left_end = (4 - count_left - 1 >= 0) ? cells[4 - count_left - 1] : 2;
-        int right_end = (4 + count_right + 1 <= 8) ? cells[4 + count_right + 1] : 2;
-        
-        if (left_end == 0 && right_end == 0) {
-            return PatternType::LIVE_FOUR;
-        } else if (left_end == 0 || right_end == 0) {
-            return PatternType::RUSH_FOUR;
-        } else {
-            return PatternType::NONE;
-        }
-    }
-    
-    if (total == 3) {
-        int left_pos = 4 - count_left - 1;
-        int right_pos = 4 + count_right + 1;
-        
-        bool has_left_space = (left_pos >= 0 && cells[left_pos] == 0);
-        bool has_right_space = (right_pos <= 8 && cells[right_pos] == 0);
-        
-        if (has_left_space && has_right_space) {
-            bool left_open = (left_pos - 1 >= 0 && cells[left_pos - 1] == 0);
-            bool right_open = (right_pos + 1 <= 8 && cells[right_pos + 1] == 0);
-            
-            if (left_open && right_open) {
-                return PatternType::LIVE_THREE;
-            } else {
-                return PatternType::SLEEPY_THREE;
-            }
-        } else {
-            return PatternType::SLEEPY_THREE;
-        }
-    }
-    
-    if (total == 2) {
-        int left_pos = 4 - count_left - 1;
-        int right_pos = 4 + count_right + 1;
-        
-        bool left_open = (left_pos >= 0 && cells[left_pos] == 0 && 
-                          left_pos - 1 >= 0 && cells[left_pos - 1] == 0);
-        bool right_open = (right_pos <= 8 && cells[right_pos] == 0 && 
-                           right_pos + 1 <= 8 && cells[right_pos + 1] == 0);
-        
-        if (left_open && right_open) {
-            return PatternType::LIVE_TWO;
-        } else if (left_open || right_open) {
-            return PatternType::SLEEPY_TWO;
-        } else {
-            return PatternType::NONE;
-        }
-    }
-    
-    return PatternType::NONE;
+
+    // The enum is ordered by threat strength, so a hole that outranks the run
+    // through the centre (XX_XX is a four, not a two) wins and a weaker one
+    // never overwrites it.
+    return std::max(match_contiguous_run(cells, count_left, count_right, total),
+                    match_gapped_run(cells, count_left, count_right, total));
 }
 
 DirectionPattern PatternRecognizer::recognize_direction(const Board& board, int row, int col,
@@ -309,6 +372,59 @@ DirectionPattern PatternRecognizer::finish_direction(const Board& board, int row
     // every branch that matches on PatternType::FIVE.
     if (type == PatternType::FIVE && color == BLACK) {
         if (board.run_length(dir, row, col, color) >= 6) type = PatternType::LONG_FIVE;
+    }
+
+    // A BLACK four is only a threat if one of its completion points makes
+    // EXACTLY five. XXXX_X labels as LIVE_FOUR because both end cells are empty,
+    // but filling the hole is a six-overline, so just one point wins; when every
+    // point overruns (X_XXXX_X) there is no four to speak of. This needs the
+    // board rather than the window: the window labels the shape, not its
+    // completions. WHITE is not affected - a six there is a win.
+    if (color == BLACK && (type == PatternType::LIVE_FOUR || type == PatternType::RUSH_FOUR)) {
+        const int dr = DIRECTIONS[dir][0];
+        const int dc = DIRECTIONS[dir][1];
+
+        // The run length a fill at (r, c) would produce, counting the square
+        // under recognition as already BLACK - the probe stone is part of the
+        // four, but it is still empty on the board, so board.run_length() alone
+        // would stop at it and report one stone short.
+        auto fill_run = [&](int r, int c) {
+            int len = 1;
+            for (int sign = -1; sign <= 1; sign += 2) {
+                for (int k = 1; k <= 5; ++k) {
+                    const int rr = r + sign * k * dr;
+                    const int cc = c + sign * k * dc;
+                    if (!board.is_valid(rr, cc)) break;
+                    if (board.get(rr, cc) != BLACK && !(rr == row && cc == col)) break;
+                    ++len;
+                }
+            }
+            return len;
+        };
+
+        const int run = fill_run(row, col);
+        // Only a contiguous four is in scope: a gap shape's completion point is
+        // its hole, which this end-cell probe cannot reach, and match_gapped_run
+        // already proved that hole makes exactly five.
+        if (run == 4) {
+            int five_points = 0;
+            for (int sign = -1; sign <= 1; sign += 2) {
+                int r = row + sign * dr;
+                int c = col + sign * dc;
+                while (board.is_valid(r, c) && board.get(r, c) == BLACK) {
+                    r += sign * dr;
+                    c += sign * dc;
+                }
+                if (board.is_valid(r, c) && board.get(r, c) == EMPTY && fill_run(r, c) == 5) {
+                    ++five_points;
+                }
+            }
+            if (five_points == 0) {
+                type = PatternType::NONE;
+            } else if (type == PatternType::LIVE_FOUR && five_points == 1) {
+                type = PatternType::RUSH_FOUR;
+            }
+        }
     }
 
     return DirectionPattern(type, dir);

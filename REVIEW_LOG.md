@@ -81,8 +81,8 @@ The last two rounds surfaced only a portability nit on a non-supported native-Wi
 
 ## Deliberately deferred (not correctness bugs; each gated on needing a strength/stress harness)
 
-- Gap-pattern matcher (R34 F3)
-- Overline-locked-four threat classification (R35 F3)
+- ~~Gap-pattern matcher (R34 F3)~~ — done in round 54
+- ~~Overline-locked-four threat classification (R35 F3)~~ — done in round 54
 - Engine perf refactors: incremental eval, `sort_moves` pattern threading, `find_defense` board
   copy (R41 F1/F2/F3)
 - Blocking worker join on the io thread (R42 F3)
@@ -257,4 +257,56 @@ them would have removed capability without fixing anything.
 All four items of the phase are implemented: 4.1 bitboard and 4.2 root dedup (released as
 `v0.4.0-phase4`), 4.4 per-move analysis capture plus `request_replay` / `replay`, and 4.3 the replay
 UI, eval curve, clickable move list, ending reason and working AI settings.
+
+## Deferred items (rounds 34/35) — gap shapes and overline-locked fours
+
+### Round 54 — teaching the matcher about holes
+
+The user re-approved the deferred list, so R34 F3 (gap/broken shapes) and R35 F3 (overline-locked
+four) are now closed together. Both live in the same two functions, and both were verified rather
+than argued.
+
+**`match_pattern` only ever counted the run through the placed stone**, so every single-hole shape was
+read one or two grades too weak: `XX_XX` was a two, `X_XXX` a three, and `XXX_X` nothing at all,
+because the scan stops at the first empty cell. The fix splits the classification into the contiguous
+run and a one-hole extension of it, and returns the stronger label — the `PatternType` enum is already
+ordered by threat strength, so that is a plain `max`. Scope is deliberately narrow:
+
+- four stones around one hole (`XXX_X`, `XX_XX`, `X_XXX`) are a **rush four**, because the hole is
+  their only five point and blocked outer ends cannot take that away;
+- three stones around one hole (`X_XX`, `XX_X`) are a **broken three**, live only when the hole fill
+  would make a *live* four (both cells outside the whole shape empty);
+- two stones around a hole (`X_X`) are left unlabelled, and shapes holding five or more stones are
+  left to the contiguous label — `X_XXXX` is a four story, not a hole story, and relabelling it would
+  hide that it has two completion points.
+
+Because `fill_pattern_lut` generates the table by running every key through `match_pattern`, the
+bitboard path and the scalar oracle moved together for free: `test_bitboard_matches_scalar` still
+passes over 111,600 windows after the change.
+
+**Two consequences had to be chased down.** `VCFSearch::find_block_move` does its own contiguous walk
+and had no idea a hole could be a forced block, so gap support there was added (stones beyond exactly
+one empty cell, four in total, block the hole) — and the new `test_vcf_gap_four_sequence_wins` proves
+the payoff: a VCF whose *only* win begins with `1.(7,6)` making `XX_XX`, where the contiguous
+alternative `1.(7,4)` is dead-ended by a white stone at `(7,1)`. That assertion could not have been
+satisfied before this change, because the move was never generated as a candidate.
+
+**R35 F3 was the riskier half, and the first attempt was wrong.** A BLACK four only threatens if some
+completion point makes *exactly* five, so `XXXX_X` (live four by the window: both ends empty) is
+really a rush four, and `X_XXXX_X` (every fill is a six) is not a four at all. The first version
+measured the completion points with `Board::run_length`, which counts the run on the board as it
+stands — the square under recognition is still empty, so the walk stopped at it and every plain live
+four looked like a three. `test_recognize_live_four` failed immediately. The correction is a local
+`fill_run` walk that treats the square under recognition as already BLACK; only shapes whose run is
+exactly four are in scope, so gap fours keep their label.
+
+- Verified: `ctest` 5/5, and a short training run confirms the matcher is not merely quieter — all four
+  recorded data games now end `five` with **WHITE** winning, where the same configuration previously
+  ended with BLACK at 27 plies. The reading is that BLACK now runs into stricter forbidden detection
+  (broken threes count toward 三三) and that WHITE's holes count as the threats they are; it is a
+  one-run observation, not a strength measurement.
+- One test expectation was relaxed on purpose: `test_vcf_defense_own_live_four_survives` hard-coded
+  the defence cell, and with holes recognised `(10,2)` / `(10,8)` are decisive tempi too, so the
+  ordering legitimately changes. It now asserts the property that matters — that WHITE answers with a
+  four-or-better of its own rather than a passive block.
 

@@ -84,6 +84,31 @@ Move VCFSearch::find_block_move(const Board& board, int row, int col, int color)
                 return Move(check_fwd_r, check_fwd_c, opponent(color));
             if (bwd_open && !fwd_open)
                 return Move(check_bwd_r, check_bwd_c, opponent(color));
+        } else {
+            // A gap four (XXX_X, XX_XX, X_XXX): the stones on the far side of one
+            // empty cell make the run four, so that cell is the only point that
+            // completes five and therefore the forced block.
+            const int ends[2][2] = {{fwd_r, fwd_c}, {bwd_r, bwd_c}};
+            const int signs[2] = {1, -1};
+            for (int e = 0; e < 2; ++e) {
+                const int sign = signs[e];
+                const int hole_r = ends[e][0] + sign * dr;
+                const int hole_c = ends[e][1] + sign * dc;
+                if (!board.is_valid(hole_r, hole_c) || !board.is_empty(hole_r, hole_c)) continue;
+
+                int beyond_r = hole_r + sign * dr;
+                int beyond_c = hole_c + sign * dc;
+                int beyond = 0;
+                while (beyond < 4 && board.is_valid(beyond_r, beyond_c) &&
+                       board.get(beyond_r, beyond_c) == color) {
+                    ++beyond;
+                    beyond_r += sign * dr;
+                    beyond_c += sign * dc;
+                }
+                if (count + beyond == 4) {
+                    return Move(hole_r, hole_c, opponent(color));
+                }
+            }
         }
     }
 
