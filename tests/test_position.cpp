@@ -55,6 +55,20 @@ bool same_cells(const SetupResult& a, const SetupResult& b) {
     return cells_of(a.board) == cells_of(b.board);
 }
 
+// The same position as one long run rather than 15 rows: `delim` goes between
+// every two cells ("" for an unseparated run) and a line break every `wrap`
+// cells, where wrap != 0. The line breaks deliberately ignore row boundaries.
+std::string flat_text(const std::vector<Position>& black, const std::vector<Position>& white,
+                      const char* b, const char* w, const char* e, const char* delim, int wrap) {
+    std::string out;
+    for (int i = 0; i < MAX_MOVES; ++i) {
+        if (i && *delim) out += delim;
+        out += token_for(black, white, i / BOARD_SIZE, i % BOARD_SIZE, b, w, e);
+        if (wrap && (i + 1) % wrap == 0 && i + 1 < MAX_MOVES) out += '\n';
+    }
+    return out;
+}
+
 }  // namespace
 
 void test_grid_parsing() {
@@ -88,6 +102,69 @@ void test_grid_parsing() {
     assert(!parse_grid_text("# only a comment\n", nope, error));
 
     std::cout << "test_grid_parsing passed" << std::endl;
+}
+
+void test_flat_strings() {
+    const SetupResult rows = position_from_text(grid_text(kBlack, kWhite, "B", "W", ".", ""));
+    assert(rows.ok());
+
+    // One unseparated run of 225 ASCII symbols is the same board.
+    SetupResult run = position_from_text(flat_text(kBlack, kWhite, "B", "W", ".", "", 0));
+    assert(run.ok() && same_cells(rows, run));
+    assert(run.encoding.black == "B");
+
+    SetupResult numeric = position_from_text(flat_text(kBlack, kWhite, "1", "2", "0", "", 0));
+    assert(numeric.ok() && same_cells(rows, numeric));
+
+    // 225 multi-byte symbols are 675 bytes: the run has to explode by codepoint,
+    // and this is the form the row parser used to refuse outright.
+    SetupResult chinese = position_from_text(flat_text(kBlack, kWhite, "黑", "白", "空", "", 0));
+    assert(chinese.ok() && same_cells(rows, chinese));
+    assert(chinese.encoding.black == "黑");
+
+    // Separated flat dumps, on one line or with breaks that ignore row
+    // boundaries. 1/-1/0 only works here: an unseparated run would read the "-"
+    // and the "1" as two different marks.
+    SetupResult sep = position_from_text(flat_text(kBlack, kWhite, "1", "-1", "0", ",", 0));
+    assert(sep.ok() && same_cells(rows, sep));
+    assert(sep.encoding.white == "-1");
+    SetupResult spaced = position_from_text(flat_text(kBlack, kWhite, "1", "2", "0", " ", 50));
+    assert(spaced.ok() && same_cells(rows, spaced));
+    SetupResult tabs = position_from_text(flat_text(kBlack, kWhite, "1", "2", "0", "\t;", 50));
+    assert(tabs.ok() && same_cells(rows, tabs));
+
+    // A fourth symbol is a refusal, not a guess, whatever the run's length is: the
+    // symbol kinds are checked before the cell count.
+    std::string four = flat_text(kBlack, kWhite, "B", "W", ".", "", 0);
+    four[0] = '4';
+    SetupResult four_marks = position_from_text(four);
+    assert(!four_marks.ok() && four_marks.error.find("三种") != std::string::npos);
+    SetupResult long_four = position_from_text(four + "BWB.WB");
+    assert(!long_four.ok() && long_four.error.find("三种") != std::string::npos);
+    SetupResult short_four = position_from_text(four.substr(0, 200));
+    assert(!short_four.ok() && short_four.error.find("三种") != std::string::npos);
+
+    // Three symbols and the wrong number of cells is a length complaint.
+    const std::string run225 = flat_text(kBlack, kWhite, "1", "2", "0", "", 0);
+    SetupResult short_run = position_from_text(run225.substr(0, 224));
+    assert(!short_run.ok() && short_run.error.find("224 格") != std::string::npos);
+    SetupResult long_run = position_from_text(run225 + "1");
+    assert(!long_run.ok() && long_run.error.find("226 格") != std::string::npos);
+    SetupResult long_sep = position_from_text(flat_text(kBlack, kWhite, "1", "2", "0", ",", 0) + ",1");
+    assert(!long_sep.ok() && long_sep.error.find("226 格") != std::string::npos);
+    SetupResult empty_run = position_from_text(std::string(300, '.'));
+    assert(!empty_run.ok() && empty_run.error.find("300 格") != std::string::npos);
+
+    // Rows that are all 15 wide but the wrong number of them are still reported
+    // as rows, and a three-cell line still reports its width: the flat reading is
+    // a fallback, not a rewrite of the existing diagnostics.
+    const std::string numeric_rows = grid_text(kBlack, kWhite, "1", "2", "0", ",");
+    SetupResult sixteen = position_from_text(numeric_rows + numeric_rows.substr(0, numeric_rows.find('\n') + 1));
+    assert(!sixteen.ok() && sixteen.error.find("16 行") != std::string::npos);
+    SetupResult three = position_from_text("1,2,3\n");
+    assert(!three.ok() && three.error.find("15 格") != std::string::npos);
+
+    std::cout << "test_flat_strings passed" << std::endl;
 }
 
 void test_encoding_detection() {
@@ -341,7 +418,8 @@ void test_shipped_templates() {
     const std::string root = GOMOKU_SOURCE_DIR;
     const char* names[] = {"data/position_template.json", "data/position_template.csv",
                            "data/position_template.txt", "data/position_bitboard_template.json",
-                           "data/position_moves_template.json"};
+                           "data/position_moves_template.json", "data/position_flat_template.txt",
+                           "data/position_flat_template.csv"};
     for (const char* name : names) {
         SetupResult loaded;
         std::string error;
@@ -356,7 +434,7 @@ void test_shipped_templates() {
     std::string error;
     assert(!load_position_file(root + "/data/no_such_position.json", missing, error));
     assert(error.find("无法打开") != std::string::npos);
-    std::cout << "test_shipped_templates passed (5 templates)" << std::endl;
+    std::cout << "test_shipped_templates passed (7 templates)" << std::endl;
 #else
     std::cout << "test_shipped_templates skipped (no GOMOKU_SOURCE_DIR)" << std::endl;
 #endif
@@ -436,6 +514,7 @@ void test_game_manager_position() {
 int main() {
     std::cout << "Running position setup tests..." << std::endl;
     test_grid_parsing();
+    test_flat_strings();
     test_encoding_detection();
     test_bitboard_form();
     test_moves_form();

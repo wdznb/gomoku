@@ -517,3 +517,47 @@ comment (`(7,7)=112 → word 1 bit 48`) is what makes the next reader re-derive 
 **Deliberate omissions.** No client-side reconnect exists for the 60 s idle socket timeout, so a page
 left open on the position panel drops its WebSocket and must be reloaded — pre-existing behaviour, out
 of scope here.
+
+## 摆设棋局（自定义开局）— feature round 58 (`phase4-ui-replay`)
+
+**What shipped.** The grid form now also accepts one long string of the whole board, separated or
+unseparated, from a file or from a socket message with no extra field: 225 tokens split on
+comma / semicolon / tab / space / newline (one line or many, breaks may fall anywhere), or 225 symbols
+written back to back (`...BW....`, `01020…`, even a `黑/白/空` run). `data/position_flat_template.txt`
+(one 225-character `B`/`W`/`.` line) and `data/position_flat_template.csv` (one line of 225 comma-
+separated `1`/`-1`/`0`) are the two new shipped templates, so the loader has seven to prove itself
+against.
+
+**The flat reading is a fallback, not a rewrite.** `parse_grid_text` still tries the row layout first
+(`split_row` reads a 15-character ASCII line as one symbol per cell, otherwise it splits on separators),
+and only when the document is not 15 rows of 15 cells does it re-read everything it collected as a
+single run. Keeping the row bookkeeping in a `ragged` flag is what preserves each existing complaint
+verbatim — 16 uniform rows are still "棋盘有 16 行，需要 15 行" and a three-cell line is still
+"第 1 行有 3 格，需要 15 格", because blaming a length for what is a layout problem sends the reader to
+the wrong place. A 15-character-per-cell line is also still the only unseparated row shape the row
+parser takes, since a 30-character numeric line really is ambiguous between 15 `-1` cells and 30 marks.
+
+**Symbol kinds are judged before the cell count.** A run is exploded by UTF-8 codepoint
+(`codepoints_of`, so 225 Chinese marks are 675 bytes and not 675 cells; a lead byte missing its
+continuation bytes yields itself alone, which matches no alphabet instead of corrupting its neighbour),
+and the distinct-kind check runs before the length check: a fourth kind of symbol cannot become a board
+at any length, so it is reported as "连续棋盘含 N 种符号 (…)，只能表示黑/白/空三种" whether the file was
+200, 300 or 225 symbols long. Only a run that does have at most three kinds gets the length complaint
+("棋盘有 N 格，需要 225 格（15x15，分隔或连写皆可）") — truncation and mixed alphabets need different
+fixes, and the first thing said should be the thing that decides the answer. `1/-1/0` remains a
+separated-only dataset by definition: unseparated, `-1` is two marks.
+
+**`read_position_payload` had to stop trusting JSON.** A numeric flat run whose first symbol is not `0`
+is not discarded text — `100…` is a legal 225-digit JSON *number*, so the old "did it parse? then it is a
+document" branch handed the server a scalar and answered "局面文档必须是 JSON 对象" for a perfectly
+readable board. Anything that is not an object or an array now goes to the parser as `{"board": text}`,
+which is the same route a CSV paste takes.
+
+**Verification.** `ctest` 6/6 with `test_flat_strings` added (ASCII run, numeric run, 675-byte Chinese
+run, separated runs with breaks every 50 cells, four-kind refusals at three lengths, wrong-length
+refusals, and the row diagnostics intact). `build/wspos.py` is up to 28 checks, covering the same forms
+over the socket plus the shipped flat file; `read_position_payload` is exactly what those six new
+checks exercise. In the browser, pasting the 225-character `B`/`W`/`.` run into 摆棋 and pressing 识别
+returned "确认标志：黑=B 白=W 空=.", 载入 stayed disabled until the box was ticked, and the loaded board
+showed 3 黑 2 白 with 白方 to move. (The socket did drop once mid-verification, for the known 60 s idle
+timeout and not for anything in this round: a reload re-ran the sequence in one script.)

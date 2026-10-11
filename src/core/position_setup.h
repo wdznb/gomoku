@@ -53,10 +53,12 @@ constexpr int BITBOARD_WORDS = 4;
 constexpr int BITBOARD_TOP_BITS = MAX_MOVES - (BITBOARD_WORDS - 1) * 64;
 constexpr uint64_t BITBOARD_TOP_MASK = (1ull << BITBOARD_TOP_BITS) - 1;
 
-// Split a plain-text grid: comma / semicolon / tab / whitespace separated, or
-// one ASCII symbol per character. Blank lines and '#' comment lines are ignored,
-// a UTF-8 BOM is tolerated. Fails unless exactly BOARD_SIZE rows of BOARD_SIZE
-// tokens remain.
+// Split a text grid into cells. Rows of BOARD_SIZE tokens (comma / semicolon /
+// tab / whitespace separated, or one ASCII symbol per character) are read first;
+// anything else is read flat, as the whole document: 225 separated cells, or a
+// continuous run of one symbol per cell — at most three distinct symbols, and
+// line breaks may fall anywhere. Blank lines and '#' comment lines are ignored,
+// a UTF-8 BOM is tolerated.
 bool parse_grid_text(const std::string& text, GridCells& out, std::string& error);
 
 // The documented encodings that cover this grid's tokens, reduced to distinct

@@ -142,6 +142,70 @@ std::vector<GridEncoding> detect_grid_encodings(const GridCells& cells) {
     return readings;
 }
 
+namespace {
+
+// One line's cells: a plain 15-character ASCII row reads as one symbol per cell,
+// anything else splits on the usual separators.
+GridRow split_row(const std::string& stripped) {
+    const bool has_separator = stripped.find_first_of(",;\t") != std::string::npos;
+    const bool one_symbol_per_cell = !has_separator && stripped.size() == BOARD_SIZE &&
+                                     std::all_of(stripped.begin(), stripped.end(), [](char ch) {
+                                         return static_cast<unsigned char>(ch) < 0x80;
+                                     });
+    GridRow row;
+    if (one_symbol_per_cell) {
+        for (char ch : stripped) row.push_back(std::string(1, ch));
+        return row;
+    }
+    std::string current;
+    auto flush = [&row, &current]() {
+        if (current.empty()) return;
+        row.push_back(current);
+        current.clear();
+    };
+    for (char ch : stripped) {
+        if (ch == ',' || ch == ';' || ch == '\t' || ch == ' ') flush();
+        else current += ch;
+    }
+    flush();
+    return row;
+}
+
+// The codepoints of a block, so an unseparated 黑/白/空 run explodes by symbol
+// and not by byte. A lead byte whose continuation bytes are missing or malformed
+// yields itself alone, which then matches no alphabet and is reported as an
+// unknown mark rather than silently corrupting a neighbour.
+std::vector<std::string> codepoints_of(const std::string& block) {
+    std::vector<std::string> out;
+    size_t i = 0;
+    while (i < block.size()) {
+        const unsigned char lead = static_cast<unsigned char>(block[i]);
+        size_t width = 1;
+        if (lead >= 0xF0) width = 4;
+        else if (lead >= 0xE0) width = 3;
+        else if (lead >= 0xC0) width = 2;
+        bool well_formed = width > 1 && i + width <= block.size();
+        for (size_t k = 1; k < width && well_formed; ++k) {
+            if ((static_cast<unsigned char>(block[i + k]) & 0xC0) != 0x80) well_formed = false;
+        }
+        if (!well_formed) width = 1;
+        out.push_back(block.substr(i, width));
+        i += width;
+    }
+    return out;
+}
+
+GridCells reshape(const std::vector<std::string>& cells) {
+    GridCells rows;
+    for (int r = 0; r < BOARD_SIZE; ++r) {
+        rows.push_back(GridRow(cells.begin() + r * BOARD_SIZE,
+                               cells.begin() + (r + 1) * BOARD_SIZE));
+    }
+    return rows;
+}
+
+}  // namespace
+
 bool parse_grid_text(const std::string& text, GridCells& out, std::string& error) {
     out.clear();
     std::string body = text;
@@ -154,48 +218,80 @@ bool parse_grid_text(const std::string& text, GridCells& out, std::string& error
     std::istringstream stream(body);
     std::string line;
     GridCells rows;
+    std::vector<std::string> blocks;  // every cell of the document, row layout ignored
+    std::string row_error;
+    bool ragged = false;
     while (std::getline(stream, line)) {
         const std::string stripped = trim(line);
         if (stripped.empty() || stripped[0] == '#') continue;
 
-        const bool has_separator = stripped.find_first_of(",;\t") != std::string::npos;
-        const bool one_symbol_per_cell = !has_separator && stripped.size() == BOARD_SIZE &&
-                                         std::all_of(stripped.begin(), stripped.end(), [](char ch) {
-                                             return static_cast<unsigned char>(ch) < 0x80;
-                                         });
-        GridRow row;
-        if (one_symbol_per_cell) {
-            // "B.W...." style: one ASCII symbol per cell. Not applied to
-            // Chinese grids, whose tokens are multi-byte and would be shredded.
-            for (char ch : stripped) row.push_back(std::string(1, ch));
-        } else {
-            std::string current;
-            auto flush = [&row, &current]() {
-                if (current.empty()) return;
-                row.push_back(current);
-                current.clear();
-            };
-            for (char ch : stripped) {
-                if (ch == ',' || ch == ';' || ch == '\t' || ch == ' ') flush();
-                else current += ch;
-            }
-            flush();
-        }
-
+        GridRow row = split_row(stripped);
+        for (const std::string& cell : row) blocks.push_back(cell);
         if (static_cast<int>(row.size()) != BOARD_SIZE) {
-            error = "第 " + std::to_string(rows.size() + 1) + " 行有 " + std::to_string(row.size()) +
-                    " 格，需要 " + std::to_string(BOARD_SIZE) + " 格";
-            return false;
+            ragged = true;
+            if (row_error.empty()) {
+                row_error = "第 " + std::to_string(rows.size() + 1) + " 行有 " +
+                            std::to_string(row.size()) + " 格，需要 " + std::to_string(BOARD_SIZE) + " 格";
+            }
         }
         rows.push_back(std::move(row));
     }
 
-    if (static_cast<int>(rows.size()) != BOARD_SIZE) {
-        error = "棋盘有 " + std::to_string(rows.size()) + " 行，需要 " + std::to_string(BOARD_SIZE) + " 行";
+    if (!ragged && static_cast<int>(rows.size()) == BOARD_SIZE) {
+        out = std::move(rows);
+        return true;
+    }
+    if (row_error.empty()) {
+        row_error = "棋盘有 " + std::to_string(rows.size()) + " 行，需要 " + std::to_string(BOARD_SIZE) + " 行";
+    }
+
+    // Flat form: the whole document as one long run, row layout ignored - 225
+    // separated cells, or as many symbols as the separators happen to leave. A
+    // dataset dumped with -1 for WHITE therefore has to keep its separators, since
+    // an unseparated run is read one symbol per character by definition.
+    if (blocks.size() == static_cast<size_t>(BOARD_SIZE * BOARD_SIZE)) {
+        out = reshape(blocks);
+        return true;
+    }
+    std::vector<std::string> symbols;
+    for (const std::string& block : blocks) {
+        for (const std::string& symbol : codepoints_of(block)) symbols.push_back(symbol);
+    }
+    // A fourth kind of symbol means the text cannot be a board however long it is,
+    // so it is reported before the cell count: a truncated dump and a file that
+    // mixes alphabets need different fixes.
+    std::vector<std::string> kinds;
+    for (const std::string& symbol : symbols) {
+        const std::string token = normalize(symbol);
+        if (std::find(kinds.begin(), kinds.end(), token) == kinds.end()) kinds.push_back(token);
+    }
+    if (kinds.size() > 3) {
+        std::string seen;
+        for (const std::string& kind : kinds) seen += (seen.empty() ? "" : "/") + kind;
+        error = "连续棋盘含 " + std::to_string(kinds.size()) + " 种符号 (" + seen +
+                ")，只能表示黑/白/空三种";
         return false;
     }
-    out = std::move(rows);
-    return true;
+    if (symbols.size() == static_cast<size_t>(BOARD_SIZE * BOARD_SIZE)) {
+        out = reshape(symbols);
+        return true;
+    }
+
+    // Rows that are all 15 cells wide but the wrong number of them: say so, that
+    // is the honest complaint. Otherwise the document was meant to be flat, so
+    // count its cells instead of blaming a row width.
+    if (!ragged) {
+        error = row_error;
+        return false;
+    }
+    const size_t seen_count = std::max(blocks.size(), symbols.size());
+    if (seen_count > static_cast<size_t>(BOARD_SIZE)) {
+        error = "棋盘有 " + std::to_string(seen_count) + " 格，需要 " +
+                std::to_string(BOARD_SIZE * BOARD_SIZE) + " 格（15x15，分隔或连写皆可）";
+        return false;
+    }
+    error = row_error;
+    return false;
 }
 
 namespace {

@@ -36,12 +36,15 @@ bool read_position_payload(const json& msg, json& doc, std::string& error) {
     } else if (value.is_string()) {
         const std::string text = value.get<std::string>();
         json parsed = json::parse(text, nullptr, false);
-        if (parsed.is_discarded()) {
-            // Not JSON, so a plain-text grid: CSV, txt or one symbol per cell.
+        if (parsed.is_object() || parsed.is_array()) {
+            doc = std::move(parsed);
+        } else {
+            // Not a document, so a grid: CSV, txt, or one long flat run of
+            // symbols. A numeric grid parses as a JSON *number* ("100...0" is a
+            // 225-digit integer), and taking that value would report "局面文档必须
+            // 是 JSON 对象" for a perfectly readable board.
             doc = json::object();
             doc["board"] = text;
-        } else {
-            doc = std::move(parsed);
         }
     } else {
         error = "position 必须是局面对象或棋盘文本";
