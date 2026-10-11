@@ -1184,10 +1184,13 @@ void GameServer::handle_resume(std::shared_ptr<WebSocketSession> session, const 
     // A game whose AI was mid-search when the socket went was stopped with it, so
     // the position it comes back to still has the AI to move. Re-arming here is
     // what makes a refresh land on "AI 思考中" rather than a board waiting on a
-    // side that never plays.
+    // side that never plays. However, a session where nobody has chosen a side
+    // yet must not start searching: set_position deliberately leaves status
+    // WAITING until side choice, and arming the AI would violate that invariant.
     GameManager& game = *entry->game;
-    if (resumed && !game.position_pending() && !game.is_ai_thinking() &&
-        game.status() != GameStatus::GAME_OVER && game.current_turn() == game.ai_color()) {
+    if (resumed && entry->side_chosen && !game.position_pending() &&
+        !game.is_ai_thinking() && game.status() != GameStatus::GAME_OVER &&
+        game.current_turn() == game.ai_color()) {
         game.start_ai_thinking();
     }
     send_session_state(session, entry, resumed);
