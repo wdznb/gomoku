@@ -52,6 +52,10 @@ private:
     
     void do_read();
     void do_write();
+    // Slide the socket's idle deadline forward. Beast's tcp_stream expiry is one
+    // absolute deadline shared by every later operation, so it has to be re-armed
+    // by hand or it caps the connection's lifetime instead of its silence.
+    void arm_idle();
     void on_http_read(beast::error_code ec, std::size_t bytes);
     void run_websocket();
     void handle_http_request();

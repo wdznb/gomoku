@@ -421,6 +421,7 @@ ctest --output-on-failure
 {"type": "check_position", "position": {"board": [[...]], "encoding": {"black": 1, "white": 2, "empty": 0}}}
 {"type": "check_position", "position": "文本棋盘或局面对象字符串", "encoding": {"black": "B", "white": "W", "empty": "."}}
 {"type": "set_position", "position": {"bitboard": {"black": [0, 281474976710656, 65537, 0], "white": [0, 562954248388608, 0, 0]}}}
+{"type": "ping"}
 ```
 
 `position` 可以是局面对象，也可以是文本（粘贴的棋盘——分行、带分隔符或 225 格连写成一串，
@@ -446,6 +447,7 @@ ctest --output-on-failure
 {"type": "position_preview", "ok": false, "error": "黑 3 子、白 0 子：黑先手，黑白差只能是 0 或 1"}
 {"type": "position_set", "board": [[...]], "current_turn": "white", "game_status": "waiting",
  "position_pending": true, "black_count": 3, "white_count": 2}
+{"type": "pong"}
 ```
 
 `state_sync` 是唯一携带**服务器权威棋盘**的消息（`choose_side` 的回应）：前端必须照它重画棋盘并采用
@@ -461,6 +463,18 @@ ctest --output-on-failure
 `set_position` 失败才走 `error`，成功回 `position_set`，其中 `position_pending: true` 表示局面已
 摆好但尚未开局：此时 `choose_side` 仍然可用，AI 不会自己落子。带 `board` 的文档必须说明 `encoding`
 （文件里写好，或 `check_position` 之后由玩家确认再带上），否则会被拒绝。
+
+### 连接保活与重连
+
+服务器按**双向静默**回收会话：一次读或写都会把套接字的到期点往后推到 120 秒，所以 120 秒内
+毫无往来的连接（被关掉的标签页、掉线的客户端）会被清掉，而正在长考的连接不会误伤。前端每
+30 秒发一个 `ping`（服务器回 `pong`，客户端忽略它）来占住这个窗口——玩家对着棋盘思考十分钟也
+不会被踢。
+
+连接断开时前端按 1、2、4、8…（上限 15 秒）退避重连，状态栏用琥珀色显示“N 秒后重连（第 k 次）”，
+期间任何点击都会提示“消息未发出”而不是静默丢弃。**重连成功等于换了一个服务器会话**：对局、
+回放与摆棋待定状态都在旧会话里，因此前端会清空本地棋盘、重新下发 `set_config`，并用绿色状态
+要求重新选边。
 
 ## 开发计划
 

@@ -651,3 +651,46 @@ rather than a third screenshot.
 five controls at once. There is still no client-side reconnect for the server's 60 s idle socket timeout
 (carried over from round 57); with the new always-visible status bar it is at least now clearly reported.
 
+## 连接寿命缺陷 — bug round 61 (`master`)
+
+**Reported as:** "才下了几个子，显示连接断开". Rounds 57, 58 and 60 all recorded this as a *60 s idle
+socket timeout* and deliberately left it alone. That diagnosis was wrong, and the wrong label is exactly
+why it survived three rounds: an idle timeout sounds like intended behaviour, a lifetime cap is a bug.
+
+**The connection had a fixed 60-second life from the moment it opened.** `WebSocketSession::start()` set
+`ws_.next_layer().expires_after(60s)` once, before the HTTP read. Beast's `tcp_stream` expiry is a single
+absolute deadline that every later async operation on that stream is checked against — it is not an idle
+timer and nothing re-armed it. So 60 s after the page connected, the next `async_read` (the player's next
+click) aborted with "The socket was closed due to a timeout" and the session was dropped, no matter how
+active the game had been. `timeout::suggested(server)` on the websocket layer only governs control
+frames, and the client never sent any, so it never interfered. Measured before changing anything: a
+session pinging every 10 s survived six round trips and died at **t = 60.0 s**, while the server process
+stayed up (so: session dropped, not a crash).
+
+**Fix: re-arm on traffic, and name the window.** `arm_idle()` is called at the top of both `do_read()` and
+`do_write()`, so liveness in either direction slides the deadline forward; the value is now
+`kIdleTimeoutSeconds = 120`. Both calls run on the one io thread that owns the stream (writes are posted
+to `ws_.get_executor()` and `ioc_.run()` is single-threaded), so this adds no synchronisation. A silent
+session is still reaped, which is the only thing the deadline was ever for.
+
+**`ping` → `pong`.** A player thinking over the board sends nothing for minutes, which a 120 s idle window
+would otherwise punish, so the server answers a `ping` with a `pong` and the browser sends one every 30 s.
+The reply is not needed to keep the socket alive — receiving anything already re-arms it — but it gives the
+client something to notice if the peer goes half-open. Unknown types used to answer
+`Unknown message type`, so a keepalive needed a real branch rather than a fallthrough.
+
+**Client reconnect.** Backoff 1, 2, 4 … capped at 15 s, with the attempt count and the wait shown in
+amber; while down, `sendMessage` reports "消息未发出" instead of dropping the click silently. A successful
+reconnect is a **new server session** — the game, the replay record and the 摆棋 pending flag all lived in
+the old one — so `resyncAfterReconnect()` clears the local board to what the server actually has, re-sends
+`set_config`, and asks for a side choice in green. Making a game outlive its socket would mean moving
+session state off the connection, which is a design change and not part of this fix.
+
+**Verified.** Active-session probe: alive through 150 s of traffic (was 60 s). Silent probe: reaped at
+exactly **t = 120.0 s**, so the reaper still works. `ping` → `pong` plus "session still alive after ping"
+are now two of the 30 socket-harness checks; `ctest` 6/6. In the browser: killed the server mid-game → the
+page counted up to "4 秒后重连（第 3 次）" in amber → restarted it → the page recovered with no refresh,
+board cleared, green "连接已恢复…请重新选边", and a fresh 执黑 + click on I7 was answered by the AI at H8
+with a real score. (The first probe run had no `sleep`, so it accidentally pushed 554,038 ping/pong round
+trips through the loop socket in 150 s; kept as a throughput data point, cadence fixed afterwards.)
+

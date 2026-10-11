@@ -61,6 +61,14 @@ class GomokuGame {
     }
     
     initWebSocket() {
+        this.wsAttempts = 0;
+        this.wsReconnect = null;
+        this.wsPing = null;
+        this.everConnected = false;
+        this.openSocket();
+    }
+
+    openSocket() {
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         const wsUrl = `${protocol}//${window.location.host}`;
         
@@ -68,23 +76,67 @@ class GomokuGame {
         
         this.ws.onopen = () => {
             console.log('Connected to server');
-            this.updateStatus('已连接，请选择执子颜色');
+            const reconnected = this.everConnected;
+            this.everConnected = true;
+            this.wsAttempts = 0;
+            this.startPing();
+            if (reconnected) {
+                this.resyncAfterReconnect();
+            } else {
+                this.updateStatus('已连接，请选择执子颜色', 'idle');
+            }
         };
         
         this.ws.onclose = () => {
             console.log('Disconnected from server');
-            this.updateStatus('连接断开，请刷新页面重连', 'error');
+            this.stopPing();
+            this.scheduleReconnect();
         };
         
         this.ws.onerror = (error) => {
+            // onclose always follows an error, and that is where the retry lives.
             console.error('WebSocket error:', error);
-            this.updateStatus('连接错误', 'error');
         };
         
         this.ws.onmessage = (event) => {
             const msg = JSON.parse(event.data);
             this.handleServerMessage(msg);
         };
+    }
+
+    // The server reaps a session that has been silent in both directions for two
+    // minutes, and a player thinking over the board sends nothing at all in that
+    // time, so the page keeps the socket warm rather than asking for a longer window.
+    startPing() {
+        this.stopPing();
+        this.wsPing = setInterval(() => this.sendMessage({ type: 'ping' }), 30000);
+    }
+
+    stopPing() {
+        if (this.wsPing) {
+            clearInterval(this.wsPing);
+            this.wsPing = null;
+        }
+    }
+
+    scheduleReconnect() {
+        if (this.wsReconnect) return;
+        const wait = Math.min(15000, 1000 * 2 ** this.wsAttempts);
+        this.wsAttempts += 1;
+        this.updateStatus(`连接断开，${Math.round(wait / 1000)} 秒后重连（第 ${this.wsAttempts} 次）`, 'warn');
+        this.wsReconnect = setTimeout(() => {
+            this.wsReconnect = null;
+            this.openSocket();
+        }, wait);
+    }
+
+    // A new socket is a new server session: the game it held is gone, so the
+    // local board cannot be trusted either. Resync by clearing to what the server
+    // really has (nothing) and re-applying the player's settings.
+    resyncAfterReconnect() {
+        this.resetGame();
+        this.sendConfig();
+        this.updateStatus('连接已恢复，服务器会话已重建：请重新选边', 'ok');
     }
     
     initUI() {
@@ -892,6 +944,10 @@ class GomokuGame {
     sendMessage(msg) {
         if (this.ws && this.ws.readyState === WebSocket.OPEN) {
             this.ws.send(JSON.stringify(msg));
+        } else if (msg.type !== 'ping') {
+            // Say it out loud: a click that quietly vanished reads as the AI
+            // ignoring the player.
+            this.updateStatus('连接已断开，正在重连：消息未发出', 'warn');
         }
     }
     

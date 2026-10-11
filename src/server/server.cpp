@@ -57,6 +57,12 @@ bool read_position_payload(const json& msg, json& doc, std::string& error) {
 const char* side_name(int color) {
     return color == BLACK ? "black" : "white";
 }
+
+// How long a session may stay silent in both directions before it is reaped. The
+// browser pings well inside this window, so it only fires for a peer that is
+// really gone; a player thinking over the board is covered by that ping rather
+// than by widening this value.
+constexpr int kIdleTimeoutSeconds = 120;
 }
 
 WebSocketSession::WebSocketSession(tcp::socket&& socket, const std::string& web_dir)
@@ -69,12 +75,19 @@ void WebSocketSession::start() {
     // WebSocket on the same origin. Read the HTTP request headers before
     // deciding which path to take; the WebSocket handshake reuses the request
     // we just parsed, so nothing is consumed twice.
-    ws_.next_layer().expires_after(std::chrono::seconds(60));
+    ws_.next_layer().expires_after(std::chrono::seconds(kIdleTimeoutSeconds));
     http::async_read(
         ws_.next_layer(), buffer_, req_,
         [self = shared_from_this()](beast::error_code ec, std::size_t bytes) {
             self->on_http_read(ec, bytes);
         });
+}
+
+// Re-arm rather than replace: the expiry set once at accept would cap how long a
+// connection may live, not how long it may be silent, and every session would
+// drop 60 s after the page loaded no matter how busy the game was.
+void WebSocketSession::arm_idle() {
+    ws_.next_layer().expires_after(std::chrono::seconds(kIdleTimeoutSeconds));
 }
 
 void WebSocketSession::on_http_read(beast::error_code ec, std::size_t) {
@@ -125,6 +138,7 @@ void WebSocketSession::run_websocket() {
 }
 
 void WebSocketSession::do_read() {
+    arm_idle();
     ws_.async_read(
         buffer_,
         [self = shared_from_this()](beast::error_code ec, std::size_t bytes_transferred) {
@@ -178,6 +192,10 @@ void WebSocketSession::do_write() {
     if (send_queue_.empty()) {
         return;
     }
+    // Traffic in either direction counts as liveness: an AI search that takes
+    // tens of seconds leaves the client silent, and the server's own progress
+    // messages should not be the thing that gets the session reaped.
+    arm_idle();
 
     ws_.async_write(
         net::buffer(send_queue_.front()),
@@ -432,6 +450,13 @@ void GameServer::handle_message(std::shared_ptr<WebSocketSession> session, const
         handle_stop_thinking(session);
     } else if (type == "set_config") {
         handle_set_config(session, msg);
+    } else if (type == "ping") {
+        // Keepalive. Receiving anything already slid the session's idle deadline
+        // forward, so the reply exists only to let the client tell a live socket
+        // from one whose peer has quietly gone.
+        json reply;
+        reply["type"] = "pong";
+        send_message(session, reply);
     } else if (type == "restart") {
         handle_restart(session);
     } else {
