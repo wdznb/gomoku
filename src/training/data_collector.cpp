@@ -1,0 +1,262 @@
+#include "data_collector.h"
+#include "../core/pattern.h"
+#include "transforms.h"
+#include <nlohmann/json.hpp>
+#include <fstream>
+#include <set>
+#include <sstream>
+#include <algorithm>
+
+using json = nlohmann::json;
+
+namespace gomoku {
+
+namespace {
+
+float centre_control(const Board& board, int color) {
+    const int middle = BOARD_SIZE / 2;
+    long long total = 0;
+    int stones = 0;
+    for (int r = 0; r < BOARD_SIZE; ++r) {
+        for (int c = 0; c < BOARD_SIZE; ++c) {
+            if (board.get(r, c) != color) continue;
+            stones++;
+            const int distance = std::max(std::abs(r - middle), std::abs(c - middle));
+            total += middle - distance;
+        }
+    }
+    if (stones == 0) return 0.0f;
+    return static_cast<float>(total) / static_cast<float>(middle * stones);
+}
+
+}
+
+std::vector<float> DataCollector::extract_features(const Board& board, int side_to_move) const {
+    std::vector<float> features(FEATURE_COUNT, 0.0f);
+    const int opp_color = opponent(side_to_move);
+
+    int my_shapes[PATTERN_SLOTS] = {0};
+    int opp_shapes[PATTERN_SLOTS] = {0};
+
+    const auto& actives = board.active_empty();
+    for (const auto& pos : actives) {
+        if (!board.is_empty(pos)) continue;
+
+        const PositionPattern mine =
+            PatternRecognizer::recognize_position(board, pos.row, pos.col, side_to_move);
+        const PositionPattern theirs =
+            PatternRecognizer::recognize_position(board, pos.row, pos.col, opp_color);
+
+        for (int d = 0; d < 4; ++d) {
+            const int my_type = static_cast<int>(mine.directions[d].type);
+            if (my_type >= 1 && my_type <= PATTERN_SLOTS) my_shapes[my_type - 1]++;
+            const int their_type = static_cast<int>(theirs.directions[d].type);
+            if (their_type >= 1 && their_type <= PATTERN_SLOTS) opp_shapes[their_type - 1]++;
+        }
+
+        for (int d = 0; d < 4; ++d) {
+            if (mine.directions[d].type == PatternType::FIVE) features[FEATURE_MY_FIVE] = 1.0f;
+            if (theirs.directions[d].type == PatternType::FIVE) features[FEATURE_OPP_FIVE] = 1.0f;
+        }
+    }
+
+    const float scale = 1.0f / static_cast<float>(std::max<size_t>(1, actives.size()));
+    for (int i = 0; i < PATTERN_SLOTS; ++i) {
+        features[i] = static_cast<float>(my_shapes[i]) * scale;
+        features[PATTERN_SLOTS + i] = static_cast<float>(opp_shapes[i]) * scale;
+    }
+
+    int my_stones = 0;
+    int opp_stones = 0;
+    for (int r = 0; r < BOARD_SIZE; ++r) {
+        for (int c = 0; c < BOARD_SIZE; ++c) {
+            const int cell = board.get(r, c);
+            if (cell == side_to_move) my_stones++;
+            else if (cell == opp_color) opp_stones++;
+        }
+    }
+    features[FEATURE_MY_STONES] = static_cast<float>(my_stones) / 20.0f;
+    features[FEATURE_OPP_STONES] = static_cast<float>(opp_stones) / 20.0f;
+    features[FEATURE_MY_CENTRE] = centre_control(board, side_to_move);
+    features[FEATURE_OPP_CENTRE] = centre_control(board, opp_color);
+    features[FEATURE_ACTIVE] = static_cast<float>(actives.size()) / 40.0f;
+    features[FEATURE_PLY] = static_cast<float>(board.move_count()) / 40.0f;
+    features[FEATURE_SIDE] = side_to_move == BLACK ? 1.0f : 0.0f;
+
+    if (board.move_count() > 0) {
+        const Move last = board.last_move();
+        features[FEATURE_LAST_ROW] = static_cast<float>(last.pos.row - BOARD_SIZE / 2) / 7.0f;
+        features[FEATURE_LAST_COL] = static_cast<float>(last.pos.col - BOARD_SIZE / 2) / 7.0f;
+
+        for (int dr = -2; dr <= 2; ++dr) {
+            for (int dc = -2; dc <= 2; ++dc) {
+                const int row = last.pos.row + dr;
+                const int col = last.pos.col + dc;
+                float value = 0.0f;
+                if (board.is_valid(row, col)) {
+                    const int cell = board.get(row, col);
+                    if (cell == BLACK) value = 1.0f;
+                    else if (cell == WHITE) value = -1.0f;
+                }
+                features[FEATURE_WINDOW + (dr + 2) * 5 + (dc + 2)] = value;
+            }
+        }
+    }
+
+    return features;
+}
+
+std::vector<TrainingSample> DataCollector::collect(const GameRecord& record, int game_id,
+                                                   bool with_augmentation) const {
+    std::vector<TrainingSample> samples;
+    if (record.reason == GameEndReason::INVALID) return samples;
+
+    Board board;
+    for (size_t i = 0; i < record.moves.size(); ++i) {
+        const MoveRecord& entry = record.moves[i];
+        const int side = entry.move.color;
+
+        const bool engine_chose = entry.method != "replay" && entry.method != "forced" &&
+                                  entry.method != "default" && entry.move.pos.is_valid();
+        if (engine_chose && entry.depth >= min_search_depth_) {
+            const float value = record.outcome_for(side);
+            if (value != 0.0f || keep_undecided_) {
+                std::set<std::pair<uint64_t, int>> seen;
+                const int variants = with_augmentation ? SYMMETRY_COUNT : 1;
+                for (int variant = 0; variant < variants; ++variant) {
+                    const Board oriented = variant == 0 ? board : transform_board(board, variant);
+                    const Move oriented_move(transform_position(entry.move.pos, variant), side);
+                    if (!seen.insert({oriented.zobrist_hash(), oriented_move.pos.to_index()}).second) {
+                        continue;
+                    }
+
+                    TrainingSample sample;
+                    sample.features = extract_features(oriented, side);
+                    sample.value = value;
+                    sample.move = oriented_move;
+                    sample.search_score = entry.score;
+                    sample.search_depth = entry.depth;
+                    sample.nodes = entry.nodes;
+                    sample.weight = 1.0f;
+                    sample.game_id = game_id;
+                    sample.move_index = static_cast<int>(i);
+                    samples.push_back(sample);
+                }
+            }
+        }
+
+        board.place_stone(entry.move.pos, side);
+    }
+
+    return samples;
+}
+
+std::string TrainingSample::to_json() const {
+    json root;
+    root["features"] = features;
+    root["value"] = value;
+    root["move"] = {{ "row", move.pos.row }, { "col", move.pos.col },
+                    { "color", move.color == BLACK ? "black" : "white" }};
+    root["search_score"] = search_score;
+    root["search_depth"] = search_depth;
+    root["nodes"] = nodes;
+    root["weight"] = weight;
+    root["game_id"] = game_id;
+    root["move_index"] = move_index;
+    return root.dump();
+}
+
+bool TrainingSample::from_json(const std::string& text, TrainingSample& out, std::string& error) {
+    json root;
+    try {
+        root = json::parse(text);
+    } catch (const json::exception& e) {
+        error = std::string("invalid sample JSON: ") + e.what();
+        return false;
+    }
+    if (!root.is_object() || !root.contains("features") || !root["features"].is_array()) {
+        error = "sample needs a features array";
+        return false;
+    }
+
+    TrainingSample sample;
+    for (const auto& value : root["features"]) {
+        if (!value.is_number()) {
+            error = "sample features must be numbers";
+            return false;
+        }
+        sample.features.push_back(value.get<float>());
+    }
+    if (root.contains("value") && root["value"].is_number()) sample.value = root["value"].get<float>();
+    if (root.contains("search_score") && root["search_score"].is_number_integer()) {
+        sample.search_score = root["search_score"].get<int>();
+    }
+    if (root.contains("search_depth") && root["search_depth"].is_number_integer()) {
+        sample.search_depth = root["search_depth"].get<int>();
+    }
+    if (root.contains("nodes") && root["nodes"].is_number_integer()) sample.nodes = root["nodes"].get<int>();
+    if (root.contains("weight") && root["weight"].is_number()) sample.weight = root["weight"].get<float>();
+    if (root.contains("game_id") && root["game_id"].is_number_integer()) sample.game_id = root["game_id"].get<int>();
+    if (root.contains("move_index") && root["move_index"].is_number_integer()) {
+        sample.move_index = root["move_index"].get<int>();
+    }
+    if (root.contains("move") && root["move"].is_object()) {
+        const json& move = root["move"];
+        // Validated rather than defaulted: a file with a malformed move would
+        // otherwise silently hand back a sample whose move belongs to the wrong
+        // colour.
+        if (!move.contains("row") || !move["row"].is_number_integer() ||
+            !move.contains("col") || !move["col"].is_number_integer() ||
+            !move.contains("color") || !move["color"].is_string()) {
+            error = "sample move needs integer row/col and a color string";
+            return false;
+        }
+        sample.move = Move(move["row"].get<int>(), move["col"].get<int>(),
+                           move["color"].get<std::string>() == "black" ? BLACK : WHITE);
+    }
+
+    out = sample;
+    return true;
+}
+
+bool DataCollector::write_jsonl(const std::vector<TrainingSample>& samples,
+                                const std::string& path, std::string& error) const {
+    std::ofstream file(path, std::ios::app);
+    if (!file.is_open()) {
+        error = "cannot append to " + path;
+        return false;
+    }
+    for (const auto& sample : samples) {
+        file << sample.to_json() << "\n";
+    }
+    if (!file.good()) {
+        error = "failed while writing " + path;
+        return false;
+    }
+    return true;
+}
+
+bool DataCollector::read_jsonl(const std::string& path, std::vector<TrainingSample>& out,
+                               std::string& error) {
+    std::ifstream file(path);
+    if (!file.is_open()) {
+        error = "cannot open " + path;
+        return false;
+    }
+
+    std::string line;
+    int line_number = 0;
+    while (std::getline(file, line)) {
+        line_number++;
+        if (line.empty()) continue;
+        TrainingSample sample;
+        if (!TrainingSample::from_json(line, sample, error)) {
+            error += " on line " + std::to_string(line_number);
+            return false;
+        }
+        out.push_back(sample);
+    }
+    return true;
+}
+
+}

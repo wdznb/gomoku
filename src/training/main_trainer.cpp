@@ -1,0 +1,273 @@
+#include "trainer.h"
+#include "params.h"
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+namespace {
+
+using namespace gomoku;
+
+void print_usage(const char* program) {
+    std::cout
+        << "Usage: " << program << " [options]\n"
+        << "\n"
+        << "Self-play training for the threat coefficients used by the engine.\n"
+        "Each round optimises a candidate set, plays it against the current\n"
+        "champion over the table with the colours swapped, promotes it only if it\n"
+        "clears --accept-score, and writes a checkpoint so the run can resume.\n"
+        "\n"
+        "  --method genetic|hill       Optimiser used inside every round (genetic)\n"
+        "  --rounds N                  Rounds to run (3). With --resume these are\n"
+        "                              additional rounds on top of the checkpoint.\n"
+        "  --population N              Genetic population size (8)\n"
+        "  --generations N             Genetic generations per round (4)\n"
+        "  --stagnation N              Generations without improvement before a\n"
+        "                              round's optimiser stops (3)\n"
+        "  --hill-iterations N         Hill-climbing evaluations per round (12)\n"
+        "  --depth N                   Search depth during training games (4)\n"
+        "  --timeout-ms N              Per-move thinking budget in ms (400)\n"
+        "  --max-moves N               Ply cap for a training game (60)\n"
+        "  --fitness-games N           Games used to score one candidate (2)\n"
+        "  --verification-games N      Games a candidate must beat the champion\n"
+        "                              over before promotion (8)\n"
+        "  --accept-score X            Promotion threshold, 0.5-1.0 (0.56)\n"
+        "  --data-games N              Self-play games kept as training data (4)\n"
+        "  --threads N                 Parallel data-collection workers (2)\n"
+        "  --no-data                   Collect no self-play data (search only)\n"
+        "  --no-resign                 Never resign during training games\n"
+        "  --seed N                    RNG seed (20261011)\n"
+        "  --params PATH               Starting coefficients (built-in defaults)\n"
+        "  --out PATH                  Where the champion is written\n"
+        "                              (data/training/best_params.json)\n"
+        "  --records PATH              Append played games as JSONL\n"
+        "  --samples PATH              Append training samples as JSONL\n"
+        "  --checkpoint PATH           Round-by-round resume state\n"
+        "                              (data/training/checkpoint.json)\n"
+        "  --resume PATH               Continue from this checkpoint\n"
+        "  --quiet                     Only print the final result\n"
+        "  --help                      Show this text\n";
+}
+
+std::string require_value(const char* flag, int& index, int argc, char** argv) {
+    if (index + 1 >= argc) {
+        throw std::invalid_argument(std::string("missing value for ") + flag);
+    }
+    return argv[++index];
+}
+
+int require_int(const char* flag, int& index, int argc, char** argv) {
+    const std::string text = require_value(flag, index, argc, argv);
+    size_t used = 0;
+    const int value = std::stoi(text, &used);
+    if (used != text.size()) {
+        throw std::invalid_argument(std::string("invalid integer for ") + flag + ": " + text);
+    }
+    return value;
+}
+
+double require_double(const char* flag, int& index, int argc, char** argv) {
+    const std::string text = require_value(flag, index, argc, argv);
+    size_t used = 0;
+    const double value = std::stod(text, &used);
+    if (used != text.size()) {
+        throw std::invalid_argument(std::string("invalid number for ") + flag + ": " + text);
+    }
+    return value;
+}
+
+uint64_t require_seed(const char* flag, int& index, int argc, char** argv) {
+    const std::string text = require_value(flag, index, argc, argv);
+    size_t used = 0;
+    const unsigned long long value = std::stoull(text, &used);
+    if (used != text.size()) {
+        throw std::invalid_argument(std::string("invalid seed for ") + flag + ": " + text);
+    }
+    return static_cast<uint64_t>(value);
+}
+
+// A training run writes several artefacts, and the default paths live in a
+// directory that only exists after a build. Creating it here keeps a bare
+// `./gomoku_train` from failing on the first promotion.
+void ensure_parent_directory(const std::string& path) {
+    if (path.empty()) return;
+    const std::filesystem::path parent = std::filesystem::path(path).parent_path();
+    if (parent.empty()) return;
+    std::error_code ec;
+    std::filesystem::create_directories(parent, ec);
+}
+
+void print_coefficients(const ThreatCoefficients& coeffs) {
+    std::cout << "champion coefficients:\n"
+              << "  live_four        = " << coeffs.live_four << "\n"
+              << "  rush_four        = " << coeffs.rush_four << "\n"
+              << "  live_three       = " << coeffs.live_three << "\n"
+              << "  sleepy_three     = " << coeffs.sleepy_three << "\n"
+              << "  live_two         = " << coeffs.live_two << "\n"
+              << "  sleepy_two       = " << coeffs.sleepy_two << "\n"
+              << "  double_four      = " << coeffs.double_four << "\n"
+              << "  double_three     = " << coeffs.double_three << "\n"
+              << "  four_three       = " << coeffs.four_three << "\n"
+              << "  position_scale   = " << coeffs.position_weight_scale << "\n"
+              << "  five             = " << coeffs.five << " (never tuned)\n";
+}
+
+}
+
+int main(int argc, char** argv) {
+    TrainingConfig config;
+    std::string base_params;
+    std::string resume_path;
+    // Both defaults live under data/training/, which .gitignore already excludes:
+    // a training run should never dirty the repository.
+    std::string out_path = "data/training/best_params.json";
+    std::string checkpoint_path = "data/training/checkpoint.json";
+    bool quiet = false;
+
+    try {
+        for (int i = 1; i < argc; ++i) {
+            const std::string flag = argv[i];
+            if (flag == "--help" || flag == "-h") {
+                print_usage(argv[0]);
+                return 0;
+            } else if (flag == "--method") {
+                const std::string method = require_value("--method", i, argc, argv);
+                if (method == "genetic") {
+                    config.optimizer = OptimizerKind::GENETIC;
+                } else if (method == "hill" || method == "hill-climbing") {
+                    config.optimizer = OptimizerKind::HILL_CLIMBING;
+                } else {
+                    throw std::invalid_argument("unknown --method " + method +
+                                                " (use genetic or hill)");
+                }
+            } else if (flag == "--rounds") {
+                config.rounds = require_int("--rounds", i, argc, argv);
+            } else if (flag == "--population") {
+                config.population_size = require_int("--population", i, argc, argv);
+            } else if (flag == "--generations") {
+                config.generations = require_int("--generations", i, argc, argv);
+            } else if (flag == "--stagnation") {
+                config.stagnation_generations = require_int("--stagnation", i, argc, argv);
+            } else if (flag == "--hill-iterations") {
+                config.hill_climbing_iterations = require_int("--hill-iterations", i, argc, argv);
+            } else if (flag == "--depth") {
+                config.search_depth = require_int("--depth", i, argc, argv);
+            } else if (flag == "--timeout-ms") {
+                config.timeout_ms = require_int("--timeout-ms", i, argc, argv);
+            } else if (flag == "--max-moves") {
+                config.max_moves = require_int("--max-moves", i, argc, argv);
+            } else if (flag == "--fitness-games") {
+                config.fitness_games = require_int("--fitness-games", i, argc, argv);
+            } else if (flag == "--verification-games") {
+                config.verification_games = require_int("--verification-games", i, argc, argv);
+            } else if (flag == "--accept-score") {
+                config.accept_score = require_double("--accept-score", i, argc, argv);
+            } else if (flag == "--data-games") {
+                config.data_games = require_int("--data-games", i, argc, argv);
+            } else if (flag == "--threads") {
+                config.data_threads = require_int("--threads", i, argc, argv);
+            } else if (flag == "--no-data") {
+                config.collect_data = false;
+            } else if (flag == "--no-resign") {
+                config.resign_enabled = false;
+            } else if (flag == "--seed") {
+                config.seed = require_seed("--seed", i, argc, argv);
+            } else if (flag == "--params") {
+                base_params = require_value("--params", i, argc, argv);
+            } else if (flag == "--out") {
+                out_path = require_value("--out", i, argc, argv);
+            } else if (flag == "--records") {
+                config.records_path = require_value("--records", i, argc, argv);
+            } else if (flag == "--samples") {
+                config.samples_path = require_value("--samples", i, argc, argv);
+            } else if (flag == "--checkpoint") {
+                checkpoint_path = require_value("--checkpoint", i, argc, argv);
+            } else if (flag == "--resume") {
+                resume_path = require_value("--resume", i, argc, argv);
+            } else if (flag == "--quiet") {
+                quiet = true;
+            } else {
+                throw std::invalid_argument("unknown option " + flag);
+            }
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << "\nTry --help for the option list.\n";
+        return 1;
+    }
+
+    if (config.rounds <= 0) {
+        std::cerr << "Error: --rounds must be at least 1" << std::endl;
+        return 1;
+    }
+    // 0.5 is a draw score, so anything at or below it would promote a candidate
+    // that merely survived.
+    if (config.accept_score < 0.5 || config.accept_score > 1.0) {
+        std::cerr << "Error: --accept-score must be between 0.5 and 1.0" << std::endl;
+        return 1;
+    }
+    if (config.search_depth < 1 || config.timeout_ms < 1 || config.max_moves < 2) {
+        std::cerr << "Error: --depth, --timeout-ms and --max-moves must be positive"
+                  << " (--max-moves at least 2)" << std::endl;
+        return 1;
+    }
+
+    config.params_path = out_path;
+    config.checkpoint_path = checkpoint_path;
+
+    ThreatCoefficients base;
+    if (!base_params.empty()) {
+        std::string error;
+        if (!CoefficientVector::load(base_params, base, error)) {
+            std::cerr << "Error: cannot use --params " << base_params << ": " << error << std::endl;
+            return 1;
+        }
+        if (!quiet) std::cout << "Starting from " << base_params << std::endl;
+    }
+
+    Trainer trainer(base, config);
+    if (!resume_path.empty()) {
+        std::string error;
+        if (!trainer.load_checkpoint(resume_path, error)) {
+            std::cerr << "Error: cannot resume from " << resume_path << ": " << error << std::endl;
+            return 1;
+        }
+        if (!quiet) {
+            std::cout << "Resumed " << resume_path << " (" << trainer.status_text() << ")"
+                      << std::endl;
+        }
+    }
+    if (!quiet) trainer.set_log_callback([](const std::string& line) {
+        std::cout << line << std::endl;
+    });
+
+    for (const auto& path : {out_path, checkpoint_path, config.records_path, config.samples_path})
+        ensure_parent_directory(path);
+
+    std::vector<TrainerRound> history = trainer.run(config.rounds);
+
+    std::string error;
+    if (!CoefficientVector::save(out_path, trainer.champion(), error)) {
+        std::cerr << "Error: cannot write champion parameters: " << error << std::endl;
+        return 1;
+    }
+
+    std::cout << "\nTraining finished: " << trainer.status_text() << "\n";
+    for (const auto& round : history) {
+        std::cout << "  round " << round.round << ": score " << round.verification_score
+                  << " -> " << (round.accepted ? "promoted" : "rejected") << "\n";
+    }
+
+    std::cout << "\nRatings:\n";
+    for (const auto& player : trainer.ratings().standings()) {
+        std::cout << "  " << player.name << "  " << player.elo << "  (" << player.wins << "-"
+                  << player.losses << "-" << player.draws << ")\n";
+    }
+
+    print_coefficients(trainer.champion());
+    std::cout << "\nChampion written to " << out_path << std::endl;
+    std::cout << "Start the server with: ./gomoku_server --params " << out_path << std::endl;
+    return 0;
+}

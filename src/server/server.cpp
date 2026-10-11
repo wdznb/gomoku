@@ -257,9 +257,14 @@ void WebSocketSession::send_http_response() {
 }
 
 GameServer::GameServer(int port, const std::string& web_dir,
-                       const std::string& book_path)
+                       const std::string& book_path,
+                       const ThreatCoefficients* coefficients)
     : ioc_(), acceptor_(net::make_strand(ioc_)),
       signals_(ioc_, SIGINT, SIGTERM), web_dir_(web_dir) {
+    if (coefficients) {
+        coefficients_ = *coefficients;
+        use_loaded_coefficients_ = true;
+    }
     std::string error;
     if (book_path.empty()) {
         std::cout << "Opening book disabled" << std::endl;
@@ -339,6 +344,7 @@ void GameServer::on_connect(std::shared_ptr<WebSocketSession> session) {
 
 void GameServer::on_open(std::shared_ptr<WebSocketSession> session) {
     auto game = std::make_shared<GameManager>();
+    if (use_loaded_coefficients_) game->set_coefficients(coefficients_);
     game->set_opening_book(&book_);
     {
         std::lock_guard<std::mutex> lock(games_mutex_);

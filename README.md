@@ -4,7 +4,7 @@
 
 ## 特性
 
-### 阶段1（当前）
+### 阶段1
 - ✅ 15x15 棋盘，支持标准五子棋规则
 - ✅ 棋型识别（活四、冲四、活三、眠三等）
 - ✅ 组合棋型检测（四四、四三、三三）
@@ -14,15 +14,26 @@
 - ✅ 纯前端 Canvas 棋盘渲染
 - ✅ 可配置威胁系数
 
+### 阶段2
+- ✅ VCF / VCT 威胁空间搜索
+- ✅ AlphaBeta + 迭代加深 + quiescence（fail-soft）
+- ✅ 置换表（Zobrist 哈希 + 代龄老化）
+- ✅ 开局库（8 对称匹配 + 加权随机）
+- ✅ 强制失败证明（loss proof）与 AI 自动认输
+- ✅ 异步控制（AI 独立线程思考 + 多会话并发 + 超时中断）
+
+### 阶段3
+- ✅ 对局记录系统（JSON / JSONL）
+- ✅ 自我对弈 + 悔棋再战（RetryExplorer，对称类去重）
+- ✅ 训练数据收集（52 维特征 + 8 方向增强）
+- ✅ 遗传算法 + 爬山法参数优化
+- ✅ Elo 评分（自适应 K）
+- ✅ 训练主循环 + 断点续训（checkpoint / resume）
+- ✅ 训练参数落地：`gomoku_server --params`
+
 ### 计划功能
-- ✅ VCF/VCT 威胁空间搜索
-- ✅ AlphaBeta + Minimax 剪枝（迭代加深 + 静态/quiescence 搜索）
-- ✅ 置换表（Zobrist哈希，含代龄老化）
-- ✅ 开局库（对称匹配 + 加权随机）
-- ✅ 强制失败证明 + 自动认输
-- ✅ 异步控制（AI 独立线程思考 + 多会话并发；非并行搜索）
-- ⏳ 自我训练系统
-- ⏳ 参数优化（遗传算法）
+- ⏳ 位棋盘（bitboard）加速
+- ⏳ 前端增强与对局回放分析
 
 ## 系统要求
 
@@ -112,6 +123,60 @@ cd build
 ./gomoku_server --web-dir /path/to/web
 ```
 
+### 开局库
+
+```bash
+./gomoku_server --book /path/to/opening_book.json   # 指定开局库文件
+./gomoku_server --no-book                          # 完全禁用开局库
+```
+
+### 使用训练出的参数
+
+```bash
+./gomoku_server --params data/training/best_params.json
+```
+
+参数文件加载失败（文件缺失、字段类型错误、`five` 超过 100000 将杀阈值）时服务器**直接退出**而不是退回默认值：正在被替换的正是棋力本身，静默忽略会让人误以为训练生效了。
+
+## 自我训练（阶段3）
+
+训练器 `gomoku_train` 用自我对弈评估威胁系数，每轮的流程是：
+
+1. 用遗传算法或爬山法在系数空间中搜索一个候选参数集；
+2. 让候选与当前冠军对战（每对组合执黑白各一次），得到验证分；
+3. 验证分 ≥ `--accept-score`（默认 0.56）才晋升为新冠军，并写入 `--out`；
+4. 生成若干盘自我对弈作为训练数据（对局记录 + 特征样本，JSONL 追加）；
+5. 保存 checkpoint，中断后可 `--resume` 继续。
+
+```bash
+cd build
+./gomoku_train --rounds 20 --method genetic --population 8
+```
+
+常用选项（完整列表见 `--help`）：
+
+| 选项 | 默认值 | 说明 |
+| --- | --- | --- |
+| `--method` | `genetic` | `genetic` 或 `hill`（爬山法） |
+| `--rounds` | 3 | 训练轮数；配合 `--resume` 表示**额外**轮数 |
+| `--depth` / `--timeout-ms` | 4 / 400 | 训练对局的搜索深度与单步思考预算 |
+| `--max-moves` | 60 | 单盘步数上限，未分胜负记为和 |
+| `--fitness-games` | 2 | 评估一个候选所用的对局数 |
+| `--verification-games` | 8 | 晋升前的验证对局数 |
+| `--accept-score` | 0.56 | 晋升门槛（必须 > 0.5，即仅靠“不输”不能晋升） |
+| `--data-games` / `--threads` | 4 / 2 | 每轮采集数据的自我对弈盘数与并发线程 |
+| `--no-data` | — | 只调参，不采集数据 |
+| `--no-resign` | — | 训练对局中禁止认输（认输会截断数据） |
+| `--params` | 内置默认 | 起始参数文件 |
+| `--out` | `data/training/best_params.json` | 冠军参数输出位置 |
+| `--records` / `--samples` | 空 | 对局记录 / 训练样本 JSONL |
+| `--checkpoint` | `data/training/checkpoint.json` | 断点文件 |
+| `--resume` | — | 从断点继续训练 |
+
+产物目录 `data/training/` 已被 `.gitignore` 忽略，训练不会污染仓库。
+
+训练期间开局库始终关闭：比赛要衡量的是系数的差别，而开局库会把双方都引到同一着记忆着法上，把这个差别掩盖掉。
+
 ## 使用
 
 1. 启动服务器后，在浏览器中打开 `http://localhost:8080`
@@ -139,20 +204,40 @@ gomoku/
 ├── src/
 │   ├── core/           # 核心模块
 │   │   ├── types.h         # 基础类型定义
-│   │   ├── board.h/cpp     # 棋盘管理
-│   │   ├── pattern.h/cpp   # 棋型识别
-│   │   └── evaluator.h/cpp # 评估函数
+│   │   ├── board.h/cpp     # 棋盘管理 + Zobrist 哈希
+│   │   ├── pattern.h/cpp   # 棋型识别 + 禁手判定
+│   │   └── evaluator.h/cpp # 评估函数与威胁系数
 │   ├── search/         # 搜索算法
-│   │   └── greedy.h/cpp    # 贪心搜索
+│   │   ├── greedy.h/cpp    # 贪心 / 强制着法
+│   │   ├── vcf.h/cpp       # VCF 搜索 + 失败证明（find_defense）
+│   │   ├── vct.h/cpp       # VCT 搜索
+│   │   ├── alphabeta.h/cpp # AlphaBeta + 迭代加深 + quiescence
+│   │   ├── search_engine.h/cpp # 分层调度
+│   │   └── controller.h/cpp    # 异步思考控制
+│   ├── optimization/   # 搜索加速
+│   │   ├── transposition.h/cpp # 置换表
+│   │   └── opening_book.h/cpp  # 开局库
+│   ├── training/       # 自我训练（阶段3）
+│   │   ├── params.h/cpp        # 可调系数向量、取值域与序列化
+│   │   ├── transforms.h/cpp    # D4 八对称与规范格去重
+│   │   ├── game_record.h/cpp   # 对局记录（3.1）
+│   │   ├── self_play.h/cpp     # 自我对弈 + 悔棋再战（3.2）
+│   │   ├── data_collector.h/cpp# 特征提取与样本采集（3.3）
+│   │   ├── genetic.h/cpp       # 遗传算法（3.4）
+│   │   ├── hill_climbing.h/cpp # 爬山法（3.4）
+│   │   ├── elo.h/cpp           # Elo 评分（3.5）
+│   │   ├── trainer.h/cpp       # 训练主循环 + checkpoint（3.6）
+│   │   └── main_trainer.cpp    # gomoku_train 命令行入口
 │   ├── server/         # 服务器
-│   │   ├── server.h/cpp    # WebSocket服务器
+│   │   ├── server.h/cpp    # WebSocket + HTTP 服务器
 │   │   ├── game_manager.h/cpp # 游戏管理
 │   │   └── protocol.h      # 消息协议
-│   └── main.cpp        # 入口
+│   └── main.cpp        # gomoku_server 入口
 ├── web/                # 前端文件
 │   ├── index.html
 │   ├── style.css
 │   └── app.js
+├── data/               # 开局库与训练产物（data/training/ 被忽略）
 ├── tests/              # 单元测试
 ├── CMakeLists.txt      # CMake配置
 ├── build.sh            # 构建脚本
@@ -172,6 +257,8 @@ ctest --output-on-failure
 ./test_board
 ./test_pattern
 ./test_evaluator
+./test_search
+./test_training
 ```
 
 ## WebSocket 消息协议
@@ -211,15 +298,21 @@ ctest --output-on-failure
 > 支持多会话并发与超时中断），并非同一着棋的并行搜索。
 
 ### 阶段3：自我训练
-- 对局记录系统
-- 悔棋再战机制
-- 训练数据收集
-- 遗传算法优化
-- Elo评分系统
+- ✅ 对局记录系统（3.1）
+- ✅ 自我对弈 + 悔棋再战（3.2）
+- ✅ 训练数据收集（3.3）
+- ✅ 遗传算法优化 + 爬山法（3.4）
+- ✅ Elo评分系统（3.5）
+- ✅ 训练主循环与断点续训（3.6）
+
+> 说明：训练对象是**威胁系数**，`five` 与 `forbidden_penalty` 不参与调参——前者是 AlphaBeta
+> 的将杀阈值（硬编码 100000）与静态评估上限的公共基准，后者是规则而非棋力。
+> “悔棋再战”从最靠近终局、且还有未尝试分支的那一步重新展开，配合 D4 对称类去重，
+> 使重复的镜像变化不占用探索预算。
 
 ### 阶段4：优化
 - 位棋盘优化
-- 对称去重
+- 对称去重（训练侧已在分支探索与样本增强中实现，搜索侧待做）
 - 前端增强
 - 对局回放分析
 

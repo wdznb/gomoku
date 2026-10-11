@@ -1,4 +1,5 @@
 #include "server/server.h"
+#include "training/params.h"
 #include <iostream>
 #include <string>
 
@@ -6,6 +7,7 @@ int main(int argc, char* argv[]) {
     int port = 8080;
     std::string web_dir = "web";
     std::string book_path = "data/opening_book.json";
+    std::string params_path;
 
     try {
         for (int i = 1; i < argc; ++i) {
@@ -18,6 +20,8 @@ int main(int argc, char* argv[]) {
                 book_path = argv[++i];
             } else if (arg == "--no-book") {
                 book_path.clear();
+            } else if (arg == "--params" && i + 1 < argc) {
+                params_path = argv[++i];
             }
         }
     } catch (const std::exception& e) {
@@ -33,11 +37,25 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    // Trained coefficients are optional; a missing or malformed file is fatal
+    // rather than silently ignored, because playing strength is exactly what the
+    // caller believes it is changing.
+    gomoku::ThreatCoefficients coefficients;
+    if (!params_path.empty()) {
+        std::string error;
+        if (!gomoku::CoefficientVector::load(params_path, coefficients, error)) {
+            std::cerr << "Cannot load --params " << params_path << ": " << error << std::endl;
+            return 1;
+        }
+        std::cout << "Parameters loaded: " << params_path << std::endl;
+    }
+
     // GameServer installs SIGINT/SIGTERM through Asio's signal_set inside
     // start(), so the io thread performs the shutdown. A raw std::signal
     // handler here would conflict with it and is not async-signal-safe.
     try {
-        gomoku::GameServer server(port, web_dir, book_path);
+        gomoku::GameServer server(port, web_dir, book_path,
+                                  params_path.empty() ? nullptr : &coefficients);
         server.start();
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;

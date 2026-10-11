@@ -20,8 +20,9 @@ endif()
 find_package(Boost REQUIRED)
 find_package(Threads REQUIRED)
 
-set(GOMOKU_SOURCES
-    src/main.cpp
+# Engine as a unit: everything below the server. Both the trainer and the test
+# targets build against this list, so a new core source is compiled everywhere.
+set(GOMOKU_CORE_SOURCES
     src/core/board.cpp
     src/core/pattern.cpp
     src/core/evaluator.cpp
@@ -33,6 +34,26 @@ set(GOMOKU_SOURCES
     src/search/controller.cpp
     src/optimization/transposition.cpp
     src/optimization/opening_book.cpp
+)
+
+set(GOMOKU_TRAINING_SOURCES
+    src/training/params.cpp
+    src/training/transforms.cpp
+    src/training/game_record.cpp
+    src/training/elo.cpp
+    src/training/self_play.cpp
+    src/training/data_collector.cpp
+    src/training/genetic.cpp
+    src/training/hill_climbing.cpp
+    src/training/trainer.cpp
+)
+
+set(GOMOKU_SOURCES
+    src/main.cpp
+    ${GOMOKU_CORE_SOURCES}
+    # Only the parameter file reader: the server plays with trained coefficients,
+    # it does not train them.
+    src/training/params.cpp
     src/server/server.cpp
     src/server/game_manager.cpp
 )
@@ -65,6 +86,35 @@ add_custom_command(TARGET gomoku_server POST_BUILD
     ${CMAKE_SOURCE_DIR}/web $<TARGET_FILE_DIR:gomoku_server>/web
     COMMAND ${CMAKE_COMMAND} -E copy_directory
     ${CMAKE_SOURCE_DIR}/data $<TARGET_FILE_DIR:gomoku_server>/data
+)
+
+# Phase 3 trainer: self-play, parameter optimisation and data collection. Needs
+# the engine but not the server, so it stays free of Boost.
+add_executable(gomoku_train
+    src/training/main_trainer.cpp
+    ${GOMOKU_CORE_SOURCES}
+    ${GOMOKU_TRAINING_SOURCES}
+)
+
+target_include_directories(gomoku_train PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(gomoku_train PRIVATE
+    Threads::Threads
+    nlohmann_json::nlohmann_json
+)
+
+if(UNIX)
+    target_link_libraries(gomoku_train PRIVATE pthread)
+endif()
+
+if(MSVC)
+    target_compile_options(gomoku_train PRIVATE /W4)
+else()
+    target_compile_options(gomoku_train PRIVATE -Wall -Wextra -O2 -Wno-template-body -Wno-template-id-cdtor)
+endif()
+
+add_custom_command(TARGET gomoku_train POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+    ${CMAKE_SOURCE_DIR}/data $<TARGET_FILE_DIR:gomoku_train>/data
 )
 
 enable_testing()
@@ -113,3 +163,19 @@ target_compile_definitions(test_search PRIVATE
     GOMOKU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 target_link_libraries(test_search PRIVATE Threads::Threads nlohmann_json::nlohmann_json)
 add_test(NAME test_search COMMAND test_search)
+
+add_executable(test_training
+    tests/test_training.cpp
+    ${GOMOKU_CORE_SOURCES}
+    ${GOMOKU_TRAINING_SOURCES}
+)
+target_include_directories(test_training PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_definitions(test_training PRIVATE
+    GOMOKU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+target_link_libraries(test_training PRIVATE Threads::Threads nlohmann_json::nlohmann_json)
+if(MSVC)
+    target_compile_options(test_training PRIVATE /W4)
+else()
+    target_compile_options(test_training PRIVATE -Wall -Wextra -Wno-template-body -Wno-template-id-cdtor)
+endif()
+add_test(NAME test_training COMMAND test_training)

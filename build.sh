@@ -82,6 +82,7 @@ else
         ../src/search/controller.cpp \
         ../src/optimization/transposition.cpp \
         ../src/optimization/opening_book.cpp \
+        ../src/training/params.cpp \
         ../src/server/server.cpp \
         ../src/server/game_manager.cpp \
         -o gomoku_server \
@@ -103,5 +104,10 @@ echo "To run the server:"
 echo "  cd build"
 echo "  ./gomoku_server"
 echo ""
+if [ "$USE_CMAKE" -eq 1 ]; then
+    echo "To train the threat coefficients (CMake build only):"
+    echo "  cd build && ./gomoku_train --help"
+    echo ""
+fi
 echo "Then open http://localhost:8080 in your browser"
 echo ""

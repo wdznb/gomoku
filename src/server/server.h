@@ -64,8 +64,11 @@ private:
 
 class GameServer {
 public:
+    // `coefficients`, when non-null, replaces the built-in threat values for every
+    // game. Only read during construction, so a temporary from main() is safe.
     GameServer(int port = 8080, const std::string& web_dir = "web",
-               const std::string& book_path = "data/opening_book.json");
+               const std::string& book_path = "data/opening_book.json",
+               const ThreatCoefficients* coefficients = nullptr);
 
     void start();
     void stop();
@@ -76,6 +79,10 @@ private:
     net::signal_set signals_;
     std::string web_dir_;
     OpeningBook book_;
+    // Trained coefficients from --params. Applied to every new game because each
+    // GameManager owns its own engine; the file is read once here, never again.
+    ThreatCoefficients coefficients_;
+    bool use_loaded_coefficients_ = false;
     std::map<WebSocketSession*, std::shared_ptr<GameManager>> games_;
     std::mutex games_mutex_;
     
