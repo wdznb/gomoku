@@ -466,19 +466,11 @@ void test_game_manager_position() {
     // Undo walks the loaded stones back off the board, one round at a time.
     int move_count = -1;
     GameStatus status = GameStatus::PLAYING;
-    int previous = 5;
-    int undos = 0;
-    while (gm.undo(move_count, status) && undos < 10) {
-        assert(move_count < previous);
-        assert(gm.board().move_count() == move_count);
-        previous = move_count;
-        ++undos;
-    }
-    assert(undos > 0 && previous == 0);
-    // Undo only removes stones; choosing a side is the sole thing that turns a
-    // hand-set position into a game, so the flag survives an empty board.
+    // In position_pending, undo is refused outright to protect the hand-set
+    // board from being eaten stone by stone.
+    assert(!gm.undo(move_count, status));
     assert(gm.position_pending());
-    assert(gm.replay_snapshot().moves.empty());
+    assert(gm.board().move_count() == 5);
 
     // A full board is refused outright: it has no side to move.
     Board full;
@@ -675,6 +667,44 @@ void test_snapshot_round_trip() {
     std::cout << "test_snapshot_round_trip passed" << std::endl;
 }
 
+// A hand-set position nobody has taken up yet is the player's setup, not a
+// game: an undo must never eat its base stones.
+void test_undo_rejected_in_position_pending() {
+    Board placed;
+    assert(placed.place_stone(7, 7, BLACK));
+    assert(placed.place_stone(6, 6, WHITE));
+    assert(placed.place_stone(8, 8, BLACK));
+    assert(placed.place_stone(7, 8, WHITE));
+    assert(placed.place_stone(9, 9, BLACK));
+
+    GameManager gm;
+    assert(gm.set_position(placed));
+    assert(gm.position_pending());
+    const int before = gm.board().move_count();
+    assert(before == 5);
+
+    int move_count = -1;
+    GameStatus status = GameStatus::PLAYING;
+    const bool accepted = gm.undo(move_count, status);
+
+    std::cout << "undo in position_pending: returned=" << (accepted ? "true" : "false")
+              << ", board move_count " << before << " -> " << gm.board().move_count()
+              << ", out_move_count=" << move_count << std::endl;
+    if (accepted && move_count != before) {
+        std::cout << "FAIL: undo in position_pending was accepted and took "
+                  << (before - move_count) << " base stone(s) off the board" << std::endl;
+    }
+
+    // Expected: the undo is refused outright. Should a fix instead accept it as
+    // a no-op, the board still has to be exactly the setup that was loaded.
+    assert(!accepted || move_count == before);
+    assert(gm.board().move_count() == before);
+    assert(cells_of(gm.board()) == cells_of(placed));
+    assert(gm.position_pending());
+
+    std::cout << "test_undo_rejected_in_position_pending passed" << std::endl;
+}
+
 int main() {
     std::cout << "Running position setup tests..." << std::endl;
     test_grid_parsing();
@@ -688,6 +718,7 @@ int main() {
     test_game_manager_position();
     test_restore_game();
     test_snapshot_round_trip();
+    test_undo_rejected_in_position_pending();
     std::cout << "All position setup tests passed!" << std::endl;
     return 0;
 }

@@ -188,6 +188,7 @@ bool GameManager::make_move(int row, int col) {
 
 bool GameManager::undo(int& out_move_count, GameStatus& out_status) {
     if (ai_thinking_.load()) return false;
+    if (position_pending_) return false;
     if (board_.move_count() == 0) return false;
     
     int undo_count = 1;
