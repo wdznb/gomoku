@@ -1,17 +1,31 @@
 const BOARD_SIZE = 15;
-const CELL_SIZE = 38;
-const PADDING = 20;
-const STONE_RADIUS = 16;
 
 const EMPTY = 0;
 const BLACK = 1;
 const WHITE = 2;
+
+// The board is drawn in the middle of the viewport and the rest of the page is
+// cut into four trapezoids by the lines from each board corner to the nearest
+// page corner. A band budget keeps those trapezoids tall/wide enough to hold
+// their content, and the board never grows past kBoardMax.
+const BAND_V = 104;
+const BAND_H = 196;
+const BAND_V_MAX = 190;
+const BAND_H_MAX = 320;
+const BOARD_MIN = 300;
+const BOARD_MAX = 780;
 
 class GomokuGame {
     constructor() {
         this.canvas = document.getElementById('board');
         this.ctx = this.canvas.getContext('2d');
         this.ws = null;
+        // Geometry and view are per-layout: cell size follows the viewport, and
+        // the view is a display-only rotation / mirror that every stone, marker,
+        // label and click passes through.
+        this.geom = { size: BOARD_MAX, cell: 38, pad: 28, stone: 15, font: 11 };
+        this.view = { rot: 0, flipH: false };
+        this.dpr = window.devicePixelRatio || 1;
         
         this.board = Array(BOARD_SIZE).fill(null).map(() => Array(BOARD_SIZE).fill(EMPTY));
         this.moveHistory = [];
@@ -42,7 +56,8 @@ class GomokuGame {
         
         this.initWebSocket();
         this.initUI();
-        this.drawBoard();
+        this.layout();
+        window.addEventListener('resize', () => this.layout());
     }
     
     initWebSocket() {
@@ -58,12 +73,12 @@ class GomokuGame {
         
         this.ws.onclose = () => {
             console.log('Disconnected from server');
-            this.updateStatus('连接断开');
+            this.updateStatus('连接断开，请刷新页面重连', 'error');
         };
         
         this.ws.onerror = (error) => {
             console.error('WebSocket error:', error);
-            this.updateStatus('连接错误');
+            this.updateStatus('连接错误', 'error');
         };
         
         this.ws.onmessage = (event) => {
@@ -123,6 +138,171 @@ class GomokuGame {
             reader.onerror = () => this.updatePositionStatus('文件读取失败。', true);
             reader.readAsText(file);
         });
+
+        document.getElementById('btn-position-toggle').addEventListener('click', () => {
+            const panel = document.getElementById('position-panel');
+            panel.hidden = !panel.hidden;
+            document.getElementById('btn-position-toggle').classList.toggle('toggled', !panel.hidden);
+        });
+        document.getElementById('btn-view-rotate').addEventListener('click', () => {
+            this.view.rot = (this.view.rot + 90) % 360;
+            this.applyView();
+        });
+        document.getElementById('btn-view-mirror').addEventListener('click', () => {
+            this.view.flipH = !this.view.flipH;
+            this.applyView();
+        });
+    }
+
+    // The view is display-only: the server keeps playing in real coordinates and
+    // only the rendering (and the click that maps back from it) is rotated.
+    applyView() {
+        // The rotate button wears the angle it last turned to, so the bar keeps
+        // showing the current view after the status line has moved on.
+        const rotate = document.getElementById('btn-view-rotate');
+        rotate.textContent = this.view.rot ? `旋转 ${this.view.rot}°` : '旋转';
+        rotate.classList.toggle('toggled', this.view.rot !== 0);
+        document.getElementById('btn-view-mirror').classList.toggle('toggled', this.view.flipH);
+        this.drawBoard();
+        this.updateStatus(`视角：${this.viewLabel()}`, 'idle');
+    }
+
+    viewLabel() {
+        const parts = [];
+        if (this.view.rot) parts.push(`旋转 ${this.view.rot}°`);
+        if (this.view.flipH) parts.push('镜像');
+        return parts.length ? parts.join(' · ') : '正常';
+    }
+
+    // Logical cell -> cell as displayed.
+    displayOf(row, col) {
+        let r = row;
+        let c = col;
+        if (this.view.rot === 90) { r = col; c = BOARD_SIZE - 1 - row; }
+        else if (this.view.rot === 180) { r = BOARD_SIZE - 1 - row; c = BOARD_SIZE - 1 - col; }
+        else if (this.view.rot === 270) { r = BOARD_SIZE - 1 - col; c = row; }
+        if (this.view.flipH) c = BOARD_SIZE - 1 - c;
+        return [r, c];
+    }
+
+    // Displayed cell -> logical cell. The exact inverse of displayOf: undo the
+    // mirror first, then undo the rotation. Both steps need the old pair at the
+    // same time, so they swap through destructuring rather than assigning in
+    // sequence (which would feed a fresh value into the second half).
+    logicalOf(row, col) {
+        let r = row;
+        let c = col;
+        if (this.view.flipH) c = BOARD_SIZE - 1 - c;
+        if (this.view.rot === 90) [r, c] = [BOARD_SIZE - 1 - c, r];
+        else if (this.view.rot === 180) [r, c] = [BOARD_SIZE - 1 - r, BOARD_SIZE - 1 - c];
+        else if (this.view.rot === 270) [r, c] = [c, BOARD_SIZE - 1 - r];
+        return [r, c];
+    }
+
+    coordName(row, col) {
+        return `${String.fromCharCode(65 + col)}${BOARD_SIZE - row}`;
+    }
+
+    // Layout: keep a vertical band for the status bar and the control bar, and a
+    // horizontal band for the two side panels, then centre the largest square
+    // board that is left. The panels take the inscribed rectangle of their
+    // trapezoid, so nothing they hold is cut by the diagonal divider.
+    layout() {
+        const width = window.innerWidth;
+        const height = window.innerHeight;
+        const bandV = Math.max(56, Math.min(BAND_V_MAX, Math.round(height * 0.2)));
+        const bandH = Math.max(96, Math.min(BAND_H_MAX, Math.round(width * 0.2)));
+        const size = Math.max(BOARD_MIN,
+            Math.min(BOARD_MAX, width - 2 * bandH, height - 2 * bandV));
+        const x0 = Math.round((width - size) / 2);
+        const y0 = Math.round((height - size) / 2);
+        const gap = 8;
+
+        this.dpr = window.devicePixelRatio || 1;
+        // The canvas has no border, so its CSS box, its backing store (scaled by
+        // dpr) and the drawing coordinates all describe the same square.
+        this.geom.pad = Math.max(20, Math.round(size * 0.05));
+        this.geom.cell = (size - 2 * this.geom.pad) / (BOARD_SIZE - 1);
+        this.geom.stone = Math.max(6, this.geom.cell * 0.45);
+        this.geom.font = Math.max(9, Math.round(this.geom.cell * 0.34));
+        this.geom.size = size;
+
+        const stage = document.getElementById('stage');
+        stage.style.left = `${x0}px`;
+        stage.style.top = `${y0}px`;
+        stage.style.width = `${size}px`;
+        stage.style.height = `${size}px`;
+        this.canvas.width = Math.round(size * this.dpr);
+        this.canvas.height = Math.round(size * this.dpr);
+        this.ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+
+        const top = document.getElementById('region-top');
+        top.style.left = `${x0}px`;
+        top.style.width = `${size}px`;
+        top.style.top = '0px';
+        top.style.height = `${Math.max(0, y0 - gap)}px`;
+
+        const bottom = document.getElementById('region-bottom');
+        bottom.style.left = `${x0}px`;
+        bottom.style.width = `${size}px`;
+        bottom.style.top = `${y0 + size + gap}px`;
+        bottom.style.height = `${Math.max(0, height - y0 - size - gap)}px`;
+
+        const left = document.getElementById('region-left');
+        left.style.left = '0px';
+        left.style.top = `${y0}px`;
+        left.style.width = `${Math.max(0, x0 - gap)}px`;
+        left.style.height = `${size}px`;
+
+        const right = document.getElementById('region-right');
+        right.style.left = `${x0 + size + gap}px`;
+        right.style.top = `${y0}px`;
+        right.style.width = `${Math.max(0, width - x0 - size - gap)}px`;
+        right.style.height = `${size}px`;
+
+        // The 摆棋 drawer is a layer rather than a fifth region: it covers the
+        // bottom band below the button row (which stays reachable) and scrolls
+        // inside itself, so opening it never resizes the board or moves the
+        // dividing lines.
+        const bar = bottom.querySelector('.bar');
+        const panelTop = Math.round(bar.getBoundingClientRect().bottom) + 6;
+        const panel = document.getElementById('position-panel');
+        panel.style.left = `${x0}px`;
+        panel.style.width = `${size}px`;
+        panel.style.top = `${panelTop}px`;
+        panel.style.maxHeight = `${Math.max(0, height - panelTop - 6)}px`;
+
+        this.drawDividers(x0, y0, size, width, height);
+        document.body.classList.toggle('compact', size < 460);
+
+        this.drawBoard();
+        this.drawEvalGraph();
+    }
+
+    drawDividers(x0, y0, size, width, height) {
+        const svg = document.getElementById('dividers');
+        const x1 = x0 + size;
+        const y1 = y0 + size;
+        const corners = [[0, 0], [width, 0], [0, height], [width, height]];
+        const boardCorners = [[x0, y0], [x1, y0], [x0, y1], [x1, y1]];
+        svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
+        svg.innerHTML = '';
+        for (const [bx, by] of boardCorners) {
+            // Each board corner joins the page corner it is closest to, which is
+            // what carves the page into the four regions.
+            let best = corners[0];
+            let bestDist = Infinity;
+            for (const [px, py] of corners) {
+                const d = (px - bx) ** 2 + (py - by) ** 2;
+                if (d < bestDist) { bestDist = d; best = [px, py]; }
+            }
+            const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+            line.setAttribute('x1', bx);
+            line.setAttribute('y1', by);
+            line.setAttribute('x2', best[0]);
+            line.setAttribute('y2', best[1]);
+            svg.appendChild(line);
+        }
     }
 
     sendConfig() {
@@ -223,7 +403,7 @@ class GomokuGame {
             }
             this.stepReplay(1);
         }, 700);
-        document.getElementById('btn-replay-play').textContent = '⏸ 暂停';
+        document.getElementById('btn-replay-play').textContent = '暂停';
     }
 
     stopReplayAuto() {
@@ -231,7 +411,7 @@ class GomokuGame {
             clearInterval(this.replayTimer);
             this.replayTimer = null;
         }
-        document.getElementById('btn-replay-play').textContent = '▶ 自动';
+        document.getElementById('btn-replay-play').textContent = '自动';
     }
 
     exitReplay() {
@@ -287,8 +467,7 @@ class GomokuGame {
         const m = this.moveHistory[this.replayIndex];
         const a = this.analysis[this.replayIndex];
         const colorName = m.color === BLACK ? '黑' : '白';
-        const coord = `${String.fromCharCode(65 + m.col)}${BOARD_SIZE - m.row}`;
-        let text = `第 ${this.replayIndex + 1}/${this.moveHistory.length} 手 · ${colorName} ${coord}`;
+        let text = `第 ${this.replayIndex + 1}/${this.moveHistory.length} 手 · ${colorName} ${this.coordName(m.row, m.col)}`;
         if (a) {
             text += ` · ${this.formatAnalysis(a, false)}`;
         } else {
@@ -297,18 +476,25 @@ class GomokuGame {
         el.textContent = text;
     }
 
+    // The curve lives in the left band, so its box is whatever that band is
+    // wide: size the backing store from the element's own client box on every
+    // draw instead of fixing a width in markup.
     drawEvalGraph() {
         const canvas = document.getElementById('eval-graph');
+        const width = Math.max(60, canvas.clientWidth || 200);
+        const height = Math.max(40, canvas.clientHeight || 64);
+        canvas.width = Math.round(width * this.dpr);
+        canvas.height = Math.round(height * this.dpr);
         const ctx = canvas.getContext('2d');
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
-        ctx.fillStyle = '#f5f0e6';
-        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+        ctx.clearRect(0, 0, width, height);
 
         // Mid line and axis.
-        ctx.strokeStyle = '#bbb';
+        ctx.strokeStyle = '#e0e0e0';
+        ctx.lineWidth = 1;
         ctx.beginPath();
-        ctx.moveTo(0, canvas.height / 2);
-        ctx.lineTo(canvas.width, canvas.height / 2);
+        ctx.moveTo(0, height / 2);
+        ctx.lineTo(width, height / 2);
         ctx.stroke();
         if (this.analysis.length === 0) return;
 
@@ -323,18 +509,18 @@ class GomokuGame {
             // opponent's numbers to read one continuous BLACK-point curve.
             const blackScore = this.moveHistory[i].color === BLACK ? a.score : -a.score;
             const clamped = Math.max(-limit, Math.min(limit, blackScore));
-            const x = canvas.width * (i + 0.5) / this.analysis.length;
-            const y = canvas.height / 2 - (clamped / limit) * (canvas.height / 2 - 8);
+            const x = width * (i + 0.5) / this.analysis.length;
+            const y = height / 2 - (clamped / limit) * (height / 2 - 6);
             points.push({ x, y, saturated: Math.abs(blackScore) > limit });
         });
         if (points.length === 0) return;
 
-        ctx.fillStyle = '#666';
+        ctx.fillStyle = '#9a9a9a';
         ctx.font = '10px sans-serif';
-        ctx.fillText('评估曲线（黑棋视角）', 4, 10);
+        ctx.fillText('评估（黑棋视角）', 2, 10);
 
-        ctx.strokeStyle = '#3a6ea5';
-        ctx.lineWidth = 1.5;
+        ctx.strokeStyle = '#4a4a4a';
+        ctx.lineWidth = 1.4;
         ctx.beginPath();
         points.forEach((p, i) => i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y));
         ctx.stroke();
@@ -344,7 +530,7 @@ class GomokuGame {
         for (const p of points) {
             if (p.saturated) {
                 ctx.beginPath();
-                ctx.arc(p.x, p.y, 3, 0, Math.PI * 2);
+                ctx.arc(p.x, p.y, 2.5, 0, Math.PI * 2);
                 ctx.fill();
             }
         }
@@ -355,8 +541,12 @@ class GomokuGame {
         const x = e.clientX - rect.left;
         const y = e.clientY - rect.top;
 
-        const col = Math.round((x - PADDING) / CELL_SIZE);
-        const row = Math.round((y - PADDING) / CELL_SIZE);
+        // The click lands on the displayed grid, so it is mapped back to the
+        // logical cell before anything else touches it.
+        const shown = this.logicalOf(Math.round((y - this.geom.pad) / this.geom.cell),
+                                    Math.round((x - this.geom.pad) / this.geom.cell));
+        const row = shown[0];
+        const col = shown[1];
 
         // Painting a position is a local edit, so it answers before any of the
         // live-game guards: a loaded position is not yet a game in progress.
@@ -548,7 +738,7 @@ class GomokuGame {
         document.getElementById('btn-resign').disabled = true;
         document.getElementById('btn-restart').disabled = false;
         this.drawBoard();
-        this.updateStatus(`局面已摆好：轮到${this.currentTurn === BLACK ? '黑' : '白'}方，请选择执子颜色`);
+        this.updateStatus(`局面已摆好：轮到${this.currentTurn === BLACK ? '黑' : '白'}方，请选择执子颜色`, 'ok');
         this.updateTurnInfo('');
         this.updatePositionStatus(
             `局面已载入：黑 ${msg.black_count} 子、白 ${msg.white_count} 子。选边后开始，AI 不会自动落子。`,
@@ -746,7 +936,7 @@ class GomokuGame {
                     this.positionSetInFlight = false;
                     this.setSideButtons(this.sideLock[0], this.sideLock[1]);
                 }
-                alert('错误: ' + msg.message);
+                this.updateStatus(`错误：${msg.message}`, 'error');
                 break;
         }
     }
@@ -762,7 +952,7 @@ class GomokuGame {
         this.currentTurn = msg.current_turn === 'black' ? BLACK : WHITE;
         this.gameStatus = 'playing';
         this.updateTurnInfo();
-        this.updateStatus('游戏开始');
+        this.updateStatus('对局开始', 'ok');
     }
     
     handleMoveMade(msg) {
@@ -778,9 +968,9 @@ class GomokuGame {
         this.aiThinking = false;
         document.getElementById('btn-stop').disabled = true;
         // ai_move is the only live message that carries the engine's verdict for
-        // the stone it just placed, so surface it before the next search clears
-        // the thinking line.
-        this.updateThinkingInfo(`AI 落子：分值 ${msg.score}，耗时 ${msg.thinking_time_ms}ms`);
+        // the stone it just placed, so surface it in the status line.
+        this.updateStatus(`AI ${this.coordName(msg.row, msg.col)} · 分值 ${msg.score} · ${msg.thinking_time_ms}ms`,
+                          'idle');
         this.updateTurnInfo();
         this.refreshReplayControls();
     }
@@ -832,10 +1022,10 @@ class GomokuGame {
             this.exitReplay();
         }
         this.highlightMove(msg.row, msg.col);
+        this.updateStatus(`建议 ${this.coordName(msg.row, msg.col)} · 分值 ${msg.score}`, 'ok');
     }
     
     handleThinkingProgress(msg) {
-        this.updateThinkingInfo(`思考中... 深度: ${msg.depth}, 节点: ${msg.nodes}, 耗时: ${msg.elapsed_ms}ms`);
         // thinking_progress is shared by the AI's move search and hint searches.
         // Only treat it as "the AI is thinking" when it is actually the AI's
         // turn; a hint runs on the player's turn, and setting aiThinking there
@@ -852,21 +1042,24 @@ class GomokuGame {
         this.gameStatus = 'game_over';
         this.aiThinking = false;
         let statusText = '游戏结束 - ';
+        let kind = 'idle';
         if (msg.winner === 'draw') {
             statusText += '和棋';
         } else {
             const winnerColor = msg.winner === 'black' ? '黑棋' : '白棋';
             if (msg.winner === (this.playerColor === BLACK ? 'black' : 'white')) {
                 statusText += `你赢了！(${winnerColor})`;
+                kind = 'ok';
             } else {
                 statusText += `你输了 (${winnerColor}胜)`;
+                kind = 'warn';
             }
         }
         // The reason the engine reports (five / resign / draw) is part of the
         // result the player is owed, not only a status code.
         statusText += ` · ${this.reasonText(msg.reason)}`;
         this.gameOverText = statusText;
-        this.updateStatus(statusText);
+        this.updateStatus(statusText, kind);
         
         document.getElementById('btn-undo').disabled = true;
         document.getElementById('btn-hint').disabled = true;
@@ -885,13 +1078,13 @@ class GomokuGame {
     
     highlightMove(row, col) {
         this.drawBoard();
-        const x = PADDING + col * CELL_SIZE;
-        const y = PADDING + row * CELL_SIZE;
+        const shown = this.displayOf(row, col);
+        const p = this.cellCenter(shown[0], shown[1]);
         
         this.ctx.beginPath();
-        this.ctx.arc(x, y, STONE_RADIUS + 3, 0, Math.PI * 2);
-        this.ctx.strokeStyle = '#ff0000';
-        this.ctx.lineWidth = 3;
+        this.ctx.arc(p.x, p.y, this.geom.stone + 3, 0, Math.PI * 2);
+        this.ctx.strokeStyle = '#c0392b';
+        this.ctx.lineWidth = 2;
         this.ctx.stroke();
     }
     
@@ -911,41 +1104,76 @@ class GomokuGame {
         return { board, lastMove };
     }
 
+    // A displayed cell -> its point on the canvas, in CSS pixels.
+    cellCenter(dr, dc) {
+        return { x: this.geom.pad + dc * this.geom.cell,
+                 y: this.geom.pad + dr * this.geom.cell };
+    }
+
+    // Which logical coordinate an edge names depends on the view: at 90° the top
+    // edge runs along rows, not columns. So ask the transform which component is
+    // constant along the line and label with that one.
+    columnLabel(dc) {
+        const a = this.logicalOf(0, dc);
+        const b = this.logicalOf(BOARD_SIZE - 1, dc);
+        return a[1] === b[1] ? String.fromCharCode(65 + a[1]) : String(BOARD_SIZE - a[0]);
+    }
+
+    rowLabel(dr) {
+        const a = this.logicalOf(dr, 0);
+        const b = this.logicalOf(dr, BOARD_SIZE - 1);
+        return a[0] === b[0] ? String(BOARD_SIZE - a[0]) : String.fromCharCode(65 + a[1]);
+    }
+
     drawBoard() {
         const ctx = this.ctx;
-        const width = this.canvas.width;
-        const height = this.canvas.height;
+        const { size, cell, pad, stone, font } = this.geom;
         const view = this.displayView();
+        const far = size - pad;
         
-        ctx.fillStyle = '#DEB887';
-        ctx.fillRect(0, 0, width, height);
+        ctx.clearRect(0, 0, size, size);
         
-        ctx.strokeStyle = '#000';
+        ctx.strokeStyle = '#b6ab97';
         ctx.lineWidth = 1;
-        
         for (let i = 0; i < BOARD_SIZE; i++) {
-            const pos = PADDING + i * CELL_SIZE;
+            const pos = pad + i * cell;
             
             ctx.beginPath();
-            ctx.moveTo(PADDING, pos);
-            ctx.lineTo(PADDING + (BOARD_SIZE - 1) * CELL_SIZE, pos);
+            ctx.moveTo(pad, pos);
+            ctx.lineTo(far, pos);
             ctx.stroke();
             
             ctx.beginPath();
-            ctx.moveTo(pos, PADDING);
-            ctx.lineTo(pos, PADDING + (BOARD_SIZE - 1) * CELL_SIZE);
+            ctx.moveTo(pos, pad);
+            ctx.lineTo(pos, far);
             ctx.stroke();
         }
         
-        const starPoints = [[3, 3], [3, 11], [11, 3], [11, 11], [7, 7]];
-        ctx.fillStyle = '#000';
-        for (const [row, col] of starPoints) {
-            const x = PADDING + col * CELL_SIZE;
-            const y = PADDING + row * CELL_SIZE;
+        // Star points are logical squares, so they travel with the view.
+        ctx.fillStyle = '#8d8375';
+        for (const [row, col] of [[3, 3], [3, 11], [11, 3], [11, 11], [7, 7]]) {
+            const shown = this.displayOf(row, col);
+            const p = this.cellCenter(shown[0], shown[1]);
             ctx.beginPath();
-            ctx.arc(x, y, 4, 0, Math.PI * 2);
+            ctx.arc(p.x, p.y, Math.max(2, cell * 0.09), 0, Math.PI * 2);
             ctx.fill();
         }
+        
+        // Edge coordinates. Each label names the logical square that currently
+        // sits on that line, so rotating or mirroring moves the labels with it
+        // and the grid stays readable as the same board seen differently.
+        ctx.fillStyle = '#8a8a8a';
+        ctx.font = `${font}px ui-monospace, SFMono-Regular, Consolas, monospace`;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        for (let dc = 0; dc < BOARD_SIZE; dc++) {
+            ctx.fillText(this.columnLabel(dc), this.cellCenter(0, dc).x, pad / 2);
+        }
+        for (let dr = 0; dr < BOARD_SIZE; dr++) {
+            ctx.fillText(this.rowLabel(dr), pad / 2, this.cellCenter(dr, 0).y);
+        }
+        ctx.textAlign = 'start';
+        ctx.textBaseline = 'alphabetic';
         
         for (let row = 0; row < BOARD_SIZE; row++) {
             for (let col = 0; col < BOARD_SIZE; col++) {
@@ -956,75 +1184,57 @@ class GomokuGame {
         }
         
         if (view.lastMove) {
-            const x = PADDING + view.lastMove.col * CELL_SIZE;
-            const y = PADDING + view.lastMove.row * CELL_SIZE;
+            const shown = this.displayOf(view.lastMove.row, view.lastMove.col);
+            const p = this.cellCenter(shown[0], shown[1]);
             ctx.beginPath();
-            ctx.arc(x, y, 5, 0, Math.PI * 2);
-            ctx.fillStyle = view.lastMove.color === BLACK ? '#fff' : '#000';
+            ctx.arc(p.x, p.y, Math.max(2.5, stone * 0.3), 0, Math.PI * 2);
+            ctx.fillStyle = view.lastMove.color === BLACK ? '#fff' : '#111';
             ctx.fill();
         }
 
         if (this.replayIndex !== null) {
             // Say so on the board itself: a past position looks exactly like a
             // live one, and the missing marker is the only other clue.
-            ctx.fillStyle = '#8b4513';
-            ctx.font = '14px sans-serif';
-            ctx.fillText(`回放中 · 第 ${this.replayIndex + 1} 手`, PADDING, height - 4);
+            ctx.fillStyle = '#8a8a8a';
+            ctx.font = `${font}px sans-serif`;
+            ctx.fillText(`回放 · 第 ${this.replayIndex + 1} 手`, pad, size - 5);
         }
     }
     
     drawStone(row, col, color) {
+        const shown = this.displayOf(row, col);
+        const p = this.cellCenter(shown[0], shown[1]);
         const ctx = this.ctx;
-        const x = PADDING + col * CELL_SIZE;
-        const y = PADDING + row * CELL_SIZE;
         
         ctx.beginPath();
-        ctx.arc(x, y, STONE_RADIUS, 0, Math.PI * 2);
-        
-        if (color === BLACK) {
-            const gradient = ctx.createRadialGradient(x - 5, y - 5, 2, x, y, STONE_RADIUS);
-            gradient.addColorStop(0, '#666');
-            gradient.addColorStop(1, '#000');
-            ctx.fillStyle = gradient;
-        } else {
-            const gradient = ctx.createRadialGradient(x - 5, y - 5, 2, x, y, STONE_RADIUS);
-            gradient.addColorStop(0, '#fff');
-            gradient.addColorStop(1, '#ccc');
-            ctx.fillStyle = gradient;
-        }
-        
+        ctx.arc(p.x, p.y, this.geom.stone, 0, Math.PI * 2);
+        ctx.fillStyle = color === BLACK ? '#1b1b1b' : '#ffffff';
         ctx.fill();
-        ctx.strokeStyle = color === BLACK ? '#000' : '#999';
+        ctx.strokeStyle = color === BLACK ? '#000000' : '#b9b9b9';
         ctx.lineWidth = 1;
         ctx.stroke();
     }
     
-    updateStatus(text) {
-        document.getElementById('status').textContent = text;
+    // The status bar is the page's only message surface, so it carries the
+    // severity: green for what worked, amber for what needs attention, red for
+    // what was refused or broken, grey for narration.
+    updateStatus(text, kind = 'idle') {
+        const el = document.getElementById('status');
+        el.textContent = text;
+        el.className = `status ${kind}`;
     }
     
     updateTurnInfo(text) {
         if (text === undefined) {
             if (this.gameStatus === 'playing') {
                 const turnColor = this.currentTurn === BLACK ? '黑棋' : '白棋';
-                const isPlayerTurn = this.currentTurn === this.playerColor;
-                text = `当前: ${turnColor} (${isPlayerTurn ? '你的回合' : 'AI思考中'})`;
+                const who = this.currentTurn === this.playerColor ? '你的回合' : 'AI 思考中';
+                text = `轮到${turnColor} · ${who}`;
             } else {
                 text = '';
             }
         }
         document.getElementById('turn-info').textContent = text;
-    }
-    
-    updateThinkingInfo(text) {
-        const el = document.getElementById('thinking-info');
-        if (text) {
-            el.textContent = text;
-            el.classList.add('active');
-        } else {
-            el.textContent = '';
-            el.classList.remove('active');
-        }
     }
     
     updateMoveList() {
@@ -1039,8 +1249,7 @@ class GomokuGame {
             div.className = `move-item ${move.color === BLACK ? 'black' : 'white'}`
                 + (isLive ? ' active' : '');
             const colorName = move.color === BLACK ? '黑' : '白';
-            const colName = String.fromCharCode(65 + move.col);
-            let text = `${index + 1}. ${colorName} ${colName}${BOARD_SIZE - move.row}`;
+            let text = `${index + 1}. ${colorName} ${this.coordName(move.row, move.col)}`;
             const analysis = this.formatAnalysis(this.analysis[index], true);
             if (analysis) text += ` · ${analysis}`;
             div.textContent = text;

@@ -594,3 +594,60 @@ threads 2 / population 8), the 100–30000 ms server-side timeout clamp, the 2^1
 the round-51 performance table. The front-end's timeout input allows 1000–60000 while the manager clamps
 to 100–30000, which is the documented server range — a UI/server mismatch, not a documentation error, and
 left alone.
+
+## 前端极简重排 — feature round 60 (`master`)
+
+**What shipped.** The page lost its title, its gradient cards and its thinking-progress line, and is now
+laid out geometrically: the board is a centred square with its coordinates drawn on the canvas edges, and
+the rest of the viewport is cut into four regions by the lines from each board corner to the nearest page
+corner — status on top, controls below, replay at left, move list at right. A view control (旋转 90° steps
+and 镜像) re-orients the board as the player sees it. All geometry is computed in `layout()` from
+`innerWidth/innerHeight` with device-pixel-ratio-scaled canvases, and re-runs on resize.
+
+**The regions take the inscribed rectangle of their trapezoid.** The dividing lines are one
+`pointer-events: none` SVG, so they can be drawn exactly where the spec puts them, but the content is
+placed in the rectangle that fits inside — width = board width for the top/bottom bands, height = board
+height for the side bands. Anything else gets clipped by the diagonal or overlaps the board.
+
+**The view is display-only, and that has to be true in both directions.** `displayOf` / `logicalOf` map
+logical ↔ shown cells; stones, star points, the last-move mark, the hint ring and the manual-paint brush
+all go through the display side, and a click is inverted before it becomes a `make_move`, so the server,
+the transcript and the exported position keep real coordinates. Two bugs came from writing that mapping
+as prose instead of checking it:
+
+- `logicalOf` first did `r = 14 - c; c = r;` — the second half read the value the first half had just
+  overwritten, so three of the eight views were not inverses at all. Extracting the two methods out of
+  `app.js` and round-tripping all 225 cells × 8 views found it immediately (840 failures), and the fix is
+  a destructuring swap.
+- The edge labels assumed the top edge names columns. At 90° the top edge runs along *rows*, so every
+  label on it collapsed to "A". `columnLabel` / `rowLabel` now ask the transform which component is
+  constant along the line and label with the other one; the check is that the two labels read at a
+  stone's position still compose to that stone's real name (`H8` reads `H8` in all eight views).
+
+**The 摆棋 drawer is a layer, not a fifth region.** Reserving bottom-band height for it looked like the
+honest answer and was not: at a 785 px-tall window the board dropped from 471 to 300 px and the drawer
+still overflowed. It is now a fixed card anchored 6 px under the button row, sized from the row's
+measured bottom, scrolling inside itself — so opening it leaves the board size, the four regions and the
+dividing lines untouched, and the controls in the bar stay reachable.
+
+**One message surface.** `#thinking-info` is gone; the AI's verdict (`ai_move` score and time) and the
+hint result now go to the status line, which carries the severity class (`ok` green, `warn` amber,
+`error` red, `idle` grey), and `alert()` on a server `error` became a red status line — a modal that
+blocks the page has no place in a layout where the board is the page. The eval curve sizes itself from
+its own client box, so it follows the left band instead of a hard-coded 260 px.
+
+**Verified in the browser** (server on :8080, 813×785 window): region rects do not overlap the board and
+the SVG has exactly four corner-to-corner lines; live play through a rotate and a rotate+mirror landed on
+H8 / C11 / M12, i.e. the logical cells the clicks addressed under those views, and the move list names
+match; 载入本局分析 → 下一手 → click record #3 → 退出回放 → 悔棋 all behave (3 stones in the replay view
+while the live board holds 6); the 摆棋 drawer recognises the 225-character flat run, echoes
+黑=B 白=W 空=., keeps 载入 disabled until confirmed, then loads 3 黑 2 白 with the green status line; a
+mixed-alphabet grid is refused in red inside the drawer; the 60 s idle disconnect now surfaces as
+"连接断开，请刷新页面重连" in red. Two screenshots captured the base layout and the rotated+mirrored
+board before the in-app browser surface went hidden; the drawer geometry is verified by measured rects
+rather than a third screenshot.
+
+**Known gaps.** Below roughly a 900 px-tall window the drawer scrolls internally rather than showing all
+five controls at once. There is still no client-side reconnect for the server's 60 s idle socket timeout
+(carried over from round 57); with the new always-visible status bar it is at least now clearly reported.
+

@@ -3,97 +3,95 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>五子棋 AI</title>
+    <title>五子棋</title>
     <link rel="stylesheet" href="style.css">
 </head>
 <body>
-    <div class="container">
-        <h1>五子棋 AI 深度思考系统</h1>
-        
-        <div class="game-area">
-            <div class="board-container">
-                <canvas id="board" width="600" height="600"></canvas>
-            </div>
-            
-            <div class="controls">
-                <div class="status-panel">
-                    <div id="status" class="status">等待开始</div>
-                    <div id="turn-info" class="turn-info"></div>
-                    <div id="thinking-info" class="thinking-info"></div>
-                </div>
-                
-                <div class="button-group">
-                    <h3>选边</h3>
-                    <button id="btn-black" class="btn">执黑先行</button>
-                    <button id="btn-white" class="btn">执白后行</button>
-                </div>
-                
-                <div class="button-group">
-                    <h3>操作</h3>
-                    <button id="btn-undo" class="btn" disabled>悔棋</button>
-                    <button id="btn-hint" class="btn" disabled>求招</button>
-                    <button id="btn-resign" class="btn" disabled>认输</button>
-                    <button id="btn-stop" class="btn btn-danger" disabled>终止思考</button>
-                    <button id="btn-restart" class="btn" disabled>重新开始</button>
-                </div>
-                
-                <div class="button-group">
-                    <h3>摆棋</h3>
-                    <label>
-                        棋盘文件:
-                        <input type="file" id="position-file" accept=".json,.csv,.txt">
-                    </label>
-                    <textarea id="position-text" rows="5"
-                        placeholder="粘贴棋盘：15 行 15 列（分隔或 225 格连写皆可），标志可用 0/1/2、1/-1/0、B/W/.、X/O/.、黑/白/空，或直接粘贴局面 JSON"></textarea>
-                    <div class="button-row">
-                        <button id="btn-check-position" class="btn btn-small">识别</button>
-                        <button id="btn-set-position" class="btn btn-small" disabled>载入</button>
-                        <button id="btn-edit-mode" class="btn btn-small">手动摆棋</button>
-                        <button id="btn-clear-position" class="btn btn-small">清空</button>
-                        <button id="btn-export-position" class="btn btn-small">导出</button>
-                    </div>
-                    <label class="confirm-row" id="position-confirm-row" hidden>
-                        <input type="checkbox" id="position-confirm">
-                        确认标志：<span id="position-mapping"></span>
-                    </label>
-                    <div id="position-status" class="position-status"></div>
-                </div>
+    <!-- The four dividers are the lines from each board corner to the nearest
+         page corner; app.js draws them after laying the board out. -->
+    <svg id="dividers" aria-hidden="true"></svg>
 
-                <div class="button-group">
-                    <h3>AI 设置</h3>
-                    <label>
-                        超时时间 (毫秒):
-                        <input type="number" id="timeout" value="5000" min="1000" max="60000">
-                    </label>
-                    <label>
-                        搜索深度:
-                        <input type="number" id="depth" value="8" min="2" max="20">
-                    </label>
-                </div>
-                
-                <div class="button-group">
-                    <h3>回放分析</h3>
-                    <button id="btn-replay" class="btn" disabled>载入本局分析</button>
-                    <div class="replay-controls">
-                        <button id="btn-replay-first" class="btn btn-small" disabled>⏮</button>
-                        <button id="btn-replay-prev" class="btn btn-small" disabled>◀</button>
-                        <button id="btn-replay-play" class="btn btn-small" disabled>▶ 自动</button>
-                        <button id="btn-replay-next" class="btn btn-small" disabled>▶</button>
-                        <button id="btn-replay-last" class="btn btn-small" disabled>⏭</button>
-                        <button id="btn-replay-exit" class="btn btn-small" disabled>退出回放</button>
-                    </div>
-                    <canvas id="eval-graph" width="260" height="72"></canvas>
-                    <div id="replay-info" class="replay-info"></div>
-                </div>
-                
-                <div class="move-history">
-                    <h3>落子记录</h3>
-                    <div id="move-list" class="move-list"></div>
-                </div>
-            </div>
-        </div>
+    <div id="stage">
+        <canvas id="board"></canvas>
     </div>
-    
+
+    <header id="region-top">
+        <div id="status" class="status idle">等待开始</div>
+        <div id="turn-info" class="turn-info"></div>
+    </header>
+
+    <aside id="region-left">
+        <button id="btn-replay" class="btn btn-small" disabled>载入本局分析</button>
+        <div class="replay-controls">
+            <button id="btn-replay-first" class="btn btn-tiny" disabled title="第一手">⏮</button>
+            <button id="btn-replay-prev" class="btn btn-tiny" disabled title="上一手">◀</button>
+            <button id="btn-replay-play" class="btn btn-tiny" disabled title="自动播放 / 暂停">自动</button>
+            <button id="btn-replay-next" class="btn btn-tiny" disabled title="下一手">▶</button>
+            <button id="btn-replay-last" class="btn btn-tiny" disabled title="最后一手">⏭</button>
+            <button id="btn-replay-exit" class="btn btn-tiny" disabled title="退出回放">✕</button>
+        </div>
+        <canvas id="eval-graph"></canvas>
+        <div id="replay-info" class="replay-info"></div>
+    </aside>
+
+    <aside id="region-right">
+        <div id="move-list" class="move-list"></div>
+    </aside>
+
+    <footer id="region-bottom">
+        <div class="bar">
+            <span class="group">
+                <button id="btn-black" class="btn">执黑</button>
+                <button id="btn-white" class="btn">执白</button>
+            </span>
+            <span class="group">
+                <button id="btn-undo" class="btn" disabled>悔棋</button>
+                <button id="btn-hint" class="btn" disabled>求招</button>
+                <button id="btn-resign" class="btn" disabled>认输</button>
+                <button id="btn-stop" class="btn" disabled>终止</button>
+                <button id="btn-restart" class="btn" disabled>重开</button>
+            </span>
+            <span class="group">
+                <label class="field">深度
+                    <input type="number" id="depth" value="8" min="2" max="20">
+                </label>
+                <label class="field">超时ms
+                    <input type="number" id="timeout" value="5000" min="1000" max="60000">
+                </label>
+            </span>
+            <span class="group">
+                <button id="btn-position-toggle" class="btn">摆棋</button>
+                <button id="btn-view-rotate" class="btn" title="顺时针旋转视角 90°">旋转</button>
+                <button id="btn-view-mirror" class="btn" title="水平镜像视角">镜像</button>
+            </span>
+        </div>
+
+        <div id="position-panel" class="panel" hidden>
+            <label class="file-row">
+                棋盘文件
+                <input type="file" id="position-file" accept=".json,.csv,.txt">
+            </label>
+            <textarea id="position-text" rows="3"
+                placeholder="粘贴棋盘：15 行 15 列（分隔或 225 格连写皆可），标志可用 0/1/2、1/-1/0、B/W/.、X/O/.、黑/白/空，或直接粘贴局面 JSON"></textarea>
+            <div class="bar">
+                <span class="group">
+                    <button id="btn-check-position" class="btn">识别</button>
+                    <button id="btn-set-position" class="btn" disabled>载入</button>
+                    <button id="btn-edit-mode" class="btn">手动摆棋</button>
+                </span>
+                <span class="group">
+                    <button id="btn-clear-position" class="btn">清空</button>
+                    <button id="btn-export-position" class="btn">导出</button>
+                </span>
+            </div>
+            <label class="confirm-row" id="position-confirm-row" hidden>
+                <input type="checkbox" id="position-confirm">
+                确认标志：<span id="position-mapping"></span>
+            </label>
+            <div id="position-status" class="position-status"></div>
+        </div>
+    </footer>
+
     <script src="app.js"></script>
 </body>
 </html>
