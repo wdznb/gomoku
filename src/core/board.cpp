@@ -40,6 +40,7 @@ Board::Board() {
 
 void Board::reset() {
     cells_.fill(EMPTY);
+    lines_ = {};
     moves_.clear();
     move_count_ = 0;
     zobrist_hash_ = 0;
@@ -57,6 +58,7 @@ bool Board::place_stone(int row, int col, int color) {
     
     int index = row * BOARD_SIZE + col;
     cells_[index] = color;
+    set_stone_bits(row, col, color, true);
     zobrist_hash_ = ZobristHash::update_hash(zobrist_hash_, index, color);
     
     moves_.push_back(Move(row, col, color));
@@ -92,6 +94,7 @@ void Board::undo_last_move() {
     //    occupied then); its count only reflects neighbors that existed
     //    before placement. Do NOT decrement its own count.
     cells_[removed_index] = EMPTY;
+    set_stone_bits(row, col, removed_color, false);
     zobrist_hash_ = ZobristHash::update_hash(zobrist_hash_, removed_index, removed_color);
     moves_.pop_back();
     move_count_--;
@@ -124,6 +127,16 @@ void Board::undo_last_move() {
         activate(removed_index, row, col);
     } else {
         has_neighbor_[removed_index] = false;
+    }
+}
+
+void Board::set_stone_bits(int row, int col, int color, bool present) {
+    if (color == EMPTY) return;
+    for (int dir = 0; dir < 4; ++dir) {
+        const int line = line_index(dir, row, col);
+        const uint64_t bit = uint64_t{1} << (line_position(dir, row, col) + LINE_MARGIN);
+        uint64_t& word = lines_[color][dir][line];
+        word = present ? (word | bit) : (word & ~bit);
     }
 }
 
@@ -178,38 +191,36 @@ bool Board::is_game_over() const {
 
 bool Board::has_five_in_a_row(int row, int col, int color) const {
     for (int d = 0; d < 4; ++d) {
-        int dr = DIRECTIONS[d][0];
-        int dc = DIRECTIONS[d][1];
-        
-        int count = 1;
-        count += count_direction(row, col, dr, dc, color);
-        count += count_direction(row, col, -dr, -dc, color);
-        
         // Renju: BLACK must form exactly five stones to win - an overline of
         // six or more is an illegal shape (already rejected by is_forbidden),
         // and treating it as a win would give BLACK two ways to win.
         // WHITE has no forbidden rules and wins on any run of five or more.
+        const int run = run_length(d, row, col, color);
         if (color == BLACK) {
-            if (count == 5) return true;
+            if (run == 5) return true;
         } else {
-            if (count >= 5) return true;
+            if (run >= 5) return true;
         }
     }
     return false;
 }
 
-int Board::count_direction(int row, int col, int dr, int dc, int color) const {
-    int count = 0;
-    int r = row + dr;
-    int c = col + dc;
-    
-    while (is_valid(r, c) && cells_[r * BOARD_SIZE + c] == color) {
-        count++;
-        r += dr;
-        c += dc;
-    }
-    
-    return count;
+int Board::run_length(int dir, int row, int col, int color) const {
+    if (dir < 0 || dir >= 4 || color < EMPTY || color > WHITE) return 0;
+    if (!is_valid(row, col)) return 1;
+
+    const uint64_t word = lines_[color][dir][line_index(dir, row, col)];
+    const int bit = line_position(dir, row, col) + LINE_MARGIN;
+
+    // The centre counts even when it holds no stone of this colour, matching the
+    // cell-by-cell walk this replaced: callers ask "would playing here make a
+    // five", so they pass an empty square. The margin bits below the first cell
+    // and above the last are never set, so both runs stop at the board edge
+    // without a bounds check per step.
+    int run = 1;
+    for (int k = bit + 1; k < 64 && ((word >> k) & 1u); ++k) ++run;
+    for (int k = bit - 1; k >= 0 && ((word >> k) & 1u); --k) ++run;
+    return run;
 }
 
 void Board::update_active_empty(int row, int col) {

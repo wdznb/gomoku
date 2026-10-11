@@ -8,6 +8,30 @@
 
 namespace gomoku {
 
+// Bitboard line geometry, shared by Board (which maintains the words) and
+// PatternRecognizer (which reads them). Every pattern direction is a family of
+// parallel lines; one line holds its stones in a single 64-bit word, with the
+// stone at distance `pos` from the line's origin at bit pos + LINE_MARGIN.
+// Eight margin bits put the 15 real cells at bits 8..22, so a 9-cell window
+// always shifts out of one word and the unused bits below the first cell and
+// above the last stay clear: cells off the board are recovered from a
+// precomputed wall mask instead of a bounds check per window cell.
+constexpr int LINE_MARGIN = 8;
+constexpr int MAX_LINE_INDEX = 2 * BOARD_SIZE - 1;   // enough for the two diagonal families
+
+inline constexpr int line_index(int dir, int row, int col) {
+    switch (dir) {
+        case 0: return row;                                     // rows:      (0, 1)
+        case 1: return col;                                     // columns:   (1, 0)
+        case 2: return row - col + BOARD_SIZE - 1;              // diagonals: (1, 1)
+        default: return row + col;                              // anti-diagonals: (1, -1)
+    }
+}
+
+inline constexpr int line_position(int dir, int row, int col) {
+    return dir == 0 ? col : row;
+}
+
 class ZobristHash {
 public:
     static void init();
@@ -44,6 +68,16 @@ public:
     bool has_five_in_a_row(int row, int col, int color) const;
     
     uint64_t zobrist_hash() const { return zobrist_hash_; }
+
+    // Stones of `color` on line `line` of direction family `dir`, as a bitboard.
+    uint64_t line_bits(int color, int dir, int line) const {
+        return lines_[color][dir][line];
+    }
+
+    // Length of the `color` run that passes through (row, col) along `dir`,
+    // counting the centre cell itself. Cells of another colour or off the board
+    // cut the run short, exactly as the old cell-by-cell walk did.
+    int run_length(int dir, int row, int col, int color) const;
     
     const std::vector<Position>& active_empty() const { return active_empty_; }
     void update_active_empty(int row, int col);
@@ -55,6 +89,13 @@ private:
     std::vector<Move> moves_;
     int move_count_;
     uint64_t zobrist_hash_;
+
+    // [color][direction family][line] bitboard view of cells_, updated with
+    // each place/undo so pattern recognition never walks the board cell by
+    // cell. Index 0 (EMPTY) stays zero.
+    std::array<std::array<std::array<uint64_t, MAX_LINE_INDEX>, 4>, 3> lines_;
+
+    void set_stone_bits(int row, int col, int color, bool present);
     
     std::array<bool, BOARD_SIZE * BOARD_SIZE> has_neighbor_;
     std::vector<Position> active_empty_;
@@ -67,7 +108,6 @@ private:
     std::array<uint8_t, BOARD_SIZE * BOARD_SIZE> neighbor_count_;
     std::array<int16_t, BOARD_SIZE * BOARD_SIZE> active_index_;
     
-    int count_direction(int row, int col, int dr, int dc, int color) const;
     void rebuild_active_empty();
     void activate(int index, int row, int col);
     void deactivate(int index);

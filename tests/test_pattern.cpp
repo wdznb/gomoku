@@ -1,6 +1,7 @@
 #include "core/board.h"
 #include "core/pattern.h"
 #include <iostream>
+#include <random>
 #include <cassert>
 
 using namespace gomoku;
@@ -331,6 +332,67 @@ void test_forbidden_from_pattern_equivalence() {
     std::cout << "test_forbidden_from_pattern_equivalence passed" << std::endl;
 }
 
+void test_bitboard_matches_scalar() {
+    // Phase 4.1 replaced the per-cell base-3 window scan with bitboard line
+    // words plus an 18-bit pattern table. The table is generated from
+    // match_pattern, so the decode side is equivalent by construction; what has
+    // to hold up under testing is the window extraction - line choice, shift
+    // alignment and the off-board wall mask for all four directions. Compare
+    // every square of every board against the scalar oracle.
+    auto compare_all = [](const Board& board, long long& checked) {
+        for (int r = 0; r < BOARD_SIZE; ++r) {
+            for (int c = 0; c < BOARD_SIZE; ++c) {
+                for (int d = 0; d < 4; ++d) {
+                    for (int side : {BLACK, WHITE}) {
+                        const DirectionPattern fast =
+                            PatternRecognizer::recognize_direction(board, r, c, side, d);
+                        const DirectionPattern ref =
+                            PatternRecognizer::recognize_direction_scalar(board, r, c, side, d);
+                        assert(fast.type == ref.type);
+                        assert(fast.direction == ref.direction);
+                        ++checked;
+                    }
+                }
+            }
+        }
+    };
+
+    long long checked = 0;
+
+    // Randomised midgame shapes.
+    std::mt19937 rng(20261011);
+    for (int game = 0; game < 60; ++game) {
+        Board board;
+        const int stones = 1 + static_cast<int>(rng() % 45);
+        for (int i = 0; i < stones; ++i) {
+            const int r = static_cast<int>(rng() % BOARD_SIZE);
+            const int c = static_cast<int>(rng() % BOARD_SIZE);
+            board.place_stone(r, c, i % 2 == 0 ? BLACK : WHITE);
+        }
+        compare_all(board, checked);
+    }
+
+    // Structured boards that put stones along every edge, corner and diagonal,
+    // so windows clipped by the board boundary are covered deliberately rather
+    // than by chance.
+    for (int color = 1; color <= 2; ++color) {
+        Board board;
+        for (int i = 0; i < BOARD_SIZE; ++i) {
+            board.place_stone(0, i, color);
+            board.place_stone(i, 0, color);
+            board.place_stone(BOARD_SIZE - 1, i, color);
+            board.place_stone(i, BOARD_SIZE - 1, color);
+            board.place_stone(i, i, color);
+            board.place_stone(i, BOARD_SIZE - 1 - i, color);
+            board.place_stone(7, i, color == BLACK ? WHITE : BLACK);
+        }
+        compare_all(board, checked);
+    }
+
+    assert(checked >= 100000);
+    std::cout << "test_bitboard_matches_scalar passed (" << checked << " windows)" << std::endl;
+}
+
 int main() {
     std::cout << "Running pattern tests..." << std::endl;
     
@@ -348,6 +410,7 @@ int main() {
     test_overline_is_win_for_white();
     test_white_gap_split_is_five();
     test_forbidden_from_pattern_equivalence();
+    test_bitboard_matches_scalar();
     
     std::cout << "All pattern tests passed!" << std::endl;
     return 0;

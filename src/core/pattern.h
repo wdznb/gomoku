@@ -75,12 +75,35 @@ public:
     
     static DirectionPattern recognize_direction(const Board& board, int row, int col, 
                                                  int color, int dir);
+
+    // The original per-cell scan (extract_window + the base-3 decoder), kept as
+    // the differential oracle for the bitboard path above: tests assert the two
+    // agree on randomised positions. Production callers use recognize_direction.
+    static DirectionPattern recognize_direction_scalar(const Board& board, int row, int col,
+                                                       int color, int dir);
     
 private:
     static bool initialized_;
     
     static int extract_window(const Board& board, int row, int col, int color, int dir);
     static PatternType match_pattern(int window_code, bool is_center);
+
+    // The colour-specific corrections applied to a raw window match (WHITE
+    // overline demotion, BLACK overline promotion). Shared by both recognition
+    // paths so they cannot drift apart.
+    static DirectionPattern finish_direction(const Board& board, int row, int col, int color,
+                                             int dir, PatternType type);
+
+    // 18-bit pattern table: each of the 9 window cells is either a stone of the
+    // recognised colour (own) or an opponent stone / board edge (blocked).
+    // Indexed (own << 9) | blocked, so one load replaces the base-3 decode and
+    // the whole shape-matching branch chain. It is filled by running every key
+    // through match_pattern, which makes the bitboard path equivalent to the
+    // scalar one by construction rather than by a second hand-written matcher.
+    static const std::array<uint8_t, 1 << 18>& pattern_lut();
+    static bool fill_pattern_lut(std::array<uint8_t, 1 << 18>& lut);
+
+    static std::array<uint8_t, 1 << 18> pattern_lut_;
 };
 
 }

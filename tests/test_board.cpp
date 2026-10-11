@@ -1,6 +1,7 @@
 #include "core/board.h"
 #include <algorithm>
 #include <iostream>
+#include <random>
 #include <vector>
 #include <cassert>
 
@@ -187,6 +188,110 @@ void test_zobrist_hash() {
     std::cout << "test_zobrist_hash passed" << std::endl;
 }
 
+void test_line_bitboard_tracks_cells() {
+    // Phase 4.1 gave the board a bitboard line view per pattern direction, read
+    // directly by the pattern recognizer. Interleave placements and undos and
+    // check after every step that each stone's bit is set in exactly the line
+    // words of its own colour, in all four direction families.
+    std::mt19937 rng(20261011);
+    Board board;
+
+    auto verify = [](const Board& b) {
+        for (int r = 0; r < BOARD_SIZE; ++r) {
+            for (int c = 0; c < BOARD_SIZE; ++c) {
+                const int cell = b.get(r, c);
+                for (int d = 0; d < 4; ++d) {
+                    const uint64_t bit = uint64_t{1} << (line_position(d, r, c) + LINE_MARGIN);
+                    const int line = line_index(d, r, c);
+                    const bool black = (b.line_bits(BLACK, d, line) & bit) != 0;
+                    const bool white = (b.line_bits(WHITE, d, line) & bit) != 0;
+                    assert(black == (cell == BLACK));
+                    assert(white == (cell == WHITE));
+                }
+            }
+        }
+    };
+
+    verify(board);
+    for (int step = 0; step < 600; ++step) {
+        if (step % 3 == 2 && board.move_count() > 0) {
+            board.undo_last_move();
+        } else {
+            const int r = static_cast<int>(rng() % BOARD_SIZE);
+            const int c = static_cast<int>(rng() % BOARD_SIZE);
+            board.place_stone(r, c, board.move_count() % 2 == 0 ? BLACK : WHITE);
+        }
+        verify(board);
+    }
+
+    // Copies must carry the bitboards too: the search clones the root board.
+    Board copy = board;
+    verify(copy);
+    assert(copy.zobrist_hash() == board.zobrist_hash());
+
+    // Undoing to an empty board and resetting must both leave every word clear.
+    while (copy.move_count() > 0) copy.undo_last_move();
+    verify(copy);
+    board.reset();
+    verify(board);
+
+    std::cout << "test_line_bitboard_tracks_cells passed" << std::endl;
+}
+
+void test_run_length_matches_walk() {
+    // run_length is the bitboard replacement for the old two-sided cell walk and
+    // now feeds has_five_in_a_row plus the Renju overline reclassification. Check
+    // it against an independent walk over get() on randomised boards, on empty
+    // squares included - callers ask "would playing here make a five".
+    auto walk = [](const Board& b, int dir, int row, int col, int color) {
+        const int dr = DIRECTIONS[dir][0];
+        const int dc = DIRECTIONS[dir][1];
+        int run = 1;
+        for (int i = 1; ; ++i) {
+            const int r = row + i * dr;
+            const int c = col + i * dc;
+            if (!b.is_valid(r, c) || b.get(r, c) != color) break;
+            ++run;
+        }
+        for (int i = 1; ; ++i) {
+            const int r = row - i * dr;
+            const int c = col - i * dc;
+            if (!b.is_valid(r, c) || b.get(r, c) != color) break;
+            ++run;
+        }
+        return run;
+    };
+
+    std::mt19937 rng(987654321);
+    long long checked = 0;
+    for (int game = 0; game < 60; ++game) {
+        Board board;
+        const int stones = 1 + static_cast<int>(rng() % 45);
+        for (int i = 0; i < stones; ++i) {
+            const int r = static_cast<int>(rng() % BOARD_SIZE);
+            const int c = static_cast<int>(rng() % BOARD_SIZE);
+            board.place_stone(r, c, i % 2 == 0 ? BLACK : WHITE);
+        }
+        for (int r = 0; r < BOARD_SIZE; ++r) {
+            for (int c = 0; c < BOARD_SIZE; ++c) {
+                for (int d = 0; d < 4; ++d) {
+                    for (int side : {BLACK, WHITE}) {
+                        assert(board.run_length(d, r, c, side) == walk(board, d, r, c, side));
+                        ++checked;
+                    }
+                }
+            }
+        }
+    }
+
+    // Out-of-board coordinates must not read outside the line arrays.
+    assert(Board().run_length(0, -1, 0, BLACK) == 1);
+    assert(Board().run_length(3, BOARD_SIZE, BOARD_SIZE, WHITE) == 1);
+
+    assert(checked >= 100000);
+    std::cout << "test_run_length_matches_walk passed (" << checked << " runs)" << std::endl;
+}
+
 int main() {
     std::cout << "Running board tests..." << std::endl;
     
@@ -198,6 +303,8 @@ int main() {
     test_diagonal_five();
     test_active_empty();
     test_active_empty_incremental_undo();
+    test_line_bitboard_tracks_cells();
+    test_run_length_matches_walk();
     test_zobrist_hash();
     
     std::cout << "All board tests passed!" << std::endl;

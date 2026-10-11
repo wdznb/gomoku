@@ -4,6 +4,50 @@
 namespace gomoku {
 
 bool PatternRecognizer::initialized_ = false;
+std::array<uint8_t, 1 << 18> PatternRecognizer::pattern_lut_;
+
+namespace {
+
+constexpr uint32_t kWindowMask = 0x1FF;
+constexpr int kCenterBit = 4;
+constexpr size_t kDescCount = BOARD_SIZE * BOARD_SIZE * 4;
+
+// Where a square's 9-cell window lives inside the bitboard line words, plus
+// which of its cells fall off the board. Shift and wall only depend on the
+// square and the direction, so they are resolved once instead of per scan.
+struct WindowDesc {
+    uint8_t line;
+    uint8_t shift;
+    uint16_t wall;
+};
+
+const std::array<WindowDesc, kDescCount>& window_descs() {
+    static const std::array<WindowDesc, kDescCount> table = [] {
+        std::array<WindowDesc, kDescCount> t{};
+        for (int row = 0; row < BOARD_SIZE; ++row) {
+            for (int col = 0; col < BOARD_SIZE; ++col) {
+                for (int dir = 0; dir < 4; ++dir) {
+                    uint16_t wall = 0;
+                    for (int i = -4; i <= 4; ++i) {
+                        const int r = row + i * DIRECTIONS[dir][0];
+                        const int c = col + i * DIRECTIONS[dir][1];
+                        if (r < 0 || r >= BOARD_SIZE || c < 0 || c >= BOARD_SIZE) {
+                            wall |= static_cast<uint16_t>(1u << (i + 4));
+                        }
+                    }
+                    t[(row * BOARD_SIZE + col) * 4 + dir] = WindowDesc{
+                        static_cast<uint8_t>(line_index(dir, row, col)),
+                        static_cast<uint8_t>(line_position(dir, row, col) + LINE_MARGIN - 4),
+                        wall};
+                }
+            }
+        }
+        return t;
+    }();
+    return table;
+}
+
+}
 
 PositionPattern::PositionPattern() {
     four_count = 0;
@@ -53,7 +97,35 @@ void PositionPattern::analyze() {
 
 void PatternRecognizer::init() {
     if (initialized_) return;
+    // Touch both tables here. They are function-local statics, so they build
+    // themselves on first use even if a caller forgets to init(); warming them
+    // at startup just keeps the first searched move out of that cost.
+    (void)pattern_lut();
+    (void)window_descs();
     initialized_ = true;
+}
+
+bool PatternRecognizer::fill_pattern_lut(std::array<uint8_t, 1 << 18>& lut) {
+    for (size_t key = 0; key < lut.size(); ++key) {
+        const uint32_t own = static_cast<uint32_t>(key >> 9);
+        const uint32_t blocked = static_cast<uint32_t>(key & kWindowMask);
+
+        int window_code = 0;
+        for (int i = 0; i < 9; ++i) {
+            const uint32_t bit = 1u << i;
+            const int cell_code = (own & bit) ? 1 : ((blocked & bit) ? 2 : 0);
+            window_code = window_code * 3 + cell_code;
+        }
+
+        lut[key] = static_cast<uint8_t>(match_pattern(window_code, true));
+    }
+    return true;
+}
+
+const std::array<uint8_t, 1 << 18>& PatternRecognizer::pattern_lut() {
+    static const bool built = fill_pattern_lut(pattern_lut_);
+    (void)built;
+    return pattern_lut_;
 }
 
 int PatternRecognizer::extract_window(const Board& board, int row, int col, 
@@ -180,9 +252,37 @@ PatternType PatternRecognizer::match_pattern(int window_code, bool /*is_center*/
 
 DirectionPattern PatternRecognizer::recognize_direction(const Board& board, int row, int col,
                                                          int color, int dir) {
-    int window = extract_window(board, row, col, color, dir);
-    PatternType type = match_pattern(window, true);
+    if (row < 0 || row >= BOARD_SIZE || col < 0 || col >= BOARD_SIZE) {
+        return DirectionPattern(PatternType::NONE, dir);
+    }
 
+    const WindowDesc& desc = window_descs()[(row * BOARD_SIZE + col) * 4 + dir];
+    const int opp = opponent(color);
+
+    uint32_t own = static_cast<uint32_t>(
+        (board.line_bits(color, dir, desc.line) >> desc.shift) & kWindowMask);
+    uint32_t blocked = static_cast<uint32_t>(
+        (board.line_bits(opp, dir, desc.line) >> desc.shift) & kWindowMask) | desc.wall;
+
+    // The window describes the square as if `color` already had a stone there:
+    // every caller evaluates empty candidate squares. Guard bits outside a
+    // line's real cells are never set by a legal stone, so the wall mask alone
+    // accounts for the off-board cells, exactly like extract_window's bounds test.
+    own |= 1u << kCenterBit;
+    blocked &= ~(1u << kCenterBit);
+
+    const PatternType matched = static_cast<PatternType>(pattern_lut()[(own << 9) | blocked]);
+    return finish_direction(board, row, col, color, dir, matched);
+}
+
+DirectionPattern PatternRecognizer::recognize_direction_scalar(const Board& board, int row, int col,
+                                                                int color, int dir) {
+    const int window = extract_window(board, row, col, color, dir);
+    return finish_direction(board, row, col, color, dir, match_pattern(window, true));
+}
+
+DirectionPattern PatternRecognizer::finish_direction(const Board& board, int row, int col,
+                                                     int color, int dir, PatternType type) {
     // match_pattern is color-blind and calls any 6+ run inside the 9-cell
     // window LONG_FIVE. Under Renju that is only true for BLACK (overline is
     // forbidden and does not win). WHITE wins on any run of five or more, so
@@ -198,26 +298,11 @@ DirectionPattern PatternRecognizer::recognize_direction(const Board& board, int 
     // any run of five or more. The window only spans +/-4 cells around the
     // placed stone, so a stone played at the end of an existing five fits
     // inside the window and looks like a FIVE when it is really a 6-stone
-    // overline. Walk the board directly for BLACK only - reclassifying a
+    // overline. Measure the real run for BLACK only - reclassifying a
     // WHITE overline as LONG_FIVE would hide WHITE's winning threat from
     // every branch that matches on PatternType::FIVE.
     if (type == PatternType::FIVE && color == BLACK) {
-        int dr = DIRECTIONS[dir][0];
-        int dc = DIRECTIONS[dir][1];
-        int run = 1;
-        for (int i = 1; ; ++i) {
-            int r = row + i * dr;
-            int c = col + i * dc;
-            if (!board.is_valid(r, c) || board.get(r, c) != color) break;
-            ++run;
-        }
-        for (int i = 1; ; ++i) {
-            int r = row - i * dr;
-            int c = col - i * dc;
-            if (!board.is_valid(r, c) || board.get(r, c) != color) break;
-            ++run;
-        }
-        if (run >= 6) type = PatternType::LONG_FIVE;
+        if (board.run_length(dir, row, col, color) >= 6) type = PatternType::LONG_FIVE;
     }
 
     return DirectionPattern(type, dir);
