@@ -219,6 +219,37 @@ void test_listing_and_corrupt_files() {
     std::cout << "test_listing_and_corrupt_files passed" << std::endl;
 }
 
+// Defect 1: Unvalidated timeout_ms/max_depth in session restore (session_store.cpp:121-122)
+// A corrupted session file with negative or extreme values should be rejected
+// rather than loaded without validation.
+void test_session_config_validation() {
+    SessionSnapshot out;
+    std::string error;
+
+    // Negative timeout_ms should be rejected
+    const char* neg_timeout = R"({"version":1,"token":"ab","status":"playing","record":{"moves":[],"total_nodes":0,"max_depth":0},"timeout_ms":-1000,"max_depth":4})";
+    assert(!session_from_json(neg_timeout, out, error));
+
+    // Excessively large timeout_ms (>120s) should be rejected
+    const char* huge_timeout = R"({"version":1,"token":"ab","status":"playing","record":{"moves":[],"total_nodes":0,"max_depth":0},"timeout_ms":999999999,"max_depth":4})";
+    assert(!session_from_json(huge_timeout, out, error));
+
+    // Negative max_depth should be rejected
+    const char* neg_depth = R"({"version":1,"token":"ab","status":"playing","record":{"moves":[],"total_nodes":0,"max_depth":0},"timeout_ms":5000,"max_depth":-5})";
+    assert(!session_from_json(neg_depth, out, error));
+
+    // Excessively large max_depth (>20) should be rejected
+    const char* huge_depth = R"({"version":1,"token":"ab","status":"playing","record":{"moves":[],"total_nodes":0,"max_depth":0},"timeout_ms":5000,"max_depth":999})";
+    assert(!session_from_json(huge_depth, out, error));
+
+    // Valid values within bounds should still work
+    const char* valid_config = R"({"version":1,"token":"ab","status":"playing","record":{"moves":[],"total_nodes":0,"max_depth":0},"timeout_ms":5000,"max_depth":8})";
+    assert(session_from_json(valid_config, out, error));
+    assert(out.timeout_ms == 5000 && out.max_depth == 8);
+
+    std::cout << "test_session_config_validation passed" << std::endl;
+}
+
 }  // namespace
 
 int main() {
@@ -227,6 +258,7 @@ int main() {
     test_rejects_damaged_files();
     test_files_are_written_atomically();
     test_listing_and_corrupt_files();
+    test_session_config_validation();
     std::cout << "All session store tests passed!" << std::endl;
     return 0;
 }

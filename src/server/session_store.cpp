@@ -133,6 +133,18 @@ bool session_from_json(const std::string& text, SessionSnapshot& out, std::strin
         error = "会话状态不认识: " + snap.status;
         return false;
     }
+    // Validate config values to prevent corrupted files from loading extreme
+    // values that bypass the clamp_timeout_ms/clamp_max_depth guards applied at
+    // message boundaries (set_config/request_hint). These bounds match those
+    // clamps: [100, 120000] ms for timeout, [1, 20] for depth.
+    if (snap.timeout_ms < 0 || snap.timeout_ms > 120000) {
+        error = "会话里的超时时间不合法";
+        return false;
+    }
+    if (snap.max_depth < 0 || snap.max_depth > 20) {
+        error = "会话里的搜索深度不合法";
+        return false;
+    }
     // Absent means no hand-set position, which is the common case. A present but
     // malformed base is refused rather than skipped: silently dropping those
     // stones would resume the player into a different position than they left.
