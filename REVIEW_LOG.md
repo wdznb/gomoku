@@ -934,3 +934,57 @@ depth 4/8/20/50 produced 8..16 / 16..32 / 40..80 / 40..80 with the depth pinned 
 the wire read `timeout_ms: 8000 / 16000 / 40000`; 求招, a move, and an undo that ate both plies and kept
 `base` 4 all still work. Screenshots: `build/tmp/r64_setup_bar.png`, `r64_import.png`, `r64_bar.png`.
 
+## 轮次71 十三项缺陷批修 — bugfix round 71 (`phase5-bugfix`)
+
+**Asked for:** 每轮严格基于需求文档分析所有性能缺陷与逻辑漏洞，交修改会话（fix-code）定向修复，再由测试会话在 WSL
+编写用例回归；全绿才提交推送。本轮由四条审计线（服务端/引擎/前端摆棋/训练）产出 20 个候选，主会话逐条核验后
+留 13 项下发，其余判为误报或既有设计。
+
+**Search.** `VCTSearch::generate_defenses` only consulted the Chebyshev≤4 proximity blocks when the
+defender had no counter-threat anywhere on the board, so a single distant reply excluded the real
+answering square and `vct_defend/vct_attack` minned over an incomplete defense set — fabricated
+`100000+depth` wins that `search_engine` commits without AlphaBeta. The proximity candidates now merge
+unconditionally (deduplicated, additions only, same monotone-safe argument as the existing note).
+Resignation had the mirror problem of a different kind: the VCF loss probe is gated on
+`probe_budget_ms > 500`, but AlphaBeta almost always consumes the whole time limit, so in real games the
+probe never unboxed; an AlphaBeta score that is itself a proven mate loss (≤ -100000, side-to-move
+perspective) now resigns directly, probe kept as the extra path. And `remaining_time * 200` stayed int
+on the AlphaBeta node budget while the trainer's `--timeout-ms` has no upper bound — 1.5e9 wrapped
+negative, tripped the limit on the first node and silently fell back to `root_moves[0]`; computed in
+64-bit and clamped now.
+
+**Server.** A stone played without `choose_side` starts the AI for real, yet `side_chosen` stayed false,
+so the c154add resume guard refused to re-arm after a reconnect or takeover and the board sat on the
+AI's turn forever — an accepted `make_move` now claims the side, and **r69's F3-A expectation is
+superseded**: `make_move → disconnect → resume` must re-arm (T3a probes `thinking_progress` within
+15 s). Settlement raced the 10 s tick: ending a game and confirming 摆棋 inside the window wiped
+`winner` before any flush, losing the game from both the session file and `records.jsonl` — the
+GAME_OVER callback posts an immediate deduped flush, and `set_position` settles the outgoing game
+before overwriting it. The flush guard keyed off `side_chosen`, letting a 0-stone choose_side→resign
+game write a file and append a decisive blank line; persistence is content-decided now (base and moves
+both empty → nothing is written, per 一子未落的空会话不写 — three legacy `sessions_probe` assertions
+that expected such files are obsolete by design). `choose_side "red"` used to reset a finished board
+before answering the error; validation happens before any state change now.
+
+**Trainer / position / frontend.** `--accept-score 0.5` slipped through a `< 0.5` rejection although the
+README pins the threshold strictly above the draw score — `<= 0.5` now, help text aligned. INVALID
+self-play games were excluded from samples but still appended to `--records` and counted in
+`games_played`; they are dropped before the push. Bitboard string words went through `std::stoull`,
+which wraps `"-1"` to 2^64-1 while the numeric path rejects negatives — strings reject `-` too.
+In `web/app.js`: `sendMessage` returns whether the frame left the socket, and a confirm whose message
+never went out rolls `confirmInFlight` back instead of disabling 确认 forever; 载入本局分析 is disabled
+while a hand-set position is unclaimed (its replay is `moves:[]` and would wipe 落子记录 before 选边,
+which the README reserves for the side claim); undo exits the replay view unconditionally, so no stale
+「回放 · 第 N 手」 pointer survives a popped ply.
+
+**Verified.** Test session (WSL): three new cases in `tests/test_search.cpp`
+(`test_vct_far_counter_does_not_fabricate_win`, `test_search_engine_resigns_when_alphabeta_proves_mate`,
+`test_alphabeta_huge_timeout_does_not_overflow_node_budget`); differential harness against
+`git show HEAD:` — T2 and T7 discriminate strongly (HEAD plays on at 300 ms / searches 0 nodes at
+1.5e9), T1 came out verdict-inert across ~1600 fuzz positions so it is recorded DISCRIMINATING=weak.
+Socket probes 20/20 (T3a/b/c, T4 settle-within-1s and no double export, T5, T12, T13), `gomoku_train`
+accept-score four gates, `wspos.py` 30/30, adapted `sessions_probe` green except the three obsolete
+expectations above, `ctest` 7/7 with only the pre-existing `server_reason_of` warning. One caveat: the
+T2 case budgets 300 ms wall-clock and aborted once while a CPU-saturating fuzzer ran beside it — green
+on an idle machine; keep it in mind if it ever flakes under load.
+
