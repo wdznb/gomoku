@@ -380,6 +380,8 @@ void GameServer::handle_message(std::shared_ptr<WebSocketSession> session, const
         handle_make_move(session, msg);
     } else if (type == "undo") {
         handle_undo(session);
+    } else if (type == "request_replay") {
+        handle_request_replay(session);
     } else if (type == "request_hint") {
         handle_request_hint(session, msg);
     } else if (type == "resign") {
@@ -507,6 +509,41 @@ void GameServer::handle_undo(std::shared_ptr<WebSocketSession> session) {
     } else {
         send_error(session, "Cannot undo");
     }
+}
+
+void GameServer::handle_request_replay(std::shared_ptr<WebSocketSession> session) {
+    std::lock_guard<std::mutex> lock(games_mutex_);
+    auto it = games_.find(session.get());
+    if (it == games_.end()) return;
+
+    const ReplaySnapshot snapshot = it->second->replay_snapshot();
+
+    json moves_json = json::array();
+    for (const MoveAnalysis& analysis : snapshot.moves) {
+        json entry;
+        entry["row"] = analysis.move.pos.row;
+        entry["col"] = analysis.move.pos.col;
+        entry["color"] = analysis.move.color == BLACK ? "black" : "white";
+        entry["score"] = analysis.score;
+        entry["depth"] = analysis.depth;
+        entry["nodes"] = analysis.nodes;
+        entry["elapsed_ms"] = analysis.elapsed_ms;
+        entry["method"] = analysis.method;
+        moves_json.push_back(entry);
+    }
+
+    json response;
+    response["type"] = "replay";
+    response["moves"] = moves_json;
+    response["game_over"] = snapshot.game_over;
+    if (!snapshot.game_over) {
+        response["winner"] = "none";
+    } else {
+        response["winner"] = snapshot.winner == EMPTY ? "draw"
+                           : (snapshot.winner == BLACK ? "black" : "white");
+    }
+    response["reason"] = snapshot.reason;
+    send_message(session, response);
 }
 
 void GameServer::handle_request_hint(std::shared_ptr<WebSocketSession> session, const json& msg) {

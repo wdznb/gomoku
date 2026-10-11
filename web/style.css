@@ -167,6 +167,7 @@ input[type="number"] {
 .move-item {
     padding: 3px 0;
     border-bottom: 1px solid #eee;
+    cursor: pointer;
 }
 
 .move-item:last-child {
@@ -179,6 +180,41 @@ input[type="number"] {
 
 .move-item.white {
     color: #666;
+}
+
+.move-item.active {
+    background: #ffe9b6;
+    font-weight: bold;
+}
+
+.replay-controls {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    margin-top: 6px;
+}
+
+.btn-small {
+    display: inline-block;
+    flex: 1 1 auto;
+    width: auto;
+    margin-bottom: 0;
+    padding: 4px 8px;
+    font-size: 0.8em;
+}
+
+#eval-graph {
+    display: block;
+    margin-top: 8px;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+}
+
+.replay-info {
+    margin-top: 6px;
+    font-size: 0.8em;
+    color: #555;
+    min-height: 1.2em;
 }
 
 @media (max-width: 900px) {

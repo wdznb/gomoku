@@ -20,6 +20,15 @@ class GomokuGame {
         this.gameStatus = 'waiting';
         this.aiThinking = false;
         this.lastMove = null;
+        // Engine numbers for the current game, index-aligned with moveHistory.
+        // Filled by the server's "replay" reply (4.4), not by the live messages.
+        this.analysis = [];
+        // True when the loaded record already covers the game's ending.
+        this.analysisEnded = false;
+        // Null while viewing the live position; a move index while replaying.
+        this.replayIndex = null;
+        this.replayTimer = null;
+        this.gameOverText = '';
         
         this.initWebSocket();
         this.initUI();
@@ -63,10 +72,253 @@ class GomokuGame {
         document.getElementById('btn-restart').addEventListener('click', () => this.restart());
         
         this.canvas.addEventListener('click', (e) => this.handleCanvasClick(e));
+
+        document.getElementById('btn-replay').addEventListener('click', () => this.requestReplay());
+        document.getElementById('btn-replay-first').addEventListener('click', () => this.showReplayMove(0));
+        document.getElementById('btn-replay-prev').addEventListener('click', () => this.stepReplay(-1));
+        document.getElementById('btn-replay-next').addEventListener('click', () => this.stepReplay(1));
+        document.getElementById('btn-replay-last').addEventListener('click', () => this.showReplayMove(this.moveHistory.length - 1));
+        document.getElementById('btn-replay-play').addEventListener('click', () => this.toggleReplayAuto());
+        document.getElementById('btn-replay-exit').addEventListener('click', () => this.exitReplay());
+
+        // The two AI settings used to reach the server only as hint parameters,
+        // so the AI's own moves always ran on its defaults. Push them as config
+        // whenever they change.
+        for (const id of ['timeout', 'depth']) {
+            document.getElementById(id).addEventListener('change', () => this.sendConfig());
+        }
+    }
+
+    sendConfig() {
+        const timeout = parseInt(document.getElementById('timeout').value, 10);
+        const depth = parseInt(document.getElementById('depth').value, 10);
+        if (!Number.isFinite(timeout) || !Number.isFinite(depth)) return;
+        this.sendMessage({ type: 'set_config', timeout_ms: timeout, max_depth: depth });
+    }
+
+    requestReplay() {
+        this.sendMessage({ type: 'request_replay' });
+    }
+
+    handleReplay(msg) {
+        // The server's move list is authoritative: it already accounts for the
+        // undos the client reconciled by count only. Rebuild the local history
+        // from it so the analysis indexes line up.
+        const moves = Array.isArray(msg.moves) ? msg.moves : [];
+        this.moveHistory = moves.map(m => ({
+            row: m.row,
+            col: m.col,
+            color: m.color === 'black' ? BLACK : WHITE
+        }));
+        this.analysis = moves.map(m => ({
+            score: m.score || 0,
+            depth: m.depth || 0,
+            nodes: m.nodes || 0,
+            elapsed_ms: m.elapsed_ms || 0,
+            method: m.method || ''
+        }));
+        this.board = Array(BOARD_SIZE).fill(null).map(() => Array(BOARD_SIZE).fill(EMPTY));
+        for (const m of this.moveHistory) {
+            this.board[m.row][m.col] = m.color;
+        }
+        // The snapshot may have been taken before an in-flight AI stone was
+        // committed, so re-derive the turn and marker from the rebuilt history
+        // rather than trusting the local flip count.
+        this.currentTurn = (this.moveHistory.length % 2 === 0) ? BLACK : WHITE;
+        this.lastMove = this.moveHistory.length > 0
+            ? this.moveHistory[this.moveHistory.length - 1]
+            : null;
+        if (msg.game_over) {
+            this.gameStatus = 'game_over';
+        }
+        this.stopReplayAuto();
+        this.replayIndex = this.moveHistory.length > 0 ? 0 : null;
+        this.analysisEnded = !!msg.game_over;
+        this.refreshReplayControls();
+        this.updateMoveList();
+        this.drawBoard();
+        this.updateReplayInfo();
+        this.updateTurnInfo();
+        this.drawEvalGraph();
+        this.updateStatus(this.replaySummary(msg));
+    }
+
+    reasonText(reason) {
+        const reasons = { five: '五连', resign: '认输', draw: '满盘和棋' };
+        return reasons[reason] || reason || '未知';
+    }
+
+    replaySummary(msg) {
+        if (!msg.game_over) {
+            return `回放已载入：${this.moveHistory.length} 手（对局进行中）`;
+        }
+        const winner = msg.winner === 'draw' ? '和棋'
+            : (msg.winner === (this.playerColor === BLACK ? 'black' : 'white') ? '你赢了' : '你输了');
+        return `回放已载入：${this.moveHistory.length} 手 · ${winner}（${this.reasonText(msg.reason)}）`;
+    }
+
+    showReplayMove(index) {
+        if (this.moveHistory.length === 0) return;
+        const clamped = Math.max(0, Math.min(this.moveHistory.length - 1, index));
+        this.replayIndex = clamped;
+        this.refreshReplayControls();
+        this.updateMoveList();
+        this.drawBoard();
+        this.updateReplayInfo();
+    }
+
+    stepReplay(delta) {
+        const from = this.replayIndex === null ? (delta > 0 ? -1 : 0) : this.replayIndex;
+        this.showReplayMove(from + delta);
+    }
+
+    toggleReplayAuto() {
+        if (this.replayTimer) {
+            this.stopReplayAuto();
+            return;
+        }
+        if (this.replayIndex === null || this.replayIndex >= this.moveHistory.length - 1) {
+            this.showReplayMove(0);
+        }
+        this.replayTimer = setInterval(() => {
+            if (this.replayIndex >= this.moveHistory.length - 1) {
+                this.stopReplayAuto();
+                return;
+            }
+            this.stepReplay(1);
+        }, 700);
+        document.getElementById('btn-replay-play').textContent = '⏸ 暂停';
+    }
+
+    stopReplayAuto() {
+        if (this.replayTimer) {
+            clearInterval(this.replayTimer);
+            this.replayTimer = null;
+        }
+        document.getElementById('btn-replay-play').textContent = '▶ 自动';
+    }
+
+    exitReplay() {
+        this.stopReplayAuto();
+        this.replayIndex = null;
+        this.refreshReplayControls();
+        this.updateMoveList();
+        this.drawBoard();
+        this.updateReplayInfo();
+        this.updateStatus(this.gameStatus === 'game_over' && this.gameOverText
+            ? this.gameOverText : '已回到当前局面');
+    }
+
+    refreshReplayControls() {
+        const hasMoves = this.moveHistory.length > 0;
+        const nav = ['btn-replay-first', 'btn-replay-prev', 'btn-replay-play',
+                     'btn-replay-next', 'btn-replay-last'];
+        for (const id of nav) {
+            const el = document.getElementById(id);
+            // While the AI is thinking, the live board is the thing to watch.
+            el.disabled = !hasMoves || this.aiThinking;
+        }
+        document.getElementById('btn-replay-exit').disabled = this.replayIndex === null;
+        // Re-enable when the record is behind the game: a move played after the
+        // last load has no analysis, and an ending that arrived since then is
+        // not in the loaded summary either.
+        const stale = this.analysis.length < this.moveHistory.length ||
+            (this.gameStatus === 'game_over' && !this.analysisEnded);
+        document.getElementById('btn-replay').disabled =
+            !hasMoves || this.aiThinking || !stale;
+    }
+
+    // One engine verdict, formatted. The non-AlphaBeta paths (book / vcf / vct /
+    // greedy) answer without a depth or node count, so those fields are shown
+    // only when the search actually filled them in.
+    formatAnalysis(a, compact) {
+        if (!a || a.method === 'human') return compact ? '' : '玩家落子';
+        const mate = Math.abs(a.score) >= 99999;
+        const verdict = mate ? (a.score > 0 ? '胜' : '负') : String(a.score);
+        const parts = [a.method, verdict];
+        if (a.depth) parts.push(`${a.depth}d`);
+        if (a.nodes) parts.push(`${(a.nodes / 1000).toFixed(1)}k`);
+        if (!compact && a.elapsed_ms) parts.push(`${a.elapsed_ms}ms`);
+        return parts.join(' ');
+    }
+
+    updateReplayInfo() {
+        const el = document.getElementById('replay-info');
+        if (this.replayIndex === null) {
+            el.textContent = '';
+            return;
+        }
+        const m = this.moveHistory[this.replayIndex];
+        const a = this.analysis[this.replayIndex];
+        const colorName = m.color === BLACK ? '黑' : '白';
+        const coord = `${String.fromCharCode(65 + m.col)}${BOARD_SIZE - m.row}`;
+        let text = `第 ${this.replayIndex + 1}/${this.moveHistory.length} 手 · ${colorName} ${coord}`;
+        if (a) {
+            text += ` · ${this.formatAnalysis(a, false)}`;
+        } else {
+            text += ' · 尚未载入分析';
+        }
+        el.textContent = text;
+    }
+
+    drawEvalGraph() {
+        const canvas = document.getElementById('eval-graph');
+        const ctx = canvas.getContext('2d');
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = '#f5f0e6';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+        // Mid line and axis.
+        ctx.strokeStyle = '#bbb';
+        ctx.beginPath();
+        ctx.moveTo(0, canvas.height / 2);
+        ctx.lineTo(canvas.width, canvas.height / 2);
+        ctx.stroke();
+        if (this.analysis.length === 0) return;
+
+        // Only the engine's own moves carry a verdict; a human ply scored 0 in
+        // the record means "not searched", so plotting it would drag the curve
+        // to the middle on every one of the player's turns.
+        const limit = 2000;
+        const points = [];
+        this.analysis.forEach((a, i) => {
+            if (!a || a.method === 'human') return;
+            // The engine scores from the side that just moved, so flip the
+            // opponent's numbers to read one continuous BLACK-point curve.
+            const blackScore = this.moveHistory[i].color === BLACK ? a.score : -a.score;
+            const clamped = Math.max(-limit, Math.min(limit, blackScore));
+            const x = canvas.width * (i + 0.5) / this.analysis.length;
+            const y = canvas.height / 2 - (clamped / limit) * (canvas.height / 2 - 8);
+            points.push({ x, y, saturated: Math.abs(blackScore) > limit });
+        });
+        if (points.length === 0) return;
+
+        ctx.fillStyle = '#666';
+        ctx.font = '10px sans-serif';
+        ctx.fillText('评估曲线（黑棋视角）', 4, 10);
+
+        ctx.strokeStyle = '#3a6ea5';
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        points.forEach((p, i) => i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y));
+        ctx.stroke();
+
+        // Points pushed to the edge are a proven win/loss, not a vague advantage.
+        ctx.fillStyle = '#c0392b';
+        for (const p of points) {
+            if (p.saturated) {
+                ctx.beginPath();
+                ctx.arc(p.x, p.y, 3, 0, Math.PI * 2);
+                ctx.fill();
+            }
+        }
     }
     
     handleCanvasClick(e) {
         if (this.gameStatus !== 'playing' || this.aiThinking) return;
+        // A replayed position is a read-only view of the past; clicking there
+        // must not send a move for the live turn.
+        if (this.replayIndex !== null) return;
         if (this.currentTurn !== this.playerColor) return;
         
         const rect = this.canvas.getBoundingClientRect();
@@ -85,6 +337,9 @@ class GomokuGame {
     
     chooseSide(color) {
         this.playerColor = color === 'black' ? BLACK : WHITE;
+        // If the AI opens the game (human picks WHITE) its first search starts
+        // before any later control change could reach the server.
+        this.sendConfig();
         this.sendMessage({
             type: 'choose_side',
             color: color
@@ -146,6 +401,16 @@ class GomokuGame {
         this.gameStatus = 'waiting';
         this.aiThinking = false;
         this.lastMove = null;
+        // A new game has no history to replay, and stale analysis would attach
+        // the old game's numbers to the new moves.
+        this.stopReplayAuto();
+        this.analysis = [];
+        this.analysisEnded = false;
+        this.replayIndex = null;
+        this.gameOverText = '';
+        this.refreshReplayControls();
+        this.updateReplayInfo();
+        this.drawEvalGraph();
         
         document.getElementById('btn-black').disabled = false;
         document.getElementById('btn-white').disabled = false;
@@ -181,6 +446,9 @@ class GomokuGame {
             case 'undo_success':
                 this.handleUndoSuccess(msg);
                 break;
+            case 'replay':
+                this.handleReplay(msg);
+                break;
             case 'hint_result':
                 this.handleHintResult(msg);
                 break;
@@ -208,6 +476,7 @@ class GomokuGame {
         this.placeStone(msg.row, msg.col, msg.color === 'black' ? BLACK : WHITE);
         this.currentTurn = this.currentTurn === BLACK ? WHITE : BLACK;
         this.updateTurnInfo();
+        this.refreshReplayControls();
     }
     
     handleAIMove(msg) {
@@ -215,8 +484,12 @@ class GomokuGame {
         this.currentTurn = this.currentTurn === BLACK ? WHITE : BLACK;
         this.aiThinking = false;
         document.getElementById('btn-stop').disabled = true;
-        this.updateThinkingInfo('');
+        // ai_move is the only live message that carries the engine's verdict for
+        // the stone it just placed, so surface it before the next search clears
+        // the thinking line.
+        this.updateThinkingInfo(`AI 落子：分值 ${msg.score}，耗时 ${msg.thinking_time_ms}ms`);
         this.updateTurnInfo();
+        this.refreshReplayControls();
     }
     
     handleUndoSuccess(msg) {
@@ -235,6 +508,17 @@ class GomokuGame {
         this.lastMove = this.moveHistory.length > 0
             ? this.moveHistory[this.moveHistory.length - 1]
             : null;
+        // The popped plies shift every analysis index after them, and a replay
+        // position that no longer exists is worse than no replay at all, so the
+        // loaded record is dropped and has to be requested again.
+        if (this.analysis.length > target) {
+            this.stopReplayAuto();
+            this.analysis = [];
+            this.analysisEnded = false;
+            this.replayIndex = null;
+            this.updateReplayInfo();
+            this.drawEvalGraph();
+        }
         if (msg.game_status === 'waiting') {
             this.gameStatus = 'waiting';
         } else if (msg.game_status === 'game_over') {
@@ -244,10 +528,16 @@ class GomokuGame {
         }
         this.updateMoveList();
         this.updateTurnInfo();
+        this.refreshReplayControls();
         this.drawBoard();
     }
     
     handleHintResult(msg) {
+        // The ring marks a square of the live position; leave any replay view
+        // first so it is not drawn on a historical board.
+        if (this.replayIndex !== null) {
+            this.exitReplay();
+        }
         this.highlightMove(msg.row, msg.col);
     }
     
@@ -261,6 +551,7 @@ class GomokuGame {
         if (this.gameStatus === 'playing' && this.currentTurn !== this.playerColor) {
             this.aiThinking = true;
             document.getElementById('btn-stop').disabled = false;
+            this.refreshReplayControls();
         }
     }
     
@@ -278,12 +569,17 @@ class GomokuGame {
                 statusText += `你输了 (${winnerColor}胜)`;
             }
         }
+        // The reason the engine reports (five / resign / draw) is part of the
+        // result the player is owed, not only a status code.
+        statusText += ` · ${this.reasonText(msg.reason)}`;
+        this.gameOverText = statusText;
         this.updateStatus(statusText);
         
         document.getElementById('btn-undo').disabled = true;
         document.getElementById('btn-hint').disabled = true;
         document.getElementById('btn-resign').disabled = true;
         document.getElementById('btn-stop').disabled = true;
+        this.refreshReplayControls();
     }
     
     placeStone(row, col, color) {
@@ -306,10 +602,27 @@ class GomokuGame {
         this.ctx.stroke();
     }
     
+    // The board as the player should see it right now: the live position, or the
+    // position after replayIndex plies when a historical view is active.
+    displayView() {
+        if (this.replayIndex === null) {
+            return { board: this.board, lastMove: this.lastMove };
+        }
+        const board = Array(BOARD_SIZE).fill(null).map(() => Array(BOARD_SIZE).fill(EMPTY));
+        let lastMove = null;
+        for (let i = 0; i <= this.replayIndex && i < this.moveHistory.length; ++i) {
+            const m = this.moveHistory[i];
+            board[m.row][m.col] = m.color;
+            lastMove = m;
+        }
+        return { board, lastMove };
+    }
+
     drawBoard() {
         const ctx = this.ctx;
         const width = this.canvas.width;
         const height = this.canvas.height;
+        const view = this.displayView();
         
         ctx.fillStyle = '#DEB887';
         ctx.fillRect(0, 0, width, height);
@@ -343,19 +656,27 @@ class GomokuGame {
         
         for (let row = 0; row < BOARD_SIZE; row++) {
             for (let col = 0; col < BOARD_SIZE; col++) {
-                if (this.board[row][col] !== EMPTY) {
-                    this.drawStone(row, col, this.board[row][col]);
+                if (view.board[row][col] !== EMPTY) {
+                    this.drawStone(row, col, view.board[row][col]);
                 }
             }
         }
         
-        if (this.lastMove) {
-            const x = PADDING + this.lastMove.col * CELL_SIZE;
-            const y = PADDING + this.lastMove.row * CELL_SIZE;
+        if (view.lastMove) {
+            const x = PADDING + view.lastMove.col * CELL_SIZE;
+            const y = PADDING + view.lastMove.row * CELL_SIZE;
             ctx.beginPath();
             ctx.arc(x, y, 5, 0, Math.PI * 2);
-            ctx.fillStyle = this.lastMove.color === BLACK ? '#fff' : '#000';
+            ctx.fillStyle = view.lastMove.color === BLACK ? '#fff' : '#000';
             ctx.fill();
+        }
+
+        if (this.replayIndex !== null) {
+            // Say so on the board itself: a past position looks exactly like a
+            // live one, and the missing marker is the only other clue.
+            ctx.fillStyle = '#8b4513';
+            ctx.font = '14px sans-serif';
+            ctx.fillText(`回放中 · 第 ${this.replayIndex + 1} 手`, PADDING, height - 4);
         }
     }
     
@@ -419,10 +740,18 @@ class GomokuGame {
         
         this.moveHistory.forEach((move, index) => {
             const div = document.createElement('div');
-            div.className = `move-item ${move.color === BLACK ? 'black' : 'white'}`;
+            const isLive = this.replayIndex === null
+                ? index === this.moveHistory.length - 1
+                : index === this.replayIndex;
+            div.className = `move-item ${move.color === BLACK ? 'black' : 'white'}`
+                + (isLive ? ' active' : '');
             const colorName = move.color === BLACK ? '黑' : '白';
             const colName = String.fromCharCode(65 + move.col);
-            div.textContent = `${index + 1}. ${colorName} ${colName}${BOARD_SIZE - move.row}`;
+            let text = `${index + 1}. ${colorName} ${colName}${BOARD_SIZE - move.row}`;
+            const analysis = this.formatAnalysis(this.analysis[index], true);
+            if (analysis) text += ` · ${analysis}`;
+            div.textContent = text;
+            div.addEventListener('click', () => this.showReplayMove(index));
             list.appendChild(div);
         });
         

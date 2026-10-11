@@ -181,8 +181,54 @@ score. `test_root_symmetry_dedup` checks the 8-variant empty board yields exactl
 representatives (Burnside), that the chosen move is always a representative, and that a horizontal and
 a vertical mirror position score alike.
 
+## Phase 4 (continued) — replay analysis and frontend (`phase4-ui-replay`)
+
+### Round 52 — audit of the replay path
+
+**The analysis list is a second copy of the move history, so it has to be edited everywhere the
+history is.** `GameManager` appends on the human's `make_move`, on the worker's committed stone (only
+inside the same `thinking_mutex_` critical section that places it), pops exactly the stones `undo()`
+gives back, and clears with `reset()`. A resign adds no stone and therefore no entry — asserted
+against `board().move_count()` in `test_game_manager_replay_snapshot`, which is the invariant the test
+holds on rather than a hardcoded size.
+
+**Reading the record from the io thread while the worker commits.** `replay_snapshot()` copies the
+list, winner, reason and status under `thinking_mutex_` in one lock, so the client can never receive
+a move list from before the ending paired with the ending's own fields. The io thread is single
+(`ioc_.run()` on one thread), which is what makes the un-locked `make_move` append safe; the worker is
+the only other writer and it holds the lock.
+
+**The client's own turn state can be stale after a rebuild.** `handleReplay` rebuilds the move list
+from the server's authoritative snapshot, which may have been taken before an in-flight AI stone was
+committed. Re-deriving `currentTurn` from parity and `lastMove` from the rebuilt list (the same
+reconciliation `handleUndoSuccess` already does) keeps the view self-consistent; the missing stone
+arrives as the next `ai_move`.
+
+**A loaded record silently goes out of date in two different ways**, and the first version of the
+enable rule only caught one: a new move makes the record shorter than the board, while an ending that
+arrives *after* a complete load changes no move count at all. The button now re-arms on either, and an
+undo drops the record outright because every analysis index after the popped plies would point at the
+wrong stone.
+
+- Verified in a real browser against the WSL server: play → load → step / auto-play / jump-to-move →
+  exit, resign → reload (ending text restored after exiting the replay), undo (record invalidated),
+  and the console stayed clean. Screenshots were used to catch the layout regression where the
+  full-width `.btn` rule stacked the replay controls one per row.
+
+**Two pre-existing frontend defects surfaced while wiring this up.** The 超时时间 / 搜索深度 inputs
+were only ever sent as `request_hint` parameters, so the AI's own moves always ran on the server's
+defaults while the UI claimed to configure it — they now send `set_config` on change and before
+choosing a side. And the game-over message's `reason` was dropped on the floor; the status line now
+names the ending (五连 / 认输 / 满盘和棋).
+
+**Curve convention.** The engine scores each move for the side that just played, so plotting the
+record directly would zig-zag with whose turn it was and drag through zero on every human ply
+(those entries carry no evaluation at all). The graph plots engine moves only, negated for WHITE, and
+says so on the canvas.
+
 ### Phase 4 status
 
-4.1 (bitboard) and 4.2 (search-side symmetry dedup) are done and released as `v0.4.0-phase4`.
-4.3 (frontend) and 4.4 (replay analysis) are the remaining work of the phase.
+All four items of the phase are implemented: 4.1 bitboard and 4.2 root dedup (released as
+`v0.4.0-phase4`), 4.4 per-move analysis capture plus `request_replay` / `replay`, and 4.3 the replay
+UI, eval curve, clickable move list, ending reason and working AI settings.
 

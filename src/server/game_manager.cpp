@@ -60,6 +60,7 @@ void GameManager::reset() {
         status_ = GameStatus::WAITING;
         winner_ = EMPTY;
         game_over_reason_.clear();
+        analyses_.clear();
     }
 }
 
@@ -100,6 +101,7 @@ bool GameManager::make_move(int row, int col) {
     if (!board_.place_stone(row, col, turn)) {
         return false;
     }
+    analyses_.push_back(MoveAnalysis{Move(row, col, turn), 0, 0, 0, 0, "human"});
     
     if (status_ == GameStatus::WAITING) {
         status_ = GameStatus::PLAYING;
@@ -123,8 +125,15 @@ bool GameManager::undo(int& out_move_count, GameStatus& out_status) {
         undo_count = 2;
     }
     
+    int undone = 0;
     for (int i = 0; i < undo_count && board_.move_count() > 0; ++i) {
         board_.undo_last_move();
+        ++undone;
+    }
+    // The board and the replay list are the same history seen two ways, so a
+    // stone the board gave up has to leave the analysis list too.
+    for (int i = 0; i < undone && !analyses_.empty(); ++i) {
+        analyses_.pop_back();
     }
     
     if (board_.move_count() == 0) {
@@ -152,6 +161,16 @@ bool GameManager::undo(int& out_move_count, GameStatus& out_status) {
     }
     
     return true;
+}
+
+ReplaySnapshot GameManager::replay_snapshot() {
+    std::lock_guard<std::mutex> lock(thinking_mutex_);
+    ReplaySnapshot snapshot;
+    snapshot.moves = analyses_;
+    snapshot.winner = winner_;
+    snapshot.reason = game_over_reason_;
+    snapshot.game_over = status_ == GameStatus::GAME_OVER;
+    return snapshot;
 }
 
 void GameManager::resign(int color) {
@@ -278,6 +297,9 @@ void GameManager::ai_thinking_worker(int timeout_ms, int max_depth) {
             status_ == GameStatus::PLAYING &&
             current_turn() == ai_color_ &&
             board_.place_stone(result.best_move.pos, ai_color_)) {
+            analyses_.push_back(MoveAnalysis{result.best_move, result.score, result.depth,
+                                             result.nodes_searched, result.elapsed_ms,
+                                             result.method});
             move_callback_(result.best_move, result.score, result.elapsed_ms);
 
             check_game_over();

@@ -49,6 +49,21 @@
                     </label>
                 </div>
                 
+                <div class="button-group">
+                    <h3>回放分析</h3>
+                    <button id="btn-replay" class="btn" disabled>载入本局分析</button>
+                    <div class="replay-controls">
+                        <button id="btn-replay-first" class="btn btn-small" disabled>⏮</button>
+                        <button id="btn-replay-prev" class="btn btn-small" disabled>◀</button>
+                        <button id="btn-replay-play" class="btn btn-small" disabled>▶ 自动</button>
+                        <button id="btn-replay-next" class="btn btn-small" disabled>▶</button>
+                        <button id="btn-replay-last" class="btn btn-small" disabled>⏭</button>
+                        <button id="btn-replay-exit" class="btn btn-small" disabled>退出回放</button>
+                    </div>
+                    <canvas id="eval-graph" width="260" height="72"></canvas>
+                    <div id="replay-info" class="replay-info"></div>
+                </div>
+                
                 <div class="move-history">
                     <h3>落子记录</h3>
                     <div id="move-list" class="move-list"></div>

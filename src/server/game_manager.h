@@ -10,6 +10,8 @@
 #include <thread>
 #include <functional>
 #include <mutex>
+#include <string>
+#include <vector>
 
 namespace gomoku {
 
@@ -17,6 +19,26 @@ enum class GameStatus {
     WAITING,
     PLAYING,
     GAME_OVER
+};
+
+// One ply of the session's own game, kept so the client can replay it with the
+// engine's numbers. Human stones carry method "human" and no search data.
+struct MoveAnalysis {
+    Move move;
+    int score = 0;
+    int depth = 0;
+    int nodes = 0;
+    int elapsed_ms = 0;
+    std::string method;
+};
+
+// Everything the replay view needs, captured in one lock so the move list and
+// the ending cannot disagree.
+struct ReplaySnapshot {
+    std::vector<MoveAnalysis> moves;
+    int winner = EMPTY;
+    std::string reason;
+    bool game_over = false;
 };
 
 class GameManager {
@@ -58,6 +80,9 @@ public:
     const Board& board() const { return board_; }
     GameStatus status() const { return status_; }
     int winner() const { return winner_; }
+    // Copies the session's own game for the replay view. Not const: it takes
+    // thinking_mutex_, which the AI worker also holds when it commits a stone.
+    ReplaySnapshot replay_snapshot();
     
     void set_coefficients(const ThreatCoefficients& coeffs);
     void set_config(int timeout_ms, int max_depth);
@@ -73,6 +98,7 @@ private:
     GameStatus status_;
     int winner_;
     std::string game_over_reason_;
+    std::vector<MoveAnalysis> analyses_;
     
     std::atomic<bool> ai_thinking_;
     std::atomic<bool> stop_flag_;

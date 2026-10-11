@@ -890,6 +890,62 @@ void test_game_manager_hint_uses_hint_callback() {
     std::cout << "test_game_manager_hint_uses_hint_callback passed" << std::endl;
 }
 
+void test_game_manager_replay_snapshot() {
+    // Phase 4.4 replays the session's own game, so the analysis list has to be
+    // the board's history seen a second way: one entry per committed stone,
+    // dropped together on undo, gone after reset, and untouched by a resign
+    // that placed no stone.
+    GameManager game;
+    game.set_player_color(BLACK);
+    game.set_config(500, 1);
+
+    std::atomic<int> ai_moves{0};
+    game.set_move_callback([&](const Move&, int, int) { ai_moves.fetch_add(1); });
+
+    assert(game.replay_snapshot().moves.empty());
+    assert(game.make_move(7, 7));
+
+    for (int i = 0; i < 300 && ai_moves.load() < 1; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    assert(ai_moves.load() >= 1);
+
+    ReplaySnapshot snap = game.replay_snapshot();
+    assert(snap.moves.size() == 2);
+    assert(snap.moves.size() == game.board().move_count());
+    assert(snap.moves[0].method == "human");
+    assert(snap.moves[0].move.color == BLACK);
+    assert(snap.moves[0].move.pos.row == 7 && snap.moves[0].move.pos.col == 7);
+    assert(snap.moves[1].move.color == WHITE);
+    assert(!snap.game_over);
+    assert(snap.winner == EMPTY);
+
+    // Both stones come back, so both entries must leave the list.
+    int move_count = 1;
+    GameStatus undo_status = GameStatus::PLAYING;
+    assert(game.undo(move_count, undo_status));
+    assert(move_count == 0);
+    assert(game.replay_snapshot().moves.empty());
+
+    assert(game.make_move(7, 7));
+    for (int i = 0; i < 300 && ai_moves.load() < 2; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    game.resign(BLACK);
+
+    snap = game.replay_snapshot();
+    assert(snap.game_over);
+    assert(snap.winner == WHITE);
+    assert(snap.reason == "resign");
+    assert(snap.moves.size() == game.board().move_count());
+    assert(snap.moves.front().method == "human");
+
+    game.reset();
+    assert(game.replay_snapshot().moves.empty());
+
+    std::cout << "test_game_manager_replay_snapshot passed" << std::endl;
+}
+
 void test_root_symmetry_dedup() {
     // Phase 4.2 drops root moves that are mirror images of a move already
     // covered. An empty board is invariant under all eight D4 variants and its
@@ -987,6 +1043,7 @@ int main() {
     test_game_manager_rejects_move_on_ai_turn();
     test_game_manager_promotes_status_when_ai_opens();
     test_game_manager_hint_uses_hint_callback();
+    test_game_manager_replay_snapshot();
     test_root_symmetry_dedup();
     test_search_engine_prefers_own_five_over_block();
 
