@@ -37,6 +37,14 @@ std::vector<int> self_symmetries(const Board& board) {
     return variants;
 }
 
+bool is_symmetry_representative(const std::vector<int>& sym, Position pos) {
+    const int index = pos.to_index();
+    for (const int variant : sym) {
+        if (transform_position(pos, variant).to_index() < index) return false;
+    }
+    return true;
+}
+
 int canonical_cell(const Board& board, Position pos) {
     int best = pos.to_index();
     for (int variant : self_symmetries(board)) {

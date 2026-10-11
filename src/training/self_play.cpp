@@ -1,6 +1,6 @@
 #include "self_play.h"
 #include "../core/pattern.h"
-#include "transforms.h"
+#include "../core/transforms.h"
 
 namespace gomoku {
 

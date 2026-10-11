@@ -1,7 +1,7 @@
 #include "trainer.h"
 #include "json_int.h"
 #include "self_play.h"
-#include "transforms.h"
+#include "../core/transforms.h"
 #include <nlohmann/json.hpp>
 #include <fstream>
 #include <sstream>

@@ -256,6 +256,12 @@ DirectionPattern PatternRecognizer::recognize_direction(const Board& board, int 
         return DirectionPattern(PatternType::NONE, dir);
     }
 
+    // The bitboard lines are indexed by colour and direction family, so a stray
+    // value here would read outside them instead of just returning no pattern.
+    if ((color != BLACK && color != WHITE) || dir < 0 || dir >= 4) {
+        return DirectionPattern(PatternType::NONE, dir);
+    }
+
     const WindowDesc& desc = window_descs()[(row * BOARD_SIZE + col) * 4 + dir];
     const int opp = opponent(color);
 

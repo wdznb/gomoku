@@ -1,6 +1,7 @@
 #include "core/board.h"
 #include "core/pattern.h"
 #include "core/evaluator.h"
+#include "core/transforms.h"
 #include "search/greedy.h"
 #include "search/vcf.h"
 #include "search/vct.h"
@@ -889,6 +890,62 @@ void test_game_manager_hint_uses_hint_callback() {
     std::cout << "test_game_manager_hint_uses_hint_callback passed" << std::endl;
 }
 
+void test_root_symmetry_dedup() {
+    // Phase 4.2 drops root moves that are mirror images of a move already
+    // covered. An empty board is invariant under all eight D4 variants and its
+    // 225 squares form 36 orbits (Burnside: (225 + 1 + 1 + 1 + 4*15) / 8), so
+    // exactly 36 squares may survive the filter.
+    Board empty;
+    const std::vector<int> full_group = self_symmetries(empty);
+    assert(full_group.size() == static_cast<size_t>(SYMMETRY_COUNT));
+
+    int representatives = 0;
+    for (int r = 0; r < BOARD_SIZE; ++r) {
+        for (int c = 0; c < BOARD_SIZE; ++c) {
+            if (is_symmetry_representative(full_group, Position(r, c))) ++representatives;
+        }
+    }
+    assert(representatives == 36);
+
+    Evaluator evaluator;
+    std::atomic<bool> stop(false);
+
+    // A single centre stone leaves the board fully symmetric, so whatever the
+    // root plays it must play the representative of the orbit, not its mirror.
+    Board center;
+    center.place_stone(7, 7, BLACK);
+
+    TranspositionTable tt_center;
+    AlphaBetaSearch ab_center(evaluator, tt_center);
+    Move chosen = ab_center.search(center, WHITE, 2, 3000, stop);
+    assert(chosen.pos.is_valid());
+    assert(is_symmetry_representative(self_symmetries(center), chosen.pos));
+
+    // The premise of the whole filter: an isomorphic position scores alike, so
+    // dropping the mirrors cannot drop the best line. {B(7,7) W(7,6)} and its
+    // transpose {B(7,7) W(6,7)} are the same shape seen from the other side.
+    Board wide;
+    wide.place_stone(7, 7, BLACK);
+    wide.place_stone(7, 6, WHITE);
+    Board tall;
+    tall.place_stone(7, 7, BLACK);
+    tall.place_stone(6, 7, WHITE);
+
+    TranspositionTable tt_wide;
+    TranspositionTable tt_tall;
+    AlphaBetaSearch ab_wide(evaluator, tt_wide);
+    AlphaBetaSearch ab_tall(evaluator, tt_tall);
+    ab_wide.search(wide, BLACK, 3, 3000, stop);
+    ab_tall.search(tall, BLACK, 3, 3000, stop);
+
+    const SearchInfo wide_info = ab_wide.last_search_info();
+    const SearchInfo tall_info = ab_tall.last_search_info();
+    assert(wide_info.score == tall_info.score);
+
+    std::cout << "test_root_symmetry_dedup passed (representatives: " << representatives
+              << ", mirrored score: " << wide_info.score << ")" << std::endl;
+}
+
 int main() {
     std::cout << "Running search tests..." << std::endl;
 
@@ -930,6 +987,7 @@ int main() {
     test_game_manager_rejects_move_on_ai_turn();
     test_game_manager_promotes_status_when_ai_opens();
     test_game_manager_hint_uses_hint_callback();
+    test_root_symmetry_dedup();
     test_search_engine_prefers_own_five_over_block();
 
     std::cout << "All search tests passed!" << std::endl;

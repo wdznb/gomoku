@@ -131,7 +131,9 @@ void Board::undo_last_move() {
 }
 
 void Board::set_stone_bits(int row, int col, int color, bool present) {
-    if (color == EMPTY) return;
+    // The line arrays are indexed by colour, so a stray value here would write
+    // outside them rather than just leaving a cell nobody reads.
+    if (color < BLACK || color > WHITE) return;
     for (int dir = 0; dir < 4; ++dir) {
         const int line = line_index(dir, row, col);
         const uint64_t bit = uint64_t{1} << (line_position(dir, row, col) + LINE_MARGIN);

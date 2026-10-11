@@ -1,4 +1,5 @@
 #include "alphabeta.h"
+#include "../core/transforms.h"
 #include <algorithm>
 #include <climits>
 #include <chrono>
@@ -268,6 +269,22 @@ Move AlphaBetaSearch::search(const Board& board, int color, int max_depth,
 
     if (root_moves.size() == 1) {
         return root_moves[0];
+    }
+
+    // Symmetric positions are searched once per mirror otherwise. When the
+    // board maps onto itself under a D4 variant, every candidate has twins that
+    // score alike, branch alike and win alike, so keep only the lowest-index
+    // cell of each orbit. Positions with no self-symmetry - almost every
+    // midgame - are untouched, which is what keeps the chosen move identical to
+    // what the undeduplicated root would have played.
+    const std::vector<int> symmetries = self_symmetries(board);
+    if (symmetries.size() > 1) {
+        root_moves.erase(
+            std::remove_if(root_moves.begin(), root_moves.end(),
+                           [&](const Move& m) {
+                               return !is_symmetry_representative(symmetries, m.pos);
+                           }),
+            root_moves.end());
     }
 
     sort_moves(root_moves, board, color);

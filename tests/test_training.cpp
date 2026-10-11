@@ -3,7 +3,7 @@
 #include "core/evaluator.h"
 #include "search/search_engine.h"
 #include "training/params.h"
-#include "training/transforms.h"
+#include "core/transforms.h"
 #include "training/game_record.h"
 #include "training/elo.h"
 #include "training/self_play.h"

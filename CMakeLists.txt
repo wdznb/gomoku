@@ -26,6 +26,7 @@ set(GOMOKU_CORE_SOURCES
     src/core/board.cpp
     src/core/pattern.cpp
     src/core/evaluator.cpp
+    src/core/transforms.cpp
     src/search/greedy.cpp
     src/search/vcf.cpp
     src/search/vct.cpp
@@ -38,7 +39,6 @@ set(GOMOKU_CORE_SOURCES
 
 set(GOMOKU_TRAINING_SOURCES
     src/training/params.cpp
-    src/training/transforms.cpp
     src/training/game_record.cpp
     src/training/elo.cpp
     src/training/self_play.cpp
@@ -148,6 +148,7 @@ add_executable(test_search
     src/core/board.cpp
     src/core/pattern.cpp
     src/core/evaluator.cpp
+    src/core/transforms.cpp
     src/search/greedy.cpp
     src/search/vcf.cpp
     src/search/vct.cpp
