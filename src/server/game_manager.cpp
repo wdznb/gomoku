@@ -9,9 +9,11 @@ namespace {
 // search deadline, the resign-probe node budget and the worker's wait. An
 // unbounded value makes the AI search for effectively forever, and a huge one
 // also overflowed the probe-node arithmetic. Clamp to a sane wall-clock range.
+// The top is 2 minutes because the page bounds the deadline by the depth it is
+// searching to (2x..4x, in seconds) and lets a player ask for depth 20.
 int clamp_timeout_ms(int timeout_ms) {
     if (timeout_ms < 100) return 100;
-    if (timeout_ms > 30000) return 30000;
+    if (timeout_ms > 120000) return 120000;
     return timeout_ms;
 }
 }

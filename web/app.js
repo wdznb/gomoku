@@ -4,6 +4,34 @@ const EMPTY = 0;
 const BLACK = 1;
 const WHITE = 2;
 
+// The server keys each game by a token it hands out, and a game outlives the
+// socket that played it. Keeping the token here is what lets a reload, a dropped
+// connection or a server restart find the same board again.
+const TOKEN_KEY = 'gomoku.session.token';
+
+function emptyMatrix() {
+    return Array(BOARD_SIZE).fill(null).map(() => Array(BOARD_SIZE).fill(EMPTY));
+}
+
+function matrixCounts(matrix) {
+    let black = 0;
+    let white = 0;
+    for (const row of matrix) {
+        for (const cell of row) {
+            if (cell === BLACK) ++black;
+            else if (cell === WHITE) ++white;
+        }
+    }
+    return { black, white };
+}
+
+// A new matrix with two of the three marks exchanged; the source is never edited
+// in place because the caller compares the result against it.
+function swappedMatrix(matrix, from, to) {
+    return matrix.map((row) => row.map((cell) =>
+        cell === from ? to : (cell === to ? from : cell)));
+}
+
 // The board is drawn in the middle of the viewport and the rest of the page is
 // cut into four trapezoids by the lines from each board corner to the nearest
 // page corner. A band budget keeps those trapezoids tall/wide enough to hold
@@ -27,7 +55,7 @@ class GomokuGame {
         this.view = { rot: 0, flipH: false };
         this.dpr = window.devicePixelRatio || 1;
         
-        this.board = Array(BOARD_SIZE).fill(null).map(() => Array(BOARD_SIZE).fill(EMPTY));
+        this.board = emptyMatrix();
         this.moveHistory = [];
         this.playerColor = null;
         this.currentTurn = BLACK;
@@ -39,20 +67,27 @@ class GomokuGame {
         this.analysis = [];
         // True when the loaded record already covers the game's ending.
         this.analysisEnded = false;
+        // Set when a `session` reply asked for the record of a resumed game: the
+        // replay that answers it paints the live board, not a scrubbed one.
+        this.resumeApplied = false;
         // Null while viewing the live position; a move index while replaying.
         this.replayIndex = null;
         this.replayTimer = null;
         this.gameOverText = '';
-        // Position editor (摆棋). preview holds the last successful
-        // check_position reply; the loaded flag keeps the 载入 button honest
-        // about whether what is on screen still matches what was recognised.
-        this.positionPreview = null;
-        this.editMode = false;
-        // True between clicking 载入 and its reply: the reply re-arms the side
-        // buttons and clears the chosen colour, so a side picked in between
-        // would be silently undone.
-        this.positionSetInFlight = false;
-        this.sideLock = [false, false];
+        // The stones a hand-set position installed and this client's own move list
+        // did not play. The board is base + moves, and anything that rebuilds a
+        // position from the record (scrubbing, the 摆棋 record) needs both halves.
+        this.baseStones = [];
+        // Position editor (摆棋). Everything happens on this working copy: the live
+        // board, the move record and the server session are untouched until 确认.
+        this.setup = {
+            active: false,
+            board: null,
+            record: [],
+            view: null,
+            preview: null,
+            confirmInFlight: false,
+        };
         
         this.initWebSocket();
         this.initUI();
@@ -65,6 +100,10 @@ class GomokuGame {
         this.wsReconnect = null;
         this.wsPing = null;
         this.everConnected = false;
+        // The token is the game: it is what the server keys its session table by,
+        // so keeping it across a reload is what makes 继续上次那局 possible at all.
+        this.sessionToken = localStorage.getItem('gomoku.session.token') || null;
+        this.resumeAsked = false;
         this.openSocket();
     }
 
@@ -76,12 +115,16 @@ class GomokuGame {
         
         this.ws.onopen = () => {
             console.log('Connected to server');
-            const reconnected = this.everConnected;
             this.everConnected = true;
             this.wsAttempts = 0;
             this.startPing();
-            if (reconnected) {
-                this.resyncAfterReconnect();
+            if (this.sessionToken) {
+                // Ask before anything else: the server holds the board, the move
+                // list and the AI's turn, and every later message is played in the
+                // session this one lands in.
+                this.resumeAsked = true;
+                this.sendMessage({ type: 'resume', token: this.sessionToken });
+                this.updateStatus('正在恢复对局…', 'idle');
             } else {
                 this.updateStatus('已连接，请选择执子颜色', 'idle');
             }
@@ -130,13 +173,102 @@ class GomokuGame {
         }, wait);
     }
 
-    // A new socket is a new server session: the game it held is gone, so the
-    // local board cannot be trusted either. Resync by clearing to what the server
-    // really has (nothing) and re-applying the player's settings.
-    resyncAfterReconnect() {
-        this.resetGame();
-        this.sendConfig();
-        this.updateStatus('连接已恢复，服务器会话已重建：请重新选边', 'ok');
+    // The server's answer to `resume`, and its announcement whenever it opened a
+    // session for this socket on its own. A resumed game is painted from the
+    // server's copy of itself: the page reloaded, and what it had on screen is not
+    // a position the engine is playing.
+    handleSession(msg) {
+        this.sessionToken = msg.token || null;
+        if (this.sessionToken) {
+            localStorage.setItem('gomoku.session.token', this.sessionToken);
+        } else {
+            localStorage.removeItem('gomoku.session.token');
+        }
+        const asked = this.resumeAsked;
+        this.resumeAsked = false;
+
+        if (!msg.resumed) {
+            // Nothing to apply. A session that was not resumed is empty by
+            // definition, and the request that made the server open it answers with
+            // its own state a moment later: overwriting the board and the chosen
+            // side here would undo the click that is already on its way.
+            if (asked) this.updateStatus('上一局找不回来了，已开新局', 'warn');
+            return;
+        }
+        this.playerColor = msg.player_color === 'black' ? BLACK
+                         : msg.player_color === 'white' ? WHITE : null;
+        this.gameStatus = msg.game_status || 'waiting';
+        this.currentTurn = msg.current_turn === 'white' ? WHITE : BLACK;
+        // The session carries its own AI settings, which outlived the page: show
+        // them rather than the form defaults, or the numbers on screen would
+        // describe a search the server is not going to run. The deadline is stored
+        // in milliseconds and shown in seconds, and the range around it follows the
+        // depth it belongs to.
+        if (Number.isInteger(msg.max_depth) && msg.max_depth > 0) {
+            document.getElementById('depth').value = msg.max_depth;
+        }
+        if (Number.isInteger(msg.timeout_ms) && msg.timeout_ms > 0) {
+            document.getElementById('timeout').value = Math.round(msg.timeout_ms / 1000);
+        }
+        this.syncTimeoutBounds('bounds');
+        this.applyBoardMatrix(msg.board);
+        this.lastMove = null;
+        this.aiThinking = false;
+        this.gameOverText = msg.game_status === 'game_over'
+            ? `已结束的对局 · ${msg.winner === 'draw' ? '和棋' : (msg.winner === 'black' ? '黑棋' : '白棋')}胜`
+              + `（${this.reasonText(msg.reason)}）`
+            : '';
+        // The move list, the installed stones it sits on and the engine numbers are
+        // the server's, so ask for them instead of redrawing a history the board
+        // cannot give back.
+        this.baseStones = [];
+        this.stopReplayAuto();
+        this.analysis = [];
+        this.analysisEnded = false;
+        this.replayIndex = null;
+        this.updateMoveList();
+        this.updateReplayInfo();
+        this.drawEvalGraph();
+        this.refreshReplayControls();
+        this.setSideButtons(this.gameStatus === 'playing' && this.playerColor !== null,
+                           this.gameStatus === 'playing' && this.playerColor !== null);
+        document.getElementById('btn-undo').disabled = this.playerColor === null;
+        document.getElementById('btn-hint').disabled = this.playerColor === null;
+        document.getElementById('btn-resign').disabled = this.gameStatus !== 'playing';
+        document.getElementById('btn-stop').disabled = true;
+        document.getElementById('btn-restart').disabled = false;
+        this.drawBoard();
+        this.updateTurnInfo();
+
+        this.sendMessage({ type: 'request_replay' });
+        // The reply to that request redraws the move list, the graph and the status
+        // line; flag it so it reports the resume rather than a replay the player
+        // never asked for.
+        this.resumeApplied = true;
+        this.updateStatus(this.resumedStatusText(),
+                          this.gameStatus === 'game_over' ? 'idle' : 'ok');
+    }
+
+    // What a resumed session is worth saying, from the state the server just
+    // described: an ending, a position nobody has taken a side of, an empty board
+    // with a side claimed, or a game in progress.
+    resumedStatusText() {
+        const turn = `轮到${this.currentTurn === BLACK ? '黑' : '白'}方`;
+        if (this.gameStatus === 'game_over' && this.gameOverText) return this.gameOverText;
+        if (this.gameStatus === 'waiting') {
+            const installed = this.board.flat().filter(v => v !== 0).length;
+            return installed > 0
+                ? `已恢复摆好的局面：${installed} 子，${turn}，请选择执子颜色`
+                : `已恢复会话：棋盘还是空的，请选择执子颜色`;
+        }
+        // A game can be "playing" with an empty move list: a hand-set position whose
+        // side has been taken but which nobody has added to yet. Reporting that as
+        // "0 手" under four stones reads as a bug, so say what is on the board.
+        if (this.moveHistory.length === 0) {
+            const installed = this.board.flat().filter(v => v !== 0).length;
+            if (installed > 0) return `已恢复摆好的局面：${installed} 子，${turn}`;
+        }
+        return `已恢复对局：${this.moveHistory.length} 手 · ${turn}`;
     }
     
     initUI() {
@@ -160,42 +292,83 @@ class GomokuGame {
 
         // The two AI settings used to reach the server only as hint parameters,
         // so the AI's own moves always ran on its defaults. Push them as config
-        // whenever they change.
-        for (const id of ['timeout', 'depth']) {
-            document.getElementById(id).addEventListener('change', () => this.sendConfig());
-        }
+        // whenever they change. A deeper search needs a longer deadline, so the
+        // timeout is bounded by the depth (2× to 4× it, in seconds) and follows a
+        // depth change back to that range's minimum.
+        document.getElementById('depth').addEventListener('change', () => {
+            this.syncTimeoutBounds('min');
+            this.sendConfig();
+        });
+        document.getElementById('timeout').addEventListener('change', () => {
+            this.syncTimeoutBounds('clamp');
+            this.sendConfig();
+        });
+        this.syncTimeoutBounds('min');
 
-        document.getElementById('btn-check-position').addEventListener('click', () => this.checkPosition());
-        document.getElementById('btn-set-position').addEventListener('click', () => this.setPosition());
-        document.getElementById('btn-edit-mode').addEventListener('click', () => this.toggleEditMode());
-        document.getElementById('btn-clear-position').addEventListener('click', () => this.clearPosition());
         document.getElementById('btn-export-position').addEventListener('click', () => this.exportPosition());
-        document.getElementById('position-confirm').addEventListener('change', () => this.refreshPositionControls());
+        document.getElementById('btn-setup-clear').addEventListener('click', () => this.clearSetupBoard());
+        document.getElementById('btn-setup-confirm').addEventListener('click', () => this.confirmSetup());
+        document.getElementById('btn-setup-cancel').addEventListener('click', () => this.exitSetup(false));
+
+        // 导入 is a modal: the paste box, the file picker and the drop zone all
+        // land in the working copy, never on the live board.
+        document.getElementById('btn-setup-import').addEventListener('click', () => this.openImportModal());
+        document.getElementById('btn-import-close').addEventListener('click', () => this.closeImportModal());
+        document.getElementById('btn-check-position').addEventListener('click', () => this.checkPosition());
+        document.getElementById('btn-import-apply').addEventListener('click', () => this.applyImport());
         document.getElementById('position-text').addEventListener('input', () => {
             // Anything typed or pasted replaces the file as the payload, and the
             // old recognition no longer describes it.
-            this.positionPreview = null;
-            this.refreshPositionControls();
+            this.setup.preview = null;
+            this.renderImportState('内容已改动，点“识别”重新检查。');
         });
-        document.getElementById('position-file').addEventListener('change', (e) => {
-            const file = e.target.files[0];
+        const drop = document.getElementById('import-drop');
+        const readFile = (file) => {
             if (!file) return;
             const reader = new FileReader();
             reader.onload = () => {
                 document.getElementById('position-text').value = String(reader.result);
-                this.positionPreview = null;
-                this.updatePositionStatus(`已读入 ${file.name}，点“识别”检查局面。`, false);
-                this.refreshPositionControls();
+                this.setup.preview = null;
+                this.renderImportState(`已读入 ${file.name}，点“识别”检查局面。`);
             };
-            reader.onerror = () => this.updatePositionStatus('文件读取失败。', true);
+            reader.onerror = () => this.updateImportStatus('文件读取失败。', true);
             reader.readAsText(file);
+        };
+        document.getElementById('position-file').addEventListener('change', (e) => {
+            readFile(e.target.files[0]);
+            // Reset so picking the same file again still fires change.
+            e.target.value = '';
+        });
+        for (const type of ['dragenter', 'dragover']) {
+            drop.addEventListener(type, (e) => {
+                e.preventDefault();
+                drop.classList.add('dragging');
+            });
+        }
+        for (const type of ['dragleave', 'drop']) {
+            drop.addEventListener(type, (e) => {
+                e.preventDefault();
+                drop.classList.remove('dragging');
+            });
+        }
+        drop.addEventListener('drop', (e) => {
+            const files = e.dataTransfer ? e.dataTransfer.files : null;
+            if (files && files.length) readFile(files[0]);
         });
 
-        document.getElementById('btn-position-toggle').addEventListener('click', () => {
-            const panel = document.getElementById('position-panel');
-            panel.hidden = !panel.hidden;
-            document.getElementById('btn-position-toggle').classList.toggle('toggled', !panel.hidden);
-        });
+        // 交换 has two homes. The bar's trio edits the 摆棋 working copy; the
+        // modal's edits the recognised preview before it lands on the copy, which
+        // is where a mis-read board is actually worth fixing.
+        const swapPairs = { bw: [BLACK, WHITE], be: [BLACK, EMPTY], we: [WHITE, EMPTY] };
+        const swapTargets = [['#group-swap', 'board'], ['#import-swap', 'preview']];
+        for (const [container, target] of swapTargets) {
+            for (const button of document.querySelectorAll(`${container} [data-swap]`)) {
+                const pair = swapPairs[button.dataset.swap];
+                button.addEventListener('click', () => this.swapMarks(pair[0], pair[1], target));
+            }
+        }
+
+        document.getElementById('btn-position-toggle').addEventListener('click', () => this.toggleSetup());
         document.getElementById('btn-view-rotate').addEventListener('click', () => {
             this.view.rot = (this.view.rot + 90) % 360;
             this.applyView();
@@ -312,18 +485,6 @@ class GomokuGame {
         right.style.width = `${Math.max(0, width - x0 - size - gap)}px`;
         right.style.height = `${size}px`;
 
-        // The 摆棋 drawer is a layer rather than a fifth region: it covers the
-        // bottom band below the button row (which stays reachable) and scrolls
-        // inside itself, so opening it never resizes the board or moves the
-        // dividing lines.
-        const bar = bottom.querySelector('.bar');
-        const panelTop = Math.round(bar.getBoundingClientRect().bottom) + 6;
-        const panel = document.getElementById('position-panel');
-        panel.style.left = `${x0}px`;
-        panel.style.width = `${size}px`;
-        panel.style.top = `${panelTop}px`;
-        panel.style.maxHeight = `${Math.max(0, height - panelTop - 6)}px`;
-
         this.drawDividers(x0, y0, size, width, height);
         document.body.classList.toggle('compact', size < 460);
 
@@ -361,7 +522,31 @@ class GomokuGame {
         const timeout = parseInt(document.getElementById('timeout').value, 10);
         const depth = parseInt(document.getElementById('depth').value, 10);
         if (!Number.isFinite(timeout) || !Number.isFinite(depth)) return;
-        this.sendMessage({ type: 'set_config', timeout_ms: timeout, max_depth: depth });
+        this.sendMessage({ type: 'set_config', timeout_ms: timeout * 1000, max_depth: depth });
+    }
+
+    // The deadline a search needs grows with the depth it is searching to, so the
+    // timeout box is bounded by it: 2× to 4× the depth, in seconds. 'min' is a
+    // depth change pulling the timeout to the new floor, 'clamp' is an edited
+    // timeout being held inside the range, and 'bounds' refreshes only the range so
+    // a resumed session can keep the deadline it was saved with.
+    syncTimeoutBounds(mode) {
+        const depthEl = document.getElementById('depth');
+        const timeoutEl = document.getElementById('timeout');
+        // The number inputs accept anything typed, and the bounds are multiples of
+        // the depth, so the depth is pinned to its own range before they are read.
+        const depth = Math.min(20, Math.max(2, parseInt(depthEl.value, 10) || 8));
+        depthEl.value = String(depth);
+        const min = depth * 2;
+        const max = depth * 4;
+        timeoutEl.min = String(min);
+        timeoutEl.max = String(max);
+        const current = parseInt(timeoutEl.value, 10);
+        if (mode === 'min' || !Number.isInteger(current)) {
+            timeoutEl.value = String(min);
+        } else if (mode === 'clamp') {
+            timeoutEl.value = String(Math.min(max, Math.max(min, current)));
+        }
     }
 
     requestReplay() {
@@ -385,22 +570,41 @@ class GomokuGame {
             elapsed_ms: m.elapsed_ms || 0,
             method: m.method || ''
         }));
-        this.board = Array(BOARD_SIZE).fill(null).map(() => Array(BOARD_SIZE).fill(EMPTY));
+        this.board = emptyMatrix();
+        // The stones the move list did not play: a game resumed or replayed from a
+        // hand-set position would otherwise lose that position on redraw, and both
+        // the scrub view and the next 摆棋 seed from them.
+        this.baseStones = (Array.isArray(msg.base) ? msg.base : [])
+            .filter((stone) => stone && stone.row >= 0 && stone.row < BOARD_SIZE &&
+                               stone.col >= 0 && stone.col < BOARD_SIZE)
+            .map((stone) => ({ row: stone.row, col: stone.col,
+                               color: stone.color === 'black' ? BLACK : WHITE }));
+        for (const stone of this.baseStones) {
+            this.board[stone.row][stone.col] = stone.color;
+        }
         for (const m of this.moveHistory) {
             this.board[m.row][m.col] = m.color;
         }
         // The snapshot may have been taken before an in-flight AI stone was
         // committed, so re-derive the turn and marker from the rebuilt history
-        // rather than trusting the local flip count.
-        this.currentTurn = (this.moveHistory.length % 2 === 0) ? BLACK : WHITE;
+        // rather than trusting the local flip count. The installed stones count
+        // too: a game played out from a hand-set position does not open with the
+        // first stone of its own list.
+        const baseStones = Array.isArray(msg.base) ? msg.base.length : 0;
+        this.currentTurn = ((baseStones + this.moveHistory.length) % 2 === 0) ? BLACK : WHITE;
         this.lastMove = this.moveHistory.length > 0
             ? this.moveHistory[this.moveHistory.length - 1]
             : null;
         if (msg.game_over) {
             this.gameStatus = 'game_over';
         }
+        // A replay that arrived for a resumed game is not one the player asked to
+        // scrub: the record and the move list are wanted, the historical view is
+        // not, so the board stays on the live position.
+        const resuming = this.resumeApplied;
+        this.resumeApplied = false;
         this.stopReplayAuto();
-        this.replayIndex = this.moveHistory.length > 0 ? 0 : null;
+        this.replayIndex = (this.moveHistory.length > 0 && !resuming) ? 0 : null;
         this.analysisEnded = !!msg.game_over;
         this.refreshReplayControls();
         this.updateMoveList();
@@ -408,6 +612,11 @@ class GomokuGame {
         this.updateReplayInfo();
         this.updateTurnInfo();
         this.drawEvalGraph();
+        if (resuming) {
+            this.updateStatus(this.resumedStatusText(),
+                              this.gameStatus === 'game_over' ? 'idle' : 'ok');
+            return;
+        }
         this.updateStatus(this.replaySummary(msg));
     }
 
@@ -600,11 +809,11 @@ class GomokuGame {
         const row = shown[0];
         const col = shown[1];
 
-        // Painting a position is a local edit, so it answers before any of the
-        // live-game guards: a loaded position is not yet a game in progress.
-        if (this.editMode) {
+        // Painting edits the 摆棋 working copy, so it answers before any of the
+        // live-game guards: a board being set up is not a game in progress.
+        if (this.setup.active) {
             if (row >= 0 && row < BOARD_SIZE && col >= 0 && col < BOARD_SIZE) {
-                this.paintCell(row, col);
+                this.paintSetupCell(row, col);
             }
             return;
         }
@@ -653,11 +862,11 @@ class GomokuGame {
     }
     
     requestHint() {
-        const timeout = parseInt(document.getElementById('timeout').value);
-        const depth = parseInt(document.getElementById('depth').value);
+        const timeout = parseInt(document.getElementById('timeout').value, 10);
+        const depth = parseInt(document.getElementById('depth').value, 10);
         this.sendMessage({
             type: 'request_hint',
-            timeout_ms: timeout,
+            timeout_ms: timeout * 1000,
             max_depth: depth
         });
     }
@@ -676,102 +885,236 @@ class GomokuGame {
         document.getElementById('btn-stop').disabled = true;
     }
     
-    // ---- 摆棋 (hand-set position) -------------------------------------
+    // ---- 摆棋 (position setup) ---------------------------------------
+    //
+    // Setup edits a working copy of the board. Entering it seeds that copy from
+    // what is on the screen now — the live game's stones and its move record — so
+    // the player can either paint on the position they are looking at or 清空 it
+    // and start over, and neither touches the session. 确认 is the only thing that
+    // talks to the server; 取消 drops the copy, which is what restores the board.
 
-    // Text from the paste box wins over the painted board: a file or a pasted
-    // grid is the thing the player just supplied, and sending it verbatim is
-    // what lets the server's auto-recognition run at all.
-    positionPayload() {
-        const text = document.getElementById('position-text').value.trim();
-        if (text) return text;
-        return { version: 1, type: 'gomoku_position',
-                 encoding: { black: 1, white: 2, empty: 0 },
-                 board: this.board.map(row => row.slice()) };
-    }
-
-    checkPosition() {
-        const payload = this.positionPayload();
-        const counts = this.localCounts();
-        if (typeof payload !== 'string' && counts.black + counts.white === 0) {
-            this.updatePositionStatus('棋盘是空的。', true);
+    toggleSetup() {
+        if (this.setup.active) {
+            this.exitSetup(false);
             return;
         }
-        this.positionPreview = null;
-        this.refreshPositionControls();
-        this.sendMessage({ type: 'check_position', position: payload });
+        this.enterSetup();
     }
 
-    setPosition() {
-        const preview = this.positionPreview;
-        if (!preview || !preview.ok || this.positionSetInFlight) return;
-        const msg = { type: 'set_position', position: this.positionPayload() };
-        // Carry the mapping the player just confirmed. A painted board already
-        // states 1/2/0 in its own document, so only a pasted or uploaded grid
-        // needs it echoed back.
-        if (typeof msg.position === 'string' && preview.encoding) {
-            msg.encoding = preview.encoding;
+    enterSetup() {
+        const setup = this.setup;
+        // The left-hand replay cluster is the only control still on screen while a
+        // position is being set up, so it is the only one put away by disabling —
+        // the bottom bar swaps its game buttons and AI settings out for the setup
+        // buttons instead, which is what they were standing in for anyway.
+        setup.gameButtons = ['btn-replay', 'btn-replay-first', 'btn-replay-prev',
+                             'btn-replay-play', 'btn-replay-next', 'btn-replay-last',
+                             'btn-replay-exit']
+            .map((id) => [id, document.getElementById(id).disabled]);
+        setup.active = true;
+        setup.board = this.board.map((row) => row.slice());
+        setup.record = this.setupSeedRecord();
+        setup.view = null;
+        setup.preview = null;
+        setup.confirmInFlight = false;
+        this.setSetupBar(true);
+        document.getElementById('btn-position-toggle').classList.add('toggled');
+        document.getElementById('position-text').value = '';
+        document.getElementById('import-status').textContent = '';
+        for (const [id] of setup.gameButtons) {
+            document.getElementById(id).disabled = true;
         }
-        // Hold the side buttons until the reply lands: it re-arms them and
-        // clears the chosen colour, so choosing in between would be undone.
-        this.positionSetInFlight = true;
-        this.sideLock = [document.getElementById('btn-black').disabled,
-                         document.getElementById('btn-white').disabled];
-        this.setSideButtons(true, true);
-        this.sendMessage(msg);
+        this.stopReplayAuto();
+        this.renderSetupPanel();
+        this.drawBoard();
+        this.updateStatus('摆棋中：点击棋盘任意位置后依次标记为 黑 / 白 / 空，'
+                          + '右侧摆棋记录可点任意步骤预览。', 'warn');
     }
 
-    setSideButtons(blackDisabled, whiteDisabled) {
-        document.getElementById('btn-black').disabled = blackDisabled;
-        document.getElementById('btn-white').disabled = whiteDisabled;
-    }
-
-    handlePositionPreview(msg) {
-        this.positionPreview = msg.ok ? msg : null;
-        const confirm = document.getElementById('position-confirm');
-        if (!msg.ok) {
-            confirm.checked = false;
-            this.updatePositionStatus(msg.error || '无法识别此局面。', true);
-            this.refreshPositionControls();
-            return;
+    // The bottom bar's two faces: the game's controls, or the setup's standing in
+    // the slots those controls vacate.
+    setSetupBar(on) {
+        for (const id of ['group-side', 'group-play', 'group-config']) {
+            document.getElementById(id).hidden = on;
         }
-        // A preview is a dry run, so it only repaints the board when nothing is
-        // in progress; overwriting a live game's display would make the client
-        // show stones the server does not have.
-        const live = this.gameStatus === 'playing' || this.gameStatus === 'game_over';
-        if (!live) this.applyBoardMatrix(msg.board);
-        const fromText = typeof this.positionPayload() === 'string';
-        // Only a grid has symbols to confirm; a pasted bitboard or move list
-        // arrives without a mapping.
-        const needsConfirm = fromText && !!msg.encoding;
-        const mapping = needsConfirm
-            ? `黑=${msg.encoding.black} 白=${msg.encoding.white} 空=${msg.encoding.empty}` : '';
-        const summary = `黑 ${msg.black_count} 子、白 ${msg.white_count} 子，轮到${msg.side_to_move === 'black' ? '黑' : '白'}方`;
-        const holds = live ? '（本局进行中，棋盘要到“载入”才会替换）' : '';
-        document.getElementById('position-confirm-row').hidden = !needsConfirm;
-        if (needsConfirm) {
-            confirm.checked = false;
-            document.getElementById('position-mapping').textContent = mapping;
-            this.updatePositionStatus(`识别成功：${summary}（${mapping}）。勾选确认后载入。${holds}`, false);
+        for (const id of ['group-setup', 'group-commit', 'group-swap']) {
+            document.getElementById(id).hidden = !on;
+        }
+    }
+
+    // The record starts as the game's own move list, with the stones that list does
+    // not explain — the ones a hand-set position installed — in front of it, so the
+    // record and the board always describe the same position.
+    setupSeedRecord() {
+        const played = new Set(this.moveHistory.map((m) => m.row * BOARD_SIZE + m.col));
+        const extras = [];
+        for (let row = 0; row < BOARD_SIZE; ++row) {
+            for (let col = 0; col < BOARD_SIZE; ++col) {
+                const color = this.board[row][col];
+                if (color !== EMPTY && !played.has(row * BOARD_SIZE + col)) {
+                    extras.push({ row, col, color });
+                }
+            }
+        }
+        return [...extras,
+                ...this.moveHistory.map((m) => ({ row: m.row, col: m.col, color: m.color }))];
+    }
+
+    // Dropping the working copy. `confirmed` only picks the words: the board the
+    // player sees afterwards is the live one either way, because setup never wrote
+    // to it.
+    exitSetup(confirmed) {
+        const setup = this.setup;
+        if (!setup.active) return;
+        setup.active = false;
+        setup.board = null;
+        setup.record = [];
+        setup.view = null;
+        setup.preview = null;
+        setup.confirmInFlight = false;
+        this.setSetupBar(false);
+        document.getElementById('btn-position-toggle').classList.remove('toggled');
+        this.closeImportModal();
+        this.updatePositionStatus('');
+        for (const [id, disabled] of setup.gameButtons || []) {
+            document.getElementById(id).disabled = disabled;
+        }
+        setup.gameButtons = null;
+        this.renderLists();
+        this.refreshReplayControls();
+        this.drawBoard();
+        if (!confirmed) {
+            this.updateStatus('已退出摆棋：棋盘已还原，落子记录未清空', 'idle');
+        }
+    }
+
+    paintSetupCell(row, col) {
+        const setup = this.setup;
+        const next = (setup.board[row][col] + 1) % 3;
+        setup.board[row][col] = next;
+        // Editing is about the whole position, so a step preview ends here rather
+        // than leaving the player painting onto a board they are not looking at.
+        setup.view = null;
+        const index = setup.record.findIndex((m) => m.row === row && m.col === col);
+        if (next === EMPTY) {
+            if (index >= 0) setup.record.splice(index, 1);
+        } else if (index >= 0) {
+            setup.record[index].color = next;
         } else {
-            document.getElementById('position-mapping').textContent = '';
-            this.updatePositionStatus(`局面合法：${summary}。${holds}`, false);
+            setup.record.push({ row, col, color: next });
         }
-        this.refreshPositionControls();
+        setup.preview = null;
+        this.renderSetupPanel();
+        this.drawBoard();
+    }
+
+    // 清空 empties the board the player is setting up. The game's own move record
+    // is not touched: it is what 取消 goes back to, and what 确认 keeps until a side
+    // is chosen.
+    clearSetupBoard() {
+        const setup = this.setup;
+        if (!setup.active) return;
+        setup.board = emptyMatrix();
+        setup.record = [];
+        setup.view = null;
+        setup.preview = null;
+        this.renderSetupPanel();
+        this.drawBoard();
+        this.updatePositionStatus('棋盘已清空（落子记录仍在，取消可还原）。', false);
+    }
+
+    // Taking a recognised board as the working copy. The record is row-major
+    // because a grid or bitboard carries no order; the position is the same either
+    // way, and the point of the record is to step through stones, not history.
+    applySetupBoard(matrix) {
+        const setup = this.setup;
+        setup.board = matrix.map((row) => row.slice());
+        setup.record = [];
+        for (let row = 0; row < BOARD_SIZE; ++row) {
+            for (let col = 0; col < BOARD_SIZE; ++col) {
+                const color = setup.board[row][col];
+                if (color !== EMPTY) setup.record.push({ row, col, color });
+            }
+        }
+        setup.view = null;
+    }
+
+    // 交换 means "the marks were read the wrong way round". The bar's trio applies
+    // it to the 摆棋 copy; the modal's applies it to the recognised preview, which
+    // is where a mis-read file is still cheap to fix.
+    swapMarks(from, to, target) {
+        const names = { [BLACK]: '黑', [WHITE]: '白', [EMPTY]: '空' };
+        if (target === 'preview') {
+            const preview = this.setup.preview;
+            if (!preview || !preview.ok) return;
+            preview.board = swappedMatrix(preview.board, from, to);
+            // The mapping is a claim about the source symbols, so it has to move
+            // with the board or the line under it would describe a different read.
+            if (preview.encoding) {
+                const keys = { [BLACK]: 'black', [WHITE]: 'white', [EMPTY]: 'empty' };
+                const enc = preview.encoding;
+                [enc[keys[from]], enc[keys[to]]] = [enc[keys[to]], enc[keys[from]]];
+            }
+            this.renderImportState(`已交换 ${names[from]} ↔ ${names[to]}。`);
+            return;
+        }
+        const setup = this.setup;
+        if (!setup.active) return;
+        const matrix = swappedMatrix(setup.board, from, to);
+        // Swapping two colours keeps every cell occupied, so the record's order (and
+        // with it the move list it was seeded from) survives with the colours
+        // recoloured. Involving 空 changes which cells are occupied at all, so the
+        // record is rebuilt from the board.
+        if (from !== EMPTY && to !== EMPTY) {
+            for (const stone of setup.record) {
+                if (stone.color === from) stone.color = to;
+                else if (stone.color === to) stone.color = from;
+            }
+            setup.board = matrix;
+        } else {
+            this.applySetupBoard(matrix);
+        }
+        this.renderSetupPanel(`已交换 ${names[from]} ↔ ${names[to]}。`);
+        this.drawBoard();
+    }
+
+    confirmSetup() {
+        const setup = this.setup;
+        if (!setup.active || setup.confirmInFlight) return;
+        const counts = matrixCounts(setup.board);
+        if (counts.black + counts.white === 0) {
+            this.updatePositionStatus('棋盘是空的，先摆几子再确认。', true);
+            return;
+        }
+        // The side buttons are hidden while 摆棋 is open, so nothing can be clicked
+        // in between; holding them would only have to be undone on the way out.
+        setup.confirmInFlight = true;
+        this.refreshSetupControls();
+        this.sendMessage({
+            type: 'set_position',
+            position: { version: 1, type: 'gomoku_position',
+                        encoding: { black: 1, white: 2, empty: 0 },
+                        board: setup.board.map((row) => row.slice()) },
+        });
     }
 
     handlePositionSet(msg) {
-        this.positionPreview = null;
-        this.positionSetInFlight = false;
-        this.editMode = false;
-        document.getElementById('btn-edit-mode').textContent = '手动摆棋';
-        document.getElementById('position-confirm-row').hidden = true;
-        document.getElementById('position-confirm').checked = false;
+        const wasSetup = this.setup.active;
+        this.exitSetup(true);
         this.applyBoardMatrix(msg.board);
-        // The loaded stones are not this session's search history: the replay
-        // view has nothing to analyse, and the move list would show plies no
-        // one played here.
+        // The installed stones are the base the record sits on: the replay view and
+        // the next 摆棋 both seed from them.
+        this.baseStones = [];
+        for (let row = 0; row < BOARD_SIZE; ++row) {
+            for (let col = 0; col < BOARD_SIZE; ++col) {
+                if (msg.board[row][col] !== EMPTY) {
+                    this.baseStones.push({ row, col, color: msg.board[row][col] });
+                }
+            }
+        }
+        // 落子记录 stays until a side is chosen: the player is looking at a position
+        // they have not committed to yet, and the old list is what 取消 goes back to.
         this.stopReplayAuto();
-        this.moveHistory = [];
         this.analysis = [];
         this.analysisEnded = false;
         this.replayIndex = null;
@@ -779,7 +1122,7 @@ class GomokuGame {
         this.currentTurn = msg.current_turn === 'black' ? BLACK : WHITE;
         this.gameStatus = 'waiting';
         this.playerColor = null;
-        this.updateMoveList();
+        this.renderLists();
         this.updateReplayInfo();
         this.drawEvalGraph();
         this.refreshReplayControls();
@@ -788,73 +1131,184 @@ class GomokuGame {
         document.getElementById('btn-undo').disabled = true;
         document.getElementById('btn-hint').disabled = true;
         document.getElementById('btn-resign').disabled = true;
+        document.getElementById('btn-stop').disabled = true;
         document.getElementById('btn-restart').disabled = false;
         this.drawBoard();
-        this.updateStatus(`局面已摆好：轮到${this.currentTurn === BLACK ? '黑' : '白'}方，请选择执子颜色`, 'ok');
+        this.updateStatus(`局面已摆好：轮到${this.currentTurn === BLACK ? '黑' : '白'}方，请选择执子颜色`,
+                          'ok');
         this.updateTurnInfo('');
-        this.updatePositionStatus(
-            `局面已载入：黑 ${msg.black_count} 子、白 ${msg.white_count} 子。选边后开始，AI 不会自动落子。`,
-            false);
+        if (!wasSetup) this.updatePositionStatus('', false);
     }
 
-    toggleEditMode() {
-        // Painting is only safe while the client and server agree that no game
-        // is running; mid-game the board belongs to the session.
-        if (!this.editMode && (this.gameStatus === 'playing' || this.aiThinking)) {
-            this.updatePositionStatus('本局进行中，请先“重新开始”再手动摆棋。', true);
+    // ---- 导入 (file / paste / drop, auto-recognised) ------------------
+
+    openImportModal() {
+        this.setup.preview = null;
+        document.getElementById('import-modal').hidden = false;
+        document.getElementById('position-text').focus();
+        this.renderImportState('');
+    }
+
+    closeImportModal() {
+        document.getElementById('import-modal').hidden = true;
+    }
+
+    // The paste box is the payload: a file or a dragged board lands in it, and
+    // sending the text verbatim is what lets the server's auto-recognition run.
+    importPayload() {
+        return document.getElementById('position-text').value.trim();
+    }
+
+    checkPosition() {
+        const text = this.importPayload();
+        if (!text) {
+            this.updateImportStatus('请先粘贴棋盘内容，或选择一个文件。', true);
             return;
         }
-        this.editMode = !this.editMode;
-        document.getElementById('btn-edit-mode').textContent = this.editMode ? '退出摆棋' : '手动摆棋';
-        const box = document.getElementById('position-text');
-        // Painting and pasting are two ways to describe one board, and the paste
-        // box wins when it has content, so manual mode starts by emptying it.
-        const hadText = this.editMode && box.value.trim().length > 0;
-        if (this.editMode) box.value = '';
-        this.positionPreview = null;
-        this.updatePositionStatus(this.editMode
-            ? `点击棋盘格循环：空 → 黑 → 白 → 空。摆好后点“识别”。${hadText ? '（粘贴框内容已清除）' : ''}`
-            : '已退出手动摆棋。', false);
-        this.refreshPositionControls();
+        this.setup.preview = null;
+        this.renderImportState('');
+        this.sendMessage({ type: 'check_position', position: text });
     }
 
-    clearPosition() {
-        this.applyBoardMatrix(Array(BOARD_SIZE).fill(null).map(() => Array(BOARD_SIZE).fill(EMPTY)));
-        document.getElementById('position-text').value = '';
-        this.positionPreview = null;
-        this.refreshPositionControls();
-        this.updatePositionStatus('棋盘已清空。', false);
+    handlePositionPreview(msg) {
+        this.setup.preview = msg.ok ? msg : null;
+        this.renderImportState(msg.ok ? '' : (msg.error || '无法识别此局面。'), !msg.ok);
     }
 
-    paintCell(row, col) {
-        const next = (this.board[row][col] + 1) % 3;
-        this.board[row][col] = next;
-        this.positionPreview = null;
-        this.drawBoard();
-        this.refreshPositionControls();
-        const counts = this.localCounts();
-        this.updatePositionStatus(
-            `本地：黑 ${counts.black} 子、白 ${counts.white} 子。点“识别”检查禁手与五连。`, false);
-    }
-
-    localCounts() {
-        let black = 0;
-        let white = 0;
-        for (const row of this.board) {
-            for (const cell of row) {
-                if (cell === BLACK) ++black;
-                else if (cell === WHITE) ++white;
-            }
+    // One render for the modal's read state: what the marks were taken to be, how
+    // many stones that gives, and whether 确认 has anything to apply. `note` is the
+    // reason the line is being redrawn — a swap just made, or a rejection to show.
+    renderImportState(note, isError) {
+        const preview = this.setup.preview;
+        const mappingEl = document.getElementById('position-mapping');
+        if (!preview) {
+            mappingEl.textContent = '识别到的标志：—';
+            this.updateImportStatus(note, !!isError);
+            this.refreshSetupControls();
+            return;
         }
-        return { black, white };
+        const enc = preview.encoding;
+        // A bitboard or a move list carries no symbols, so there is nothing to
+        // report and nothing to correct — the swap trio has no meaning for it.
+        mappingEl.textContent = enc
+            ? `识别到的标志：黑=${enc.black} 白=${enc.white} 空=${enc.empty}`
+            : '此形式没有符号，无需修正标志';
+        const counts = matrixCounts(preview.board);
+        const summary = `黑 ${counts.black} 子、白 ${counts.white} 子，`
+            + `轮到${(counts.black + counts.white) % 2 === 0 ? '黑' : '白'}方`;
+        this.updateImportStatus(`${note ? note + ' ' : ''}识别结果：${summary}。`
+            + '点“确认”写入棋盘。', false);
+        this.refreshSetupControls();
+    }
+
+    applyImport() {
+        const preview = this.setup.preview;
+        if (!preview || !preview.ok) return;
+        this.applySetupBoard(preview.board);
+        this.setup.preview = null;
+        this.closeImportModal();
+        document.getElementById('position-text').value = '';
+        this.renderSetupPanel('已导入识别出的局面，可继续手动修改后确认。');
+        this.drawBoard();
+    }
+
+    // ---- the setup bar's own rendering --------------------------------
+
+    renderSetupPanel(note) {
+        this.renderLists();
+        this.refreshSetupControls();
+        const counts = matrixCounts(this.setup.board);
+        this.updatePositionStatus(
+            (note ? note + ' ' : '') +
+            `摆棋中：黑 ${counts.black} 子、白 ${counts.white} 子，` +
+            `轮到${(counts.black + counts.white) % 2 === 0 ? '黑' : '白'}方。` +
+            `确认后才写入棋局。`, false);
+    }
+
+    updateSetupList() {
+        const list = document.getElementById('setup-list');
+        list.innerHTML = '';
+        this.setup.record.forEach((move, index) => {
+            const div = document.createElement('div');
+            const isLive = this.setup.view === null
+                ? index === this.setup.record.length - 1
+                : index === this.setup.view;
+            div.className = `move-item ${move.color === BLACK ? 'black' : 'white'}`
+                + (isLive ? ' active' : '');
+            div.textContent = `${index + 1}. ${move.color === BLACK ? '黑' : '白'} `
+                + this.coordName(move.row, move.col);
+            div.addEventListener('click', () => this.showSetupStep(index));
+            list.appendChild(div);
+        });
+        if (this.setup.record.length === 0) {
+            const div = document.createElement('div');
+            div.className = 'move-item';
+            div.textContent = '（摆棋记录为空）';
+            list.appendChild(div);
+        }
+    }
+
+    // Clicking a step switches the board to that step's stone state; clicking the
+    // highlighted step again drops back to the whole position.
+    showSetupStep(index) {
+        this.setup.view = this.setup.view === index ? null : index;
+        this.renderSetupPanel();
+        this.drawBoard();
+    }
+
+    renderLists() {
+        const inSetup = this.setup.active;
+        document.getElementById('list-title').textContent = inSetup ? '摆棋记录' : '落子记录';
+        document.getElementById('setup-list').hidden = !inSetup;
+        document.getElementById('move-list').hidden = inSetup;
+        if (inSetup) {
+            this.updateSetupList();
+        } else {
+            this.updateMoveList();
+        }
+    }
+
+    refreshSetupControls() {
+        const setup = this.setup;
+        const read = !!(setup.preview && setup.preview.ok);
+        document.getElementById('btn-import-apply').disabled = !read;
+        // The modal's trio only means something once there is a read to correct,
+        // and only while that read came with symbols that can be wrong about.
+        for (const button of document.querySelectorAll('#import-swap [data-swap]')) {
+            button.disabled = !read || !setup.preview.encoding;
+        }
+        // 确认 is held while the server has the position in hand, so a double click
+        // cannot send two loads.
+        document.getElementById('btn-setup-confirm').disabled = setup.confirmInFlight;
+    }
+
+    updatePositionStatus(text, isError) {
+        const el = document.getElementById('position-status');
+        el.textContent = text;
+        el.classList.toggle('error', !!isError);
+    }
+
+    updateImportStatus(text, isError) {
+        const el = document.getElementById('import-status');
+        el.textContent = text;
+        el.classList.toggle('error', !!isError);
+    }
+
+    setSideButtons(blackDisabled, whiteDisabled) {
+        document.getElementById('btn-black').disabled = blackDisabled;
+        document.getElementById('btn-white').disabled = whiteDisabled;
     }
 
     exportPosition() {
+        // While 摆棋 is open the player is working on a copy, and that copy is what
+        // they mean by "the board" — exporting the live position instead would
+        // write out stones they had just painted off.
+        const matrix = this.setup.active ? this.setup.board : this.board;
         const doc = {
             version: 1,
             type: 'gomoku_position',
             encoding: { black: 1, white: 2, empty: 0 },
-            board: this.board.map(row => row.slice())
+            board: matrix.map(row => row.slice())
         };
         const blob = new Blob([JSON.stringify(doc, null, 2)], { type: 'application/json' });
         const link = document.createElement('a');
@@ -875,39 +1329,20 @@ class GomokuGame {
         this.drawBoard();
     }
 
-    refreshPositionControls() {
-        const preview = this.positionPreview;
-        const confirmRow = document.getElementById('position-confirm-row');
-        const confirm = document.getElementById('position-confirm');
-        const fromText = typeof this.positionPayload() === 'string';
-        // A pasted or uploaded grid is the one case that owes the player the
-        // second look, so 载入 stays dead until the box is ticked. A bitboard or
-        // move list carries no symbols, so the server sends no mapping for it
-        // and there is nothing to confirm.
-        const needsConfirm = !!(preview && fromText && preview.encoding);
-        confirmRow.hidden = !needsConfirm;
-        if (!preview) confirm.checked = false;
-        const ready = !!preview && preview.ok && (!needsConfirm || confirm.checked);
-        document.getElementById('btn-set-position').disabled = !ready;
-        document.getElementById('btn-check-position').disabled = this.aiThinking;
-    }
-
-    updatePositionStatus(text, isError) {
-        const el = document.getElementById('position-status');
-        el.textContent = text;
-        el.classList.toggle('error', !!isError);
-    }
-
     restart() {
         this.sendMessage({ type: 'restart' });
         this.resetGame();
     }
     
     resetGame() {
-        this.board = Array(BOARD_SIZE).fill(null).map(() => Array(BOARD_SIZE).fill(EMPTY));
+        this.board = emptyMatrix();
         this.moveHistory = [];
         this.currentTurn = BLACK;
         this.gameStatus = 'waiting';
+        // The server starts a restarted game with nobody committed to a side, so
+        // holding onto the old colour would let a click land before the player has
+        // chosen again.
+        this.playerColor = null;
         this.aiThinking = false;
         this.lastMove = null;
         // A new game has no history to replay, and stale analysis would attach
@@ -917,12 +1352,12 @@ class GomokuGame {
         this.analysisEnded = false;
         this.replayIndex = null;
         this.gameOverText = '';
-        this.editMode = false;
-        this.positionPreview = null;
-        this.positionSetInFlight = false;
-        document.getElementById('btn-edit-mode').textContent = '手动摆棋';
-        this.refreshPositionControls();
-        this.updatePositionStatus('');
+        // A restarted game has no position to set up: the working copy would paint
+        // onto a board that no longer exists, so it goes with it. exitSetup first —
+        // it hands the buttons back, and every line below then says what the new
+        // game actually does with them.
+        this.exitSetup(true);
+        this.baseStones = [];
         this.refreshReplayControls();
         this.updateReplayInfo();
         this.drawEvalGraph();
@@ -935,7 +1370,7 @@ class GomokuGame {
         document.getElementById('btn-stop').disabled = true;
         document.getElementById('btn-restart').disabled = true;
         
-        this.updateMoveList();
+        this.renderLists();
         this.drawBoard();
         this.updateStatus('等待开始');
         this.updateTurnInfo('');
@@ -953,6 +1388,9 @@ class GomokuGame {
     
     handleServerMessage(msg) {
         switch (msg.type) {
+            case 'session':
+                this.handleSession(msg);
+                break;
             case 'state_sync':
                 this.handleStateSync(msg);
                 break;
@@ -987,10 +1425,11 @@ class GomokuGame {
                 this.resetGame();
                 break;
             case 'error':
-                // A refused load must not leave the side buttons held.
-                if (this.positionSetInFlight) {
-                    this.positionSetInFlight = false;
-                    this.setSideButtons(this.sideLock[0], this.sideLock[1]);
+                // A refused 确认 leaves the setup open with its working copy intact:
+                // re-arm 确认 so the player can fix what was objected to and retry.
+                if (this.setup.confirmInFlight) {
+                    this.setup.confirmInFlight = false;
+                    this.refreshSetupControls();
                 }
                 this.updateStatus(`错误：${msg.message}`, 'error');
                 break;
@@ -1002,11 +1441,31 @@ class GomokuGame {
         // starts (choose_side), so it has to overwrite whatever the client is
         // showing: an un-loaded position preview would otherwise stay on screen
         // while the server plays an empty board.
-        this.positionPreview = null;
-        if (Array.isArray(msg.board)) this.applyBoardMatrix(msg.board);
+        this.applyBoardMatrix(msg.board);
+        // Choosing a side is what commits a hand-set position: the game now runs as
+        // a new one from this board, so every stone on it is base and the old 落子
+        //记录 — the game that was played before the position was set — is dropped.
+        this.baseStones = [];
+        if (Array.isArray(msg.board)) {
+            for (let row = 0; row < BOARD_SIZE; ++row) {
+                for (let col = 0; col < BOARD_SIZE; ++col) {
+                    if (msg.board[row][col] !== EMPTY) {
+                        this.baseStones.push({ row, col, color: msg.board[row][col] });
+                    }
+                }
+            }
+        }
+        this.moveHistory = [];
+        this.analysis = [];
+        this.analysisEnded = false;
+        this.replayIndex = null;
         this.lastMove = null;
         this.currentTurn = msg.current_turn === 'black' ? BLACK : WHITE;
         this.gameStatus = 'playing';
+        this.renderLists();
+        this.updateReplayInfo();
+        this.drawEvalGraph();
+        this.refreshReplayControls();
         this.updateTurnInfo();
         this.updateStatus('对局开始', 'ok');
     }
@@ -1033,24 +1492,31 @@ class GomokuGame {
     
     handleUndoSuccess(msg) {
         // The server may remove 1 or 2 stones (its own reply plus the human's,
-        // so a single undo reverts a full round). Reconcile to the authoritative
-        // server move_count instead of assuming one pop, and take the turn from
-        // parity (BLACK always opens) rather than a local flip.
-        const target = Number.isInteger(msg.move_count)
+        // so a single undo reverts a full round), and its count is every stone
+        // left on the board — the ones a hand-set position installed included. The
+        // player's own list is what lies beyond that base, and once the played
+        // stones run out the undo eats into the base from its end, which is what
+        // the board's stack pops. Rebuild the whole position from those two halves
+        // instead of assuming one local pop, and take the turn from parity (BLACK
+        // always opens) rather than a local flip.
+        const total = Number.isInteger(msg.move_count)
             ? msg.move_count
-            : Math.max(0, this.moveHistory.length - 1);
-        while (this.moveHistory.length > target) {
-            const m = this.moveHistory.pop();
-            this.board[m.row][m.col] = EMPTY;
-        }
-        this.currentTurn = (target % 2 === 0) ? BLACK : WHITE;
+            : this.baseStones.length + Math.max(0, this.moveHistory.length - 1);
+        const kept = this.baseStones.slice(0, Math.min(total, this.baseStones.length));
+        const played = Math.max(0, Math.min(total - kept.length, this.moveHistory.length));
+        this.baseStones = kept;
+        this.moveHistory = this.moveHistory.slice(0, played);
+        this.board = emptyMatrix();
+        for (const stone of kept) this.board[stone.row][stone.col] = stone.color;
+        for (const m of this.moveHistory) this.board[m.row][m.col] = m.color;
+        this.currentTurn = (total % 2 === 0) ? BLACK : WHITE;
         this.lastMove = this.moveHistory.length > 0
             ? this.moveHistory[this.moveHistory.length - 1]
             : null;
         // The popped plies shift every analysis index after them, and a replay
         // position that no longer exists is worse than no replay at all, so the
         // loaded record is dropped and has to be requested again.
-        if (this.analysis.length > target) {
+        if (this.analysis.length > played) {
             this.stopReplayAuto();
             this.analysis = [];
             this.analysisEnded = false;
@@ -1144,20 +1610,45 @@ class GomokuGame {
         this.ctx.stroke();
     }
     
-    // The board as the player should see it right now: the live position, or the
-    // position after replayIndex plies when a historical view is active.
+    // The board as the player should see it right now: the 摆棋 working copy while
+    // that mode is open, otherwise the live position — or the position after
+    // replayIndex plies when a historical view is active. Scrubbing lays the
+    // installed stones down first, so a game played out from a hand-set position
+    // scrubs to that position's history rather than to the moves alone.
     displayView() {
+        if (this.setup.active) {
+            if (this.setup.view === null) {
+                return { board: this.setup.board, lastMove: this.setupLastMove() };
+            }
+            const board = emptyMatrix();
+            let lastMove = null;
+            for (let i = 0; i <= this.setup.view && i < this.setup.record.length; ++i) {
+                const m = this.setup.record[i];
+                board[m.row][m.col] = m.color;
+                lastMove = m;
+            }
+            return { board, lastMove };
+        }
         if (this.replayIndex === null) {
             return { board: this.board, lastMove: this.lastMove };
         }
-        const board = Array(BOARD_SIZE).fill(null).map(() => Array(BOARD_SIZE).fill(EMPTY));
-        let lastMove = null;
+        const board = emptyMatrix();
+        for (const stone of this.baseStones) {
+            board[stone.row][stone.col] = stone.color;
+        }
+        let lastMove = this.lastMove;
         for (let i = 0; i <= this.replayIndex && i < this.moveHistory.length; ++i) {
             const m = this.moveHistory[i];
             board[m.row][m.col] = m.color;
             lastMove = m;
         }
         return { board, lastMove };
+    }
+
+    setupLastMove() {
+        return this.setup.record.length > 0
+            ? this.setup.record[this.setup.record.length - 1]
+            : null;
     }
 
     // A displayed cell -> its point on the canvas, in CSS pixels.

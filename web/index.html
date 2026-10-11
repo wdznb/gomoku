@@ -35,29 +35,49 @@
     </aside>
 
     <aside id="region-right">
+        <div id="list-title" class="list-title">落子记录</div>
         <div id="move-list" class="move-list"></div>
+        <div id="setup-list" class="move-list" hidden></div>
     </aside>
 
     <footer id="region-bottom">
+        <!-- 摆棋 takes over the two slots whose buttons it disables: the game
+             controls and the AI settings both have nothing to say while a position
+             is being set up, so the setup buttons and the mark swaps stand in for
+             them instead of covering the board with a drawer. -->
         <div class="bar">
-            <span class="group">
+            <span class="group" id="group-side">
                 <button id="btn-black" class="btn">执黑</button>
                 <button id="btn-white" class="btn">执白</button>
             </span>
-            <span class="group">
+            <span class="group" id="group-play">
                 <button id="btn-undo" class="btn" disabled>悔棋</button>
                 <button id="btn-hint" class="btn" disabled>求招</button>
                 <button id="btn-resign" class="btn" disabled>认输</button>
                 <button id="btn-stop" class="btn" disabled>终止</button>
                 <button id="btn-restart" class="btn" disabled>重开</button>
             </span>
-            <span class="group">
+            <span class="group" id="group-setup" hidden>
+                <button id="btn-setup-clear" class="btn" title="只清空棋盘，落子记录保留">清空</button>
+                <button id="btn-setup-import" class="btn">导入</button>
+                <button id="btn-export-position" class="btn">导出</button>
+            </span>
+            <span class="group" id="group-commit" hidden>
+                <button id="btn-setup-confirm" class="btn btn-primary">确认</button>
+                <button id="btn-setup-cancel" class="btn">取消</button>
+            </span>
+            <span class="group" id="group-config">
                 <label class="field">深度
                     <input type="number" id="depth" value="8" min="2" max="20">
                 </label>
-                <label class="field">超时ms
-                    <input type="number" id="timeout" value="5000" min="1000" max="60000">
+                <label class="field">超时秒
+                    <input type="number" id="timeout" value="16" min="16" max="32" step="1">
                 </label>
+            </span>
+            <span class="group" id="group-swap" hidden>
+                <button class="btn btn-tight" data-swap="bw" title="交换棋盘上的黑子与白子">黑↔白</button>
+                <button class="btn btn-tight" data-swap="be" title="交换棋盘上的黑子与空位">黑↔空</button>
+                <button class="btn btn-tight" data-swap="we" title="交换棋盘上的白子与空位">白↔空</button>
             </span>
             <span class="group">
                 <button id="btn-position-toggle" class="btn">摆棋</button>
@@ -66,31 +86,40 @@
             </span>
         </div>
 
-        <div id="position-panel" class="panel" hidden>
-            <label class="file-row">
-                棋盘文件
+        <div id="position-status" class="position-status"></div>
+    </footer>
+
+    <div id="import-modal" class="modal" hidden>
+        <div class="modal-card">
+            <div class="modal-title">导入棋盘</div>
+            <label class="drop-zone" id="import-drop">
                 <input type="file" id="position-file" accept=".json,.csv,.txt">
+                <span>拖拽文件到此处，或点击选择（.json / .csv / .txt）</span>
             </label>
-            <textarea id="position-text" rows="3"
-                placeholder="粘贴棋盘：15 行 15 列（分隔或 225 格连写皆可），标志可用 0/1/2、1/-1/0、B/W/.、X/O/.、黑/白/空，或直接粘贴局面 JSON"></textarea>
+            <textarea id="position-text" rows="6"
+                placeholder="也可直接粘贴棋盘：15 行 15 列（分隔或 225 格连写皆可），标志可用 0/1/2、1/-1/0、B/W/.、X/O/.、黑/白/空，或直接粘贴局面 JSON"></textarea>
             <div class="bar">
                 <span class="group">
                     <button id="btn-check-position" class="btn">识别</button>
-                    <button id="btn-set-position" class="btn" disabled>载入</button>
-                    <button id="btn-edit-mode" class="btn">手动摆棋</button>
                 </span>
                 <span class="group">
-                    <button id="btn-clear-position" class="btn">清空</button>
-                    <button id="btn-export-position" class="btn">导出</button>
+                    <button id="btn-import-apply" class="btn btn-primary" disabled>确认</button>
+                    <button id="btn-import-close" class="btn">取消</button>
                 </span>
             </div>
-            <label class="confirm-row" id="position-confirm-row" hidden>
-                <input type="checkbox" id="position-confirm">
-                确认标志：<span id="position-mapping"></span>
-            </label>
-            <div id="position-status" class="position-status"></div>
+            <!-- The three swaps fix a mis-read board before it lands on the copy,
+                 which is why they sit by the marks they change. -->
+            <div class="mapping-row">
+                <span class="mapping" id="position-mapping">识别到的标志：—</span>
+                <span class="group" id="import-swap">
+                    <button class="btn btn-tight" data-swap="bw" disabled title="交换预览局面里的黑子与白子">黑↔白</button>
+                    <button class="btn btn-tight" data-swap="be" disabled title="交换预览局面里的黑子与空位">黑↔空</button>
+                    <button class="btn btn-tight" data-swap="we" disabled title="交换预览局面里的白子与空位">白↔空</button>
+                </span>
+            </div>
+            <div id="import-status" class="position-status"></div>
         </div>
-    </footer>
+    </div>
 
     <script src="app.js"></script>
 </body>
