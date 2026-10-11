@@ -4,7 +4,9 @@ Standings goal under review: *严格基于需求文档，审查所有性能漏�
 
 Every fix below was built in WSL (`cmake --build build -j4`) and verified with `ctest`
 (**4/4 passing**: `test_board`, `test_pattern`, `test_evaluator`, `test_search`) before its
-commit. Branch: `phase2-advanced-search`.
+commit. Branch: `phase2-advanced-search`. Rounds 49–50 continue the same loop over the Phase 3
+training modules on branch `phase3-self-training`, where `ctest` is **5/5** (they add
+`test_training`).
 
 ## Round 44 — `f680a72`
 
@@ -86,3 +88,58 @@ The last two rounds surfaced only a portability nit on a non-supported native-Wi
 - Blocking worker join on the io thread (R42 F3)
 - Verified false positive: VCF/VCT live-four early win (R43 F1) — correct because
   `find_block_move` returns the unique forced block
+
+## Phase 3 — self-training (`8cc5ac6`, `118e921`)
+
+### Round 49 — audit of the new training modules
+
+**Silent integer truncation at every training file boundary.** JSON keeps integers in 64 bits and
+nlohmann's `get<int>()` only casts, so `"five": 4294967396` was applied as `100` — a mate score the
+file never stated, which also slipped past the `five <= 100000` guard because that check ran on the
+already-truncated value. Board coordinates were worse: `row: 4294967299` narrowed to `3` and
+replayed a different square. Added `training/json_int.h` (`read_json_int`, `read_json_uint`) and
+used it at each boundary with the policy the value deserves: parameters and coordinates are
+**rejected** with a message (`CoefficientVector::from_json_string`, `GameRecord::from_json`,
+`TrainingSample::from_json`), while informational counters fall back to their default
+(record metadata, `EloSystem::load_json` — those only choose the K-factor bracket).
+
+- Verified: `gomoku_server --params` and `gomoku_train --params` both exit non-zero on an
+  out-of-range `five` / `live_four`; new `test_readers_reject_out_of_range_numbers`.
+
+**Data race on `games_played_`.** `Trainer::generate_data_games` incremented the shared, non-atomic
+counter from every collection worker while the main thread incremented it for match games. The
+per-worker record lists are now merged after `join()` and counted once.
+
+**An unusable record could still be scored.** `is_decisive()` excluded only `MOVE_LIMIT`, so a
+parsed record carrying `winner` with `reason: "invalid"` produced ±1 from `outcome_for` — the same
+direction-of-error rule the search side enforces (UNKNOWN must not read as a result). A record that
+cannot be replayed now reports no outcome, and `DataCollector` reads through it.
+
+**Checkpoint resume applied partial state.** The counters were `get<int>()`'d straight into the
+members, so a rejected file could leave the trainer running on the checkpoint's versions and
+ratings, and a full-width `--seed` came back narrowed. Reads now go into locals and are applied only
+after the whole file validates; out-of-range or negative counters and a mismatched champion index
+are rejected.
+
+- Verified: new `test_trainer_checkpoint_seed_and_counters` (seed `0xFFFF…FF` round-trips;
+  `rounds_completed: -2` is rejected and leaves the trainer's state intact).
+
+### Round 50 — measured the shipped training defaults
+
+One hill-climbing round at the documented defaults (`--depth 4 --timeout-ms 400 --max-moves 60`,
+resign on) does produce decisive games: both data games ended `five` for BLACK at 27 plies, 256
+samples, champion and candidate each 0-0-1. Fitness and verification still land on exactly 0.500,
+because the pairing is symmetric — each side wins the game in which it holds the first move. That is
+what colour-swapping is for (a candidate must win **with white** to clear `--accept-score 0.56`
+instead of being credited for the opening advantage), but it means `--fitness-games 2` hands the
+optimiser a 0 / 0.5 / 1 plateau rather than a gradient.
+
+Documented in the README instead of changed: raising the default match size multiplies the cost of
+every round, and turning the fitness signal into something strength-graded is the deferred
+strength-harness work listed under "Deliberately deferred" above.
+
+### Phase 3 status
+
+`ctest` is 5/5 (`test_board`, `test_pattern`, `test_evaluator`, `test_search`, `test_training`),
+`make -j4` is warning-free, and the round-50 run exercised the full pipeline end to end
+(records, samples, checkpoint, promoted champion file, `--params` load into `gomoku_server`).
