@@ -694,3 +694,243 @@ board cleared, green "连接已恢复…请重新选边", and a fresh 执黑 + c
 with a real score. (The first probe run had no `sleep`, so it accidentally pushed 554,038 ping/pong round
 trips through the loop socket in 150 s; kept as a throughput data point, cadence fixed afterwards.)
 
+## 会话与断线续局 — feature round 62 (`master`)
+
+**Asked for:** "服务器 session token，且定时（如每隔10秒）将会话表的落子记录永久保存在硬盘，这也便于
+随时复盘或继续下以及后续训练用" — the follow-up round 61 explicitly refused: making a game outlive its
+socket moves session state off the connection, which is a design change. Two decisions were taken before
+writing anything: **a token must still resume after the server restarts**, and **one file per game under
+`data/sessions/<token>.json`, reusing the training `GameRecord` format**, with finished games also appended
+as one line to `data/training/records.jsonl` so the trainer's existing entry point reads them unchanged.
+
+**The table, not the socket, owns the game.** `GameServer` keeps `sessions_: token → TrackedGame{game,
+attached, created/updated/detached, side_chosen, exported, saved_payload}` plus `socket_tokens_` for the
+reverse map, and `games_` (socket → game) stays exactly as the eleven handlers use it. A handshake no
+longer builds anything: `GameManager` is created by the first message that needs a game, or by `resume`.
+`on_disconnect` became `detach_socket`: halt the search that was writing into that socket, clear the
+callbacks, flush, and leave the game in the table for 30 minutes. `resume` of a hot token reattaches; of a
+cold one, rebuilds. A token claimed by a second tab is taken by the newcomer.
+
+**Startup loads the files, but not as games.** Every `data/sessions/*.json` is read into
+`cold_sessions_: token → SessionSnapshot` and *no* `GameManager` is built for it — each engine carries its
+own tens-of-MB transposition table, so a server that restarts with five hundred saved games must not pay
+five hundred boards. A cold token is materialised only when someone resumes it, and a hot session that
+waits out the reattach window is demoted back to a snapshot (its file is already current, so nothing is
+lost but memory). The token therefore outlives the process, the restart, and the window.
+
+**`base` is derived, not remembered.** A session started from a 摆棋 position has stones the move list does
+not cover, and undo can walk *those* off the board too, so any separately-stored copy of "the position as
+installed" would drift. `Board::move_history()` is already `base ++ played` (the loader's `place_stone`
+calls are the same stack the later moves append to), so `ReplaySnapshot::base` is simply the history minus
+the last `analyses_.size()` entries, taken under `thinking_mutex_`. `restore_game` places that list first
+and the played moves after, which reproduces the same split on the next flush — round-trip stable, and
+`test_snapshot_round_trip` asserts it through an undo.
+
+**Nothing on the flush path reads the board off-lock.** `ReplaySnapshot` gained `status` (replacing the
+`game_over` bool, which it subsumes), `move_count` and `base`; `session`'s own board is rebuilt from the
+snapshot by `board_of()` rather than reading `board_`, because a *stolen* session may still have a worker
+running. Dirtiness is decided by comparing the serialised payload with its timestamps zeroed against
+`saved_payload`, so a session nobody has moved in is written once, not every tick; an untouched session
+(no stones, no chosen side) is never written at all, which is what keeps 重开 from littering the directory.
+
+**`halt_search()` replaces four copies of the abort-and-join sequence** (destructor, `reset`,
+`set_position`, `restore_game`) and is now public, because detach and the steal path need it too. The
+steal has to halt *before* rewiring callbacks: the searching thread reads `progress_callback_` while it
+searches, so swapping the `std::function`s underneath it is a race, and the re-armed search on the resume
+path is what picks the position back up.
+
+**A bug the probe found by freezing the server.** `WebSocketSession::close()` was Beast's closing
+handshake — `ws_.close(code, ec)` — which *blocks waiting for the peer to echo the close frame*. Called
+from the steal path on the one io thread, it stopped the whole server: the probe's second socket got no
+reply at all and timed out at 30 s. `close()` now shuts the socket down directly, so the outstanding read
+comes back as an error and that handler releases the session like any other disconnect. A tab that is
+already gone, or one that never answers, can no longer take the server with it.
+
+**Training export stays honest.** A finished game is appended once (`exported`, seeded from the loaded
+snapshot so a resumed ending is not exported a second time by a new process) and only when `base` is empty
+— a record that began from a hand-set position is not replayable from an empty board, and quietly feeding
+it to the trainer would be worse than not feeding it at all. Those games stay in the session file, for
+review and for resuming.
+
+**`session` is a second authoritative frame, and the client has to treat it as one.** The protocol's
+"side chosen means playing" rule (choose_side's reply already said so) is applied in `send_session_state`,
+otherwise a game the human opens — side taken, board still empty, nothing armed — comes back as `waiting`
+and the page refuses the first click. `replay` gained `base`, which also fixes a carried-over round-58
+bug: clicking 回放 on a 摆棋 game rebuilt the board from the move list alone and erased the installed
+stones from the screen.
+
+**Client.** The token lives in `localStorage`; every socket open sends `resume` for it, and the status bar
+says 正在恢复对局… → 已恢复对局：N 手 · 轮到X方 / 已恢复摆好的局面：N 子… / 已恢复会话：棋盘还是空的，
+请选择执子颜色 (green), or 上一局找不回来了，已开新局 (amber). `resumed:false` stores the token and applies
+*nothing else* — found in the browser, where the fresh-session announcement (which arrives before
+`choose_side`'s own reply) cleared the side the player had just picked. The replay that answers a resume
+paints the live board rather than entering the scrub view; the 回放 button still does what it always did.
+Round 60's known gap ("no client-side reconnect … the board is lost on refresh") is closed by this round.
+
+**Who holds a side.** Sessions now have to answer "has anyone chosen a side?" (`side_chosen`), because
+`GameManager::player_color_` always has a default and a saved "" is what distinguishes the two. That made
+three places have to say so out loud: `set_position` clears the claim (the client does too, and a loaded
+position has no side until someone takes it), `restart` clears it, and `resetGame()` on the client now
+clears `playerColor` — previously a restarted page still believed it was WHITE while the server's fresh
+`GameManager` was BLACK, so a click before the next 执黑/执白 placed a stone for the other side. Carrying
+the old colour across 重开 was tried first and dropped: it leaves a game that reports itself as playing,
+refuses every click and waits for a side choice that the UI no longer asks for.
+
+**Verified.** `ctest` 7/7 — new `test_session` (token validation incl. path-traversal rejection, envelope
+round-trip with `base`, damaged-file rejection, atomic write leaving no `.tmp`, listing and truncated
+JSON), plus `test_restore_game` and `test_snapshot_round_trip` in `test_position`. `build/sessions_probe.py`
+(40 checks, raw WebSocket + reading the real files): token issued on the first game message; the 10 s tick
+creating the file with 4 plies, the side, the config and the engine numbers; a second socket stealing a live
+token while the first is closed; detach flushing immediately (mtime moves without waiting for a tick); a
+brand-new socket resuming and *continuing* to 8 plies with a continuous move list; unknown and malformed
+tokens opening fresh sessions and writing nothing for untouched ones; 重开 issuing a new token while the
+abandoned game stays on disk; a 摆棋 game saved with 3 base + 2 played stones and resuming at 5 stones with
+`replay.base` intact; resign ending the game and appending exactly one `records.jsonl` line readable as a
+game; **server killed and restarted → the same token resumes at 8 plies, plays on, and keeps its numbers**;
+a `game_over` session resuming as finished without a duplicate export. `wspos.py`'s 30 position checks
+still pass. In the browser: reload resumed a 4-stone game (stones, move list with `book` annotations, side
+buttons locked, the session's own 800 ms / depth 2 echoed into the AI settings), a second reload resumed
+6, play continued after the reload, 载入本局分析 + 跳到最后一手 + 退出 still work, a reloaded *pending*
+position came back as "已恢复摆好的局面：3 子，轮到白方，请选择执子颜色" and accepted a side and a stone,
+and a reloaded restarted-empty session came back as "已恢复会话：棋盘还是空的，请选择执子颜色" with the
+side buttons live. Screenshot: `build/tmp/session_resume.png`.
+
+## 网页摆棋重做 — feature round 63 (`master`)
+
+**Asked for:** "网页摆棋优化：点击摆棋之后，可以在现有棋盘上直接手动摆棋，也可以临时清空棋盘再摆棋
+（不清空落子记录）；网页右侧改为显示当前摆棋记录（自动将当前落子记录写入到当前摆棋记录，可直接点击摆棋
+记录的任意步骤切换棋盘落子状态）；清空：临时清空棋盘，不清空落子记录；旋转/镜像：将棋盘旋转/镜像；导入：
+出现弹窗，点击上传或拖拽导入棋盘文件，或者直接粘贴内容，自动识别棋盘；交换：出现弹窗，三个选项，可将当前
+棋盘上的黑/白/空两两交换，主要用于修正自动识别的结果；确认/取消：确认后，将棋局信息发给后台，然后开始后续
+流程（进行选边，选边后自动清空落子记录，按新局运行）；返回后，不清空落子记录，还原棋盘。'确认/取消'这两个
+按钮任一点击后，与摆棋有关按钮消失，清空当前摆棋记录"
+
+**One working copy, one server write.** Round 62's editor painted onto `this.board` behind a 手动摆棋
+toggle, so the copy and the live game were the same array and leaving the mode without 载入 silently kept
+the painted stones on screen. Setup now owns `setup = {active, board, record, view, preview,
+confirmInFlight, sideLock, gameButtons}`, seeded from what is on screen at the moment 摆棋 is clicked, and
+**确认 is the only message that touches the session**. That is what makes 取消 free: there is nothing to
+restore, because the live board was never edited. `displayView()` answers with the copy while the mode is
+open, and the click handler answers with `paintSetupCell` before any of the live-game guards — a board
+being set up is not a game in progress.
+
+**The 摆棋记录 is seeded, not rebuilt.** Entering setup copies the game's own move list into the record and
+puts the stones that list does not explain (the ones a hand-set position installed) in front of it, so the
+record and the board always describe the same position — which is what lets 确认 send only a board and let
+选边 rebuild the record afterwards. Clicking step *N* shows the position after *N* stones; clicking the
+highlighted step again drops back to the whole position. Painting ends a preview (editing onto a board you
+are not looking at is worse than no preview) and edits the record in place: a cell already in it is
+recoloured or spliced out, a new cell is appended.
+
+**清空 clears the copy, not the game.** The game's 落子记录 is what 取消 goes back to and what 确认 keeps
+until a side is chosen, so it is untouched; the 摆棋记录 describes the copy's board and goes with the
+stones, otherwise clicking a step would repaint exactly what was just cleared.
+
+**导入 is a modal whose payload is the textarea.** A picked or dropped file is read by `FileReader` into
+the box, and the box's contents are sent verbatim as `check_position` — the server's recogniser stays the
+only decoder of grids, long strings, bitboards and move lists. Only a grid comes back with an `encoding`,
+so only a grid has symbols to confirm; the checkbox gates 导入, which writes the recognised board into the
+copy. A grid carries no order, so the record is rebuilt row-major: the position is the same either way, and
+the record's job is stepping through stones, not recovering history.
+
+**交换 has two behaviours because only one of them is safe.** 黑↔白 recolours the record and keeps its
+order — every occupied cell stays occupied, so the move order it was seeded from still reads correctly.
+A swap involving 空 changes *which cells are occupied at all*, so the record has to be rebuilt from the
+board. The modal stays open after a swap because fixing a mis-read board is often two swaps.
+
+**选边 is the commit, and the server's `move_count` is every stone on the board.** `position_set` hides the
+setup buttons and clears the 摆棋记录 but keeps 落子记录 on screen — the player has not committed to the new
+position yet — and re-arms the side buttons; `state_sync` (choose_side's reply, the only place that frame is
+emitted) is where the record is cleared and every stone then on the board becomes `base`. That split is also
+what makes 悔棋 correct from a hand-set position: the stack is `base ++ played`, so once the played stones
+run out an undo eats the installed position too. `handleUndoSuccess` now divides `msg.move_count` into the
+kept base prefix and the remaining plies and rebuilds the board from both, instead of popping one local move
+and comparing a played-only length against a total count.
+
+**A refused 确认 stays inside 摆棋.** The server answers `error` (illegal position, AI thinking), and the
+copy is still there with 确认 re-armed and the side buttons handed back from `sideLock` — the player fixes
+what was objected to and confirms again. Confirmed in the browser with a 2-black position: "黑 2 子、白 0
+子：黑先手，黑白差只能是 0 或 1", record and panel intact, retry enabled.
+
+**What disappeared**: 手动摆棋 (painting *is* the mode now), 载入 (导入 into the copy replaced it), the
+drawer's inline file input and textarea (they are the modal's), and the `editMode` / `positionPreview` /
+`localCounts` state that only existed to arbitrate between an edited board and a live one. The drawer lost
+its textarea and gained nothing, so it is one button row plus a status line; its padding went 8→6 and the
+status margin 6→4 so that row fits the 62 px left under the bottom bar at an 813×785 viewport instead of
+scrolling 5 px. 旋转/镜像 are unchanged and still work during setup — they are display-only, so they rotate
+what the player sees without touching the position.
+
+**Verified.** `ctest` 7/7 (no C++ changed this round; the tree was rebuilt to confirm). Browser
+end-to-end: a 4-ply game entered setup with 摆棋记录 = those 4 moves and the game buttons (including the
+replay cluster) held; painting appended step 5 and clicking step 2 showed 2 stones, clicking it again
+showed 5; 清空 emptied the copy while the game kept its 4 plies; the 导入 modal recognised a pasted
+`B/W/.` grid (黑=B 白=W 空=., 3/2, 白方), refused 导入 until the mark was ticked, then wrote 5 stones
+row-major; a dragged CSV file took the same path; 黑↔白 recoloured the record in place, 黑↔空 rebuilt it
+(220 黑 + 3 白, row-major); 旋转 90° + 镜像 kept clicks landing on the true cells; 取消 restored the live
+4-stone board with 落子记录 intact and the toggle's pressed state cleared; a refused confirm stayed
+editable; a confirmed 1黑1白 position left the old record on screen until 执黑, after which 落子记录 was
+empty, `base` held 2 stones and the next exchange played on top of them; 悔棋 from 2 base + 2 played gave
+2 stones then 0 (the base eaten from its end, as the server's stack does it); 载入本局分析 + ⏭ + ✕ still
+scrub a base+played game; a page reload resumed the same session with `base` 2 + 2 plies; the newest
+`data/sessions/*.json` after the flush tick held `base` 4 and 2 moves with the engine numbers. Console
+clean. Screenshots: `build/tmp/r63_setup.png`, `r63_import.png`, `r63_swap.png`.
+
+## 摆棋界面重排与超时改用秒 — feature round 64 (`master`)
+
+**Asked for:** "摆棋界面上方状态栏增加醒目提示，比如'点击棋盘任意位置后依次标记为黑/白/空'；摆棋时的按钮
+位置调整，既然上面一排按钮都被禁用了，那么直接把摆棋相关的按钮放到他们位置上；点交换按钮后的弹窗挡住无法看到
+棋盘界面了，改成点击之后不再弹窗而是将这三个按钮放到原来在深度和超时的位置（摆棋时这两个输入框也不需要改的）；
+导入棋盘界面，移除'确认标志'的选框，按钮为：识别，确认，取消，在'确认标志'提示信息的附近加上交换黑白空的三个
+按钮；每个深度的超时时间都不一样，因此修改超时单位从毫秒改成为秒，且超时最小值设置为深度的2倍，最大值为深度的
+4倍，比如深度为4，超时最小为8秒最多16秒，默认用最小值"
+
+**The bar has two faces.** 摆棋 disables the side and play buttons, so the drawer that used to float over
+the bottom band was covering board to host buttons that had nowhere else to go. They now have somewhere:
+`group-side` + `group-play` swap out for `group-setup` (清空/导入/导出) + `group-commit` (确认/取消), and
+`group-config` (深度/超时) swaps for `group-swap` (黑↔白/黑↔空/白↔空) — the inputs have nothing to set
+while a position is being painted either. `setSetupBar(on)` flips the six spans and the 摆棋/旋转/镜像
+group never moves, so the board is no more covered during setup than during play. The drawer, its
+`position: fixed` anchoring in `layout()`, and `.panel` are gone; `#position-status` became an ordinary
+second line of `#region-bottom`, and the only overlay left is 导入, which needs the space (paste box plus
+file drop). Only the left-hand replay cluster still has to be disabled by hand, and `setup.gameButtons`
+shrank to exactly that list.
+
+**A latent CSS bug the new layout exposed.** `[hidden] { display: none }` lives in the UA sheet, so any
+author rule that sets `display` outranks it regardless of specificity — and `.group`, `.confirm-row` and
+`.modal-card`'s siblings all do. The round-63 交换 modal happened to work because `.modal` carries its own
+`[hidden]` rule, written for exactly this reason, but `#position-confirm-row` (`display: flex`) never
+actually hid: a bitboard or move-list read would have shown an empty 确认标志 line. Fixed once, globally,
+with `[hidden] { display: none !important }`, which is also what the screenshot caught on the first try at
+this round's layout — both faces of the bar on screen at once.
+
+**The swap trio has two targets because it fixes two different things.** The bar's edits the 摆棋 copy
+(record included: 黑↔白 recolours in place, anything involving 空 rebuilds row-major). The modal's edits
+the *preview*, which is where a mis-read file is still cheap: the recognised marks are swapped alongside
+the board, so the line under them keeps reading truthfully (`黑=W 白=B 空=.` after 黑↔白), and the counts
+and side to move are recomputed from the swapped matrix. A form that came in as a bitboard or a move list
+has no marks to be wrong about, so the modal's trio is disabled for it. With the trio in the modal there is
+nothing left for the checkbox to gate, and 确认 simply applies what is shown.
+
+**Timeouts are in seconds and belong to their depth.** The box is bounded by 2× to 4× the depth and a
+depth change pulls it to the floor of that range (`syncTimeoutBounds('min' | 'clamp' | 'bounds')`); an
+edited value is clamped back inside, and a garbage one falls to the floor rather than sending nothing.
+The depth itself is pinned to 2–20 before the bounds are derived, because it is read from a number input a
+player can type into. `set_config` and `request_hint` convert back to `timeout_ms` on the way out.
+
+**Which meant raising the server's cap.** `clamp_timeout_ms` topped out at 30 s, so depth 8's stated
+maximum (32 s) and anything past depth 15 would have been silently truncated — a UI that promises a range
+it cannot get is worse than a smaller range. The cap is now 120 s, which still bounds the wall-clock, the
+resign-probe node budget and the worker's wait the original comment was guarding. A resumed session keeps
+the deadline it was saved with (the resume path uses `'bounds'`, refreshing only the range) rather than
+being rewritten to the new floor on reconnect.
+
+**Verified.** `ctest` 7/7. Browser: both bar faces measure 64 px inside the 149 px bottom band with no
+overflow and no drawer; the amber setup hint reads 点击棋盘任意位置后依次标记为 黑 / 白 / 空; the import
+modal's buttons are 识别/确认/取消, a `X/O/.` grid came back as `识别到的标志：黑=X 白=O 空=.`, its 黑↔白
+flipped both the board and that line, and 确认 wrote the recoloured four stones into the copy; the bar's
+黑↔白 recoloured the copy's record in place; 确认 installed the position, flipped the bar back and left
+落子记录 for 选边 to clear; a 2-black position was refused with the counts in the error and 确认 re-armed;
+depth 4/8/20/50 produced 8..16 / 16..32 / 40..80 / 40..80 with the depth pinned to 20, and the frames on
+the wire read `timeout_ms: 8000 / 16000 / 40000`; 求招, a move, and an undo that ate both plies and kept
+`base` 4 all still work. Screenshots: `build/tmp/r64_setup_bar.png`, `r64_import.png`, `r64_bar.png`.
+
