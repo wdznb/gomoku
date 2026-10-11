@@ -30,7 +30,6 @@ public:
     SearchInfo last_search_info() const { return info_; }
 
     void set_node_limit(int limit) { node_limit_ = limit; }
-    void set_move_time_limit(int limit) { move_time_limit_ms_ = limit; }
 
 private:
     const Evaluator& evaluator_;

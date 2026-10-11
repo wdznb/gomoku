@@ -80,7 +80,6 @@ public:
     void reset();
 
 private:
-    void record_new_plies(const std::vector<PlyChoices>& tail);
     bool rewind_to_next_branch(const std::vector<Move>& played);
 
     SelfPlay self_play_;

@@ -107,8 +107,6 @@ private:
     void handle_restart(std::shared_ptr<WebSocketSession> session);
     
     json board_to_json(const Board& board);
-    json move_to_json(const Move& move);
-    json game_state_json(const GameManager& game);
     
     void setup_game_callbacks(std::shared_ptr<WebSocketSession> session, GameManager& game);
 };

@@ -4,7 +4,6 @@
 #include "../core/board.h"
 #include "../core/evaluator.h"
 #include "../search/search_engine.h"
-#include "protocol.h"
 #include <memory>
 #include <atomic>
 #include <thread>

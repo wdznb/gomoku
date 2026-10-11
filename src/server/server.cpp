@@ -620,39 +620,6 @@ json GameServer::board_to_json(const Board& board) {
     return board_json;
 }
 
-json GameServer::move_to_json(const Move& move) {
-    json move_json;
-    move_json["row"] = move.pos.row;
-    move_json["col"] = move.pos.col;
-    move_json["color"] = move.color == BLACK ? "black" : "white";
-    return move_json;
-}
-
-json GameServer::game_state_json(const GameManager& game) {
-    json state;
-    state["board"] = board_to_json(game.board());
-    state["current_turn"] = game.current_turn() == BLACK ? "black" : "white";
-    
-    switch (game.status()) {
-        case GameStatus::WAITING:
-            state["game_status"] = "waiting";
-            break;
-        case GameStatus::PLAYING:
-            state["game_status"] = "playing";
-            break;
-        case GameStatus::GAME_OVER:
-            state["game_status"] = "game_over";
-            if (game.winner() == EMPTY) {
-                state["winner"] = "draw";
-            } else {
-                state["winner"] = game.winner() == BLACK ? "black" : "white";
-            }
-            break;
-    }
-    
-    return state;
-}
-
 void GameServer::setup_game_callbacks(std::shared_ptr<WebSocketSession> session, GameManager& game) {
     game.set_progress_callback([this, session](int depth, int nodes, int elapsed_ms) {
         json msg;

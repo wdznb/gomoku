@@ -264,8 +264,7 @@ gomoku/
 │   │   └── main_trainer.cpp    # gomoku_train 命令行入口
 │   ├── server/         # 服务器
 │   │   ├── server.h/cpp    # WebSocket + HTTP 服务器
-│   │   ├── game_manager.h/cpp # 游戏管理
-│   │   └── protocol.h      # 消息协议
+│   │   └── game_manager.h/cpp # 游戏管理 + 回放快照
 │   └── main.cpp        # gomoku_server 入口
 ├── web/                # 前端文件
 │   ├── index.html

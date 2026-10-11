@@ -226,6 +226,32 @@ record directly would zig-zag with whose turn it was and drag through zero on ev
 (those entries carry no evaluation at all). The graph plots engine moves only, negated for WHITE, and
 says so on the canvas.
 
+### Round 53 — dead code left behind by the JSON protocol
+
+Swept every function declared in `src/**/ *.h` for call sites across `src/`, `tests/` and `web/`.
+
+**The whole of `src/server/protocol.h` was unused.** Its `ClientMessage` / `ServerMessage` /
+`MoveJson` structs described an earlier typed-message layer; the handlers parse and emit `nlohmann::json`
+directly, so nothing ever populated them. `game_manager.h` still included the header, which kept it alive
+in the dependency graph without any consumer. `GameServer::game_state_json` was the same story one layer
+up: `choose_side` builds its `state_sync` inline, so the helper had no caller and only duplicated the
+board/turn/status serialization. `move_to_json` was never called either.
+
+**Two more were misleading rather than merely unused.** `AlphaBetaSearch::set_move_time_limit` wrote
+`move_time_limit_ms_`, but `search()` overwrites that member from its own `time_limit_ms` argument on
+every call, so a value set through the public setter could not survive into a search.
+`RetryExplorer::record_new_plies` was declared and never defined — legal for an unused member, but any
+future call would be a link error rather than a compile error, so the stale declaration went.
+
+**Deliberately kept:** the `SearchEngine::set_vcf_depth` / `set_vct_depth` / `set_alphabeta_*` /
+`set_resign_node_limit` and `DataCollector::set_keep_undecided` setters, and the read-only
+`exhausted()` / `current_line()` / `transposition_table()` accessors. Each fronts a member the code does
+use, so they are an unexercised configuration and introspection surface rather than dead logic; deleting
+them would have removed capability without fixing anything.
+
+- Rebuilt warning-free and `ctest` 5/5 after the removals; `build/web` matches `web/`, so the server
+  started from the build directory serves the current UI.
+
 ### Phase 4 status
 
 All four items of the phase are implemented: 4.1 bitboard and 4.2 root dedup (released as
