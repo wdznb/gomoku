@@ -16,6 +16,16 @@ int clamp_timeout_ms(int timeout_ms) {
     if (timeout_ms > 120000) return 120000;
     return timeout_ms;
 }
+
+// max_depth is client-controlled through the same two doors, and the page's
+// 2..20 is only an input rule: iterative deepening runs depth 1..max_depth and
+// is stopped by nothing but the deadline, so an unbounded value buys no stronger
+// move and a socket client can ask for one. Clamp to what the page can express.
+int clamp_max_depth(int max_depth) {
+    if (max_depth < 1) return 1;
+    if (max_depth > 20) return 20;
+    return max_depth;
+}
 }
 
 GameManager::GameManager() 
@@ -266,6 +276,7 @@ void GameManager::resign_now(int color) {
 bool GameManager::request_hint(int timeout_ms, int max_depth) {
     if (ai_thinking_.load() || hint_active_.load()) return false;
     timeout_ms = clamp_timeout_ms(timeout_ms);
+    max_depth = clamp_max_depth(max_depth);
 
     if (hint_thread_ && hint_thread_->joinable()) {
         hint_thread_->join();
@@ -406,7 +417,7 @@ void GameManager::set_opening_book(const OpeningBook* book) {
 
 void GameManager::set_config(int timeout_ms, int max_depth) {
     timeout_ms_ = clamp_timeout_ms(timeout_ms);
-    max_depth_ = max_depth;
+    max_depth_ = clamp_max_depth(max_depth);
 }
 
 }
