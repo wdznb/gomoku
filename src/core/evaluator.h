@@ -43,6 +43,12 @@ public:
     int evaluate_position_with_pattern(const Board& board, int row, int col,
                                        const PositionPattern& pattern) const;
     int evaluate_position_both(const Board& board, int row, int col, int my_color) const;
+
+    // Both sides' candidate scores at one empty square: exactly
+    // evaluate_position(board, r, c, color) + evaluate_position(board, r, c,
+    // opponent(color)), but from a single shared four-direction pass. Used for
+    // move ordering, which always wants both sides of every candidate.
+    int evaluate_position_pair(const Board& board, int row, int col, int color) const;
     
     int evaluate_board(const Board& board, int my_color) const;
     
@@ -54,6 +60,9 @@ private:
     
     void init_position_weights();
     int pattern_score(const PositionPattern& pattern) const;
+    // A recognised candidate pattern's value for its colour: the mate bonus for
+    // a five, otherwise the pattern score plus the square's centre bias.
+    int candidate_value(int row, int col, const PositionPattern& pattern) const;
 };
 
 }

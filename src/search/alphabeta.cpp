@@ -51,7 +51,6 @@ void AlphaBetaSearch::sort_moves(std::vector<Move>& moves, const Board& board, i
     // would rerun is_forbidden (which does a second recognize_combined) on
     // every node of every ply. Score both sides directly and skip that
     // redundant work.
-    int opp = opponent(color);
     int start = tt_swapped ? 1 : 0;
     int count = static_cast<int>(moves.size()) - start;
     if (count <= 1) return;
@@ -60,8 +59,7 @@ void AlphaBetaSearch::sort_moves(std::vector<Move>& moves, const Board& board, i
     scored.reserve(count);
     for (int i = 0; i < count; ++i) {
         const Move& m = moves[start + i];
-        int s = evaluator_.evaluate_position(board, m.pos.row, m.pos.col, color) +
-                evaluator_.evaluate_position(board, m.pos.row, m.pos.col, opp);
+        int s = evaluator_.evaluate_position_pair(board, m.pos.row, m.pos.col, color);
         scored.emplace_back(s, static_cast<size_t>(start + i));
     }
     std::sort(scored.begin(), scored.end(),
@@ -297,6 +295,12 @@ Move AlphaBetaSearch::search(const Board& board, int color, int max_depth,
         int depth_best_score = -INT_MAX;
         Move depth_best_move;
 
+        // Re-copied per iteration on purpose. undo_last_move() restores the
+        // candidate list by swap-remove, so a board that has already played and
+        // undone this iteration's root moves holds active_empty() in a different
+        // order than a fresh copy, and the score ties in sort_moves break
+        // against that order. Reusing one board across depths would quietly
+        // change which equal-valued moves get searched first.
         Board mutable_board = board;
         for (const auto& move : root_moves) {
             if (stop_flag.load() || is_timeout() || nodes_searched_ > node_limit_) break;

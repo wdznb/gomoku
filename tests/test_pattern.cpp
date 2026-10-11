@@ -436,6 +436,84 @@ void test_overline_locked_four() {
     std::cout << "test_overline_locked_four passed" << std::endl;
 }
 
+// recognize_position_both is the shared-load fast path for callers that score
+// one candidate for both colours (AlphaBeta's sort_moves, evaluate_board and
+// evaluate_position_both). It has to answer exactly what the two single-colour
+// calls answer, or move ordering and static evaluation quietly diverge from
+// every branch that still recognizes one colour at a time.
+static bool patterns_equal(const PositionPattern& a, const PositionPattern& b) {
+    for (int d = 0; d < 4; ++d) {
+        if (a.directions[d].type != b.directions[d].type) return false;
+        if (a.directions[d].direction != b.directions[d].direction) return false;
+    }
+    return a.four_count == b.four_count &&
+           a.three_count == b.three_count &&
+           a.live_four_count == b.live_four_count &&
+           a.rush_four_count == b.rush_four_count &&
+           a.live_three_count == b.live_three_count &&
+           a.has_four_four == b.has_four_four &&
+           a.has_four_three == b.has_four_three &&
+           a.has_three_three == b.has_three_three &&
+           a.has_live_four == b.has_live_four &&
+           a.has_rush_four == b.has_rush_four &&
+           a.has_live_three == b.has_live_three;
+}
+
+void test_recognize_position_both_matches_pair() {
+    auto compare_all = [](const Board& board, long long& checked) {
+        for (int r = 0; r < BOARD_SIZE; ++r) {
+            for (int c = 0; c < BOARD_SIZE; ++c) {
+                for (int side : {BLACK, WHITE}) {
+                    const PositionPattern ref_first =
+                        PatternRecognizer::recognize_position(board, r, c, side);
+                    const PositionPattern ref_second =
+                        PatternRecognizer::recognize_position(board, r, c, opponent(side));
+
+                    PositionPattern first, second;
+                    PatternRecognizer::recognize_position_both(board, r, c, side, first, second);
+
+                    assert(patterns_equal(ref_first, first));
+                    assert(patterns_equal(ref_second, second));
+                    ++checked;
+                }
+            }
+        }
+    };
+
+    long long checked = 0;
+
+    std::mt19937 rng(20261012);
+    for (int game = 0; game < 40; ++game) {
+        Board board;
+        const int stones = 1 + static_cast<int>(rng() % 45);
+        for (int i = 0; i < stones; ++i) {
+            const int r = static_cast<int>(rng() % BOARD_SIZE);
+            const int c = static_cast<int>(rng() % BOARD_SIZE);
+            board.place_stone(r, c, i % 2 == 0 ? BLACK : WHITE);
+        }
+        compare_all(board, checked);
+    }
+
+    // Rows, columns and both diagonals fully packed, so the shared pass is
+    // checked against runs that reach the window's ends and against the
+    // colour-specific corrections (WHITE overline demotion, BLACK overline
+    // promotion and the locked-four probe) on every square at once.
+    for (int color = 1; color <= 2; ++color) {
+        Board board;
+        for (int i = 0; i < BOARD_SIZE; ++i) {
+            board.place_stone(7, i, color);
+            board.place_stone(i, 7, color);
+            board.place_stone(i, i, color);
+            board.place_stone(i, BOARD_SIZE - 1 - i, color);
+        }
+        compare_all(board, checked);
+    }
+
+    assert(checked >= 10000);
+    std::cout << "test_recognize_position_both_matches_pair passed (" << checked
+              << " squares)" << std::endl;
+}
+
 void test_bitboard_matches_scalar() {
     // Phase 4.1 replaced the per-cell base-3 window scan with bitboard line
     // words plus an 18-bit pattern table. The table is generated from
@@ -516,6 +594,7 @@ int main() {
     test_gap_shapes();
     test_overline_locked_four();
     test_forbidden_from_pattern_equivalence();
+    test_recognize_position_both_matches_pair();
     test_bitboard_matches_scalar();
     
     std::cout << "All pattern tests passed!" << std::endl;

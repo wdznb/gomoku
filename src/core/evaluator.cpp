@@ -98,6 +98,10 @@ int Evaluator::evaluate_position_with_pattern(const Board& board, int row, int c
                                               const PositionPattern& pattern) const {
     if (!board.is_empty(row, col)) return 0;
 
+    return candidate_value(row, col, pattern);
+}
+
+int Evaluator::candidate_value(int row, int col, const PositionPattern& pattern) const {
     for (int d = 0; d < 4; ++d) {
         if (pattern.directions[d].type == PatternType::FIVE) {
             return coeffs_.five;
@@ -110,33 +114,39 @@ int Evaluator::evaluate_position_with_pattern(const Board& board, int row, int c
     return score;
 }
 
+int Evaluator::evaluate_position_pair(const Board& board, int row, int col, int color) const {
+    if (!board.is_empty(row, col)) return 0;
+
+    PositionPattern mine, theirs;
+    PatternRecognizer::recognize_position_both(board, row, col, color, mine, theirs);
+
+    return candidate_value(row, col, mine) + candidate_value(row, col, theirs);
+}
+
 int Evaluator::evaluate_position_both(const Board& board, int row, int col, int my_color) const {
     if (!board.is_empty(row, col)) return 0;
-    
-    int opp_color = opponent(my_color);
-    
+
     if (PatternRecognizer::is_forbidden(board, row, col, my_color)) {
         return -coeffs_.forbidden_penalty;
     }
-    
-    int my_score = evaluate_position(board, row, col, my_color);
-    int opp_score = evaluate_position(board, row, col, opp_color);
-    
-    return my_score + opp_score;
+
+    return evaluate_position_pair(board, row, col, my_color);
 }
 
 int Evaluator::evaluate_board(const Board& board, int my_color) const {
-    int opp_color = opponent(my_color);
     long long my_total = 0;
     long long opp_total = 0;
     
     const auto& candidates = board.active_empty();
     
     for (const auto& pos : candidates) {
-        PositionPattern my_pattern = PatternRecognizer::recognize_position(board, pos.row, pos.col, my_color);
+        // One shared pass over the four directions yields both colours; two
+        // recognize_position calls read the same two bitboard lines again.
+        PositionPattern my_pattern, opp_pattern;
+        PatternRecognizer::recognize_position_both(board, pos.row, pos.col, my_color,
+                                                  my_pattern, opp_pattern);
+
         my_total += pattern_score(my_pattern);
-        
-        PositionPattern opp_pattern = PatternRecognizer::recognize_position(board, pos.row, pos.col, opp_color);
         opp_total += pattern_score(opp_pattern);
     }
     

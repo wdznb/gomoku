@@ -221,16 +221,17 @@ int VCFSearch::vcf_attack(Board& board, int color, int depth, int alpha, int bet
 VCFMove VCFSearch::search(const Board& board, int color, int max_depth,
                            std::atomic<bool>& stop_flag) {
     nodes_searched_ = 0;
-    return search_impl(board, color, max_depth, stop_flag);
+    // One copy for the whole search: search_impl plays and unhands its
+    // candidates on it, so the win-attempt loop needs no per-candidate clone.
+    Board working = board;
+    return search_impl(working, color, max_depth, stop_flag);
 }
 
-VCFMove VCFSearch::search_impl(const Board& board, int color, int max_depth,
+VCFMove VCFSearch::search_impl(Board& board, int color, int max_depth,
                                 std::atomic<bool>& stop_flag) {
     VCFMove result;
 
-    Board mutable_board = board;
-
-    auto rush_fours = generate_rush_fours(mutable_board, color);
+    auto rush_fours = generate_rush_fours(board, color);
     if (rush_fours.empty()) {
         result.result = VCFResult::UNKNOWN;
         return result;
@@ -242,10 +243,10 @@ VCFMove VCFSearch::search_impl(const Board& board, int color, int max_depth,
     for (const auto& move : rush_fours) {
         if (aborted(stop_flag)) break;
 
-        mutable_board.place_stone(move.pos.row, move.pos.col, color);
+        board.place_stone(move.pos.row, move.pos.col, color);
 
-        if (mutable_board.has_five_in_a_row(move.pos.row, move.pos.col, color)) {
-            mutable_board.undo_last_move();
+        if (board.has_five_in_a_row(move.pos.row, move.pos.col, color)) {
+            board.undo_last_move();
             result.result = VCFResult::WIN;
             result.best_move = move;
             result.variation.push_back(move);
@@ -253,7 +254,7 @@ VCFMove VCFSearch::search_impl(const Board& board, int color, int max_depth,
         }
 
         PositionPattern pattern = PatternRecognizer::recognize_position(
-            mutable_board, move.pos.row, move.pos.col, color);
+            board, move.pos.row, move.pos.col, color);
         bool has_live_four = false;
         for (int d = 0; d < 4; ++d) {
             if (pattern.directions[d].type == PatternType::LIVE_FOUR) {
@@ -263,7 +264,7 @@ VCFMove VCFSearch::search_impl(const Board& board, int color, int max_depth,
         }
 
         if (has_live_four) {
-            mutable_board.undo_last_move();
+            board.undo_last_move();
             result.result = VCFResult::WIN;
             result.best_move = move;
             result.variation.push_back(move);
@@ -271,38 +272,38 @@ VCFMove VCFSearch::search_impl(const Board& board, int color, int max_depth,
         }
 
         if (pattern.four_count >= 2) {
-            mutable_board.undo_last_move();
+            board.undo_last_move();
             result.result = VCFResult::WIN;
             result.best_move = move;
             result.variation.push_back(move);
             return result;
         }
 
-        Move block = find_block_move(mutable_board, move.pos.row, move.pos.col, color);
+        Move block = find_block_move(board, move.pos.row, move.pos.col, color);
         if (block.pos.row < 0) {
-            mutable_board.undo_last_move();
+            board.undo_last_move();
             continue;
         }
 
-        if (block.color == BLACK && PatternRecognizer::is_forbidden(mutable_board, block.pos.row, block.pos.col, block.color)) {
-            mutable_board.undo_last_move();
+        if (block.color == BLACK && PatternRecognizer::is_forbidden(board, block.pos.row, block.pos.col, block.color)) {
+            board.undo_last_move();
             result.result = VCFResult::WIN;
             result.best_move = move;
             result.variation.push_back(move);
             return result;
         }
 
-        mutable_board.place_stone(block.pos.row, block.pos.col, block.color);
+        board.place_stone(block.pos.row, block.pos.col, block.color);
 
         // Same tempo check as vcf_attack: a block that hands the defender a
         // five, a live four, a rush four, or a double-four invalidates this
         // attacker candidate; skip and try the next attack.
         bool defender_has_tempo = false;
-        if (mutable_board.has_five_in_a_row(block.pos.row, block.pos.col, block.color)) {
+        if (board.has_five_in_a_row(block.pos.row, block.pos.col, block.color)) {
             defender_has_tempo = true;
         } else {
             PositionPattern block_pattern = PatternRecognizer::recognize_position(
-                mutable_board, block.pos.row, block.pos.col, block.color);
+                board, block.pos.row, block.pos.col, block.color);
             for (int d = 0; d < 4; ++d) {
                 PatternType t = block_pattern.directions[d].type;
                 if (t == PatternType::LIVE_FOUR || t == PatternType::RUSH_FOUR) {
@@ -316,16 +317,16 @@ VCFMove VCFSearch::search_impl(const Board& board, int color, int max_depth,
         }
 
         if (defender_has_tempo) {
-            mutable_board.undo_last_move();
-            mutable_board.undo_last_move();
+            board.undo_last_move();
+            board.undo_last_move();
             continue;
         }
 
-        int score = vcf_attack(mutable_board, color, max_depth - 1,
+        int score = vcf_attack(board, color, max_depth - 1,
                                 -INT_MAX, INT_MAX, stop_flag);
 
-        mutable_board.undo_last_move();
-        mutable_board.undo_last_move();
+        board.undo_last_move();
+        board.undo_last_move();
 
         if (score > best_score) {
             best_score = score;
@@ -394,6 +395,10 @@ DefenseResult VCFSearch::find_defense(const Board& board, int defender, int max_
             return DefenseResult::SURVIVES;
         }
 
+        // A fresh copy per reply, not one board played and undone across the
+        // loop: undo_last_move() restores the candidate list by swap-remove, so
+        // a reused board hands search_impl a different active_empty() order for
+        // each reply, and the ties in threat ordering break against that order.
         Board after = board;
         after.place_stone(pos.row, pos.col, defender);
 

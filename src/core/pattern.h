@@ -63,6 +63,14 @@ public:
     static void init();
     
     static PositionPattern recognize_position(const Board& board, int row, int col, int color);
+    // Both colours at one empty square, from a single pass over the four
+    // directions. The pair reads the same two bitboard lines per direction (a
+    // stone of one colour is a blocked cell for the other), so this costs four
+    // line loads and two table lookups where calling recognize_position twice
+    // costs eight. Used by callers that score both sides of a candidate: move
+    // ordering and whole-board evaluation.
+    static void recognize_position_both(const Board& board, int row, int col, int color,
+                                        PositionPattern& first, PositionPattern& second);
     static CombinedPattern recognize_combined(const Board& board, int row, int col, int color);
     
     static bool is_forbidden(const Board& board, int row, int col, int color);
@@ -87,6 +95,12 @@ private:
     
     static int extract_window(const Board& board, int row, int col, int color, int dir);
     static PatternType match_pattern(int window_code, bool is_center);
+
+    // The window bits for one colour at one square, already OR'd with the
+    // probe stone. Split out so recognize_position_both can fetch the two
+    // colours' loads once and hand each pair to the table lookup.
+    static DirectionPattern direction_from_bits(const Board& board, int row, int col, int color,
+                                                int dir, uint32_t own, uint32_t blocked);
 
     // The colour-specific corrections applied to a raw window match (WHITE
     // overline demotion, BLACK overline promotion). Shared by both recognition

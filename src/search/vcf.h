@@ -73,7 +73,11 @@ private:
     std::vector<Move> generate_rush_fours(const Board& board, int color);
     Move find_block_move(const Board& board, int row, int col, int color);
 
-    VCFMove search_impl(const Board& board, int color, int max_depth,
+    // Takes the board it may mutate: the caller hands over a private working
+    // copy, so the win-attempt loop can place/undo instead of cloning a board per
+    // candidate. find_defense reuses one copy across all of the defender's
+    // replies for the same reason.
+    VCFMove search_impl(Board& board, int color, int max_depth,
                         std::atomic<bool>& stop_flag);
 
     // A move that makes five or a live four forces the opponent to answer, which

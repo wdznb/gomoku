@@ -333,6 +333,12 @@ DirectionPattern PatternRecognizer::recognize_direction(const Board& board, int 
     uint32_t blocked = static_cast<uint32_t>(
         (board.line_bits(opp, dir, desc.line) >> desc.shift) & kWindowMask) | desc.wall;
 
+    return direction_from_bits(board, row, col, color, dir, own, blocked);
+}
+
+DirectionPattern PatternRecognizer::direction_from_bits(const Board& board, int row, int col,
+                                                         int color, int dir,
+                                                         uint32_t own, uint32_t blocked) {
     // The window describes the square as if `color` already had a stone there:
     // every caller evaluates empty candidate squares. Guard bits outside a
     // line's real cells are never set by a legal stone, so the wall mask alone
@@ -441,6 +447,37 @@ PositionPattern PatternRecognizer::recognize_position(const Board& board, int ro
     pattern.analyze();
     
     return pattern;
+}
+
+void PatternRecognizer::recognize_position_both(const Board& board, int row, int col, int color,
+                                                PositionPattern& first, PositionPattern& second) {
+    const int opp = opponent(color);
+
+    if (row < 0 || row >= BOARD_SIZE || col < 0 || col >= BOARD_SIZE ||
+        (color != BLACK && color != WHITE)) {
+        first.analyze();
+        second.analyze();
+        return;
+    }
+
+    const size_t base = (row * BOARD_SIZE + col) * 4;
+    for (int d = 0; d < 4; ++d) {
+        const WindowDesc& desc = window_descs()[base + d];
+        const uint32_t mine = static_cast<uint32_t>(
+            (board.line_bits(color, d, desc.line) >> desc.shift) & kWindowMask);
+        const uint32_t theirs = static_cast<uint32_t>(
+            (board.line_bits(opp, d, desc.line) >> desc.shift) & kWindowMask);
+
+        // Same pairing as recognize_direction: own stones for one colour are the
+        // blocked cells for the other, so the two windows come out of two loads.
+        first.directions[d] =
+            direction_from_bits(board, row, col, color, d, mine, theirs | desc.wall);
+        second.directions[d] =
+            direction_from_bits(board, row, col, opp, d, theirs, mine | desc.wall);
+    }
+
+    first.analyze();
+    second.analyze();
 }
 
 CombinedPattern PatternRecognizer::recognize_combined(const Board& board, int row, int col, 

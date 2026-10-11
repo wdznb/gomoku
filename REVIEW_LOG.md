@@ -83,8 +83,9 @@ The last two rounds surfaced only a portability nit on a non-supported native-Wi
 
 - ~~Gap-pattern matcher (R34 F3)~~ — done in round 54
 - ~~Overline-locked-four threat classification (R35 F3)~~ — done in round 54
-- Engine perf refactors: incremental eval, `sort_moves` pattern threading, `find_defense` board
-  copy (R41 F1/F2/F3)
+- ~~Engine perf refactors: `sort_moves` pattern threading, `find_defense` board copy (R41 F1/F2)~~ —
+  done in round 55. Incremental whole-board evaluation (R41 F3) was measured there and rejected: a
+  make/undo delta costs about as much as the re-scan it replaces.
 - Blocking worker join on the io thread (R42 F3)
 - Verified false positive: VCF/VCT live-four early win (R43 F1) — correct because
   `find_block_move` returns the unique forced block
@@ -309,4 +310,75 @@ exactly four are in scope, so gap fours keep their label.
   the defence cell, and with holes recognised `(10,2)` / `(10,8)` are decisive tempi too, so the
   ordering legitimately changes. It now asserts the property that matters — that WHITE answers with a
   four-or-better of its own rather than a passive block.
+
+## Deferred item (round 41) — engine performance refactors
+
+### Round 55 — threading one recognition pass, and measuring the third refactor
+
+R41 F1/F2/F3 are three separate claims: `sort_moves` re-recognizing patterns, board copies in the
+threat searches, and incremental whole-board evaluation. The first two were implemented; the third was
+measured and rejected. All three were settled with numbers rather than argument, which is exactly the
+harness this list was gated on.
+
+**The verification gate came first.** These refactors must not change what the engine plays, so
+`build/fingerprint.cpp` (scratch, not built by CMake) prints method / score / nodes / chosen move /
+resign flag for 25 positions × depths 2, 4, 6 × threats on and off × resign on and off, plus a
+`find_defense` loss proof for both colours at every position — 350 lines. Compiling it against
+`git archive HEAD`'s tree and against the working tree and diffing gives a byte-level behaviour check
+far stronger than the unit tests: node counts included, so any change in move ordering shows up even
+when the chosen move does not.
+
+**F2: `sort_moves` ran eight direction scans per candidate.** It scored each candidate with
+`evaluate_position(board, r, c, color) + evaluate_position(board, r, c, opp)` — two full four-direction
+recognitions of the *same* two bitboard lines, because a BLACK stone is exactly a blocked cell in
+WHITE's window and vice versa. `PatternRecognizer::recognize_position_both` now walks the four
+directions once, takes the two line loads per direction and derives both colours' windows from them,
+and `Evaluator::evaluate_position_pair` / `evaluate_board` / `evaluate_position_both` use it. The
+scoring rule (mate first, then pattern score plus centre bias) moved into one private
+`candidate_value`, so the pair path and the single path cannot disagree.
+
+- Verified: new `test_recognize_position_both_matches_pair` compares the shared pass against two
+  single-colour `recognize_position` calls field-by-field on every square of 42 boards — 18,900 squares
+  including occupied ones and both colours, on packed rows, columns and both diagonals so the
+  colour-specific corrections are covered on every square at once. It failed on its first run for the
+  wrong reason (a copied `assert(checked >= 100000)` threshold sized for the four-direction-scan
+  scalar test, while this one counts squares), which is a reminder to size the coverage assertion to
+  the loop the test actually runs.
+
+**F1: only one of the three "board copies" was a loop copy.** `vcf.cpp` and `vct.cpp` recursion already
+make/unmake on a `Board&`; the copies at `VCFSearch::search_impl`, `VCTSearch::search` and
+`AlphaBetaSearch::search` are once per search or once per depth iteration. The real loop copy was
+`find_defense`'s `Board after = board;` inside the reply loop — and it was paying *two* copies per
+reply, because `search_impl` then copied its argument again. `search_impl` now takes `Board&` (its
+caller owns the copy) and the resign probe pays one instead of two.
+
+**Reusing the board across replies was tried and reverted.** `undo_last_move()` restores `active_empty_`
+by swap-remove, so a board that has played and unplayed stones holds its candidate list in a different
+order than a fresh copy — and `sort_moves` breaks score ties against that order. Timing the fingerprint
+proved it: hoisting AlphaBeta's per-iteration copy out of the loop kept every score and every chosen
+move but moved node counts by ~4% (13,987 → 14,847 at two stones, depth 4), i.e. a different search.
+Same for `find_defense`: one shared board across the defender's replies would silently re-order the
+threat generators. Both copies are load-bearing for reproducibility and now say so at the call site.
+After that revert the fingerprint is `IDENTICAL (350 lines)` — the accepted refactors change speed
+only.
+
+**F3: incremental evaluation does not pay for itself here.** Measured on the working tree:
+`evaluate_board` is 0.58 calls per node at 12 stones / depth 6 and each call costs ~3.7 µs, so the full
+re-scan is ~50% of search time — worth attacking if a delta were cheap. It is not. A pattern at cell X
+reads the 9-cell window along each direction through X, so one stone changes the candidates on the four
+lines through it: measured over every candidate of a 12-stone position, **15 cells (27% of the 56
+candidates)** must be refreshed per placement, 38% at four stones and 18% at 26. A make plus its undo
+therefore costs ~54% of the full re-scan that the node's single `evaluate_board` call costs 58% of —
+break-even in the midgame, a loss in the early game, and only a win past ~20 stones, and that ignores
+the bookkeeping for candidates entering and leaving the set. Not implemented.
+
+| position | depth | nodes (before = after) | before | after |
+| --- | --- | --- | --- | --- |
+| 12 stones | 4 | 39,990 | 222 ms | 185 ms |
+| 12 stones | 6 | 722,966 | 3,764 ms | 3,159 ms (192k → 229k nps) |
+| 16 stones | 6 | 921,214 | 4,527 ms | 3,704 ms (203k → 249k nps) |
+| `evaluate_board` at 12 stones | — | — | 4.89 µs/call | 3.75 µs/call |
+
+- Rebuilt warning-free, `ctest` 5/5 (now 6 pattern binaries' worth of cases including the new
+  differential test), and the pre/post fingerprint diff identical, after each accepted step.
 
