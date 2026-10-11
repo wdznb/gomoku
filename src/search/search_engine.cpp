@@ -157,6 +157,13 @@ SearchResult SearchEngine::search(const Board& board, int color,
         remaining_time -= used_ms;
         if (remaining_time < 100) remaining_time = 100;
 
+        // Tie the node budget to the wall-clock deadline so that a large
+        // timeout actually buys more search. Empirical throughput on this
+        // target is roughly 100k–250k nodes/s, so 200 nodes/ms is a safe
+        // middle ground: a 30 s move gets up to 6 M nodes, while a 4 s move
+        // still has 800 k — far above the old hard-coded 2 M cap.
+        ab.set_node_limit(remaining_time * 200);
+
         int depth = (max_depth > 0) ? max_depth : alphabeta_max_depth_;
         Move ab_move = ab.search(board, color, depth, remaining_time, stop_flag);
 
