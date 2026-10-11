@@ -561,3 +561,36 @@ checks exercise. In the browser, pasting the 225-character `B`/`W`/`.` run into 
 returned "确认标志：黑=B 白=W 空=.", 载入 stayed disabled until the box was ticked, and the loaded board
 showed 3 黑 2 白 with 白方 to move. (The socket did drop once mid-verification, for the known 60 s idle
 timeout and not for anything in this round: a reload re-ran the sequence in one script.)
+
+## Documentation audit — round 59 (`phase4-ui-replay`, before merging to master)
+
+**`build.sh`'s non-CMake fallback had been left behind by three phases of growth, and README
+recommended the script as 方法1.** Its compile line listed no `transforms.cpp`, `position_setup.cpp` or
+`position_json.cpp`, still cloned and included **websocketpp** (the transport has been Boost.Beast for
+the whole time), and linked `-lboost_system -lboost_thread` — which the CMake path never needs, because
+`find_package(Boost REQUIRED)` there resolves to headers only and `-lboost_system` is not even installed
+on this host. So the documented "recommended" build would fail with undefined references on any machine
+without CMake. The list now mirrors `GOMOKU_SOURCES`, the websocketpp download is gone, and the link is
+`-lpthread`; verified by running exactly that command (compiles clean under `-Wall -Wextra`, and the
+binary it produced serves HTTP and loads `data/opening_book.json` on a scratch port).
+
+**README corrections.** The dependency section named websocketpp as an auto-downloaded dependency; the
+"手动编译" example was a stale nine-file command that could not link, and now says plainly that the
+source list belongs to `CMakeLists.txt` and that cherry-picking files only produces missing symbols. The
+训练 defaults paragraph still reported round 50's measurement ("27 手内黑棋成五") as the current
+behaviour, which round 54's stricter forbidden / gap reading overturned — it now gives both measurements
+and states the conclusion that actually matters for the CLI: verification pairs each colour once, so a
+colour-decided outcome lands the score at exactly 0.500 and `--accept-score 0.56` demands the candidate
+win the game where it does *not* hold the advantageous colour. The 服务器→客户端 protocol block listed
+only seven of the twelve message types the server can send, missing `state_sync` — the one message that
+carries the server's authoritative board, and the reason round 57's phantom-board defect mattered — so
+`state_sync`, `move_made`, `undo_success`, `hint_result` and `game_restarted` are documented, with the
+note that `restart` deliberately answers `game_restarted` rather than `state_sync`. The 版本 section now
+says which merged content still has no tag.
+
+**What checked out.** The `src/` and `tests/` trees, the five server CLI flags, every trainer default in
+the options table (rounds 3 / depth 4 / 400 ms / 60 moves / fitness 2 / verification 8 / 0.56 / data 4 /
+threads 2 / population 8), the 100–30000 ms server-side timeout clamp, the 2^18 shape-table numbers and
+the round-51 performance table. The front-end's timeout input allows 1000–60000 while the manager clamps
+to 100–30000, which is the documented server range — a UI/server mismatch, not a documentation error, and
+left alone.

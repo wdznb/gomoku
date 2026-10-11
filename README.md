@@ -15,6 +15,9 @@
 
 阶段3 的三个标签：`v0.3.0-phase3` 是功能基线，`v0.3.1-phase3` 是训练模块审查（`REVIEW_LOG.md` 轮次 49–50）后的修复版本，`v0.3.2-phase3` 是阶段收尾（文档与版本记录）后的 `master` 基线。
 
+`v0.4.0-phase4` 之后合入 `master` 的内容（4.3 前端增强、4.4 对局回放分析、摆设棋局，以及轮次 53–58
+的死代码清理、缺口棋型、过线锁四判定与性能重构）**尚无对应标签**。
+
 ## 特性
 
 ### 阶段1
@@ -63,11 +66,10 @@ io 线程上的工作线程 `join` 经实测确认被单个搜索节点的耗时
 
 - **操作系统**: Linux 或 WSL (Windows Subsystem for Linux)
 - **编译器**: g++ 7+ (支持 C++17)
-- **构建工具**: CMake 3.14+ (可选)
+- **构建工具**: CMake 3.14+
 - **依赖库**:
-  - Boost (system, thread)
-  - websocketpp (自动下载)
-  - nlohmann/json (自动下载)
+  - Boost（WebSocket / HTTP 走 **Boost.Beast**，头文件为主；`find_package(Boost REQUIRED)` + pthread）
+  - nlohmann/json（找不到系统包时由 CMake `FetchContent` 自动下载 v3.11.2）
 
 ## 安装依赖
 
@@ -104,27 +106,10 @@ make -j$(nproc)
 
 ### 方法3：手动编译
 
-```bash
-# 下载依赖
-git clone --depth 1 --branch 0.8.2 https://github.com/zaphoyd/websocketpp.git deps/websocketpp
-git clone --depth 1 --branch v3.11.2 https://github.com/nlohmann/json.git deps/json
-
-# 编译
-g++ -std=c++17 -O2 -Wall -Wextra \
-    -Isrc -Ideps/websocketpp -Ideps/json/include \
-    src/main.cpp \
-    src/core/board.cpp \
-    src/core/pattern.cpp \
-    src/core/evaluator.cpp \
-    src/search/greedy.cpp \
-    src/server/server.cpp \
-    src/server/game_manager.cpp \
-    -o build/gomoku_server \
-    -lboost_system -lboost_thread -lpthread
-
-# 复制前端文件
-cp -r web build/
-```
+不推荐。服务器需要 `CMakeLists.txt` 里 `GOMOKU_SOURCES` 列出的**全部**源文件（core / search /
+optimization / server，外加 `src/training/params.cpp`）一起编译，头文件目录指向 Boost 与
+nlohmann/json，链接 `-lpthread`，再把 `web/` 与 `data/` 复制到可执行文件旁边——开局库和局面模板
+都是按相对路径打开的。单独挑几个文件编译只会缺符号，文件清单以 `CMakeLists.txt` 为准。
 
 ## 运行
 
@@ -201,7 +186,7 @@ cd build
 
 训练期间开局库始终关闭：比赛要衡量的是系数的差别，而开局库会把双方都引到同一着记忆着法上，把这个差别掩盖掉。
 
-实测默认配置（`--depth 4 --timeout-ms 400 --max-moves 60`）下自我对弈是会分胜负的（常见 27 手内黑棋成五），但**先手优势很明显**：同一套系数互换黑白通常一胜一负，验证分正好落在 0.5。所以候选必须**执白取胜**才能越过 `--accept-score`——这是交换先手配对刻意为之，否则先手优势会被误当成参数提升。副作用是 `--fitness-games 2`（只有 1 对）时优化器能看到的信号只有 0 / 0.5 / 1 三档，几乎是个平台；要更有区分度就调大 `--fitness-games`，代价是每轮对局数成倍增加。
+实测默认配置（`--depth 4 --timeout-ms 400 --max-moves 60`）下自我对弈是会分胜负的，但**胜负由先手颜色决定，而不是由系数决定**：轮次 50 记录的两盘都在 27 手内由黑棋成五，轮次 54 把缺口棋型与禁手判定收紧之后，四盘记录全部改为**白棋**成五——黑棋现在更容易撞上三三/四四，而白棋的空洞终于被当成威胁。因为验证赛是同一套系数互换黑白各打一局，这种“颜色通吃”会让验证分正好落在 0.5，所以门槛刻意设在 0.56：候选必须**赢下它不占颜色优势的那一局**才能晋升（这是实测现象，不是棋力结论）。副作用是 `--fitness-games 2`（只有 1 对）时优化器能看到的信号只有 0 / 0.5 / 1 三档，几乎是个平台；要更有区分度就调大 `--fitness-games`，代价是每轮对局数成倍增加。
 
 参数文件里的整数会做**范围校验**：JSON 用 64 位存整数而 `get<int>` 只做截断，`five: 4294967396` 会被读成 `100`，因此这类文件直接拒绝而不是套用截断值；坐标同理，只有元数据（节点数、搜索深度）允许回落到默认值。
 
@@ -416,9 +401,14 @@ ctest --output-on-failure
 ### 服务器 → 客户端
 
 ```json
+{"type": "state_sync", "board": [[...]], "current_turn": "black", "game_status": "playing"}
+{"type": "move_made", "row": 7, "col": 7, "color": "black"}
 {"type": "ai_move", "row": 7, "col": 8, "color": "white", "score": 1234, "thinking_time_ms": 5000}
+{"type": "undo_success", "move_count": 4, "game_status": "playing"}
+{"type": "hint_result", "row": 8, "col": 8, "score": 1234}
 {"type": "thinking_progress", "depth": 4, "nodes": 50000}
 {"type": "game_over", "winner": "black", "reason": "five"}
+{"type": "game_restarted", "game_status": "waiting"}
 {"type": "replay", "game_over": true, "winner": "white", "reason": "resign",
  "moves": [{"row": 7, "col": 7, "color": "black", "method": "human",
             "score": 0, "depth": 0, "nodes": 0, "elapsed_ms": 0}]}
@@ -429,6 +419,10 @@ ctest --output-on-failure
 {"type": "position_set", "board": [[...]], "current_turn": "white", "game_status": "waiting",
  "position_pending": true, "black_count": 3, "white_count": 2}
 ```
+
+`state_sync` 是唯一携带**服务器权威棋盘**的消息（`choose_side` 的回应）：前端必须照它重画棋盘并采用
+`current_turn`，否则页面上可能显示服务器并没有的子。`thinking_progress` 的 `elapsed_ms` 与
+`depth` 随迭代加深推进，`ai_move` 是这一次思考的终点。
 
 `replay` 是本会话对局的逐手分析：`method` 为 `human` 表示玩家落子（无搜索数据），
 其余为引擎返回路径（`book` / `vcf` / `vct` / `alphabeta` / `greedy`）；

@@ -45,15 +45,6 @@ else
     echo "Building with direct compilation..."
     
     # Download dependencies if not present
-    if [ ! -d "../deps/websocketpp" ]; then
-        echo "Downloading websocketpp..."
-        mkdir -p ../deps
-        cd ../deps
-        git clone --depth 1 --branch 0.8.2 https://github.com/zaphoyd/websocketpp.git
-        cd ..
-        cd build
-    fi
-    
     if [ ! -d "../deps/json" ]; then
         echo "Downloading nlohmann/json..."
         mkdir -p ../deps
@@ -63,17 +54,20 @@ else
         cd build
     fi
     
-    # Compile
+    # Compile. The source list mirrors GOMOKU_SOURCES in CMakeLists.txt: the
+    # transport is Boost.Beast (header-only here, so no websocketpp and no
+    # -lboost_system), and skipping a core source only shows up later as an
+    # undefined reference.
     echo "Compiling..."
     g++ -std=c++17 -O2 -Wall -Wextra \
         -I../src \
-        -I../deps/websocketpp \
         -I../deps/json/include \
-        -I/usr/include/boost \
         ../src/main.cpp \
         ../src/core/board.cpp \
         ../src/core/pattern.cpp \
         ../src/core/evaluator.cpp \
+        ../src/core/transforms.cpp \
+        ../src/core/position_setup.cpp \
         ../src/search/greedy.cpp \
         ../src/search/vcf.cpp \
         ../src/search/vct.cpp \
@@ -85,8 +79,9 @@ else
         ../src/training/params.cpp \
         ../src/server/server.cpp \
         ../src/server/game_manager.cpp \
+        ../src/server/position_json.cpp \
         -o gomoku_server \
-        -lboost_system -lboost_thread -lpthread
+        -lpthread
     
     # Copy web files
     echo "Copying web files..."
