@@ -61,6 +61,10 @@ class GomokuGame {
         this.currentTurn = BLACK;
         this.gameStatus = 'waiting';
         this.aiThinking = false;
+        // True from sending request_hint until its reply (or the game is
+        // replaced): the server answers a second concurrent hint with an error,
+        // so the click still being answered disarms its own button.
+        this.hintInFlight = false;
         this.lastMove = null;
         // Engine numbers for the current game, index-aligned with moveHistory.
         // Filled by the server's "replay" reply (4.4), not by the live messages.
@@ -241,6 +245,9 @@ class GomokuGame {
                            this.gameStatus === 'playing' && this.playerColor !== null);
         document.getElementById('btn-undo').disabled = this.playerColor === null;
         document.getElementById('btn-hint').disabled = this.playerColor === null;
+        // A resumed or re-synced game replaces whatever position the hint was
+        // searched on, so an in-flight request from before cannot answer here.
+        this.hintInFlight = false;
         document.getElementById('btn-resign').disabled = this.gameStatus !== 'playing';
         document.getElementById('btn-stop').disabled = true;
         document.getElementById('btn-restart').disabled = false;
@@ -864,6 +871,7 @@ class GomokuGame {
         document.getElementById('btn-white').disabled = true;
         document.getElementById('btn-undo').disabled = false;
         document.getElementById('btn-hint').disabled = false;
+        this.hintInFlight = false;
         document.getElementById('btn-resign').disabled = false;
         document.getElementById('btn-restart').disabled = false;
     }
@@ -881,6 +889,7 @@ class GomokuGame {
     }
     
     requestHint() {
+        if (this.hintInFlight) return;
         const timeout = parseInt(document.getElementById('timeout').value, 10);
         const depth = parseInt(document.getElementById('depth').value, 10);
         // Same finite guard as sendConfig: an emptied box would serialise to
@@ -890,11 +899,13 @@ class GomokuGame {
             this.updateStatus('超时和深度需要先填好数字', 'warn');
             return;
         }
-        this.sendMessage({
+        if (!this.sendMessage({
             type: 'request_hint',
             timeout_ms: timeout * 1000,
             max_depth: depth
-        });
+        })) return;
+        this.hintInFlight = true;
+        document.getElementById('btn-hint').disabled = true;
     }
     
     resign() {
@@ -1368,7 +1379,13 @@ class GomokuGame {
     }
 
     restart() {
-        this.sendMessage({ type: 'restart' });
+        // 重开 means "settle this game and take a new token", and offline the
+        // server never hears it - clearing the board anyway would show an empty
+        // game that the stored token resumes back into the old one.
+        if (!this.sendMessage({ type: 'restart' })) {
+            this.updateStatus('未连接，重开没有生效', 'warn');
+            return;
+        }
         this.resetGame();
     }
     
@@ -1382,6 +1399,9 @@ class GomokuGame {
         // chosen again.
         this.playerColor = null;
         this.aiThinking = false;
+        // Whatever hint was in flight belonged to the game that just ended; the
+        // button state below is what the new game starts from.
+        this.hintInFlight = false;
         this.lastMove = null;
         // A new game has no history to replay, and stale analysis would attach
         // the old game's numbers to the new moves.
@@ -1471,6 +1491,13 @@ class GomokuGame {
                 if (this.setup.confirmInFlight) {
                     this.setup.confirmInFlight = false;
                     this.refreshSetupControls();
+                }
+                // The hint's failure reply is this same frame, so the button comes
+                // back for a retry instead of staying armed on a search that ended.
+                if (this.hintInFlight) {
+                    this.hintInFlight = false;
+                    document.getElementById('btn-hint').disabled =
+                        this.playerColor === null || this.gameStatus === 'game_over';
                 }
                 this.updateStatus(`错误：${msg.message}`, 'error');
                 break;
@@ -1587,11 +1614,14 @@ class GomokuGame {
     }
     
     handleHintResult(msg) {
+        this.hintInFlight = false;
         // The ring marks a square of the live position; leave any replay view
         // first so it is not drawn on a historical board.
         if (this.replayIndex !== null) {
             this.exitReplay();
         }
+        document.getElementById('btn-hint').disabled =
+            this.playerColor === null || this.gameStatus === 'game_over';
         this.highlightMove(msg.row, msg.col);
         this.updateStatus(`建议 ${this.coordName(msg.row, msg.col)} · 分值 ${msg.score}`, 'ok');
     }
@@ -1612,6 +1642,7 @@ class GomokuGame {
     handleGameOver(msg) {
         this.gameStatus = 'game_over';
         this.aiThinking = false;
+        this.hintInFlight = false;
         let statusText = '游戏结束 - ';
         let kind = 'idle';
         if (msg.winner === 'draw') {

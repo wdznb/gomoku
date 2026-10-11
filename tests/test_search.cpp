@@ -598,6 +598,38 @@ void test_opening_book_rejects_occupied() {
     std::cout << "test_opening_book_rejects_occupied passed" << std::endl;
 }
 
+void test_opening_book_rejects_swapped_colours() {
+    // Round 74: the book key is only the sequence of landing squares, so a
+    // hand-set position whose stones were laid down out of colour alternation
+    // used to walk into a book line whose first entries are BLACK. query() now
+    // checks every history stone against the line's own colours.
+    OpeningBook book;
+    book.add_line({{7, 7}, {7, 8}, {8, 8}}, 10, "hua_yue");
+
+    Board normal;                                    // the true alternation
+    normal.place_stone(7, 7, BLACK);
+    normal.place_stone(7, 8, WHITE);
+    Move response;
+    assert(book.query(normal, BLACK, response));
+    // The hua_yue line and its vertical mirror coincide on the first two
+    // squares (row 7 is the centre row), so this key legitimately holds two
+    // replies - (8,8) and (6,8) - and the weighted pick may land on either.
+    assert(response.color == BLACK);
+    assert(response.pos == Position(8, 8) || response.pos == Position(6, 8));
+
+    Board swapped;                                   // same squares, colours swapped
+    swapped.place_stone(7, 7, WHITE);
+    swapped.place_stone(7, 8, BLACK);
+    assert(swapped.move_history()[0].color == WHITE);
+    assert(swapped.move_history()[1].color == BLACK);
+    assert(swapped.move_history()[0].pos == Position(7, 7));
+    assert(swapped.move_history()[1].pos == Position(7, 8));
+    Move other;
+    assert(!book.query(swapped, BLACK, other));      // old code answered true here
+
+    std::cout << "test_opening_book_rejects_swapped_colours passed" << std::endl;
+}
+
 void test_opening_book_large_weight_no_overflow() {
     // Two candidates share one key, each with a weight near 2^31. The old code
     // summed them into a signed int, overflowing into UB and a negative
@@ -1253,6 +1285,7 @@ int main() {
     test_opening_book_miss();
     test_opening_book_load_json();
     test_opening_book_rejects_occupied();
+    test_opening_book_rejects_swapped_colours();
     test_opening_book_large_weight_no_overflow();
     test_search_engine_uses_book();
     test_search_engine_ignores_book_midgame();

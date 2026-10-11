@@ -1,7 +1,7 @@
-// Round-73 regression probes for the round-73 web/app.js fixes (A6-A10).
-// The real file is loaded read-only into a vm context with DOM/browser stubs,
-// then the methods the fixes touch are driven directly. No browser and no
-// server are needed; run it with `node tests/web_frontend_check.js`.
+// Regression probes for the round-73 (A6-A10) and round-74 (C6/C7) web/app.js
+// fixes. The real file is loaded read-only into a vm context with DOM/browser
+// stubs, then the methods the fixes touch are driven directly. No browser and
+// no server are needed; run it with `node tests/web_frontend_check.js`.
 'use strict';
 
 const fs = require('fs');
@@ -265,6 +265,128 @@ check('A10 undo to empty board promotes with a chosen side', () => {
     unclaimed.moveHistory = [];
     unclaimed.handleUndoSuccess({ move_count: 0, game_status: 'waiting' });
     assert(unclaimed.gameStatus === 'waiting', 'no side chosen stays waiting');
+});
+
+// C6: 重开 must not clear the board while the socket is down - the stored token
+// would resume straight back into the game the player just "restarted".
+check('C6 restart is refused while the socket is down', () => {
+    const game = newGame();
+    game.board[7][7] = BLACK;
+    game.moveHistory = [{ row: 7, col: 7, color: BLACK }];
+    game.gameStatus = 'playing';
+    game.playerColor = BLACK;
+    game.ws.readyState = bundle.sandbox.WebSocket.CLOSED;
+
+    let resets = 0;
+    game.resetGame = () => { resets++; };
+    let status = null;
+    const original = game.updateStatus.bind(game);
+    game.updateStatus = (text, kind) => { status = text; original(text, kind); };
+
+    game.restart();
+    assert(resets === 0, 'resetGame must not run while offline');
+    assert(game.board[7][7] === BLACK, 'the board must be untouched');
+    assert(game.moveHistory.length === 1, 'the move record must be untouched');
+    assert(game.playerColor === BLACK, 'the claimed side must be untouched');
+    assert(status !== null && status.indexOf('未连接') !== -1,
+           'the refusal must be shown in the status line');
+});
+
+// C7a: 求招 arms once per click and the hint_result releases it, so a slow
+// search cannot be queued twice and the button comes back when it answers.
+check('C7 hint is sent once and released by hint_result', () => {
+    const game = newGame();
+    game.playerColor = BLACK;
+    const sent = [];
+    game.sendMessage = (msg) => { sent.push(msg); return true; };
+    el('timeout').value = '5';
+    el('depth').value = '6';
+
+    game.requestHint();
+    assert(sent.length === 1, 'the first click must be sent');
+    assert(sent[0].type === 'request_hint', 'request_hint must go out');
+    assert(game.hintInFlight === true, 'the flag must be armed');
+    assert(el('btn-hint').disabled === true, 'the button must be disabled');
+
+    game.requestHint();
+    assert(sent.length === 1, 'a second click must not send a second frame');
+
+    game.handleServerMessage({ type: 'hint_result', row: 7, col: 7, score: 100 });
+    assert(game.hintInFlight === false, 'hint_result must disarm the flag');
+    assert(el('btn-hint').disabled === false, 'the button must come back');
+});
+
+// C7b: a hint that was in flight when the page dropped must not stay armed
+// forever once the reconnect resumes the session - the resumed session frame
+// describes a game that the old search cannot answer.
+check('C7 resumed session releases an in-flight hint', () => {
+    const game = newGame();
+    game.playerColor = BLACK;
+    game.gameStatus = 'playing';
+    const sent = [];
+    game.sendMessage = (msg) => { sent.push(msg); return true; };
+    el('timeout').value = '5';
+    el('depth').value = '6';
+
+    game.requestHint();
+    assert(game.hintInFlight === true, 'armed before the drop');
+
+    game.handleServerMessage({
+        type: 'session',
+        token: 'b'.repeat(16),
+        resumed: true,
+        player_color: 'black',
+        game_status: 'playing',
+        current_turn: 'white',
+        move_count: 2,
+        max_depth: 6,
+        timeout_ms: 5000,
+        winner: '',
+        reason: '',
+        board: emptyBoard(),
+    });
+    assert(game.hintInFlight === false, 'the resumed session must release the flag');
+    assert(el('btn-hint').disabled === false, 'the hint button must come back');
+
+    game.requestHint();
+    assert(sent.filter((m) => m.type === 'request_hint').length === 2,
+           'a fresh hint must go out after the resume');
+});
+
+// C7c: a session that was NOT resumed (token no longer known) leaves the
+// request untouched - by design, the click on its way owns the state - and the
+// side buttons are the documented way out: choosing a side re-arms 求招.
+check('C7 non-resumed session recovers via chooseSide', () => {
+    const game = newGame();
+    game.playerColor = BLACK;
+    game.gameStatus = 'playing';
+    const sent = [];
+    game.sendMessage = (msg) => { sent.push(msg); return true; };
+    el('timeout').value = '5';
+    el('depth').value = '6';
+
+    game.requestHint();
+    assert(game.hintInFlight === true, 'armed before the drop');
+
+    game.handleServerMessage({
+        type: 'session',
+        token: 'c'.repeat(16),
+        resumed: false,
+        player_color: '',
+        game_status: 'waiting',
+        current_turn: 'black',
+        move_count: 0,
+        max_depth: 6,
+        timeout_ms: 5000,
+        winner: '',
+        reason: '',
+        board: emptyBoard(),
+    });
+    assert(el('btn-hint').disabled === true, 'still held by the old request');
+
+    game.chooseSide('white');
+    assert(game.hintInFlight === false, 'claiming a side must release the flag');
+    assert(el('btn-hint').disabled === false, 'the hint button must come back');
 });
 
 let failed = 0;

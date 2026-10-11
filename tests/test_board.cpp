@@ -1,7 +1,10 @@
 #include "core/board.h"
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <iostream>
 #include <random>
+#include <thread>
 #include <vector>
 #include <cassert>
 
@@ -188,6 +191,55 @@ void test_zobrist_hash() {
     std::cout << "test_zobrist_hash passed" << std::endl;
 }
 
+void test_zobrist_init_concurrent_first_use() {
+    // Round 74: ZobristHash::init used check-then-fill on a plain bool, so two
+    // training threads constructing their first Board could refill the shared
+    // table at once: readers took half-filled words and the table mixed two
+    // generations. The values are unchanged (seed 12345, same fill order), so
+    // the canonical table can be rebuilt here from the seed and compared.
+    // This test runs first in main(), before any other Board exists, so its
+    // threads are the process's first users of the table.
+    std::array<std::array<uint64_t, 3>, BOARD_SIZE * BOARD_SIZE> expected;
+    {
+        std::mt19937_64 rng(12345);
+        for (int i = 0; i < BOARD_SIZE * BOARD_SIZE; ++i) {
+            for (int c = 0; c < 3; ++c) {
+                expected[i][c] = rng();
+            }
+        }
+    }
+
+    const int thread_count = 8;
+    std::atomic<int> ready{0};
+    std::atomic<bool> go{false};
+    std::vector<uint64_t> hashes(thread_count, 0);
+    std::vector<std::thread> threads;
+    threads.reserve(thread_count);
+    for (int t = 0; t < thread_count; ++t) {
+        threads.emplace_back([&, t] {
+            ready.fetch_add(1);
+            while (!go.load()) {}
+            Board board;
+            board.place_stone(7, 7, BLACK);
+            board.place_stone(3, 11, WHITE);
+            hashes[t] = board.zobrist_hash();
+        });
+    }
+    while (ready.load() < thread_count) {}
+    go.store(true);
+    for (auto& th : threads) {
+        th.join();
+    }
+
+    const uint64_t want = expected[7 * BOARD_SIZE + 7][BLACK] ^
+                          expected[3 * BOARD_SIZE + 11][WHITE];
+    for (int t = 0; t < thread_count; ++t) {
+        assert(hashes[t] == want);
+    }
+
+    std::cout << "test_zobrist_init_concurrent_first_use passed" << std::endl;
+}
+
 void test_line_bitboard_tracks_cells() {
     // Phase 4.1 gave the board a bitboard line view per pattern direction, read
     // directly by the pattern recognizer. Interleave placements and undos and
@@ -295,6 +347,7 @@ void test_run_length_matches_walk() {
 int main() {
     std::cout << "Running board tests..." << std::endl;
     
+    test_zobrist_init_concurrent_first_use();
     test_board_init();
     test_place_stone();
     test_undo();

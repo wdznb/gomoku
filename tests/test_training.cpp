@@ -940,6 +940,41 @@ void test_trainer_round_rejects_regression() {
     std::cout << "test_trainer_round_rejects_regression passed" << std::endl;
 }
 
+void test_trainer_keeps_rule_constants_through_promotion() {
+    // Round 74: the optimisers rebuild candidates from a default-constructed
+    // struct, so before the fix a promoted candidate lost the rule constants
+    // the run started from - the written parameter file carried the built-in
+    // five (100000) and forbidden_penalty (50000) instead of the loaded ones.
+    TrainingConfig config = fast_training_config();
+    config.params_path = temp_path("constant_params.json").string();
+    config.checkpoint_path = temp_path("constant_checkpoint.json").string();
+
+    ThreatCoefficients base;
+    base.five = 88888;
+    base.forbidden_penalty = 77777;
+
+    Trainer trainer(base, config);
+    trainer.set_fitness_override(deviation_score);
+
+    const TrainerRound round = trainer.run_round();
+    assert(round.accepted);                       // the injected objective promotes
+    assert(round.candidate.five == 88888);
+    assert(round.candidate.forbidden_penalty == 77777);
+    assert(trainer.champion().five == 88888);
+    assert(trainer.champion().forbidden_penalty == 77777);
+
+    std::string error;
+    ThreatCoefficients from_file;
+    assert(CoefficientVector::load(config.params_path, from_file, error));
+    assert(from_file.five == 88888);
+    assert(from_file.forbidden_penalty == 77777);
+
+    std::ifstream checkpoint(config.checkpoint_path);
+    assert(checkpoint.is_open());
+
+    std::cout << "test_trainer_keeps_rule_constants_through_promotion passed" << std::endl;
+}
+
 void test_trainer_genetic_round_and_status() {
     TrainingConfig config = fast_training_config();
     config.optimizer = OptimizerKind::GENETIC;
@@ -1455,6 +1490,7 @@ int main() {
     test_random_opening_line();
     test_trainer_round_promotes();
     test_trainer_round_rejects_regression();
+    test_trainer_keeps_rule_constants_through_promotion();
     test_trainer_genetic_round_and_status();
     test_trainer_rejects_bad_checkpoint();
     test_trainer_checkpoint_seed_and_counters();

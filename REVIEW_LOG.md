@@ -1084,3 +1084,77 @@ repeats `move_index` inside a game by design — so it asserts `game_id` non-reu
 round-trip instead of weakening the fix. Main session re-ran the whole gate independently: plain
 `cmake ..` (asserts live, `CMAKE_BUILD_TYPE` empty), `make -j4` clean apart from the known
 `server_reason_of` warning, `ctest` 8/8, `node tests/web_frontend_check.js` 5/5.
+
+## 轮次74 参数防线、token 身份与规则常量 — bugfix round 74 (phase5-bugfix)
+
+**Found.** Four audit domains (search/engine, pattern/shape, server/session, training/frontend) plus a
+main-session pass over the layers no agent held — `main.cpp`, `CMakeLists.txt`, `position_setup`,
+`position_json`, `transforms` — produced thirty-odd candidates. Ten survived verification and were
+dispatched in two batches. Two of them are not code bugs but missing defences: `gomoku_server` had no
+`else` on its option chain, so `--prts 9090` or a bare `--params` started a server on 8080 with built-in
+coefficients and exit 0, silently contradicting the rule `main.cpp:49-51` states for `--params`
+(README:132-161 document these as the operator interface); and every one of the 984 `assert()`s in the
+eight suites compiles away under `-DCMAKE_BUILD_TYPE=Release/RelWithDebInfo` while `ctest` still prints
+8/8 green — the exact trap that already burned round 72, until then guarded only by the verbal
+"plain `cmake ..`" rule. The rest: `open_session` minted a fresh token even when rebuilding from a
+snapshot, so a cold resume broke README:543's "token 依旧有效" — the old URL landed on a blank game while
+the same board occupied two files on disk; the optimisers rebuild candidates through
+`CoefficientVector::from_vector`, which only writes the tunable fields, so `five` and
+`forbidden_penalty` — rule constants per README:583-584 — came back as compile defaults, making the
+verification match pit two different rule sets against each other and rewriting the parameter file on
+promotion; `OpeningBook::query` keyed itself on landing squares and only checked the parity of
+`history.size()`, so a hand-set position whose base stones were placed out of alternation
+(white@(7,7), black@(7,8)) matched a black-first book line and returned 花月's third move as `method:"book"`,
+skipping VCF/VCT/AlphaBeta entirely (README:39); `handle_resign` settled a game nobody had started,
+awarding the win over zero moves against README:283/321; `require_int` accepted 0 and negatives, so
+`--verification-games 0` trained forever with nothing promoted; offline `restart()` cleared the local
+board the server never heard about; a second 求招 click while the first was in flight produced a
+spurious "No hint available"; and `ZobristHash::init` was a check-then-set on a `static bool`, so the
+concurrent first `Board` of each training thread could refill the table while another thread read it.
+
+**Fixed.** `else` on the option chain rejects unknown/valueless tokens; a `foreach` over the eight test
+targets appends `-UNDEBUG` (`/UNDEBUG` for MSVC) after the build-type flags, so asserts no longer depend
+on `CMAKE_BUILD_TYPE` while `gomoku_server`/`gomoku_train` stay untouched. `open_session` keeps
+`from->token` for any session rebuilt from disk and mints a new one only for a genuinely fresh session;
+the trainer copies `five`/`forbidden_penalty` from the champion into the candidate before
+`play_match`; the book now rejects any history whose per-stone colours disagree with BLACK-WHITE-BLACK;
+`handle_resign` requires `side_chosen` or at least one stone and otherwise answers "Game not started";
+`require_int` gained a lower bound (default 1, `--rounds` 0, `--timeout-ms`/`--max-moves` unbounded);
+`restart()` only resets locally when the frame actually left the socket; 求招 arms an in-flight flag and
+disables its button until the reply or a covering frame lands; `ZobristHash::init` fills the table under
+`std::call_once` with the values and seed unchanged.
+
+**Not defects / deliberately left.** `match_contiguous_run`'s two-stone branch keeps `&&`: a 活二 needs
+two free cells on both sides to ever become a 活三, and README:29 only constrains the three. The gapped
+four not proving its hole makes *exactly* five is unreachable as a wrong verdict — a fill that would make
+six is itself a 长连 at that point, and six still wins for white. `recognize_combined`'s OR-ed
+`four_four`/`three_three` fields feed nothing (`is_forbidden` derives its answer from black's own pattern
+alone). `set_position` leaving `player_color_`/`ai_color_` alone only bites if the client allowed a click
+on a white-to-move pending board without choosing a side, which it does not. The loss-proof
+`probe_budget_ms > 500` gate is the documented budget reservation with resignation's live path being the
+mate score (README:40 holds), and the un-aged quiescence mate is a play-strength enhancement, not a rule
+defect. Carried over from round 73: unbounded `cold_sessions_` growth, the second-tab takeover,
+`--resume` overriding `--seed`, clicking the record list mid-search, and the per-session `1<<18` tables.
+
+**Verified.** Test session (WSL) added `test_opening_book_rejects_swapped_colours` (C3, both branches:
+normal alternating order still answers from the book and the swapped-colour board now returns false —
+the control that fails once the per-ply loop is removed), `test_trainer_keeps_rule_constants_through_promotion`
+(C2, driven through the *promotion* path with a deviation-forcing fitness, so `five`/`forbidden_penalty`
+are asserted on candidate, champion and the emitted file), the C8 Zobrist `call_once` case in
+`tests/test_board.cpp`, and three `tests/web_frontend_check.js` cases for C6/C7 (restart refused while the
+socket is down, hint sent once and released by `hint_result`, resumed session releases an in-flight hint).
+Two CLI cases were run as end-to-end scripts: B1's five bad-option forms plus the `--port 0/70000` range
+guard and a healthy `--port 9099 --no-book --no-sessions` boot; C1's cold round-trip — kill the server,
+restart on the same `--sessions` dir, resume with the original token, and assert `token == T`,
+`resumed == true`, unchanged `move_count` and still exactly one file in the directory; C4 asserted
+`Game not started` for a bare resign and a normal `game_over (reason: resign)` after `choose_side`.
+B2 was proved at build-system *and* compiler level: in a separate Release configure dir every one of the
+eight test targets shows `-DNDEBUG` followed by `-UNDEBUG` in `flags.make`, and a minimal program aborts
+under `-DNDEBUG -UNDEBUG` while surviving under bare `-DNDEBUG`. The external dir was deleted afterwards.
+Three rows the brief listed as expected-FAIL are expectation errors in the brief, not code defects:
+`--optimizer` is really `--method`, `--accept-score -10` is refused by the pre-existing 0.5-1.0 guard
+(`main_trainer.cpp:219`), and `--rounds 0` / `--timeout-ms 0` / `--max-moves 0` are refused by the
+downstream semantic guards at `main_trainer.cpp:213` and `:224` — which is the README-consistent
+behaviour, so `require_int` deliberately leaves them to those guards. Main session re-ran the gate
+independently: plain `cmake ..` (asserts live), `make -j4` clean apart from the known `server_reason_of`
+warning, `ctest` 8/8, `node tests/web_frontend_check.js` 9/9.

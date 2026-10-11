@@ -162,6 +162,16 @@ bool OpeningBook::query(const std::vector<Move>& history, int color, Move& out_m
     int expected = (history.size() % 2 == 0) ? BLACK : WHITE;
     if (color != expected) return false;
 
+    // The key is only the sequence of landing squares, so a board whose stones
+    // were placed out of alternation (a hand-set position) can share a book
+    // prefix while the two colours play each other's roles. A book line belongs
+    // to the game that opened BLACK-WHITE-BLACK..., so reject any history whose
+    // per-stone colours disagree with that.
+    for (size_t i = 0; i < history.size(); ++i) {
+        const int stone_color = (i % 2 == 0) ? BLACK : WHITE;
+        if (history[i].color != stone_color) return false;
+    }
+
     std::vector<Position> prefix;
     prefix.reserve(history.size());
     for (const auto& m : history) {

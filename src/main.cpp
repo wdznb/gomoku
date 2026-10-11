@@ -31,6 +31,9 @@ int main(int argc, char* argv[]) {
                 records_path = argv[++i];
             } else if (arg == "--params" && i + 1 < argc) {
                 params_path = argv[++i];
+            } else {
+                std::cerr << "Unknown or valueless option: " << arg << std::endl;
+                return 1;
             }
         }
     } catch (const std::exception& e) {

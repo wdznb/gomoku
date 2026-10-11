@@ -940,7 +940,18 @@ void GameServer::handle_resign(std::shared_ptr<WebSocketSession> session) {
     std::lock_guard<std::mutex> lock(games_mutex_);
     auto it = games_.find(session.get());
     if (it == games_.end()) return;
-    
+
+    // A game that was never started has no side to resign: the opening actions
+    // are choosing a colour or playing the first stone, and settling an untouched
+    // board would hand the opponent a win over zero moves.
+    const std::shared_ptr<TrackedGame> entry = entry_locked(session.get());
+    const bool started = entry && (entry->side_chosen ||
+                                   entry->game->replay_snapshot().move_count > 0);
+    if (!started) {
+        send_error(session, "Game not started");
+        return;
+    }
+
     auto& game = it->second;
     game->resign(game->player_color());
 }
@@ -1070,10 +1081,17 @@ std::shared_ptr<GameServer::TrackedGame> GameServer::open_session(const SessionS
     }
     entry->game = game;
 
-    // Tokens name files, so a collision would overwrite another session.
-    std::string token = make_token();
-    while (sessions_.count(token) || cold_sessions_.count(token)) token = make_token();
-    entry->token = std::move(token);
+    // Tokens name files, so a collision would overwrite another session. A
+    // session rebuilt from disk keeps the token it was read under: the caller
+    // already proved that token is not in sessions_, and the player holding the
+    // old URL must land on this game rather than a blank one.
+    if (from) {
+        entry->token = from->token;
+    } else {
+        std::string token = make_token();
+        while (sessions_.count(token) || cold_sessions_.count(token)) token = make_token();
+        entry->token = std::move(token);
+    }
     sessions_[entry->token] = entry;
     return entry;
 }

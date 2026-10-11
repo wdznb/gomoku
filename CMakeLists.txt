@@ -254,3 +254,15 @@ else()
     target_compile_options(test_training PRIVATE -Wall -Wextra -Wno-template-body -Wno-template-id-cdtor)
 endif()
 add_test(NAME test_training COMMAND test_training)
+
+# All eight suites rely on plain assert(); a Release/RelWithDebInfo -DNDEBUG
+# would compile every assert away while ctest still reports green, so undo it
+# for the test targets only.
+foreach(gomoku_test_target test_board test_pattern test_evaluator test_search
+                           test_position test_session test_server test_training)
+    if(MSVC)
+        target_compile_options(${gomoku_test_target} PRIVATE /UNDEBUG)
+    else()
+        target_compile_options(${gomoku_test_target} PRIVATE -UNDEBUG)
+    endif()
+endforeach()

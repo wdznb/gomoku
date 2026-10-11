@@ -1,22 +1,26 @@
 #include "board.h"
 #include <algorithm>
 #include <cstring>
+#include <mutex>
 
 namespace gomoku {
 
 std::array<std::array<uint64_t, 3>, BOARD_SIZE * BOARD_SIZE> ZobristHash::random_table_;
-bool ZobristHash::initialized_ = false;
 
 void ZobristHash::init() {
-    if (initialized_) return;
-    
-    std::mt19937_64 rng(12345);
-    for (int i = 0; i < BOARD_SIZE * BOARD_SIZE; ++i) {
-        for (int c = 0; c < 3; ++c) {
-            random_table_[i][c] = rng();
+    // Every training thread constructs its own first Board, so the old
+    // check-a-boolean-then-fill let two of them refill random_table_ at once: a
+    // reader could take a half-filled word, and the table would gain values from
+    // two interleaved generations. The values themselves are unchanged.
+    static std::once_flag filled;
+    std::call_once(filled, [] {
+        std::mt19937_64 rng(12345);
+        for (int i = 0; i < BOARD_SIZE * BOARD_SIZE; ++i) {
+            for (int c = 0; c < 3; ++c) {
+                random_table_[i][c] = rng();
+            }
         }
-    }
-    initialized_ = true;
+    });
 }
 
 uint64_t ZobristHash::compute_hash(const std::array<int, BOARD_SIZE * BOARD_SIZE>& cells) {

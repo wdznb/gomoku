@@ -1,5 +1,6 @@
 #include "trainer.h"
 #include "params.h"
+#include <climits>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -59,12 +60,19 @@ std::string require_value(const char* flag, int& index, int argc, char** argv) {
     return argv[++index];
 }
 
-int require_int(const char* flag, int& index, int argc, char** argv) {
+// A count of zero for anything but --rounds is not a smaller run, it is a run
+// that silently does nothing (no verification games means no candidate is ever
+// promoted), so the bounds are checked here rather than at each call site.
+int require_int(const char* flag, int& index, int argc, char** argv, int minimum = 1) {
     const std::string text = require_value(flag, index, argc, argv);
     size_t used = 0;
     const int value = std::stoi(text, &used);
     if (used != text.size()) {
         throw std::invalid_argument(std::string("invalid integer for ") + flag + ": " + text);
+    }
+    if (value < minimum) {
+        throw std::invalid_argument(std::string(flag) + " must be >= " +
+                                    std::to_string(minimum) + ", got " + std::to_string(value));
     }
     return value;
 }
@@ -144,7 +152,9 @@ int main(int argc, char** argv) {
                                                 " (use genetic or hill)");
                 }
             } else if (flag == "--rounds") {
-                config.rounds = require_int("--rounds", i, argc, argv);
+                // Zero is the documented "load the parameters, train nothing"
+                // case handled below, so only negatives are rejected here.
+                config.rounds = require_int("--rounds", i, argc, argv, 0);
             } else if (flag == "--population") {
                 config.population_size = require_int("--population", i, argc, argv);
             } else if (flag == "--generations") {
@@ -156,9 +166,11 @@ int main(int argc, char** argv) {
             } else if (flag == "--depth") {
                 config.search_depth = require_int("--depth", i, argc, argv);
             } else if (flag == "--timeout-ms") {
-                config.timeout_ms = require_int("--timeout-ms", i, argc, argv);
+                // Untimed / unbounded search are meanings of their own, so these
+                // two keep accepting whatever the caller writes.
+                config.timeout_ms = require_int("--timeout-ms", i, argc, argv, INT_MIN);
             } else if (flag == "--max-moves") {
-                config.max_moves = require_int("--max-moves", i, argc, argv);
+                config.max_moves = require_int("--max-moves", i, argc, argv, INT_MIN);
             } else if (flag == "--fitness-games") {
                 config.fitness_games = require_int("--fitness-games", i, argc, argv);
             } else if (flag == "--verification-games") {

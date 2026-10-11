@@ -290,6 +290,12 @@ TrainerRound Trainer::run_round() {
                  std::to_string(best_fitness));
         }
     }
+    // Rule constants are not genes: the optimisers rebuild candidates from a
+    // default-constructed struct, so carry the champion's values over or the
+    // verification match compares two different rule sets and a promotion would
+    // rewrite the parameter file's constants with defaults.
+    candidate.five = result.champion.five;
+    candidate.forbidden_penalty = result.champion.forbidden_penalty;
     result.candidate = candidate;
 
     result.verification_score =
