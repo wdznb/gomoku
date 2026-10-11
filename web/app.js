@@ -29,6 +29,16 @@ class GomokuGame {
         this.replayIndex = null;
         this.replayTimer = null;
         this.gameOverText = '';
+        // Position editor (摆棋). preview holds the last successful
+        // check_position reply; the loaded flag keeps the 载入 button honest
+        // about whether what is on screen still matches what was recognised.
+        this.positionPreview = null;
+        this.editMode = false;
+        // True between clicking 载入 and its reply: the reply re-arms the side
+        // buttons and clears the chosen colour, so a side picked in between
+        // would be silently undone.
+        this.positionSetInFlight = false;
+        this.sideLock = [false, false];
         
         this.initWebSocket();
         this.initUI();
@@ -87,6 +97,32 @@ class GomokuGame {
         for (const id of ['timeout', 'depth']) {
             document.getElementById(id).addEventListener('change', () => this.sendConfig());
         }
+
+        document.getElementById('btn-check-position').addEventListener('click', () => this.checkPosition());
+        document.getElementById('btn-set-position').addEventListener('click', () => this.setPosition());
+        document.getElementById('btn-edit-mode').addEventListener('click', () => this.toggleEditMode());
+        document.getElementById('btn-clear-position').addEventListener('click', () => this.clearPosition());
+        document.getElementById('btn-export-position').addEventListener('click', () => this.exportPosition());
+        document.getElementById('position-confirm').addEventListener('change', () => this.refreshPositionControls());
+        document.getElementById('position-text').addEventListener('input', () => {
+            // Anything typed or pasted replaces the file as the payload, and the
+            // old recognition no longer describes it.
+            this.positionPreview = null;
+            this.refreshPositionControls();
+        });
+        document.getElementById('position-file').addEventListener('change', (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+            const reader = new FileReader();
+            reader.onload = () => {
+                document.getElementById('position-text').value = String(reader.result);
+                this.positionPreview = null;
+                this.updatePositionStatus(`已读入 ${file.name}，点“识别”检查局面。`, false);
+                this.refreshPositionControls();
+            };
+            reader.onerror = () => this.updatePositionStatus('文件读取失败。', true);
+            reader.readAsText(file);
+        });
     }
 
     sendConfig() {
@@ -315,18 +351,27 @@ class GomokuGame {
     }
     
     handleCanvasClick(e) {
+        const rect = this.canvas.getBoundingClientRect();
+        const x = e.clientX - rect.left;
+        const y = e.clientY - rect.top;
+
+        const col = Math.round((x - PADDING) / CELL_SIZE);
+        const row = Math.round((y - PADDING) / CELL_SIZE);
+
+        // Painting a position is a local edit, so it answers before any of the
+        // live-game guards: a loaded position is not yet a game in progress.
+        if (this.editMode) {
+            if (row >= 0 && row < BOARD_SIZE && col >= 0 && col < BOARD_SIZE) {
+                this.paintCell(row, col);
+            }
+            return;
+        }
+
         if (this.gameStatus !== 'playing' || this.aiThinking) return;
         // A replayed position is a read-only view of the past; clicking there
         // must not send a move for the live turn.
         if (this.replayIndex !== null) return;
         if (this.currentTurn !== this.playerColor) return;
-        
-        const rect = this.canvas.getBoundingClientRect();
-        const x = e.clientX - rect.left;
-        const y = e.clientY - rect.top;
-        
-        const col = Math.round((x - PADDING) / CELL_SIZE);
-        const row = Math.round((y - PADDING) / CELL_SIZE);
         
         if (row >= 0 && row < BOARD_SIZE && col >= 0 && col < BOARD_SIZE) {
             if (this.board[row][col] === EMPTY) {
@@ -389,6 +434,228 @@ class GomokuGame {
         document.getElementById('btn-stop').disabled = true;
     }
     
+    // ---- 摆棋 (hand-set position) -------------------------------------
+
+    // Text from the paste box wins over the painted board: a file or a pasted
+    // grid is the thing the player just supplied, and sending it verbatim is
+    // what lets the server's auto-recognition run at all.
+    positionPayload() {
+        const text = document.getElementById('position-text').value.trim();
+        if (text) return text;
+        return { version: 1, type: 'gomoku_position',
+                 encoding: { black: 1, white: 2, empty: 0 },
+                 board: this.board.map(row => row.slice()) };
+    }
+
+    checkPosition() {
+        const payload = this.positionPayload();
+        const counts = this.localCounts();
+        if (typeof payload !== 'string' && counts.black + counts.white === 0) {
+            this.updatePositionStatus('棋盘是空的。', true);
+            return;
+        }
+        this.positionPreview = null;
+        this.refreshPositionControls();
+        this.sendMessage({ type: 'check_position', position: payload });
+    }
+
+    setPosition() {
+        const preview = this.positionPreview;
+        if (!preview || !preview.ok || this.positionSetInFlight) return;
+        const msg = { type: 'set_position', position: this.positionPayload() };
+        // Carry the mapping the player just confirmed. A painted board already
+        // states 1/2/0 in its own document, so only a pasted or uploaded grid
+        // needs it echoed back.
+        if (typeof msg.position === 'string' && preview.encoding) {
+            msg.encoding = preview.encoding;
+        }
+        // Hold the side buttons until the reply lands: it re-arms them and
+        // clears the chosen colour, so choosing in between would be undone.
+        this.positionSetInFlight = true;
+        this.sideLock = [document.getElementById('btn-black').disabled,
+                         document.getElementById('btn-white').disabled];
+        this.setSideButtons(true, true);
+        this.sendMessage(msg);
+    }
+
+    setSideButtons(blackDisabled, whiteDisabled) {
+        document.getElementById('btn-black').disabled = blackDisabled;
+        document.getElementById('btn-white').disabled = whiteDisabled;
+    }
+
+    handlePositionPreview(msg) {
+        this.positionPreview = msg.ok ? msg : null;
+        const confirm = document.getElementById('position-confirm');
+        if (!msg.ok) {
+            confirm.checked = false;
+            this.updatePositionStatus(msg.error || '无法识别此局面。', true);
+            this.refreshPositionControls();
+            return;
+        }
+        // A preview is a dry run, so it only repaints the board when nothing is
+        // in progress; overwriting a live game's display would make the client
+        // show stones the server does not have.
+        const live = this.gameStatus === 'playing' || this.gameStatus === 'game_over';
+        if (!live) this.applyBoardMatrix(msg.board);
+        const fromText = typeof this.positionPayload() === 'string';
+        // Only a grid has symbols to confirm; a pasted bitboard or move list
+        // arrives without a mapping.
+        const needsConfirm = fromText && !!msg.encoding;
+        const mapping = needsConfirm
+            ? `黑=${msg.encoding.black} 白=${msg.encoding.white} 空=${msg.encoding.empty}` : '';
+        const summary = `黑 ${msg.black_count} 子、白 ${msg.white_count} 子，轮到${msg.side_to_move === 'black' ? '黑' : '白'}方`;
+        const holds = live ? '（本局进行中，棋盘要到“载入”才会替换）' : '';
+        document.getElementById('position-confirm-row').hidden = !needsConfirm;
+        if (needsConfirm) {
+            confirm.checked = false;
+            document.getElementById('position-mapping').textContent = mapping;
+            this.updatePositionStatus(`识别成功：${summary}（${mapping}）。勾选确认后载入。${holds}`, false);
+        } else {
+            document.getElementById('position-mapping').textContent = '';
+            this.updatePositionStatus(`局面合法：${summary}。${holds}`, false);
+        }
+        this.refreshPositionControls();
+    }
+
+    handlePositionSet(msg) {
+        this.positionPreview = null;
+        this.positionSetInFlight = false;
+        this.editMode = false;
+        document.getElementById('btn-edit-mode').textContent = '手动摆棋';
+        document.getElementById('position-confirm-row').hidden = true;
+        document.getElementById('position-confirm').checked = false;
+        this.applyBoardMatrix(msg.board);
+        // The loaded stones are not this session's search history: the replay
+        // view has nothing to analyse, and the move list would show plies no
+        // one played here.
+        this.stopReplayAuto();
+        this.moveHistory = [];
+        this.analysis = [];
+        this.analysisEnded = false;
+        this.replayIndex = null;
+        this.lastMove = null;
+        this.currentTurn = msg.current_turn === 'black' ? BLACK : WHITE;
+        this.gameStatus = 'waiting';
+        this.playerColor = null;
+        this.updateMoveList();
+        this.updateReplayInfo();
+        this.drawEvalGraph();
+        this.refreshReplayControls();
+        document.getElementById('btn-black').disabled = false;
+        document.getElementById('btn-white').disabled = false;
+        document.getElementById('btn-undo').disabled = true;
+        document.getElementById('btn-hint').disabled = true;
+        document.getElementById('btn-resign').disabled = true;
+        document.getElementById('btn-restart').disabled = false;
+        this.drawBoard();
+        this.updateStatus(`局面已摆好：轮到${this.currentTurn === BLACK ? '黑' : '白'}方，请选择执子颜色`);
+        this.updateTurnInfo('');
+        this.updatePositionStatus(
+            `局面已载入：黑 ${msg.black_count} 子、白 ${msg.white_count} 子。选边后开始，AI 不会自动落子。`,
+            false);
+    }
+
+    toggleEditMode() {
+        // Painting is only safe while the client and server agree that no game
+        // is running; mid-game the board belongs to the session.
+        if (!this.editMode && (this.gameStatus === 'playing' || this.aiThinking)) {
+            this.updatePositionStatus('本局进行中，请先“重新开始”再手动摆棋。', true);
+            return;
+        }
+        this.editMode = !this.editMode;
+        document.getElementById('btn-edit-mode').textContent = this.editMode ? '退出摆棋' : '手动摆棋';
+        const box = document.getElementById('position-text');
+        // Painting and pasting are two ways to describe one board, and the paste
+        // box wins when it has content, so manual mode starts by emptying it.
+        const hadText = this.editMode && box.value.trim().length > 0;
+        if (this.editMode) box.value = '';
+        this.positionPreview = null;
+        this.updatePositionStatus(this.editMode
+            ? `点击棋盘格循环：空 → 黑 → 白 → 空。摆好后点“识别”。${hadText ? '（粘贴框内容已清除）' : ''}`
+            : '已退出手动摆棋。', false);
+        this.refreshPositionControls();
+    }
+
+    clearPosition() {
+        this.applyBoardMatrix(Array(BOARD_SIZE).fill(null).map(() => Array(BOARD_SIZE).fill(EMPTY)));
+        document.getElementById('position-text').value = '';
+        this.positionPreview = null;
+        this.refreshPositionControls();
+        this.updatePositionStatus('棋盘已清空。', false);
+    }
+
+    paintCell(row, col) {
+        const next = (this.board[row][col] + 1) % 3;
+        this.board[row][col] = next;
+        this.positionPreview = null;
+        this.drawBoard();
+        this.refreshPositionControls();
+        const counts = this.localCounts();
+        this.updatePositionStatus(
+            `本地：黑 ${counts.black} 子、白 ${counts.white} 子。点“识别”检查禁手与五连。`, false);
+    }
+
+    localCounts() {
+        let black = 0;
+        let white = 0;
+        for (const row of this.board) {
+            for (const cell of row) {
+                if (cell === BLACK) ++black;
+                else if (cell === WHITE) ++white;
+            }
+        }
+        return { black, white };
+    }
+
+    exportPosition() {
+        const doc = {
+            version: 1,
+            type: 'gomoku_position',
+            encoding: { black: 1, white: 2, empty: 0 },
+            board: this.board.map(row => row.slice())
+        };
+        const blob = new Blob([JSON.stringify(doc, null, 2)], { type: 'application/json' });
+        const link = document.createElement('a');
+        link.href = URL.createObjectURL(blob);
+        link.download = 'position.json';
+        link.click();
+        URL.revokeObjectURL(link.href);
+    }
+
+    applyBoardMatrix(matrix) {
+        if (!Array.isArray(matrix)) return;
+        for (let row = 0; row < BOARD_SIZE; ++row) {
+            for (let col = 0; col < BOARD_SIZE; ++col) {
+                const value = matrix[row] ? matrix[row][col] : EMPTY;
+                this.board[row][col] = Number.isInteger(value) ? value : EMPTY;
+            }
+        }
+        this.drawBoard();
+    }
+
+    refreshPositionControls() {
+        const preview = this.positionPreview;
+        const confirmRow = document.getElementById('position-confirm-row');
+        const confirm = document.getElementById('position-confirm');
+        const fromText = typeof this.positionPayload() === 'string';
+        // A pasted or uploaded grid is the one case that owes the player the
+        // second look, so 载入 stays dead until the box is ticked. A bitboard or
+        // move list carries no symbols, so the server sends no mapping for it
+        // and there is nothing to confirm.
+        const needsConfirm = !!(preview && fromText && preview.encoding);
+        confirmRow.hidden = !needsConfirm;
+        if (!preview) confirm.checked = false;
+        const ready = !!preview && preview.ok && (!needsConfirm || confirm.checked);
+        document.getElementById('btn-set-position').disabled = !ready;
+        document.getElementById('btn-check-position').disabled = this.aiThinking;
+    }
+
+    updatePositionStatus(text, isError) {
+        const el = document.getElementById('position-status');
+        el.textContent = text;
+        el.classList.toggle('error', !!isError);
+    }
+
     restart() {
         this.sendMessage({ type: 'restart' });
         this.resetGame();
@@ -408,6 +675,12 @@ class GomokuGame {
         this.analysisEnded = false;
         this.replayIndex = null;
         this.gameOverText = '';
+        this.editMode = false;
+        this.positionPreview = null;
+        this.positionSetInFlight = false;
+        document.getElementById('btn-edit-mode').textContent = '手动摆棋';
+        this.refreshPositionControls();
+        this.updatePositionStatus('');
         this.refreshReplayControls();
         this.updateReplayInfo();
         this.drawEvalGraph();
@@ -449,6 +722,12 @@ class GomokuGame {
             case 'replay':
                 this.handleReplay(msg);
                 break;
+            case 'position_preview':
+                this.handlePositionPreview(msg);
+                break;
+            case 'position_set':
+                this.handlePositionSet(msg);
+                break;
             case 'hint_result':
                 this.handleHintResult(msg);
                 break;
@@ -462,13 +741,27 @@ class GomokuGame {
                 this.resetGame();
                 break;
             case 'error':
+                // A refused load must not leave the side buttons held.
+                if (this.positionSetInFlight) {
+                    this.positionSetInFlight = false;
+                    this.setSideButtons(this.sideLock[0], this.sideLock[1]);
+                }
                 alert('错误: ' + msg.message);
                 break;
         }
     }
     
     handleStateSync(msg) {
+        // state_sync is the server's authoritative board at the moment the game
+        // starts (choose_side), so it has to overwrite whatever the client is
+        // showing: an un-loaded position preview would otherwise stay on screen
+        // while the server plays an empty board.
+        this.positionPreview = null;
+        if (Array.isArray(msg.board)) this.applyBoardMatrix(msg.board);
+        this.lastMove = null;
+        this.currentTurn = msg.current_turn === 'black' ? BLACK : WHITE;
         this.gameStatus = 'playing';
+        this.updateTurnInfo();
         this.updateStatus('游戏开始');
     }
     

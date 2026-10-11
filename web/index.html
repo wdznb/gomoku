@@ -38,6 +38,28 @@
                 </div>
                 
                 <div class="button-group">
+                    <h3>摆棋</h3>
+                    <label>
+                        棋盘文件:
+                        <input type="file" id="position-file" accept=".json,.csv,.txt">
+                    </label>
+                    <textarea id="position-text" rows="5"
+                        placeholder="粘贴棋盘：15 行 15 列，标志可用 0/1/2、1/-1/0、B/W/.、X/O/.、黑/白/空，或直接粘贴局面 JSON"></textarea>
+                    <div class="button-row">
+                        <button id="btn-check-position" class="btn btn-small">识别</button>
+                        <button id="btn-set-position" class="btn btn-small" disabled>载入</button>
+                        <button id="btn-edit-mode" class="btn btn-small">手动摆棋</button>
+                        <button id="btn-clear-position" class="btn btn-small">清空</button>
+                        <button id="btn-export-position" class="btn btn-small">导出</button>
+                    </div>
+                    <label class="confirm-row" id="position-confirm-row" hidden>
+                        <input type="checkbox" id="position-confirm">
+                        确认标志：<span id="position-mapping"></span>
+                    </label>
+                    <div id="position-status" class="position-status"></div>
+                </div>
+
+                <div class="button-group">
                     <h3>AI 设置</h3>
                     <label>
                         超时时间 (毫秒):

@@ -50,6 +50,7 @@
 - ✅ 对称去重：训练侧分支探索 + 搜索侧根节点镜像候选
 - ✅ 对局回放分析：逐手引擎分析（方法/分值/深度/节点/耗时）+ 回放导航 + 评估曲线
 - ✅ 前端增强：落子记录可点击跳转回放、终局原因显示、AI 设置真正下发到服务器
+- ✅ 摆设棋局：自定义局面（15x15 数组 / 位棋盘 / 落子序列）可从文件、报文或前端编辑器载入，自动识别黑白空标志并校验手数差、禁手与已有五连
 
 ### 计划功能
 阶段1–4 的计划功能已全部落地。`REVIEW_LOG.md` 的 “Deliberately deferred” 清单也已全部关闭：
@@ -204,6 +205,65 @@ cd build
 
 参数文件里的整数会做**范围校验**：JSON 用 64 位存整数而 `get<int>` 只做截断，`five: 4294967396` 会被读成 `100`，因此这类文件直接拒绝而不是套用截断值；坐标同理，只有元数据（节点数、搜索深度）允许回落到默认值。
 
+## 摆设棋局（自定义开局）
+
+除了从空盘开始对局，还可以直接把一个自定义局面摆上桌：后端判断它是否合法（黑白手数差、
+黑方禁手、是否已有五连），并据此算出下一步轮到谁（黑先手，因此手数相等是黑行棋，黑多一子是白行棋）。
+
+### 三种输入形式
+
+| 形式 | 字段 | 说明 |
+| --- | --- | --- |
+| 完整棋盘 | `board` | 15×15 嵌套数组、225 元行优先数组，或文本棋盘字符串（CSV / txt / 每格一符号） |
+| 位棋盘 | `bitboard` | `{"black":[4 个 uint64], "white":[4 个 uint64]}`，第 `row*15+col` 位表示该格，只允许 `< 225` 的位；字可以是十进制整数，也可以是带 `0x` 前缀的字符串（字符串避免 JSON 浮点丢掉 64 位精度） |
+| 落子序列 | `moves` | `[row, col]` 或 `{"row":…,"col":…}` 的列表，按黑白交替自动着色，`first` 指定首手颜色（默认 `black`） |
+
+三者只能出现一个，同时出现或全部缺失都会被拒绝。位棋盘与落子序列没有符号歧义，因此不需要
+标志确认；棋盘形式必须说明黑/白/空对应哪些标志（见下）。
+
+### 标志识别
+
+`board` 里的每个符号按下面顺序尝试匹配，第一个能覆盖**全部**出现的符号的读法被采用：
+
+| 黑 | 白 | 空 |
+| --- | --- | --- |
+| `1` | `2` | `0` |
+| `1` | `-1` | `0` |
+| `B` | `W` | `.` / `_` / `-` / `·` |
+| `X` | `O` | `.` / `_` / `-` / `·` |
+| `黑` | `白` | `空` / `.` / `_` / `-` / `·` |
+
+字母大小写等价（`b`/`w`/`o` 同大写）。识别不了就**直接拒绝**并列出看到的符号，绝不猜：一套
+棋盘里混用 `1/2/0` 与 `B/W/.` 会被拒，而不是把认不出的符号当成空、悄悄把棋子抹掉。
+前端文本载入需要先确认这次读法（`check_position` 会回显识别到的标志），自动化训练与测试因为
+双方共用同一套算法或同一份模板，不需要这一步——模板里写明 `encoding` 即可直接载入。
+
+### 标准模板
+
+`data/` 下的五个模板就是给训练、复盘与测试用的标准格式，都是可被后端直接识别的合法局面
+（3 黑 2 白，轮到白方）：
+
+- `position_template.json` —— 规范文档：`version` / `type` / `encoding` / `board`
+- `position_template.csv` —— 逗号分隔的 0/1/2 棋盘
+- `position_template.txt` —— 每格一符号的 `B`/`W`/`.` 棋盘
+- `position_bitboard_template.json` —— 4×uint64 位棋盘对
+- `position_moves_template.json` —— 落子坐标序列 + `first`
+
+导出用的规范文档由 `position_to_json(board)` 产生，前端“导出”按钮写出的是同一种形状，因此
+导出的文件可以原样再载入。
+
+### 代码入口
+
+不依赖 JSON 与网络的核心解析层是 `src/core/position_setup.h`：`parse_grid_text`、
+`detect_grid_encodings`、`position_from_grid`、`position_from_bitboard`、`position_from_moves`、
+`validate_position`。JSON / 文件层在 `src/server/position_json.h`：`position_from_json`、
+`position_from_text`、`load_position_file`、`position_to_json`。训练与测试可直接调用它们摆出
+指定局面；服务器则用 `GameManager::set_position` 把局面装上会话的棋盘。
+
+装上之后**只摆局面、不开新局**：状态回到 `waiting`，已有的思考线程被 join 并丢弃，回放分析清空，
+AI 不会自动落子。玩家随后选择执子颜色或直接落子，这局才开始（选择颜色/落子也是唯一会清除“摆棋待定”
+标记的两个动作，因此空盘之外也仍能选边）。
+
 ## 使用
 
 1. 启动服务器后，在浏览器中打开 `http://localhost:8080`
@@ -234,6 +294,16 @@ cd build
 - **搜索深度**: AI搜索的最大深度
 - 两项改动会通过 `set_config` 立即下发，对本局后续的 AI 落子生效
 
+### 摆棋
+
+- **选择文件**: 载入 `data/position_template.*` 那种格式的局面文件（json / csv / txt 皆可）
+- **文本框**: 直接粘贴棋盘或局面对象，配合 **识别** 使用
+- **识别**: 干跑一次解析，回显黑白手数、轮到谁以及识别到的黑/白/空标志；识别成功后勾选
+  “确认标志”才能 **载入**（导出数组等非文本形式无需勾选）
+- **载入**: 把局面摆上服务器棋盘，状态回到“等待选边”，AI 不会自动落子
+- **手动摆棋**: 点棋盘按 空→黑→白→空 循环刷格，本地计数即可看出是否合法，**识别** 会做完整校验
+- **清空** / **导出**: 清掉本地编辑盘；导出规范 JSON 文档（`position.json` 下载），可原样再载入
+
 ## 项目结构
 
 ```
@@ -244,6 +314,7 @@ gomoku/
 │   │   ├── board.h/cpp     # 棋盘管理 + 位棋盘行 + Zobrist 哈希
 │   │   ├── pattern.h/cpp   # 棋型识别（位窗口 + 形状查表）+ 禁手判定
 │   │   ├── transforms.h/cpp# D4 八对称、自对称集合与规范格去重
+│   │   ├── position_setup.h/cpp # 局面载入：标志识别、棋盘/位棋盘/落子序列、合法性校验
 │   │   └── evaluator.h/cpp # 评估函数与威胁系数
 │   ├── search/         # 搜索算法
 │   │   ├── greedy.h/cpp    # 贪心 / 强制着法
@@ -268,13 +339,14 @@ gomoku/
 │   │   └── main_trainer.cpp    # gomoku_train 命令行入口
 │   ├── server/         # 服务器
 │   │   ├── server.h/cpp    # WebSocket + HTTP 服务器
-│   │   └── game_manager.h/cpp # 游戏管理 + 回放快照
+│   │   ├── position_json.h/cpp # 局面文档 / 文件读写与规范导出
+│   │   └── game_manager.h/cpp # 游戏管理 + 回放快照 + set_position
 │   └── main.cpp        # gomoku_server 入口
 ├── web/                # 前端文件
 │   ├── index.html
 │   ├── style.css
 │   └── app.js
-├── data/               # 开局库与训练产物（data/training/ 被忽略）
+├── data/               # 开局库、局面模板与训练产物（data/training/ 被忽略）
 ├── tests/              # 单元测试
 ├── CMakeLists.txt      # CMake配置
 ├── build.sh            # 构建脚本
@@ -295,8 +367,13 @@ ctest --output-on-failure
 ./test_pattern
 ./test_evaluator
 ./test_search
+./test_position
 ./test_training
 ```
+
+`test_position` 覆盖局面载入的三层：文本/数组/位棋盘/落子序列的解析、五种标志表与混合符号拒绝、
+手数差 / 禁手 / 已有五连 / 满盘校验、`data/` 里五个模板文件都能载入、以及 `set_position` 之后
+不开新局、可选边、可替换、可悔到空盘的行为。
 
 ## WebSocket 消息协议
 
@@ -312,7 +389,13 @@ ctest --output-on-failure
 {"type": "resign"}
 {"type": "stop_thinking"}
 {"type": "restart"}
+{"type": "check_position", "position": {"board": [[...]], "encoding": {"black": 1, "white": 2, "empty": 0}}}
+{"type": "check_position", "position": "文本棋盘或局面对象字符串", "encoding": {"black": "B", "white": "W", "empty": "."}}
+{"type": "set_position", "position": {"bitboard": {"black": [0, 281474976710656, 65537, 0], "white": [0, 562954248388608, 0, 0]}}}
 ```
+
+`position` 可以是局面对象，也可以是文本（粘贴的棋盘或整份 JSON 文档字符串）；顶层 `encoding`
+会并入文档，作为调用方声明的标志映射。
 
 ### 服务器 → 客户端
 
@@ -324,11 +407,22 @@ ctest --output-on-failure
  "moves": [{"row": 7, "col": 7, "color": "black", "method": "human",
             "score": 0, "depth": 0, "nodes": 0, "elapsed_ms": 0}]}
 {"type": "error", "message": "Invalid move"}
+{"type": "position_preview", "ok": true, "black_count": 3, "white_count": 2, "side_to_move": "white",
+ "encoding": {"black": "1", "white": "2", "empty": "0"}, "board": [[...]]}
+{"type": "position_preview", "ok": false, "error": "黑 3 子、白 0 子：黑先手，黑白差只能是 0 或 1"}
+{"type": "position_set", "board": [[...]], "current_turn": "white", "game_status": "waiting",
+ "position_pending": true, "black_count": 3, "white_count": 2}
 ```
 
 `replay` 是本会话对局的逐手分析：`method` 为 `human` 表示玩家落子（无搜索数据），
 其余为引擎返回路径（`book` / `vcf` / `vct` / `alphabeta` / `greedy`）；
 `score` 是**刚落子一方**视角的分值，非 AlphaBeta 路径不填 `depth` / `nodes`。
+
+`position_preview` 是干跑结果，不会改动会话状态；识别失败也用 `ok:false` + `error` 回答而不是
+`error` 消息，方便表单内联显示。`encoding` 只在棋盘形式下出现（位棋盘与落子序列没有标志可言）。
+`set_position` 失败才走 `error`，成功回 `position_set`，其中 `position_pending: true` 表示局面已
+摆好但尚未开局：此时 `choose_side` 仍然可用，AI 不会自己落子。带 `board` 的文档必须说明 `encoding`
+（文件里写好，或 `check_position` 之后由玩家确认再带上），否则会被拒绝。
 
 ## 开发计划
 

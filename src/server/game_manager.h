@@ -56,6 +56,15 @@ public:
     int player_color() const { return player_color_; }
     int ai_color() const { return ai_color_; }
     int current_turn() const;
+
+    // Install a hand-set position without starting a game. The caller has
+    // already validated it (position_setup), so this only has to stop any
+    // worker, swap the board and drop the replay history: no stones of its own
+    // are recorded, and no AI search is armed. The session then sits in
+    // `position_pending()` until the player picks a side or plays, which is
+    // what keeps choose_side usable on a board that is not empty.
+    bool set_position(const Board& board);
+    bool position_pending() const { return position_pending_; }
     
     bool make_move(int row, int col);
     // On success, out_move_count / out_status report the board state captured
@@ -96,6 +105,10 @@ private:
     int ai_color_;
     GameStatus status_;
     int winner_;
+    // True between "position installed" and "the player chose a side or played"
+    // (see set_position). Only ever touched on the io thread and under
+    // thinking_mutex_ inside set_position / reset.
+    bool position_pending_ = false;
     std::string game_over_reason_;
     std::vector<MoveAnalysis> analyses_;
     

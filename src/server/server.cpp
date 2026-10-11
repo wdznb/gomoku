@@ -1,4 +1,5 @@
 #include "server.h"
+#include "position_json.h"
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -18,6 +19,40 @@ namespace {
 int get_int(const json& msg, const char* key, int fallback) {
     if (!msg.contains(key) || !msg[key].is_number_integer()) return fallback;
     return msg[key].get<int>();
+}
+
+// Pull the position payload out of a check_position / set_position message.
+// `position` is either the canonical document or the board as text, so a file
+// upload and a paste box send the same shape; a top-level `encoding` is merged
+// into the document because it is the mapping the caller is stating.
+bool read_position_payload(const json& msg, json& doc, std::string& error) {
+    if (!msg.contains("position")) {
+        error = "缺少 position 字段";
+        return false;
+    }
+    const json& value = msg["position"];
+    if (value.is_object()) {
+        doc = value;
+    } else if (value.is_string()) {
+        const std::string text = value.get<std::string>();
+        json parsed = json::parse(text, nullptr, false);
+        if (parsed.is_discarded()) {
+            // Not JSON, so a plain-text grid: CSV, txt or one symbol per cell.
+            doc = json::object();
+            doc["board"] = text;
+        } else {
+            doc = std::move(parsed);
+        }
+    } else {
+        error = "position 必须是局面对象或棋盘文本";
+        return false;
+    }
+    if (msg.contains("encoding")) doc["encoding"] = msg["encoding"];
+    return true;
+}
+
+const char* side_name(int color) {
+    return color == BLACK ? "black" : "white";
 }
 }
 
@@ -376,6 +411,10 @@ void GameServer::handle_message(std::shared_ptr<WebSocketSession> session, const
     
     if (type == "choose_side") {
         handle_choose_side(session, msg);
+    } else if (type == "check_position") {
+        handle_check_position(session, msg);
+    } else if (type == "set_position") {
+        handle_set_position(session, msg);
     } else if (type == "make_move") {
         handle_make_move(session, msg);
     } else if (type == "undo") {
@@ -414,7 +453,10 @@ void GameServer::handle_choose_side(std::shared_ptr<WebSocketSession> session, c
     if (it == games_.end()) return;
     
     auto& game = it->second;
-    if (game->is_ai_thinking() || game->board().move_count() > 0) {
+    // A hand-set position is the one case where stones are already on the board
+    // and the side choice is still open: set_position deliberately leaves the
+    // game unstarted, so picking a side is how the player starts it.
+    if (game->is_ai_thinking() || (game->board().move_count() > 0 && !game->position_pending())) {
         send_error(session, "Cannot choose side after the game has started");
         return;
     }
@@ -451,6 +493,98 @@ void GameServer::handle_choose_side(std::shared_ptr<WebSocketSession> session, c
     if (game->current_turn() == game->ai_color()) {
         game->start_ai_thinking();
     }
+}
+
+// A dry run: recognise and validate a position without touching the session's
+// game. The reply carries ok / counts / side to move / the encoding that was
+// read, which is what the UI shows the player for the confirmation step. A
+// rejected position answers with ok:false and the reason rather than an error
+// message, so a form can display it inline.
+void GameServer::handle_check_position(std::shared_ptr<WebSocketSession> session, const json& msg) {
+    json doc;
+    std::string error;
+    json reply;
+    reply["type"] = "position_preview";
+    if (!read_position_payload(msg, doc, error)) {
+        reply["ok"] = false;
+        reply["error"] = error;
+        send_message(session, reply);
+        return;
+    }
+
+    SetupResult result = position_from_json(doc);
+    reply["ok"] = result.ok();
+    if (!result.ok()) {
+        reply["error"] = result.error;
+        send_message(session, reply);
+        return;
+    }
+    reply["black_count"] = result.black_count;
+    reply["white_count"] = result.white_count;
+    reply["side_to_move"] = side_name(result.side_to_move);
+    // Only a grid has symbols to echo back; a bitboard or move list carries no
+    // mapping, and empty strings there would read as "the marks are blank".
+    if (doc.contains("board")) {
+        reply["encoding"] = {{"black", result.encoding.black},
+                             {"white", result.encoding.white},
+                             {"empty", result.encoding.empty}};
+    }
+    reply["board"] = board_to_json(result.board);
+    send_message(session, reply);
+}
+
+// Install the position as the session's board. Deliberately does not start the
+// game: the client stays in the waiting state, no AI search is armed, and the
+// player then chooses a side (or plays the side to move) to begin.
+void GameServer::handle_set_position(std::shared_ptr<WebSocketSession> session, const json& msg) {
+    json doc;
+    std::string error;
+    if (!read_position_payload(msg, doc, error)) {
+        send_error(session, error);
+        return;
+    }
+    // The second confirmation the UI owes a board file. Symbols are the only
+    // form where the reading can disagree with what the player meant, so a
+    // grid-shaped document has to state its mapping - either in the file
+    // itself, which is why the shipped templates carry an `encoding`, or in the
+    // message after the player confirms the one check_position reported.
+    if (doc.contains("board") && !doc.contains("encoding")) {
+        send_error(session, "棋盘文件需要先确认黑/白/空标志：请先用 check_position 取得识别结果，"
+                            "再在 set_position 里带上 encoding");
+        return;
+    }
+
+    SetupResult result = position_from_json(doc);
+    if (!result.ok()) {
+        send_error(session, result.error);
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(games_mutex_);
+    auto it = games_.find(session.get());
+    if (it == games_.end()) return;
+
+    auto& game = it->second;
+    if (game->is_ai_thinking()) {
+        send_error(session, "AI 正在思考，请先停止再摆棋");
+        return;
+    }
+    if (!game->set_position(result.board)) {
+        send_error(session, "无法摆上此局面");
+        return;
+    }
+
+    // No worker exists now (set_position joined both), so reading the board and
+    // the turn here cannot race a commit.
+    json reply;
+    reply["type"] = "position_set";
+    reply["board"] = board_to_json(game->board());
+    reply["current_turn"] = side_name(game->current_turn());
+    reply["game_status"] = "waiting";
+    reply["position_pending"] = true;
+    reply["black_count"] = result.black_count;
+    reply["white_count"] = result.white_count;
+    send_message(session, reply);
 }
 
 void GameServer::handle_make_move(std::shared_ptr<WebSocketSession> session, const json& msg) {

@@ -27,6 +27,7 @@ set(GOMOKU_CORE_SOURCES
     src/core/pattern.cpp
     src/core/evaluator.cpp
     src/core/transforms.cpp
+    src/core/position_setup.cpp
     src/search/greedy.cpp
     src/search/vcf.cpp
     src/search/vct.cpp
@@ -56,6 +57,7 @@ set(GOMOKU_SOURCES
     src/training/params.cpp
     src/server/server.cpp
     src/server/game_manager.cpp
+    src/server/position_json.cpp
 )
 
 add_executable(gomoku_server ${GOMOKU_SOURCES})
@@ -164,6 +166,26 @@ target_compile_definitions(test_search PRIVATE
     GOMOKU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 target_link_libraries(test_search PRIVATE Threads::Threads nlohmann_json::nlohmann_json)
 add_test(NAME test_search COMMAND test_search)
+
+# The position loader spans three layers (core parsing, JSON/documents, the
+# GameManager slot a loaded board lands in), so it links the whole engine rather
+# than a hand-picked list.
+add_executable(test_position
+    tests/test_position.cpp
+    ${GOMOKU_CORE_SOURCES}
+    src/server/game_manager.cpp
+    src/server/position_json.cpp
+)
+target_include_directories(test_position PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_definitions(test_position PRIVATE
+    GOMOKU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+target_link_libraries(test_position PRIVATE Threads::Threads nlohmann_json::nlohmann_json)
+if(MSVC)
+    target_compile_options(test_position PRIVATE /W4)
+else()
+    target_compile_options(test_position PRIVATE -Wall -Wextra -Wno-template-body -Wno-template-id-cdtor)
+endif()
+add_test(NAME test_position COMMAND test_position)
 
 add_executable(test_training
     tests/test_training.cpp

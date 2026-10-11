@@ -453,3 +453,67 @@ save ~0.3 ms of io-thread time on a user-initiated abort while that client is al
 the AI. Closed on the measurement; the deferred list is now empty apart from the recorded false
 positive (R43 F1).
 
+
+## 摆设棋局（自定义开局）— feature round 57 (`phase4-ui-replay`)
+
+**What shipped.** A position can now be installed instead of played out: `src/core/position_setup.*`
+parses the three forms (15×15 / flat-225 / text grid, a 4×`uint64` black+white mask pair, an alternating
+coordinate list), detects the black/white/empty marks over five alphabets (`1/2/0`, `1/-1/0`, `B/W/.`,
+`X/O/.`, `黑/白/空`), and validates the result (count difference, an existing five, and every BLACK
+stone re-tested through `is_forbidden` by removing it, which is also what catches 长连 — `check_winner`
+deliberately does not treat an overline as a win). `src/server/position_json.*` adds the document/file
+layer and the canonical emitter; `GameManager::set_position` installs the board; `check_position` /
+`set_position` carry it over the socket; the web panel paints, imports, detects, confirms and exports.
+`ctest` is **6/6** (`test_position` covers all three layers plus the five shipped `data/` templates).
+
+**An unrecognisable grid is refused, never guessed.** The detection loop demands that one alphabet
+cover *every* distinct token in the file, so `./2/B` yields "无法识别棋盘标志 (./2/B)" rather than a
+reading that treats the stray symbol as empty and quietly deletes a stone. An explicitly supplied
+`encoding` is trusted as stated but still has to cover every token, for the same reason.
+
+**The confirmation rule fits a human and a script through one code path.** A grid-shaped document must
+state its mapping — either in the file (which is why the templates carry `encoding`) or in the message
+after the player confirms the reading `check_position` echoed. Bitboard and move-list forms have no
+symbols, so they owe nothing. No client-type flag was added; a trainer pointing at the same template
+simply loads it directly.
+
+**只摆局面，不开新局.** `set_position` aborts and joins both workers, drops them, clears `analyses_`,
+leaves `status_ = WAITING` and sets `position_pending_`. Only `set_player_color` and a played stone clear
+that flag, which is also why `choose_side`'s guard could be relaxed to
+`move_count() > 0 && !position_pending()` without letting a mid-game client re-pick a side. The turn
+needs no extra state: `current_turn()` derives it from `move_count() % 2`, exactly as the loader's
+count rule does.
+
+`build/wspos.py` (scratch stdlib WebSocket harness, not built by CMake) is what proves the socket half
+of that: 22 checks over detect → confirm → load → choose_side → human move → AI answer, including that a
+load arms no worker, that a loaded position replaces a live game, and that each refusal reaches the
+client as the right message (`position_preview{ok:false}` for a dry run, `error` for a refused load).
+
+**Three defects found while verifying, all on the preview side.** (i) The server attached
+`encoding` to every `position_preview`, so a bitboard or move-list position came back as
+`{"black":"","white":"","empty":""}` — meaningless strings that read as "the marks are blank". It is now
+sent only for the `board` form (`server.cpp:522`). (ii) That wart was load-bearing for a crash: the
+client computed the mapping line unconditionally, so pasting a *bitboard document as text* threw a
+`TypeError` inside `handlePositionPreview` and the preview was silently dropped — the 载入 button never
+enabled and no reason was shown. Both branches now key off `needsConfirm = fromText && !!msg.encoding`,
+which is also the exact condition under which `set_position` requires the box ticked. (iii) A preview
+repaints the board (a dry run should show what the file means), but `state_sync` — the one message that
+carries the server's authoritative board, and the reply to `choose_side` — was handled by setting a
+status string and nothing else. So "识别 → 忘了点载入 → 直接选边" left the player looking at five stones
+while the session played an empty board, with the turn and the parity disagreeing. `handleStateSync` now
+applies `msg.board`, adopts `msg.current_turn`, drops the preview and redraws, which makes the server's
+board the only thing a started game can display.
+
+Verified in a real browser: pasted bitboard JSON loads with no checkbox, a pasted `B/W/.` grid shows
+黑=B 白=W 空=. and stays disabled until confirmed, and the choose-the-non-moving-side path arms the AI
+immediately on the loaded position (the socket harness saw the same sequence as
+`thinking_progress{depth:5}` → `ai_move`, and the board the client renders matches it).
+
+**Test fixtures were the main source of failures, not the parser.** A hand-written `white[1]` of
+`0x0003000000000000` sets bits 48 and 49, i.e. (7,7) and (7,8), and (7,7) is BLACK — the overlap
+assertion fired on the test's own arithmetic, not on `word_of`. Recording the cell→bit derivation in the
+comment (`(7,7)=112 → word 1 bit 48`) is what makes the next reader re-derive instead of trusting it.
+
+**Deliberate omissions.** No client-side reconnect exists for the 60 s idle socket timeout, so a page
+left open on the position panel drops its WebSocket and must be reloaded — pre-existing behaviour, out
+of scope here.

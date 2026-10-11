@@ -142,10 +142,56 @@ input[type="number"] {
     font-size: 0.9em;
 }
 
+#position-text {
+    width: 100%;
+    box-sizing: border-box;
+    margin-top: 5px;
+    padding: 8px;
+    border: 1px solid #ddd;
+    border-radius: 5px;
+    font-family: monospace;
+    font-size: 0.85em;
+    resize: vertical;
+}
+
+input[type="file"] {
+    display: block;
+    margin-top: 5px;
+    font-size: 0.85em;
+}
+
+.button-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-bottom: 10px;
+}
+
+.confirm-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 0.85em;
+}
+
+.confirm-row input[type="checkbox"] {
+    margin: 0;
+}
+
+.position-status {
+    font-size: 0.85em;
+    color: #555;
+    min-height: 1.2em;
+    word-break: break-all;
+}
+
+.position-status.error {
+    color: #c0392b;
+}
+
 .move-history {
     margin-top: 20px;
 }
-
 .move-history h3 {
     font-size: 1em;
     color: #333;

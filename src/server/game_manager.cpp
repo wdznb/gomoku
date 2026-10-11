@@ -61,12 +61,45 @@ void GameManager::reset() {
         winner_ = EMPTY;
         game_over_reason_.clear();
         analyses_.clear();
+        position_pending_ = false;
     }
+}
+
+bool GameManager::set_position(const Board& board) {
+    // A full board has no side to move, so installing one would leave the
+    // session with nothing to do. The loader's own validation rejects it too;
+    // this guard is here because set_position is also callable directly by the
+    // trainer and the tests.
+    if (board.move_count() >= MAX_MOVES) return false;
+
+    // Same hard-abort sequence as reset(): the in-flight worker must not commit
+    // a stone onto the board that replaces the one it searched.
+    discard_pending_.store(true);
+    stop_thinking();
+    if (search_thread_ && search_thread_->joinable()) {
+        search_thread_->join();
+    }
+    if (hint_thread_ && hint_thread_->joinable()) {
+        hint_thread_->join();
+    }
+    search_thread_.reset();
+    hint_thread_.reset();
+
+    std::lock_guard<std::mutex> lock(thinking_mutex_);
+    board_ = board;
+    status_ = GameStatus::WAITING;
+    winner_ = EMPTY;
+    game_over_reason_.clear();
+    analyses_.clear();
+    position_pending_ = true;
+    return true;
 }
 
 void GameManager::set_player_color(int color) {
     player_color_ = color;
     ai_color_ = opponent(color);
+    // Picking a side is how a hand-set position becomes a game.
+    position_pending_ = false;
 }
 
 int GameManager::current_turn() const {
@@ -101,6 +134,8 @@ bool GameManager::make_move(int row, int col) {
     if (!board_.place_stone(row, col, turn)) {
         return false;
     }
+    // Playing a stone is the other way out of a hand-set position.
+    position_pending_ = false;
     analyses_.push_back(MoveAnalysis{Move(row, col, turn), 0, 0, 0, 0, "human"});
     
     if (status_ == GameStatus::WAITING) {

@@ -97,6 +97,8 @@ private:
     void send_error(std::shared_ptr<WebSocketSession> session, const std::string& message);
     
     void handle_choose_side(std::shared_ptr<WebSocketSession> session, const json& msg);
+    void handle_check_position(std::shared_ptr<WebSocketSession> session, const json& msg);
+    void handle_set_position(std::shared_ptr<WebSocketSession> session, const json& msg);
     void handle_make_move(std::shared_ptr<WebSocketSession> session, const json& msg);
     void handle_undo(std::shared_ptr<WebSocketSession> session);
     void handle_request_replay(std::shared_ptr<WebSocketSession> session);
