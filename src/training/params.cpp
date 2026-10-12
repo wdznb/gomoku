@@ -222,6 +222,26 @@ bool CoefficientVector::from_json_string(const std::string& text, ThreatCoeffici
         return false;
     }
 
+    // The file is an instruction, not a suggestion: sanitize() would clamp an
+    // out-of-range tunable into its bound and the loader would still report
+    // success (README:154 wants a refusal). The clamping stays for the
+    // optimizers, whose own moves are always generated inside the bounds.
+    static const char* tunable_names[] = {"live_four", "rush_four", "live_three",
+                                          "sleepy_three", "live_two", "sleepy_two",
+                                          "double_four", "double_three", "four_three",
+                                          "position_weight_scale"};
+    for (int i = 0; i < TUNABLE_COUNT; ++i) {
+        TunableParam param = static_cast<TunableParam>(i);
+        ParamBound bound = default_bound_for(param);
+        const int value = field_of(coeffs, param);
+        if (value < bound.min_value || value > bound.max_value) {
+            error = std::string(tunable_names[i]) + " " + std::to_string(value) +
+                    " is outside the allowed range [" + std::to_string(bound.min_value) +
+                    ", " + std::to_string(bound.max_value) + "]";
+            return false;
+        }
+    }
+
     sanitize(coeffs);
     out = coeffs;
     return true;

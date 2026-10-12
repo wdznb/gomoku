@@ -436,6 +436,7 @@ ctest --output-on-failure
 ./test_search
 ./test_position
 ./test_session
+./test_server
 ./test_training
 ```
 

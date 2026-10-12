@@ -77,9 +77,11 @@ else
         ../src/optimization/transposition.cpp \
         ../src/optimization/opening_book.cpp \
         ../src/training/params.cpp \
+        ../src/training/game_record.cpp \
         ../src/server/server.cpp \
         ../src/server/game_manager.cpp \
         ../src/server/position_json.cpp \
+        ../src/server/session_store.cpp \
         -o gomoku_server \
         -lpthread
     

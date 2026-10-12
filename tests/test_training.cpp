@@ -2159,6 +2159,71 @@ void test_params_rejects_unrecognised_keys() {
     std::cout << "test_params_rejects_unrecognised_keys passed" << std::endl;
 }
 
+// R84 E3: a parameter file is an instruction, so an out-of-range tunable must be
+// refused with the key and its allowed range named - sanitize() clamping the
+// value and reporting a successful load let a file ask for 500000 and silently
+// get 40000. The clamps stay for the optimizers, whose moves are always inside
+// the bounds, which is why sanitize_vector / from_vector are pinned below.
+void test_params_rejects_out_of_range_tunables() {
+    std::string error;
+    ThreatCoefficients parsed;
+
+    const struct {
+        const char* text;
+        const char* key;
+        const char* range;
+    } cases[] = {
+        {R"({"live_four":500000})", "live_four", "[1500, 40000]"},
+        {R"({"live_three":-1})", "live_three", "[150, 8000]"},
+        {R"({"coefficients":{"rush_four":99999}})", "rush_four", "[300, 15000]"},
+        {R"({"position_weight_scale":-50})", "position_weight_scale", "[0, 20]"},
+        {R"({"coefficients":{"sleepy_two":0}})", "sleepy_two", "[1, 500]"},
+    };
+    for (const auto& c : cases) {
+        error.clear();
+        const bool ok = CoefficientVector::from_json_string(c.text, parsed, error);
+        assert(!ok);
+        assert(error.find(c.key) != std::string::npos);
+        assert(error.find(c.range) != std::string::npos);
+        std::cout << "  rejected " << c.text << " -> " << error << std::endl;
+    }
+
+    // The boundary values themselves are inside the range and still load.
+    error.clear();
+    assert(CoefficientVector::from_json_string(R"({"live_four":40000})", parsed, error));
+    assert(parsed.live_four == 40000);
+    error.clear();
+    assert(CoefficientVector::from_json_string(R"({"live_four":1500})", parsed, error));
+    assert(parsed.live_four == 1500);
+
+    // A whole valid file (the writer's own output) is unaffected.
+    ThreatCoefficients normal;
+    normal.live_four = 12000;
+    normal.live_three = 480;
+    error.clear();
+    assert(CoefficientVector::from_json_string(CoefficientVector::to_json_string(normal),
+                                               parsed, error));
+    assert(parsed.live_four == normal.live_four);
+    assert(parsed.live_three == normal.live_three);
+
+    // Anti-regression: sanitize_vector still clamps to the bounds (the genetic
+    // and hill-climbing paths depend on it), and from_vector still accepts an
+    // out-of-range vector instead of throwing it away.
+    std::vector<int> values = CoefficientVector::to_vector(ThreatCoefficients());
+    values[static_cast<int>(TunableParam::LIVE_FOUR)] = 500000;
+    values[static_cast<int>(TunableParam::LIVE_THREE)] = -9;
+    CoefficientVector::sanitize_vector(values);
+    assert(values[static_cast<int>(TunableParam::LIVE_FOUR)] == 40000);
+    assert(values[static_cast<int>(TunableParam::LIVE_THREE)] == 150);
+
+    std::vector<int> wild = CoefficientVector::to_vector(ThreatCoefficients());
+    wild[static_cast<int>(TunableParam::LIVE_FOUR)] = -1;
+    const ThreatCoefficients clamped = CoefficientVector::from_vector(wild);
+    assert(clamped.live_four == 1500);
+
+    std::cout << "test_params_rejects_out_of_range_tunables passed" << std::endl;
+}
+
 // R77 L2: stod() parses "nan"/"inf" with used == text.size(), and a NaN then
 // sails through every range guard below it (all comparisons are false), so
 // --accept-score nan used to start a training run whose promotion threshold no
@@ -2252,6 +2317,7 @@ int main() {
     test_params_rejects_non_object_coefficients();
     test_params_rejects_broken_rule_constants();
     test_params_rejects_unrecognised_keys();
+    test_params_rejects_out_of_range_tunables();
     test_trainer_cli_rejects_non_finite_accept_score();
 
     std::cout << "All training tests passed" << std::endl;

@@ -162,7 +162,11 @@ int Trainer::generate_data_games(int games, int threads) {
     if (games <= 0 || fitness_override_) return 0;
     // Nothing to write means nothing to play for: without either output path
     // the games would only burn the round's budget and be dropped at merge.
-    if (config_.records_path.empty() && config_.samples_path.empty()) return 0;
+    if (config_.records_path.empty() && config_.samples_path.empty()) {
+        std::cout << "skipping data games this round: no --records or --samples "
+                     "output path was given" << std::endl;
+        return 0;
+    }
 
     const int worker_count = std::max(1, std::min(threads, games));
     const int per_worker = games / worker_count;

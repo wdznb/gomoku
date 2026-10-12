@@ -17,7 +17,17 @@ int main(int argc, char* argv[]) {
         for (int i = 1; i < argc; ++i) {
             std::string arg = argv[i];
             if (arg == "--port" && i + 1 < argc) {
-                port = std::stoi(argv[++i]);
+                const std::string text = argv[++i];
+                std::size_t used = 0;
+                const int parsed = std::stoi(text, &used);
+                // stoi stops at the first non-digit, so without this check
+                // --port 9090x would silently bind 9090 as if it were asked for.
+                if (used != text.size()) {
+                    std::cerr << "Invalid --port " << text
+                              << " (must be a whole number)" << std::endl;
+                    return 1;
+                }
+                port = parsed;
             } else if (arg == "--web-dir" && i + 1 < argc) {
                 web_dir = argv[++i];
             } else if (arg == "--book" && i + 1 < argc) {
