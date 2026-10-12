@@ -966,10 +966,12 @@ void GameServer::handle_resign(std::shared_ptr<WebSocketSession> session) {
 
     // A game that was never started has no side to resign: the opening actions
     // are choosing a colour or playing the first stone, and settling an untouched
-    // board would hand the opponent a win over zero moves.
+    // board would hand the opponent a win over zero moves. Only the analysis list
+    // counts as a start - the board's stone count also covers 摆棋 base stones,
+    // which undo refuses to give back for the same reason.
     const std::shared_ptr<TrackedGame> entry = entry_locked(session.get());
     const bool started = entry && (entry->side_chosen ||
-                                   entry->game->replay_snapshot().move_count > 0);
+                                   !entry->game->replay_snapshot().moves.empty());
     if (!started) {
         send_error(session, "Game not started");
         return;

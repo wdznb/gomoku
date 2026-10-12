@@ -81,6 +81,22 @@ Move VCFSearch::find_block_move(const Board& board, int row, int col, int color)
             bool bwd_open = board.is_valid(check_bwd_r, check_bwd_c) &&
                             board.is_empty(check_bwd_r, check_bwd_c);
 
+            // An endpoint is only worth defending if the attacker may legally make
+            // five there: for BLACK a fill that joins more stones beyond the end is
+            // an overline, which wins nothing, so X_XXXX leaves no block to find.
+            auto fill_len = [&](int er, int ec, int sign) {
+                int len = count + 1;
+                for (int i = 1; i <= 4; ++i) {
+                    const int r = er + sign * i * dr;
+                    const int c = ec + sign * i * dc;
+                    if (!board.is_valid(r, c) || board.get(r, c) != color) break;
+                    ++len;
+                }
+                return len;
+            };
+            if (color == BLACK && fwd_open && fill_len(check_fwd_r, check_fwd_c, 1) != 5) fwd_open = false;
+            if (color == BLACK && bwd_open && fill_len(check_bwd_r, check_bwd_c, -1) != 5) bwd_open = false;
+
             if (fwd_open && !bwd_open)
                 return Move(check_fwd_r, check_fwd_c, opponent(color));
             if (bwd_open && !fwd_open)

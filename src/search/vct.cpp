@@ -53,9 +53,11 @@ std::vector<Move> VCTSearch::generate_defenses(const Board& board, int color,
 
     for (const auto& pos : candidates) {
         if (!board.is_empty(pos.row, pos.col)) continue;
-        if (opp == BLACK && PatternRecognizer::is_forbidden(board, pos.row, pos.col, opp)) continue;
-
         PositionPattern pattern = PatternRecognizer::recognize_position(board, pos.row, pos.col, opp);
+        // The forbidden test reads the same four directions the recognition above
+        // already scanned, so it takes the pattern instead of re-running them.
+        if (opp == BLACK && PatternRecognizer::is_forbidden_from_pattern(pattern)) continue;
+
         bool is_threat = false;
         for (int d = 0; d < 4; ++d) {
             PatternType t = pattern.directions[d].type;

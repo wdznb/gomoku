@@ -247,8 +247,7 @@ class GomokuGame {
         this.updateReplayInfo();
         this.drawEvalGraph();
         this.refreshReplayControls();
-        this.setSideButtons(this.gameStatus === 'playing' && this.playerColor !== null,
-                           this.gameStatus === 'playing' && this.playerColor !== null);
+        this.setSideButtons(!this.sideChoicePending(), !this.sideChoicePending());
         document.getElementById('btn-undo').disabled =
             this.playerColor === null || this.gameStatus === 'game_over';
         document.getElementById('btn-hint').disabled =
@@ -916,10 +915,14 @@ class GomokuGame {
         this.playerColor = color === 'black' ? BLACK : WHITE;
         document.getElementById('btn-black').disabled = true;
         document.getElementById('btn-white').disabled = true;
-        document.getElementById('btn-undo').disabled = false;
-        document.getElementById('btn-hint').disabled = false;
-        this.hintInFlight = false;
-        document.getElementById('btn-resign').disabled = false;
+        // A choice that arrives after the game settled - only a stale frame can
+        // deliver it, the ending disables these buttons - must not re-arm them.
+        if (this.gameStatus !== 'game_over') {
+            document.getElementById('btn-undo').disabled = false;
+            document.getElementById('btn-hint').disabled = false;
+            this.hintInFlight = false;
+            document.getElementById('btn-resign').disabled = false;
+        }
         document.getElementById('btn-restart').disabled = false;
     }
     
@@ -1399,6 +1402,13 @@ class GomokuGame {
         el.classList.toggle('error', !!isError);
     }
 
+    // A side can only be claimed on a board that has not started. Once the game is
+    // playing - or has ended - the way on is 新对局/再来一局, and leaving these
+    // armed would let a finished board take a second colour choice.
+    sideChoicePending() {
+        return this.gameStatus === 'waiting' && this.playerColor === null;
+    }
+
     setSideButtons(blackDisabled, whiteDisabled) {
         document.getElementById('btn-black').disabled = blackDisabled;
         document.getElementById('btn-white').disabled = whiteDisabled;
@@ -1689,6 +1699,11 @@ class GomokuGame {
         this.hintInFlight = false;
         document.getElementById('btn-hint').disabled =
             this.playerColor === null || this.gameStatus === 'game_over';
+        // 摆棋 never touches moveHistory, so the ply-count test below cannot see
+        // that the board the hint was searched on is gone; and the ring would land
+        // on the working copy the display shows. Release the control above, then
+        // drop the answer whole - no ring, no line over 摆棋中.
+        if (this.setup.active) return;
         // The server searched the position as it was when 求招 left; every path
         // that changes the position pushes onto moveHistory, so a different ply
         // count means the answer can name a square that is occupied now, or one
@@ -1756,6 +1771,9 @@ class GomokuGame {
         document.getElementById('btn-hint').disabled = true;
         document.getElementById('btn-resign').disabled = true;
         document.getElementById('btn-stop').disabled = true;
+        // A settled board takes no colour choice: picking one here would re-arm
+        // 悔棋/求招/认输 for a game that is already over.
+        this.setSideButtons(true, true);
         this.refreshReplayControls();
     }
     

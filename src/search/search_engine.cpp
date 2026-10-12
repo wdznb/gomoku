@@ -211,7 +211,7 @@ SearchResult SearchEngine::search(const Board& board, int color,
             result.method = "resign";
         }
 
-        if (resign_detection_ && !stop_flag.load()) {
+        if (resign_detection_ && !stop_flag.load() && !result.resigned) {
             auto elapsed_after_ab = std::chrono::high_resolution_clock::now() - start;
             int total_used_ms = static_cast<int>(
                 std::chrono::duration_cast<std::chrono::milliseconds>(elapsed_after_ab).count());

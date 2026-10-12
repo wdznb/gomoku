@@ -138,7 +138,8 @@ int Evaluator::evaluate_board(const Board& board, int my_color) const {
     long long opp_total = 0;
     
     const auto& candidates = board.active_empty();
-    
+    const bool black_is_mine = (my_color == BLACK);
+
     for (const auto& pos : candidates) {
         // One shared pass over the four directions yields both colours; two
         // recognize_position calls read the same two bitboard lines again.
@@ -146,8 +147,16 @@ int Evaluator::evaluate_board(const Board& board, int my_color) const {
         PatternRecognizer::recognize_position_both(board, pos.row, pos.col, my_color,
                                                   my_pattern, opp_pattern);
 
-        my_total += pattern_score(my_pattern);
-        opp_total += pattern_score(opp_pattern);
+        // pattern_score pays out double_four / double_three / four_three, so a
+        // shape BLACK can never legally play would bank points for a stone the
+        // move generator refuses to place. Each side is judged on its own pattern:
+        // the square may be forbidden for BLACK and a live four for WHITE.
+        if (!black_is_mine || !PatternRecognizer::is_forbidden_from_pattern(my_pattern)) {
+            my_total += pattern_score(my_pattern);
+        }
+        if (black_is_mine || !PatternRecognizer::is_forbidden_from_pattern(opp_pattern)) {
+            opp_total += pattern_score(opp_pattern);
+        }
     }
     
     long long diff = my_total - opp_total;

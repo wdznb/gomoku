@@ -1166,6 +1166,206 @@ check('B5 eval graph dots only for mate scores', () => {
            'both clipped plies share the top edge, ys=' + mixed.ys.join(','));
 });
 
+// C2a: the side buttons answer "is a colour still owed?", not "is a game
+// running?". A resumed frame that ends the game, or one already mid-play, must
+// keep them greyed; a resumed frame waiting for a colour must hand them back.
+check('C2 side buttons follow the pending-choice rule on every resumed status', () => {
+    const session = (status, color) => ({
+        type: 'session',
+        token: 'd'.repeat(16),
+        resumed: true,
+        player_color: color,
+        game_status: status,
+        current_turn: 'black',
+        move_count: 2,
+        max_depth: 6,
+        timeout_ms: 5000,
+        winner: status === 'game_over' ? 'white' : '',
+        reason: status === 'game_over' ? 'five' : '',
+        board: emptyBoard(),
+    });
+
+    // waiting with no colour: a choice is pending, the buttons are the way on.
+    const opening = newGame();
+    opening.sendMessage = () => true;
+    assert(opening.gameStatus === 'waiting' && opening.playerColor === null,
+           'a fresh game waits for a colour');
+    el('btn-black').disabled = true;
+    el('btn-white').disabled = true;
+    opening.handleServerMessage(session('waiting', ''));
+    assert(el('btn-black').disabled === false, 'waiting without a colour opens 执黑');
+    assert(el('btn-white').disabled === false, 'waiting without a colour opens 执白');
+
+    // waiting with a colour already claimed: nothing is pending.
+    const claimed = newGame();
+    claimed.sendMessage = () => true;
+    el('btn-black').disabled = false;
+    el('btn-white').disabled = false;
+    claimed.handleServerMessage(session('waiting', 'black'));
+    assert(el('btn-black').disabled === true && el('btn-white').disabled === true,
+           'an already claimed side keeps both buttons down');
+
+    // playing with a colour: the ordinary mid-game resume.
+    const playing = newGame();
+    playing.sendMessage = () => true;
+    el('btn-black').disabled = false;
+    el('btn-white').disabled = false;
+    playing.handleServerMessage(session('playing', 'black'));
+    assert(el('btn-black').disabled === true && el('btn-white').disabled === true,
+           'a running game takes no colour choice');
+
+    // game over: the settled board takes no colour choice either.
+    const over = newGame();
+    over.sendMessage = () => true;
+    el('btn-black').disabled = false;
+    el('btn-white').disabled = false;
+    over.handleServerMessage(session('game_over', 'black'));
+    assert(el('btn-black').disabled === true && el('btn-white').disabled === true,
+           'a finished game takes no colour choice');
+
+    // The predicate the rule is built on, pinned on the two states it decides.
+    assert(opening.sideChoicePending() === true, 'the waiting board is still pending');
+    assert(over.sideChoicePending() === false, 'a finished game is not pending');
+});
+
+// C2b: 摆棋-confirmed awaiting colour is the same pending state, and the live
+// ending puts the side buttons down where the resumed frame does.
+check('C2 the ending locks the side buttons and 摆棋 keeps them open', () => {
+    // After 确认 the page is waiting with no colour claimed: pending.
+    const pos = newGame();
+    pos.sendMessage = () => true;
+    pos.board = emptyBoard();
+    pos.board[7][7] = BLACK;
+    pos.setup.active = true;
+    pos.setup.board = pos.board.map((row) => row.slice());
+    pos.handlePositionSet({ board: pos.board, current_turn: 'black' });
+    assert(pos.gameStatus === 'waiting' && pos.playerColor === null,
+           'position_set lands on waiting with no colour');
+    assert(el('btn-black').disabled === false && el('btn-white').disabled === false,
+           'the confirmed position shows the colour choice');
+
+    // A live game_over frame must take the pair down. They start up here because
+    // that is the state the ending has to clear: the ending is reachable without
+    // any resume, and a colour click on a settled board would re-arm the game.
+    const over = newGame();
+    over.sendMessage = () => true;
+    over.playerColor = BLACK;
+    over.gameStatus = 'playing';
+    el('btn-black').disabled = false;
+    el('btn-white').disabled = false;
+    over.handleServerMessage({ type: 'game_over', winner: 'white', reason: 'five' });
+    assert(el('btn-black').disabled === true && el('btn-white').disabled === true,
+           'handleGameOver locks both side buttons');
+
+    // The predicate on the state the server hands back after 确认.
+    assert(pos.sideChoicePending() === true, 'the confirmed position is still pending');
+});
+
+// C2c: a chooseSide that only arrives after the game settled - a stale frame is
+// the only way it can reach the click handler, the ending greys the pair - must
+// not re-arm 悔棋/求招/认输 nor drop an in-flight hint flag.
+check('C2 chooseSide after game over does not re-arm the game', () => {
+    const game = newGame();
+    game.sendMessage = () => true;
+    game.playerColor = null;
+    game.gameStatus = 'game_over';
+    game.hintInFlight = true;
+    el('btn-undo').disabled = true;
+    el('btn-hint').disabled = true;
+    el('btn-resign').disabled = true;
+    el('btn-black').disabled = false;
+    el('btn-white').disabled = false;
+
+    game.chooseSide('black');
+    assert(game.playerColor === BLACK, 'the click still claims the colour');
+    assert(el('btn-undo').disabled === true, 'a finished game keeps 悔棋 down');
+    assert(el('btn-hint').disabled === true, 'a finished game keeps 求招 down');
+    assert(el('btn-resign').disabled === true, 'a finished game keeps 认输 down');
+    assert(game.hintInFlight === true, 'the in-flight hint is not silently cleared');
+
+    // Control: the ordinary opening is still locally 'waiting' at click time, so
+    // the same call must hand all three back.
+    const fresh = newGame();
+    fresh.sendMessage = () => true;
+    fresh.hintInFlight = true;
+    el('btn-undo').disabled = true;
+    el('btn-hint').disabled = true;
+    el('btn-resign').disabled = true;
+    fresh.chooseSide('black');
+    assert(fresh.gameStatus === 'waiting', 'the client is still waiting when it clicks');
+    assert(el('btn-undo').disabled === false && el('btn-hint').disabled === false &&
+           el('btn-resign').disabled === false, 'the opening re-arms all three');
+    assert(fresh.hintInFlight === false, 'the opening releases the hint flag');
+});
+
+// C3a: a hint searched before 摆棋 was opened cannot describe the working copy.
+// The answer is dropped whole - no ring, no replay move, no line over 摆棋中 -
+// but the control it was holding comes back.
+check('C3 a hint result during setup draws nothing and keeps 摆棋中', () => {
+    const game = newGame();
+    game.sendMessage = () => true;
+    game.playerColor = BLACK;
+    game.gameStatus = 'playing';
+    game.board = emptyBoard();
+    game.enterSetup();
+    assert(game.setup.active === true, 'enterSetup arms the working copy');
+    const setupStatus = el('status').textContent;
+    assert(setupStatus.indexOf('摆棋中') === 0, 'the setup line is on screen');
+
+    game.replayIndex = 3;
+    game.hintInFlight = true;
+    el('btn-hint').disabled = true;
+    let rings = 0;
+    game.highlightMove = () => { rings += 1; };
+
+    game.handleHintResult({ row: 7, col: 7, score: 100 });
+    assert(game.hintInFlight === false, 'the answer still releases the flag');
+    assert(el('btn-hint').disabled === false, 'and 求招 comes back for the new position');
+    assert(rings === 0, 'no ring may land on the setup board');
+    assert(game.replayIndex === 3, 'the replay cursor must not move');
+    assert(el('status').textContent === setupStatus, 'the 摆棋中 line stays');
+});
+
+// C3b: the control test above must not swallow the normal path - outside 摆棋
+// the answer still marks the square and writes the status line.
+check('C3 a hint result outside setup still marks the board', () => {
+    const game = newGame();
+    game.sendMessage = () => true;
+    game.playerColor = BLACK;
+    game.gameStatus = 'playing';
+    game.board = emptyBoard();
+    game.moveHistory = [];
+    game.hintMoveCount = 0;
+    game.replayIndex = null;
+    game.hintInFlight = true;
+    el('btn-hint').disabled = true;
+    const seen = [];
+    game.highlightMove = (row, col) => { seen.push([row, col]); };
+
+    game.handleHintResult({ row: 6, col: 8, score: 123 });
+    assert(seen.length === 1 && seen[0][0] === 6 && seen[0][1] === 8,
+           'the ring still marks the suggested square');
+    assert(el('status').textContent.indexOf('建议') === 0 &&
+           el('status').textContent.indexOf('123') >= 0,
+           'the status line reports the hint, got: ' + el('status').textContent);
+    assert(game.hintInFlight === false && el('btn-hint').disabled === false,
+           'and the control is released');
+
+    // The stale-ply void still works: a different ply count says the searched
+    // position is gone, so no ring and 建议已失效.
+    const stale = newGame();
+    stale.sendMessage = () => true;
+    stale.playerColor = BLACK;
+    stale.gameStatus = 'playing';
+    stale.moveHistory = [{ row: 7, col: 7, color: BLACK }];
+    stale.hintMoveCount = 0;
+    let staleRings = 0;
+    stale.highlightMove = () => { staleRings += 1; };
+    stale.handleHintResult({ row: 5, col: 5, score: 9 });
+    assert(staleRings === 0, 'a stale answer draws no ring');
+    assert(el('status').textContent === '建议已失效', 'and reports the hint as void');
+});
+
 let failed = 0;
 for (const result of results) {
     console.log(`${result.ok ? 'PASS' : 'FAIL'} ${result.label}` +

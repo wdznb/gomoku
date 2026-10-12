@@ -894,6 +894,125 @@ void test_unreadable_record_file_survives() {
     std::cout << "test_unreadable_record_file_survives passed" << std::endl;
 }
 
+// Round 81, C1: handle_resign's "started" guard must count played plies, not
+// stones on the board. A hand-set position installs its base stones as the board
+// itself (game_manager.cpp:90), so replay_snapshot().move_count is non-zero while
+// analyses_ is still empty - and undo already refuses to give those stones back
+// for the same reason. Settling such a position handed the opponent 白棋胜（认输）
+// over zero moves on the default player_color_(BLACK).
+void test_resign_needs_a_played_ply_not_base_stones() {
+    const auto dir = scratch("c1_sessions");
+    const auto records = scratch("c1_records.jsonl");
+
+    json matrix = json::array();
+    for (int r = 0; r < BOARD_SIZE; ++r) {
+        json row = json::array();
+        for (int c = 0; c < BOARD_SIZE; ++c) row.push_back(0);
+        matrix.push_back(std::move(row));
+    }
+    matrix[7][3] = 1;  // black
+    matrix[7][4] = 2;  // white
+    const json encoding = {{"black", 1}, {"white", 2}, {"empty", 0}};
+    // The document form the client's 确认 sends: a bare matrix as a JSON value is
+    // refused outright by read_position_payload (only a *string* may be a bare
+    // grid), so nothing would be installed and the guard could not be tested.
+    const json position = {{"version", 1},
+                           {"type", "gomoku_position"},
+                           {"encoding", encoding},
+                           {"board", matrix}};
+
+    {
+        // (1) 摆子 only, no side chosen: the position is pending, two stones sit
+        // on the board, and 认输 has to be refused without settling anything.
+        Harness h(dir, records);
+        size_t seen = 0;
+        h.server.handle_set_position(h.socket, json{{"position", position}});
+        drain_frames(h.server, h.socket, seen);
+        assert(h.entry->game->position_pending());
+        assert(!h.entry->side_chosen);
+        assert(h.entry->game->board().move_count() == 2);
+        assert(h.entry->game->replay_snapshot().move_count == 2);
+        assert(h.entry->game->replay_snapshot().moves.empty());
+        assert(h.entry->game->status() == GameStatus::WAITING);
+
+        h.server.handle_resign(h.socket);
+        const std::vector<std::string> frames = drain_frames(h.server, h.socket, seen);
+        assert(frames.size() == 1);
+        const json refused = json::parse(frames[0]);
+        assert(refused["type"] == "error");
+        assert(refused["message"] == "Game not started");
+        assert(h.entry->game->status() == GameStatus::WAITING);
+        assert(h.entry->game->winner() == EMPTY);
+        assert(h.entry->game->game_over_reason_.empty());
+        assert(h.entry->game->board().move_count() == 2);
+        h.server.flush_entry(h.entry);
+        assert(records_lines(records) == 0);
+    }
+    {
+        // (2) 摆子 then choose a side and play: a real ply is on the board, so
+        // 认输 settles the game exactly as it did before.
+        Harness h(dir, records);
+        size_t seen = 0;
+        h.server.handle_set_position(h.socket, json{{"position", position}});
+        drain_frames(h.server, h.socket, seen);
+        assert(h.entry->game->position_pending());
+        h.entry->game->set_config(120000, 20);
+        h.server.handle_choose_side(h.socket, json{{"color", "black"}});
+        assert(h.entry->side_chosen);
+        assert(h.entry->game->player_color() == BLACK);
+        h.entry->game->halt_search();
+        drain_frames(h.server, h.socket, seen);
+
+        h.server.handle_make_move(h.socket, json{{"row", 9}, {"col", 9}});
+        h.entry->game->halt_search();
+        std::vector<std::string> frames = drain_frames(h.server, h.socket, seen);
+        int move_frames = 0;
+        for (const std::string& frame : frames) {
+            const json parsed = json::parse(frame);
+            assert(parsed["type"] != "error");
+            if (parsed["type"] == "move_made") ++move_frames;
+        }
+        assert(move_frames == 1);
+        assert(!h.entry->game->replay_snapshot().moves.empty());
+
+        h.server.handle_resign(h.socket);
+        assert(h.entry->game->status() == GameStatus::GAME_OVER);
+        assert(h.entry->game->winner() == WHITE);
+        assert(h.entry->game->game_over_reason_ == "resign");
+        h.server.handle_resign(h.socket);  // a finished game resigns nothing further
+        assert(h.entry->game->winner() == WHITE);
+        frames = drain_frames(h.server, h.socket, seen);
+        for (const std::string& frame : frames) {
+            assert(json::parse(frame)["type"] != "error");
+        }
+    }
+    {
+        // (3) Control, ordinary game: the first stone from an empty board starts
+        // it, and 认输 behaves verbatim as before the guard change.
+        Harness h(dir, records);
+        size_t seen = 0;
+        h.entry->game->set_config(120000, 20);
+        h.server.handle_make_move(h.socket, json{{"row", 7}, {"col", 7}});
+        h.entry->game->halt_search();
+        drain_frames(h.server, h.socket, seen);
+        assert(h.entry->game->board().move_count() == 1);
+        assert(h.entry->game->replay_snapshot().moves.size() == 1);
+
+        h.server.handle_resign(h.socket);
+        assert(h.entry->game->status() == GameStatus::GAME_OVER);
+        assert(h.entry->game->winner() == WHITE);
+        assert(h.entry->game->game_over_reason_ == "resign");
+        h.server.flush_entry(h.entry);
+        // 认输 from an empty start is a decisive game, so it still reaches the
+        // training stream.
+        assert(records_lines(records) == 1);
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    std::filesystem::remove(records, ec);
+    std::cout << "test_resign_needs_a_played_ply_not_base_stones passed" << std::endl;
+}
+
 }  // namespace
 
 int main() {
@@ -912,6 +1031,7 @@ int main() {
     test_pending_position_direct_move_claims_side();
     test_resign_survives_interruption();
     test_unreadable_record_file_survives();
+    test_resign_needs_a_played_ply_not_base_stones();
 
     std::cout << "All server tests passed!" << std::endl;
     return 0;

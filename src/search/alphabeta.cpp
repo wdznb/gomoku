@@ -122,7 +122,7 @@ int AlphaBetaSearch::quiescence(Board& board, int alpha, int beta, int color,
         }
 
         if (is_threat) {
-            if (color == BLACK && PatternRecognizer::is_forbidden(board, pos.row, pos.col, color)) {
+            if (color == BLACK && PatternRecognizer::is_forbidden_from_pattern(pattern)) {
                 continue;
             }
             // Score from the pattern we just recognized; calling

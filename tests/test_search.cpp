@@ -285,6 +285,90 @@ void test_vcf_gap_four_sequence_wins() {
     std::cout << "test_vcf_gap_four_sequence_wins passed" << std::endl;
 }
 
+void test_vcf_block_move_ignores_overline_endpoint() {
+    // Round 81 E3: an endpoint of a four is only worth defending when the attacker
+    // may legally complete five there. BLACK (7,4)(7,5)(7,6)(7,7) with a fifth
+    // stone at (7,9): filling the hole (7,8) joins (7,9) and makes six, an
+    // overline that wins nothing, so the unique legal five point is (7,3) and that
+    // is the forced block. HEAD saw both endpoints as open and returned no block
+    // at all, which made the caller `continue` and drop the candidate.
+    Board board;
+    Evaluator evaluator;
+    TranspositionTable tt;
+
+    board.place_stone(7, 4, BLACK);
+    board.place_stone(7, 5, BLACK);
+    board.place_stone(7, 6, BLACK);
+    board.place_stone(7, 7, BLACK);
+    board.place_stone(7, 9, BLACK);
+
+    // Sanity: (7,8) really is a forbidden (overline) point and (7,3) is legal.
+    assert(PatternRecognizer::is_forbidden(board, 7, 8, BLACK));
+    assert(!PatternRecognizer::is_forbidden(board, 7, 3, BLACK));
+
+    VCFSearch vcf(evaluator, tt);
+    Move block = vcf.find_block_move(board, 7, 7, BLACK);
+    assert(block.pos.row == 7);
+    assert(block.pos.col == 3);
+    assert(block.color == WHITE);
+
+    // The same group scanned from an interior stone gives the same block.
+    Move block_mid = vcf.find_block_move(board, 7, 5, BLACK);
+    assert(block_mid.pos.row == 7 && block_mid.pos.col == 3);
+
+    // And the sequence reports the win, at the legal five point.
+    std::atomic<bool> stop(false);
+    VCFMove result = vcf.search(board, BLACK, 10, stop);
+    assert(result.result == VCFResult::WIN);
+    assert(result.best_move.pos.row == 7 && result.best_move.pos.col == 3);
+
+    // WHITE is not subject to the overline rule: the identical white shape keeps
+    // both ends live, so there is still no unique block (verbatim HEAD behaviour).
+    Board white_board;
+    white_board.place_stone(7, 4, WHITE);
+    white_board.place_stone(7, 5, WHITE);
+    white_board.place_stone(7, 6, WHITE);
+    white_board.place_stone(7, 7, WHITE);
+    white_board.place_stone(7, 9, WHITE);
+    Move white_block = vcf.find_block_move(white_board, 7, 7, WHITE);
+    assert(white_block.pos.row < 0);
+
+    // BLACK with BOTH endpoints illegal must still be skipped - an illegal point
+    // is not a block. (7,2) and (7,9) each turn their side's fill into six.
+    Board both_illegal;
+    both_illegal.place_stone(7, 2, BLACK);
+    both_illegal.place_stone(7, 4, BLACK);
+    both_illegal.place_stone(7, 5, BLACK);
+    both_illegal.place_stone(7, 6, BLACK);
+    both_illegal.place_stone(7, 7, BLACK);
+    both_illegal.place_stone(7, 9, BLACK);
+    assert(PatternRecognizer::is_forbidden(both_illegal, 7, 8, BLACK));
+    assert(PatternRecognizer::is_forbidden(both_illegal, 7, 3, BLACK));
+    Move none = vcf.find_block_move(both_illegal, 7, 7, BLACK);
+    assert(none.pos.row < 0);
+    Move none_mid = vcf.find_block_move(both_illegal, 7, 5, BLACK);
+    assert(none_mid.pos.row < 0);
+
+    // Control: an ordinary four with two legal ends is still ambiguous, and a
+    // four against the edge still blocks at the single open end.
+    Board open_four;
+    open_four.place_stone(7, 4, BLACK);
+    open_four.place_stone(7, 5, BLACK);
+    open_four.place_stone(7, 6, BLACK);
+    open_four.place_stone(7, 7, BLACK);
+    assert(vcf.find_block_move(open_four, 7, 7, BLACK).pos.row < 0);
+
+    Board edge_four;
+    edge_four.place_stone(7, 0, BLACK);
+    edge_four.place_stone(7, 1, BLACK);
+    edge_four.place_stone(7, 2, BLACK);
+    edge_four.place_stone(7, 3, BLACK);
+    Move edge_block = vcf.find_block_move(edge_four, 7, 3, BLACK);
+    assert(edge_block.pos.row == 7 && edge_block.pos.col == 4);
+
+    std::cout << "test_vcf_block_move_ignores_overline_endpoint passed" << std::endl;
+}
+
 void test_vct_immediate_win() {
     Board board;
     Evaluator evaluator;
@@ -1864,6 +1948,7 @@ int main() {
     test_vcf_immediate_five();
     test_vcf_no_win();
     test_vcf_gap_four_sequence_wins();
+    test_vcf_block_move_ignores_overline_endpoint();
     test_vct_immediate_win();
     test_vct_diagonal_rush_four_is_not_a_win();
     test_vct_deadline_aborts_search();
