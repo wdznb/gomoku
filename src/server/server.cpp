@@ -705,6 +705,10 @@ void GameServer::handle_choose_side(std::shared_ptr<WebSocketSession> session, c
     // commit its move, so the session would lock up immediately.
     if (game->status() == GameStatus::GAME_OVER) {
         game->reset();
+        // The export stamp describes the game that just ended - a cold resume sets
+        // it from the saved record - and this entry keeps living, so leaving it true
+        // would keep the next finished game out of records.jsonl.
+        if (auto entry = entry_locked(session.get())) entry->exported = false;
     }
     int color = (color_str == "black") ? BLACK : WHITE;
     

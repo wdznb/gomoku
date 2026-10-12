@@ -1053,15 +1053,17 @@ check('B2 btn-replay still follows only the stale judgment', () => {
     assert(el('btn-replay-first').disabled === true, 'no moves means no replay nav');
 });
 
-// B3: 断线 texts are errors (red), 上一局找不回来了 stays a warning.
-check('B3 disconnect statuses are errors', () => {
+// B3: README:530 wants the reconnect countdown in amber (warn); only refused or
+// lost-connection events are errors (red). 上一局找不回来了 stays a warning.
+check('B3 disconnect statuses follow README colour rules', () => {
     const game = newGame();
 
     game.ws.readyState = bundle.sandbox.WebSocket.CLOSED;
     game.wsReconnect = null;
     game.scheduleReconnect();
-    assert(el('status').className === 'status error',
-           '重连倒计时 must be an error, got ' + el('status').className);
+    // README:530 explicitly prescribes amber for the reconnect countdown.
+    assert(el('status').className === 'status warn',
+           '重连倒计时 must be warn (amber), got ' + el('status').className);
 
     game.restart();
     assert(el('status').className === 'status error',
@@ -1164,6 +1166,78 @@ check('B5 eval graph dots only for mate scores', () => {
     assert(Math.abs(mixed.dots[0].x - 150) < 1e-9, 'the dot belongs to the mated ply');
     assert(Math.abs(mixed.ys[0] - 6) < 1e-9 && Math.abs(mixed.ys[1] - 6) < 1e-9,
            'both clipped plies share the top edge, ys=' + mixed.ys.join(','));
+});
+
+// D4: README:283-284 allows 直接落子 after 摆棋 confirmation without claiming a
+// side first. An empty waiting board still requires choose_side.
+check('D4 click sends make_move on a pending position', () => {
+    const game = newGame();
+    let lastMsg = null;
+    game.sendMessage = (msg) => { lastMsg = msg; return true; };
+
+    // Pending position: waiting, no colour, base stones present.
+    game.gameStatus = 'waiting';
+    game.playerColor = null;
+    game.baseStones = [{ row: 7, col: 7, color: BLACK }];
+    // The live board must also carry the base stone - displayView() composes it,
+    // but the click guard checks this.board directly.
+    game.board[7][7] = BLACK;
+    game.aiThinking = false;
+    game.replayIndex = null;  // not in replay mode
+    game.currentTurn = BLACK;  // server owns the turn until a side is claimed
+
+    // Simulate a canvas click at cell (7,8) using the geometry constants.
+    const pad = game.geom.pad;
+    const cell = game.geom.cell;
+    const x = pad + 8 * cell;  // column 8
+    const y = pad + 7 * cell;  // row 7
+    game.handleCanvasClick({ clientX: x, clientY: y });
+    
+    assert(lastMsg && lastMsg.type === 'make_move',
+           'a pending position must send make_move, got ' + JSON.stringify(lastMsg));
+    assert(lastMsg.row === 7 && lastMsg.col === 8, 'coordinates must match the click');
+
+    // Empty waiting board: no base stones → still requires choose_side.
+    const fresh = newGame();
+    fresh.sendMessage = (msg) => { lastMsg = msg; return true; };
+    fresh.gameStatus = 'waiting';
+    fresh.playerColor = null;
+    fresh.baseStones = [];
+    fresh.aiThinking = false;
+    fresh.replayIndex = null;
+    fresh.currentTurn = BLACK;
+
+    lastMsg = null;
+    fresh.handleCanvasClick({ clientX: pad + 7 * cell, clientY: pad + 7 * cell });
+    assert(lastMsg === null, 'empty waiting board must not send any move');
+
+    // Guards remain intact: aiThinking blocks clicks.
+    const thinking = newGame();
+    thinking.sendMessage = (msg) => { lastMsg = msg; return true; };
+    thinking.gameStatus = 'playing';
+    thinking.playerColor = BLACK;
+    thinking.baseStones = [];
+    thinking.aiThinking = true;
+    thinking.replayIndex = null;
+    thinking.currentTurn = BLACK;
+
+    lastMsg = null;
+    thinking.handleCanvasClick({ clientX: pad + 7 * cell, clientY: pad + 7 * cell });
+    assert(lastMsg === null, 'aiThinking must still block clicks');
+
+    // Replay view blocks clicks.
+    const replaying = newGame();
+    replaying.sendMessage = (msg) => { lastMsg = msg; return true; };
+    replaying.gameStatus = 'playing';
+    replaying.playerColor = BLACK;
+    replaying.baseStones = [];
+    replaying.aiThinking = false;
+    replaying.replayIndex = 0;  // in replay mode
+    replaying.currentTurn = BLACK;
+
+    lastMsg = null;
+    replaying.handleCanvasClick({ clientX: pad + 7 * cell, clientY: pad + 7 * cell });
+    assert(lastMsg === null, 'replay view must still block clicks');
 });
 
 // C2a: the side buttons answer "is a colour still owed?", not "is a game

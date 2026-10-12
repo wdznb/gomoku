@@ -1,5 +1,6 @@
 #include "server/server.h"
 #include "training/params.h"
+#include <filesystem>
 #include <iostream>
 #include <string>
 
@@ -67,6 +68,15 @@ int main(int argc, char* argv[]) {
             return 1;
         }
         std::cout << "Parameters loaded: " << params_path << std::endl;
+    }
+
+    // GameServer only stores web_dir and answers every GET with "Not found", so a
+    // mistyped path would still print the Open URL and leave the browser looking at
+    // dead links. Fail like --params does instead.
+    std::error_code web_ec;
+    if (!std::filesystem::is_directory(web_dir, web_ec)) {
+        std::cerr << "Invalid --web-dir " << web_dir << " (not a directory)" << std::endl;
+        return 1;
     }
 
     // GameServer installs SIGINT/SIGTERM through Asio's signal_set inside

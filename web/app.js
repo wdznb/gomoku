@@ -175,7 +175,9 @@ class GomokuGame {
         if (this.wsReconnect) return;
         const wait = Math.min(15000, 1000 * 2 ** this.wsAttempts);
         this.wsAttempts += 1;
-        this.updateStatus(`连接断开，${Math.round(wait / 1000)} 秒后重连（第 ${this.wsAttempts} 次）`, 'error');
+        // README:530 wants the reconnect countdown in 琥珀色; only the refused or
+        // lost-connection events are errors.
+        this.updateStatus(`连接断开，${Math.round(wait / 1000)} 秒后重连（第 ${this.wsAttempts} 次）`, 'warn');
         this.wsReconnect = setTimeout(() => {
             this.wsReconnect = null;
             this.openSocket();
@@ -881,7 +883,14 @@ class GomokuGame {
             return;
         }
 
-        if (this.gameStatus !== 'playing' || this.aiThinking) return;
+        // A hand-set position that nobody has claimed a side for starts with a stone
+        // just as much as with 执黑/执白 (README:283): the server claims the colour
+        // from the move and move_made brings it back, so this board is clickable.
+        // An empty waiting board is not - it has no position to start.
+        const pendingPosition = this.gameStatus === 'waiting' && this.playerColor === null &&
+            this.baseStones.length > 0;
+        if (this.aiThinking) return;
+        if (this.gameStatus !== 'playing' && !pendingPosition) return;
         // A replayed position is a read-only view of the past; clicking there
         // must not send a move for the live turn. Say so, because the click
         // otherwise vanishes and the board looks like it is ignoring the player.
@@ -889,7 +898,9 @@ class GomokuGame {
             this.updateStatus('正在回放历史，先退出回放才能落子', 'warn');
             return;
         }
-        if (this.currentTurn !== this.playerColor) return;
+        // Whose turn it is stays the server's call while no side is claimed:
+        // playerColor is null here and would reject every click.
+        if (!pendingPosition && this.currentTurn !== this.playerColor) return;
         
         if (row >= 0 && row < BOARD_SIZE && col >= 0 && col < BOARD_SIZE) {
             if (this.board[row][col] === EMPTY) {

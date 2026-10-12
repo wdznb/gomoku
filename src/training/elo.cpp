@@ -81,9 +81,12 @@ void EloSystem::record_result(int id_a, int id_b, double score_a) {
 
     a.games++;
     b.games++;
-    if (score_a > 0.75) {
+    // A partial score is only a draw when it is exactly half: with
+    // --verification-games 4 a 3-1 result lands on 0.75, and a strict bracket
+    // here printed it as a draw.
+    if (score_a >= 0.75) {
         a.wins++; b.losses++;
-    } else if (score_a < 0.25) {
+    } else if (score_a <= 0.25) {
         a.losses++; b.wins++;
     } else {
         a.draws++; b.draws++;

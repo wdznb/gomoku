@@ -221,6 +221,8 @@ bool parse_grid_text(const std::string& text, GridCells& out, std::string& error
     std::vector<std::string> blocks;  // every cell of the document, row layout ignored
     std::string row_error;
     bool ragged = false;
+    bool past_rows = false;
+    bool past_cells = false;
     while (std::getline(stream, line)) {
         const std::string stripped = trim(line);
         if (stripped.empty() || stripped[0] == '#') continue;
@@ -235,6 +237,19 @@ bool parse_grid_text(const std::string& text, GridCells& out, std::string& error
             }
         }
         rows.push_back(std::move(row));
+
+        // Tokenising the whole upload before refusing it cost 12 s and 439 MB on a
+        // 16 MB text, on the single io thread and without a session. A grid wider
+        // than 15 rows and any run past 225 cells can no longer become a board, so
+        // reading stops there and the complaint carries the count reached so far.
+        if (!ragged && static_cast<int>(rows.size()) > BOARD_SIZE) {
+            past_rows = true;
+            break;
+        }
+        if (blocks.size() > static_cast<size_t>(BOARD_SIZE * BOARD_SIZE)) {
+            past_cells = true;
+            break;
+        }
     }
 
     if (!ragged && static_cast<int>(rows.size()) == BOARD_SIZE) {
@@ -242,7 +257,11 @@ bool parse_grid_text(const std::string& text, GridCells& out, std::string& error
         return true;
     }
     if (row_error.empty()) {
-        row_error = "棋盘有 " + std::to_string(rows.size()) + " 行，需要 " + std::to_string(BOARD_SIZE) + " 行";
+        row_error = past_rows
+            ? "棋盘有超过 " + std::to_string(BOARD_SIZE) + " 行（读到 " +
+              std::to_string(rows.size()) + " 行），需要 " + std::to_string(BOARD_SIZE) + " 行"
+            : "棋盘有 " + std::to_string(rows.size()) + " 行，需要 " +
+              std::to_string(BOARD_SIZE) + " 行";
     }
 
     // Flat form: the whole document as one long run, row layout ignored - 225
@@ -286,8 +305,12 @@ bool parse_grid_text(const std::string& text, GridCells& out, std::string& error
     }
     const size_t seen_count = std::max(blocks.size(), symbols.size());
     if (seen_count > static_cast<size_t>(BOARD_SIZE)) {
-        error = "棋盘有 " + std::to_string(seen_count) + " 格，需要 " +
-                std::to_string(BOARD_SIZE * BOARD_SIZE) + " 格（15x15，分隔或连写皆可）";
+        error = past_cells
+            ? "棋盘有超过 " + std::to_string(BOARD_SIZE * BOARD_SIZE) + " 格（读到 " +
+              std::to_string(seen_count) + " 格），需要 " +
+              std::to_string(BOARD_SIZE * BOARD_SIZE) + " 格（15x15，分隔或连写皆可）"
+            : "棋盘有 " + std::to_string(seen_count) + " 格，需要 " +
+              std::to_string(BOARD_SIZE * BOARD_SIZE) + " 格（15x15，分隔或连写皆可）";
         return false;
     }
     error = row_error;
