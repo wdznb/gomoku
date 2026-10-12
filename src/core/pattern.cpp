@@ -412,28 +412,25 @@ DirectionPattern PatternRecognizer::finish_direction(const Board& board, int row
             return len;
         };
 
-        const int run = fill_run(row, col);
-        // Only a contiguous four is in scope: a gap shape's completion point is
-        // its hole, which this end-cell probe cannot reach, and match_gapped_run
-        // already proved that hole makes exactly five.
-        if (run == 4) {
-            int five_points = 0;
-            for (int sign = -1; sign <= 1; sign += 2) {
-                int r = row + sign * dr;
-                int c = col + sign * dc;
-                while (board.is_valid(r, c) && board.get(r, c) == BLACK) {
-                    r += sign * dr;
-                    c += sign * dc;
-                }
-                if (board.is_valid(r, c) && board.get(r, c) == EMPTY && fill_run(r, c) == 5) {
-                    ++five_points;
-                }
+        // The walk stops on the first empty cell after the group, which is the
+        // hole for a gapped four: only the board can say whether filling it makes
+        // exactly five, since XX_XX does while X_XXXX_X is a six-overline.
+        int five_points = 0;
+        for (int sign = -1; sign <= 1; sign += 2) {
+            int r = row + sign * dr;
+            int c = col + sign * dc;
+            while (board.is_valid(r, c) && board.get(r, c) == BLACK) {
+                r += sign * dr;
+                c += sign * dc;
             }
-            if (five_points == 0) {
-                type = PatternType::NONE;
-            } else if (type == PatternType::LIVE_FOUR && five_points == 1) {
-                type = PatternType::RUSH_FOUR;
+            if (board.is_valid(r, c) && board.get(r, c) == EMPTY && fill_run(r, c) == 5) {
+                ++five_points;
             }
+        }
+        if (five_points == 0) {
+            type = PatternType::NONE;
+        } else if (type == PatternType::LIVE_FOUR && five_points == 1) {
+            type = PatternType::RUSH_FOUR;
         }
     }
 

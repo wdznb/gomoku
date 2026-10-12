@@ -1,6 +1,7 @@
 #include "trainer.h"
 #include "params.h"
 #include <climits>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -82,6 +83,11 @@ double require_double(const char* flag, int& index, int argc, char** argv) {
     size_t used = 0;
     const double value = std::stod(text, &used);
     if (used != text.size()) {
+        throw std::invalid_argument(std::string("invalid number for ") + flag + ": " + text);
+    }
+    // stod parses "nan" and "inf" as numbers with used==size, and a NaN passes
+    // every range guard below it, so the threshold has to be checked here.
+    if (!std::isfinite(value)) {
         throw std::invalid_argument(std::string("invalid number for ") + flag + ": " + text);
     }
     return value;

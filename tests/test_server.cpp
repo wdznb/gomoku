@@ -1,7 +1,8 @@
 // Round-72 white-box tests over GameServer's session bookkeeping: the exported
 // stamp that undo / set_position reset, the residue delete when a board empties,
 // and the saved_payload stamp that may only move after a successful write.
-// All three live behind private handlers and private maps, so the class is
+// Round 77 adds GameManager's discard mark (K2), read directly by its test.
+// All of it lives behind private handlers and private maps, so the classes are
 // un-privated for this translation unit only: every header server.h pulls in is
 // pre-included first, so only this project's classes are affected. No io thread
 // is started - handlers are called directly and sends just queue on the
@@ -18,7 +19,6 @@
 #include "search/alphabeta.h"
 #include "search/search_engine.h"
 #include "training/game_record.h"
-#include "server/game_manager.h"
 #include "server/session_store.h"
 
 #include <boost/beast/core.hpp>
@@ -78,6 +78,11 @@
 #include <vector>
 
 #define private public
+// game_manager.h is included inside the macro on purpose: the K2 test below
+// reads GameManager's discard_pending_ directly, and its include guard means
+// the class body is only rewriteable here, on first inclusion. Everything it
+// pulls in is pre-included above.
+#include "server/game_manager.h"
 #include "server/server.h"
 #undef private
 
@@ -455,6 +460,50 @@ void test_failed_export_retries_records_append() {
     std::cout << "test_failed_export_retries_records_append passed" << std::endl;
 }
 
+// R77 K2: halt_search (reset / set_position / restore / resign / the destructor)
+// raises discard_pending_ so an in-flight worker drops its best move, and only
+// start_ai_thinking used to lower it again. A hint asked for right after any of
+// those paths was accepted and really searched, but the worker dropped the
+// answer at the discard gate - the client's 求招 waited forever. request_hint
+// is a fresh delivery and must clear the mark before it starts.
+void test_request_hint_clears_stale_discard() {
+    Board setup;
+    setup.place_stone(7, 7, BLACK);
+    setup.place_stone(6, 6, WHITE);
+
+    auto probe = [](const char* path, GameManager& game) {
+        assert(game.discard_pending_.load());
+        assert(game.request_hint(300, 1));
+        assert(!game.discard_pending_.load());
+        game.halt_search();
+        std::cout << "  request_hint clears the discard mark after " << path << std::endl;
+    };
+
+    GameManager after_reset;
+    after_reset.reset();
+    probe("reset", after_reset);
+
+    GameManager after_position;
+    assert(after_position.set_position(setup));
+    probe("set_position", after_position);
+
+    GameManager after_resign;
+    after_resign.set_player_color(BLACK);
+    after_resign.resign(BLACK);
+    assert(after_resign.status() == GameStatus::GAME_OVER);
+    probe("resign", after_resign);
+
+    // Control: the other clearing door, start_ai_thinking, behaves the same.
+    GameManager after_arm;
+    after_arm.reset();
+    assert(after_arm.discard_pending_.load());
+    after_arm.start_ai_thinking(300, 1);
+    assert(!after_arm.discard_pending_.load());
+    after_arm.halt_search();
+
+    std::cout << "test_request_hint_clears_stale_discard passed" << std::endl;
+}
+
 }  // namespace
 
 int main() {
@@ -468,6 +517,7 @@ int main() {
     test_failed_flush_retries_and_keeps_dedup();
     test_check_position_skips_session_creation();
     test_failed_export_retries_records_append();
+    test_request_hint_clears_stale_discard();
 
     std::cout << "All server tests passed!" << std::endl;
     return 0;

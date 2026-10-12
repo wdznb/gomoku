@@ -897,6 +897,67 @@ check('J8 stale hint replies are refused', () => {
     assert(freshStatus === '建议 H8 · 分值 100', 'got: ' + freshStatus);
 });
 
+// L7: 终止 stops the AI search, not a hint search - a hint already in flight
+// still answers after stop_thinking (the ply-count check is what voids a stale
+// one). The old code restored 求招 by the plain rule at the end of
+// stopThinking, so the button claimed idle while hintInFlight was still armed.
+check('L7 stop_thinking keeps 求招 held while a hint is in flight', () => {
+    const game = newGame();
+    game.playerColor = BLACK;
+    game.gameStatus = 'playing';
+    game.sendMessage = () => true;
+    game.hintInFlight = true;
+    el('btn-hint').disabled = true;
+
+    game.stopThinking();
+    assert(game.aiThinking === false, '终止 disarms the throwaway flag');
+    assert(el('btn-hint').disabled === true,
+           'an in-flight hint keeps 求招 held through stop_thinking');
+
+    // Control: with no hint out, 终止 restores the ordinary rule as before.
+    const idle = newGame();
+    idle.playerColor = BLACK;
+    idle.gameStatus = 'playing';
+    idle.sendMessage = () => true;
+    idle.hintInFlight = false;
+    el('btn-hint').disabled = true;
+    idle.stopThinking();
+    assert(el('btn-hint').disabled === false, 'a plain stop hands 求招 back');
+
+    // The other two corners of the old rule still hold.
+    const unclaimed = newGame();
+    unclaimed.playerColor = null;
+    unclaimed.gameStatus = 'playing';
+    unclaimed.sendMessage = () => true;
+    unclaimed.hintInFlight = false;
+    el('btn-hint').disabled = false;
+    unclaimed.stopThinking();
+    assert(el('btn-hint').disabled === true, 'no side chosen keeps 求招 held');
+
+    const over = newGame();
+    over.playerColor = BLACK;
+    over.gameStatus = 'game_over';
+    over.sendMessage = () => true;
+    over.hintInFlight = false;
+    el('btn-hint').disabled = false;
+    over.stopThinking();
+    assert(el('btn-hint').disabled === true, 'a finished game keeps 求招 held');
+
+    // The undo path is unchanged: it releases the flag and hands the control
+    // back by the plain rule (F3 above pins the same shape).
+    const undone = newGame();
+    undone.playerColor = BLACK;
+    undone.gameStatus = 'playing';
+    undone.baseStones = [];
+    undone.moveHistory = [];
+    undone.board = emptyBoard();
+    undone.hintInFlight = true;
+    el('btn-hint').disabled = true;
+    undone.handleUndoSuccess({ move_count: 0, game_status: 'playing' });
+    assert(undone.hintInFlight === false, 'the undo releases the flag');
+    assert(el('btn-hint').disabled === false, 'the undo hands 求招 back by the rule');
+});
+
 let failed = 0;
 for (const result of results) {
     console.log(`${result.ok ? 'PASS' : 'FAIL'} ${result.label}` +

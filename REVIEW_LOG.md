@@ -1331,3 +1331,70 @@ they are recorded here as round-77 candidates rather than as regressions of this
   while `match_gapped_run` (`:257-259`) only counts stones: `stones == 4` becomes `RUSH_FOUR` with no board
   check. The consequence is not limited to the evaluation - a phantom four feeds `four_count`, so a legal
   black move can be rejected as 双四/四三.
+
+## 轮次77 缺口四的成五点、被吞掉的求招与规则常量的下界 — bugfix round 77 (phase5-bugfix)
+
+**Found.** Round 76's two evidence probes came back 属实 and were joined by three more read-only audits
+(core rules, server/session lifecycle, training/CLI). R1: the black-four correction in
+`pattern.cpp:393-437` was gated on `if (run == 4)` (`:419`), so gap shapes never got the board-level
+exactly-five check - `match_gapped_run` (`:257-259`) only counts stones - and the comment at `:416-418`
+asserted a proof that function never makes. K2: `request_hint()` (`game_manager.cpp:286-296`) cleared
+`stop_flag_` but never `discard_pending_`, the only flag K1's delivery predicate reads, and every path that
+goes through `halt_search()` (reset / set_position / restore_game / resign / destructor) leaves it raised,
+so a 求招 after 摆棋 or 重开 searched to completion and was then dropped without even an `error` frame.
+L1: `params.cpp:183` guarded `five` only from above and `forbidden_penalty` not at all, so a file could set
+`five: 0` (making `evaluator.cpp:158-162`'s `cap = five - 1` flatten or invert the whole static
+evaluation) or `forbidden_penalty: 0` (turning a 禁手 into an incentive) or `>= 100000` (making
+`alphabeta.cpp:247/:357` read our own rule penalty as a proven mate loss and `search_engine.cpp:191`
+resign). L2: `require_double` (`main_trainer.cpp:80-88`) only checked `used != text.size()`, and `stod`
+consumes `nan`/`inf` wholly, so `--accept-score nan` passed the `(0.5, 1.0]` guard at `:219` - NaN
+compares false against everything - leaving every Elo comparison false and the run silently never
+promoting. L3: `--no-sessions` cleared both persistence paths inside the parse loop (`main.cpp:27-29`), so
+a later `--records` re-armed half of what README:161 calls 完全关闭落盘. L5: README:115-118 enumerated the
+manual-compile source set as core/search/optimization/server "外加 `src/training/params.cpp`", but
+`GOMOKU_SOURCES` also carries `src/training/game_record.cpp`, which `server.cpp:157`'s `GameEndReason`
+needs. L7: `stopThinking()` (`app.js:954-966`) re-enabled 求招 without releasing `hintInFlight`, the very
+flag `requestHint()` short-circuits on (`:928`) - and a hint really can be running when 终止 is clickable,
+because the server emits `thinking_progress` for a hint search too - so the button looked free and did
+nothing; `handleUndoSuccess`'s comment meanwhile claimed an undo aborts the hint search, which
+`GameManager::undo` (`:189-192`) never does.
+
+**Refuted before dispatch.** The core audit's "the whole-board evaluation credits black's forbidden
+shapes" is unreachable: every move-generation path filters them first (`alphabeta.cpp:33/:125`,
+`greedy.cpp:32`, `search_engine.cpp:46/:88`, `vcf.cpp:16`, `vct.cpp:16`, `opening_book.cpp:236`,
+`self_play.cpp:11`), so `evaluate_board` never sees an illegal black stone. "The default-empty
+`--records`/`--samples` make README:175's step 4 silently produce nothing" is README-consistent - README:199
+documents both defaults as 空 and README:195 makes `--no-data` the opt-out, and games with no destination
+would only burn the round's budget. The `--resume` overriding `--seed` row is the round-73/74 refutation
+re-surfaced. The crash-between-append-and-checkpoint duplicate `game_id` finding is real but its fix is an
+idempotent-resume design (persist a high-water mark before appending, or dedup on load), not a point defect,
+so it is recorded as deferred rather than dispatched; the same goes for the trainer's `game_id` base hole and
+the redundant forbidden check from round 76.
+
+**Fixed.** R1: the `run == 4` gate is gone, so the exactly-five scan runs for every black four - the walk
+past the group stops on the first empty cell, which *is* the gap shape's hole, and `fill_run` on the board
+decides whether filling it makes five; zero five-points drops the label to NONE, one demotes a LIVE_FOUR to
+RUSH_FOUR, and white is untouched because a six there is a win. K2: `request_hint()` now clears
+`discard_pending_` immediately after joining the previous hint thread and before spawning the new one. L1:
+`five` must stay above zero, `forbidden_penalty` must stay strictly inside `(0, 100000)`; a missing key still
+keeps the compile default, so `five: 100000` / `forbidden_penalty: 50000` files and the 88888/77777
+pass-through round-trip both still load. L2: `require_double` rejects non-finite values, so `nan`, `inf` and
+`-inf` exit 1 like any other bad number. L3: `--no-sessions` only records the flag and clears both paths
+after the loop, making it order-independent. L5: README now lists both training sources. L7: `stopThinking()`
+keeps 求招 disabled while `hintInFlight` is true, and the undo comment now says what actually happens - the
+in-flight answer still arrives and is voided by the ply-count check.
+
+**Verified.** The test session wrote the cases and the orchestrator re-ran the gate on the same tree: plain
+`cmake .. && make -j4` with no new warnings, `ctest` **8/8**, `node tests/web_frontend_check.js` **18/18**.
+New in-suite cases: `test_window_edge_gapped_four` (R1 - edge shape NONE, whole-position `four_count == 0`,
+the three-stone control still RUSH_FOUR, a real live four still LIVE_FOUR, a single-five-point shape still
+demoted to RUSH_FOUR, and white unchanged), `test_request_hint_clears_stale_discard` (K2 white-box), and the
+L1 loader rejections. Negative proofs were all done off-repo - relinking the pre-fix `pattern.cpp`,
+`params.cpp`, trainer and server in `/tmp`, or a copied harness - and each fired exactly the expected
+failure (`Assertion \`edge.type == PatternType::NONE' failed` printing `RUSH_FOUR`; the HEAD loader
+accepting all five broken constant files; the HEAD trainer accepting `nan`/`inf`/`-inf`; the HEAD server
+creating the session dir and re-opening persistence for `--no-sessions --records`; one FAIL / 17 pass with
+`|| this.hintInFlight` removed). K2 was re-checked end to end against the live binary: the 摆棋 and restart
+sequences that previously printed zero frames in 15 s now answer in 11.2 s and 19.9 s. The repo diff is
+confined to `tests/` (+318/-2 in four files); no `src/`, `web/`, `README.md`, `CMakeLists.txt` or `data/`
+file was touched by the test session, and no `gomoku_server` process was left behind.

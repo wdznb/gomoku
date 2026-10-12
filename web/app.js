@@ -961,8 +961,10 @@ class GomokuGame {
         // it; the player is owed the ordinary rules, not a stuck board.
         document.getElementById('btn-undo').disabled =
             this.playerColor === null || this.gameStatus === 'game_over';
+        // 终止 only stops the search early - the hint still answers, so the control
+        // stays disabled while that answer is in flight instead of pretending idle.
         document.getElementById('btn-hint').disabled =
-            this.playerColor === null || this.gameStatus === 'game_over';
+            this.playerColor === null || this.gameStatus === 'game_over' || this.hintInFlight;
     }
     
     // ---- 摆棋 (position setup) ---------------------------------------
@@ -1664,9 +1666,9 @@ class GomokuGame {
         this.updateTurnInfo();
         this.refreshReplayControls();
         this.drawBoard();
-        // An undo interrupts a hint search that is still running, and the aborted
-        // search answers with neither hint_result nor an error, so this is where
-        // the control comes back - otherwise 求招 stays greyed for the whole game.
+        // An undo does not abort a hint search that is still running: the search
+        // finishes and still answers, so this only hands the control back. The
+        // answer for the pre-undo position is voided by the ply-count check.
         this.hintInFlight = false;
         document.getElementById('btn-hint').disabled =
             this.playerColor === null || this.gameStatus === 'game_over';

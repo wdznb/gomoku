@@ -1695,6 +1695,114 @@ void test_params_rejects_non_object_coefficients() {
     std::cout << "test_params_rejects_non_object_coefficients passed" << std::endl;
 }
 
+// R77 L1: the two rule constants behind every mate score are checked at the
+// door. five <= 0 collapses the evaluation scale (ordinary scores are capped at
+// five - 1), and forbidden_penalty <= 0 turns the forbidden-move cost into a
+// bonus; at the 100000 mate threshold AlphaBeta reads our own penalty as a
+// proven loss and resigns. A rejected file must leave `out` untouched.
+void test_params_rejects_broken_rule_constants() {
+    ThreatCoefficients sentinel;
+    sentinel.five = 31337;
+    sentinel.forbidden_penalty = 4242;
+
+    const char* rejected[] = {
+        R"({"coefficients":{"five":0}})",
+        R"({"coefficients":{"five":-1}})",
+        R"({"coefficients":{"five":100001}})",
+        R"({"coefficients":{"forbidden_penalty":0}})",
+        R"({"coefficients":{"forbidden_penalty":-5}})",
+        R"({"coefficients":{"forbidden_penalty":100000}})",
+        R"({"coefficients":{"forbidden_penalty":100001}})",
+        R"({"five":0})",
+    };
+    std::string error;
+    for (const char* text : rejected) {
+        ThreatCoefficients out = sentinel;
+        error.clear();
+        assert(!CoefficientVector::from_json_string(text, out, error));
+        assert(!error.empty());
+        assert(out.five == sentinel.five);
+        assert(out.forbidden_penalty == sentinel.forbidden_penalty);
+        std::cout << "  rejected " << text << " -> " << error << std::endl;
+    }
+
+    // Accepted: the defaults when neither key is present, the boundary values,
+    // and a round-trip through the writer.
+    const ThreatCoefficients defaults;
+    ThreatCoefficients parsed;
+    error.clear();
+    assert(CoefficientVector::from_json_string("{}", parsed, error));
+    assert(parsed.five == defaults.five);
+    assert(parsed.forbidden_penalty == defaults.forbidden_penalty);
+
+    error.clear();
+    assert(CoefficientVector::from_json_string(
+        R"({"coefficients":{"five":100000,"forbidden_penalty":50000}})", parsed, error));
+    assert(parsed.five == 100000);
+    assert(parsed.forbidden_penalty == 50000);
+    std::cout << "  accepted the 100000/50000 boundary" << std::endl;
+
+    ThreatCoefficients round_trip;
+    round_trip.five = 88888;
+    round_trip.forbidden_penalty = 77777;
+    error.clear();
+    assert(CoefficientVector::from_json_string(
+        CoefficientVector::to_json_string(round_trip), parsed, error));
+    assert(parsed.five == 88888);
+    assert(parsed.forbidden_penalty == 77777);
+    std::cout << "  round-tripped 88888/77777 through the writer" << std::endl;
+
+    std::cout << "test_params_rejects_broken_rule_constants passed" << std::endl;
+}
+
+// R77 L2: stod() parses "nan"/"inf" with used == text.size(), and a NaN then
+// sails through every range guard below it (all comparisons are false), so
+// --accept-score nan used to start a training run whose promotion threshold no
+// score can clear. The reader must refuse non-finite numbers like any other
+// malformed text, and the ordinal threshold must still parse.
+void test_trainer_cli_rejects_non_finite_accept_score() {
+#ifndef _WIN32
+    if (!std::filesystem::exists("gomoku_train")) {
+        std::cout << "  trainer CLI --accept-score probes skipped: binary not in the"
+                     " working directory" << std::endl;
+        return;
+    }
+    const std::filesystem::path out = temp_path("accept_cli_stdout.txt");
+    const std::filesystem::path err = temp_path("accept_cli_stderr.txt");
+    auto read_all = [](const std::filesystem::path& p) {
+        std::ifstream in(p);
+        std::ostringstream text;
+        text << in.rdbuf();
+        return text.str();
+    };
+    auto run = [&](const std::string& command) {
+        const int status = std::system(command.c_str());
+        assert(status != -1);
+        return WEXITSTATUS(status);
+    };
+    const std::string redirect = " > '" + out.string() + "' 2> '" + err.string() + "'";
+    std::error_code ec;
+
+    for (const char* value : {"nan", "inf", "-inf"}) {
+        std::filesystem::remove(out, ec);
+        std::filesystem::remove(err, ec);
+        assert(run(std::string("./gomoku_train --accept-score ") + value + redirect) == 1);
+        const std::string message = read_all(err);
+        assert(message.find("invalid number for --accept-score") != std::string::npos);
+        std::cout << "  --accept-score " << value << ": "
+                  << message.substr(0, message.find('\n')) << std::endl;
+    }
+
+    // Positive control: a finite value parses, so --help still runs and prints
+    // the usage text - the refusals above are about the value, not the flag.
+    std::filesystem::remove(out, ec);
+    assert(run("./gomoku_train --accept-score 0.9 --help" + redirect) == 0);
+    assert(read_all(out).find("Usage:") != std::string::npos);
+    std::cout << "  --accept-score 0.9: parsed, --help printed the usage text" << std::endl;
+#endif
+    std::cout << "test_trainer_cli_rejects_non_finite_accept_score passed" << std::endl;
+}
+
 int main() {
     std::cout << "Running training tests..." << std::endl;
 
@@ -1733,6 +1841,8 @@ int main() {
     test_write_failures_report_to_stderr();
     test_buffered_write_failures_are_caught();
     test_params_rejects_non_object_coefficients();
+    test_params_rejects_broken_rule_constants();
+    test_trainer_cli_rejects_non_finite_accept_score();
 
     std::cout << "All training tests passed" << std::endl;
     return 0;

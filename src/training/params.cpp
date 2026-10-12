@@ -184,6 +184,19 @@ bool CoefficientVector::from_json_string(const std::string& text, ThreatCoeffici
         error = "five must not exceed the 100000 mate threshold";
         return false;
     }
+    // The evaluator caps ordinary scores at five - 1, so a non-positive five
+    // flattens them or turns the whole static evaluation negative.
+    if (coeffs.five <= 0) {
+        error = "five must stay above zero or the evaluation scale collapses";
+        return false;
+    }
+    // forbidden_penalty is a cost: at or below zero a forbidden move becomes an
+    // incentive, and at the mate threshold alphabeta reads our own penalty as a
+    // proven loss and resigns.
+    if (coeffs.forbidden_penalty <= 0 || coeffs.forbidden_penalty >= 100000) {
+        error = "forbidden_penalty must stay between zero and the 100000 mate threshold";
+        return false;
+    }
 
     sanitize(coeffs);
     out = coeffs;

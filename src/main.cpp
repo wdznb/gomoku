@@ -10,6 +10,7 @@ int main(int argc, char* argv[]) {
     std::string sessions_dir = "data/sessions";
     std::string records_path = "data/training/records.jsonl";
     std::string params_path;
+    bool no_sessions = false;
 
     try {
         for (int i = 1; i < argc; ++i) {
@@ -25,8 +26,9 @@ int main(int argc, char* argv[]) {
             } else if (arg == "--sessions" && i + 1 < argc) {
                 sessions_dir = argv[++i];
             } else if (arg == "--no-sessions") {
-                sessions_dir.clear();
-                records_path.clear();
+                // Only the flag is recorded here: clearing the paths in the loop
+                // would let a later --records re-open one half of persistence.
+                no_sessions = true;
             } else if (arg == "--records" && i + 1 < argc) {
                 records_path = argv[++i];
             } else if (arg == "--params" && i + 1 < argc) {
@@ -47,6 +49,11 @@ int main(int argc, char* argv[]) {
     if (port < 1 || port > 65535) {
         std::cerr << "Invalid --port " << port << " (must be 1-65535)" << std::endl;
         return 1;
+    }
+
+    if (no_sessions) {
+        sessions_dir.clear();
+        records_path.clear();
     }
 
     // Trained coefficients are optional; a missing or malformed file is fatal

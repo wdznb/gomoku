@@ -294,6 +294,10 @@ bool GameManager::request_hint(int timeout_ms, int max_depth) {
 
     hint_active_.store(true);
     stop_flag_.store(false);
+    // A hint is a fresh delivery, so it has to undo the discard mark the last
+    // halt_search left: 摆棋/重开 route through halt_search, and without this the
+    // next hint searches to completion and then drops the answer in silence.
+    discard_pending_.store(false);
     int turn = current_turn();
     Board board_snapshot = board_;
 

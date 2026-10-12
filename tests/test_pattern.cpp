@@ -646,6 +646,100 @@ void test_asymmetric_live_three() {
     std::cout << "test_asymmetric_live_three passed" << std::endl;
 }
 
+static const char* pattern_name(PatternType type) {
+    switch (type) {
+        case PatternType::NONE:         return "NONE";
+        case PatternType::SLEEPY_TWO:   return "SLEEPY_TWO";
+        case PatternType::LIVE_TWO:     return "LIVE_TWO";
+        case PatternType::SLEEPY_THREE: return "SLEEPY_THREE";
+        case PatternType::LIVE_THREE:   return "LIVE_THREE";
+        case PatternType::RUSH_FOUR:    return "RUSH_FOUR";
+        case PatternType::LIVE_FOUR:    return "LIVE_FOUR";
+        case PatternType::FIVE:         return "FIVE";
+        case PatternType::LONG_FIVE:    return "LONG_FIVE";
+    }
+    return "?";
+}
+
+// R77 R1: the phantom four at the window edge. BLACK holds (7,2)..(7,5) with
+// (7,6) empty and the probe lands on (7,7). The 9-cell window only sees cols
+// 3..5 plus the probe, so the gapped matcher reads XX_X and calls it a rush
+// four. The old code skipped the five-point walk whenever the run through the
+// probe was not four stones, so the label survived even though filling (7,6)
+// connects cols 2..7 - a six, i.e. an overline, not a five. The walk now always
+// runs for BLACK fours, and a completion-less "four" is demoted to NONE.
+void test_window_edge_gapped_four() {
+    // The phantom: (7,2) sits outside the window, so nothing in the window can
+    // see that the hole completion overruns.
+    Board phantom;
+    phantom.place_stone(7, 2, BLACK);
+    phantom.place_stone(7, 3, BLACK);
+    phantom.place_stone(7, 4, BLACK);
+    phantom.place_stone(7, 5, BLACK);
+    const DirectionPattern edge =
+        PatternRecognizer::recognize_direction(phantom, 7, 7, BLACK, 0);
+    std::cout << "  (7,2)(7,3)(7,4)(7,5) probe (7,7) dir (0,1): "
+              << pattern_name(edge.type) << std::endl;
+    assert(edge.type == PatternType::NONE);
+    const PositionPattern whole = PatternRecognizer::recognize_position(phantom, 7, 7, BLACK);
+    assert(whole.directions[0].type == PatternType::NONE);
+    assert(whole.four_count == 0 && !whole.has_rush_four && !whole.has_live_four);
+    assert(whole.has_four_four == false && whole.has_four_three == false);
+
+    // Control: drop the out-of-window stone and the same probe IS a rush four -
+    // filling (7,6) now makes exactly five (cols 3..7).
+    Board control;
+    control.place_stone(7, 3, BLACK);
+    control.place_stone(7, 4, BLACK);
+    control.place_stone(7, 5, BLACK);
+    const DirectionPattern kept =
+        PatternRecognizer::recognize_direction(control, 7, 7, BLACK, 0);
+    std::cout << "  control (7,3)..(7,5) probe (7,7) dir (0,1): "
+              << pattern_name(kept.type) << std::endl;
+    assert(kept.type == PatternType::RUSH_FOUR);
+
+    // (a) A true live four keeps both of its five points: filling either end of
+    // XXXX_ still makes exactly five.
+    Board live;
+    live.place_stone(7, 4, BLACK);
+    live.place_stone(7, 5, BLACK);
+    live.place_stone(7, 6, BLACK);
+    const DirectionPattern live_four =
+        PatternRecognizer::recognize_direction(live, 7, 7, BLACK, 0);
+    std::cout << "  live four (7,4)..(7,6) probe (7,7) dir (0,1): "
+              << pattern_name(live_four.type) << std::endl;
+    assert(live_four.type == PatternType::LIVE_FOUR);
+
+    // (b) The one-five-point demotion the walk already performed is not lost:
+    // with (7,2) added, the left completion overruns (cols 2..7) and only
+    // (7,8) still wins, so the same live four becomes a rush four.
+    Board one_point;
+    one_point.place_stone(7, 2, BLACK);
+    one_point.place_stone(7, 4, BLACK);
+    one_point.place_stone(7, 5, BLACK);
+    one_point.place_stone(7, 6, BLACK);
+    const DirectionPattern demoted =
+        PatternRecognizer::recognize_direction(one_point, 7, 7, BLACK, 0);
+    std::cout << "  live four + (7,2) probe (7,7) dir (0,1): "
+              << pattern_name(demoted.type) << std::endl;
+    assert(demoted.type == PatternType::RUSH_FOUR);
+
+    // (c) WHITE is not subject to the overline rule, so the same phantom shape
+    // is a real winning threat for WHITE and keeps its label.
+    Board white;
+    white.place_stone(7, 2, WHITE);
+    white.place_stone(7, 3, WHITE);
+    white.place_stone(7, 4, WHITE);
+    white.place_stone(7, 5, WHITE);
+    const DirectionPattern white_four =
+        PatternRecognizer::recognize_direction(white, 7, 7, WHITE, 0);
+    std::cout << "  WHITE (7,2)..(7,5) probe (7,7) dir (0,1): "
+              << pattern_name(white_four.type) << std::endl;
+    assert(white_four.type == PatternType::RUSH_FOUR);
+
+    std::cout << "test_window_edge_gapped_four passed" << std::endl;
+}
+
 int main() {
     std::cout << "Running pattern tests..." << std::endl;
     
@@ -668,6 +762,7 @@ int main() {
     test_recognize_position_both_matches_pair();
     test_bitboard_matches_scalar();
     test_asymmetric_live_three();
+    test_window_edge_gapped_four();
     
     std::cout << "All pattern tests passed!" << std::endl;
     return 0;

@@ -113,7 +113,7 @@ make -j$(nproc)
 ### 方法3：手动编译
 
 不推荐。服务器需要 `CMakeLists.txt` 里 `GOMOKU_SOURCES` 列出的**全部**源文件（core / search /
-optimization / server，外加 `src/training/params.cpp`）一起编译，头文件目录指向 Boost 与
+optimization / server，外加 `src/training/params.cpp` 与 `src/training/game_record.cpp`）一起编译，头文件目录指向 Boost 与
 nlohmann/json，链接 `-lpthread`，再把 `web/` 与 `data/` 复制到可执行文件旁边——开局库和局面模板
 都是按相对路径打开的。单独挑几个文件编译只会缺符号，文件清单以 `CMakeLists.txt` 为准。
 
