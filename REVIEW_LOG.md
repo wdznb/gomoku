@@ -1579,6 +1579,66 @@ wording, the `--resume` write-back and exit-1 rule).
 **Verified.** Fixer-side only at entry time: each item passed its permitted syntax self-check
 (`g++ -fsyntax-only` on the touched translation unit, `node --check web/app.js`), all clean; the F1
 regression that motivated F1b is on record (`test_training.cpp` failed on
-`from_json_string(R"({"live_four":40000})")` before the narrowing). The full `ctest` and web-harness
-regressions belong to the test session and were still pending when this entry was written; the batch was
-uncommitted in the tree.
+`from_json_string(R"({"live_four":40000})")` before the narrowing). The test session then ran the gate:
+`ctest` **8/8**, `node tests/web_frontend_check.js` **30/30**, and the `--resume`/`--checkpoint` CLI script.
+Negative proofs against `c052f59` (`build/neg85`): F1 `test_training.cpp:2257`, F3 `test_search.cpp:552`,
+G1 `test_server.cpp:1093`, G2 `:1198`, G3 `test_position.cpp:307`, G4 `test_server.cpp:1152`, H1 `:1257`,
+F1b's probe table (HEAD silently rewrote the stated values `live_two 1000→100`, `rush_four 15000→10000`,
+`sleepy_two 500→50`), F2-HEAD (the resumed checkpoint stayed at `rounds_completed:1` while the default file
+was written), and F4 only at a 10 ms budget (HEAD `alphabeta depth 0` vs `greedy depth 0`). Two reds turned
+out to be **the tests' own assumptions**, not the code: `test_set_position_reopens_export` cached
+`h.entry` at construction and G1 legitimately replaces the entry once the previous game has content, and
+`test_opening_book_large_weight_no_overflow` pinned a single draw when the ordered key `(7,7),(8,8)` legally
+holds the identity *and* the transposed reply - `(6,6)/(6,7)/(7,6)` in a 49.8/24.9/25.3 split over 100k
+draws, which `c052f59`'s per-move seeding exposed. Both were rewritten to the new contract; the remaining
+six `handle_set_position` call sites were audited and are unaffected (empty pre-state → in-place reuse).
+
+## 轮次86 文本字段的类型门、越界的配置哨兵与被吞掉的临时文件 — bugfix round 86 (phase5-bugfix)
+
+**Found.** All four sit in the loaders the page and the trainer read back from disk, and each one is a
+present-but-unusable value being treated as an absent one:
+
+`session_store.cpp:111-113` read a `player_color`/`status`/`winner`/`reason` key only when it was a string,
+so a damaged `"winner": null` resumed as "" - the writer's own "not decided yet" - and the page announced
+白棋胜 for a game that ended differently (`web/app.js:1823` falls through to the white branch for anything
+that is not `black`/`draw`). `session_store.cpp:166-177` claimed its bounds matched the message-boundary
+clamps but used `< 0` / `> 120000` and `< 0` / `> 20`, so a file stating `timeout_ms: 50` loaded and was
+installed straight through `game->set_config` at the resume path, below the 100 ms floor README:338 and the
+1-20 depth rule README:340 promise. `save_session` removed the `.tmp` when the *rename* failed
+(`:240-245`) but returned early on a mid-write failure (`:235-238`) without removing it, leaving
+`<token>.json.tmp` behind forever - README:450 states the atomic write leaves no temporary file.
+`data_collector.cpp:222` turned any colour string that was not exactly `"black"` into WHITE, including
+`"BLACK"`, `"b"` and `""`, loading a sample whose label blames the wrong player for the move - while the
+writer at `:160` only ever emits `black`/`white` and the sibling loader at `game_record.cpp:138-144`
+*refuses* an unknown colour for the same field.
+
+**Fixed.** `read_string` now returns a verdict: absent stays absent (the writer's "not set yet" is legal),
+present-but-not-a-string refuses the whole file, which is the rule `position_pending` and `base` already
+followed - and the refused file then takes the documented unreadable-record path (fresh token, file kept
+for inspection, README:474-478). The config bounds became `!= 0 && (out of [100,120000] / [1,20])`, with 0
+kept as the "never set" sentinel `SessionSnapshot`'s default and `server.cpp`'s `> 0` test both depend on,
+and the comment rewritten to say exactly that. The mid-write failure branch now
+`std::filesystem::remove(tmp, ec)` before returning. The sample colour read accepts only `"black"`/`"white"`
+and refuses anything else, with no new cross-module dependency.
+
+**Refuted this round.** `elo.cpp:153-164` defaulting a damaged wins/losses/draws/games counter to 0: the
+comment at `:146-147` pins the intent, README promises nothing about that file's strictness, and the only
+consequence is the K-factor bracket - hardening, not a defect. The same reasoning kept `created_ms` /
+`updated_ms` out of the type gate (they are re-stamped on every flush, so refusing a file over them would
+cost the player a playable game), and it rules out a "status == game_over implies non-empty winner"
+cross-field rule (round-75 settled EMPTY↔"draw" as notation). From the frontend audit: the 摆棋记录 seeded
+with the old game's 落子记录 is README:356's prescribed behaviour (进入摆棋时自动把当前落子记录写进摆棋记录),
+the status line printing `分值 100000` is README:320 asking for the score (the 胜/负 mapping is the list and
+curve's job), and an unguarded `localStorage` in a sandboxed iframe is an untargeted environment, not a
+reachable defect.
+
+**Verified.** `ctest` **8/8** and `node tests/web_frontend_check.js` **30/30** (re-run by the orchestrator at
+the commit), new cases `test_rejects_non_string_envelope_fields`, `test_session_config_range_edges`,
+`test_save_session_leaves_no_tmp`, `test_sample_move_color_must_be_exact`. Negative proofs against
+`891df39` in `build/neg86`: P1 `test_session.cpp:263` (HEAD accepts `"winner": null`), P2 `:362` (HEAD
+accepts `timeout_ms: 50`), P3 `test_training.cpp:1478` (HEAD reads `"BLACK"` as WHITE and returns true).
+P5 has **no observable difference** in these cases and was left without a negative proof on purpose: the
+branch needs a real mid-write failure (`file.good()` after the flush), which no test can provoke through
+`save_session(dir, snap, error)` - inventing one would mean opening a failure back door in `src`, and the
+degraded case (a normal save leaves no `.tmp`, an illegal token writes nothing) passes on HEAD exactly as it
+should.

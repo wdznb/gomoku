@@ -447,7 +447,9 @@ ctest --output-on-failure
 
 `test_session` 对着真实的临时目录测会话文件：token 只认小写十六进制（`../etc/passwd` 这类一律拒绝，
 非法 token 连磁盘都不碰）、快照字段与内嵌 `GameRecord` 的原样往返、版本 / 状态 / `base` 损坏时的
-拒绝、`.tmp` + rename 之后不留临时文件、目录列举跳过 `*.txt` 与 `*.json.tmp`、被截断的 JSON 读不出来。
+拒绝、文本字段（`player_color` / `status` / `winner` / `reason`）**写了就必须是字符串**、写错类型整份拒收
+（缺失仍是「未设置」）、`timeout_ms` / `max_depth` 只允许 0（未设置）或落在 100–120000 / 1–20、
+`.tmp` + rename 之后不留临时文件、目录列举跳过 `*.txt` 与 `*.json.tmp`、被截断的 JSON 读不出来。
 
 ## WebSocket 消息协议
 

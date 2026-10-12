@@ -219,7 +219,12 @@ bool TrainingSample::from_json(const std::string& text, TrainingSample& out, std
         error = "sample move coordinates are outside the supported range";
         return false;
     }
-    sample.move = Move(row, col, move["color"].get<std::string>() == "black" ? BLACK : WHITE);
+    const std::string color = move["color"].get<std::string>();
+    if (color != "black" && color != "white") {
+        error = "sample move color must be black or white";
+        return false;
+    }
+    sample.move = Move(row, col, color == "black" ? BLACK : WHITE);
     if (!sample.move.pos.is_valid()) {
         error = "sample move is off the board";
         return false;

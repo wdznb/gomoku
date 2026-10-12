@@ -4,6 +4,8 @@
 // properties.
 #include "server/session_store.h"
 
+#include <nlohmann/json.hpp>
+
 #include <cassert>
 #include <chrono>
 #include <filesystem>
@@ -13,6 +15,7 @@
 #include <vector>
 
 using namespace gomoku;
+using nlohmann::json;
 
 namespace {
 
@@ -233,6 +236,139 @@ void test_envelope_rejects_damaged_flags() {
     std::cout << "test_envelope_rejects_damaged_flags passed" << std::endl;
 }
 
+// R86 P1: the envelope's four textual fields (player_color / status / winner /
+// reason) are read with read_string, which skips a key whose value is not a
+// string - so a damaged "winner":null used to resume as "no result" instead of
+// refusing the file. A present key of the wrong type now refuses it whole; a
+// key that is simply absent still means the writer's "not set yet". The two
+// timestamps are deliberately outside this: they are rewritten on every save,
+// so refusing on their type would refuse files the writer itself will not keep.
+void test_rejects_non_string_envelope_fields() {
+    SessionSnapshot out;
+    std::string error;
+
+    SessionSnapshot done = sample("ab");
+    done.status = "game_over";
+    done.winner = "black";
+    done.reason = "five";
+    done.record.winner = BLACK;
+    done.record.reason = GameEndReason::FIVE;
+    const json base = json::parse(session_to_json(done));
+
+    // winner in a shape no string door can read: null, a number, an array.
+    for (const json& bad : {json(nullptr), json(1), json::array({7})}) {
+        json doc = base;
+        doc["winner"] = bad;
+        error.clear();
+        assert(!session_from_json(doc.dump(), out, error));
+        assert(!error.empty());
+    }
+    // A winner string outside ""/black/white/draw is the legal-set refusal.
+    {
+        json doc = base;
+        doc["winner"] = "BLACK";
+        error.clear();
+        assert(!session_from_json(doc.dump(), out, error));
+        assert(!error.empty());
+    }
+
+    // player_color: null refuses; absent is "side not chosen yet" and loads on.
+    {
+        json doc = base;
+        doc["player_color"] = nullptr;
+        error.clear();
+        assert(!session_from_json(doc.dump(), out, error));
+        assert(!error.empty());
+    }
+    {
+        json doc = base;
+        doc.erase("player_color");
+        error.clear();
+        assert(session_from_json(doc.dump(), out, error) && error.empty());
+        assert(out.player_color.empty());
+    }
+
+    // status: the listed strings still load, a number refuses.
+    {
+        json doc = base;
+        doc["status"] = "playing";
+        error.clear();
+        assert(session_from_json(doc.dump(), out, error) && error.empty());
+        assert(out.status == "playing");
+    }
+    {
+        json doc = base;
+        doc["status"] = 1;
+        error.clear();
+        assert(!session_from_json(doc.dump(), out, error));
+        assert(!error.empty());
+    }
+
+    // reason: null refuses - the old reader cleared it and resumed anyway.
+    {
+        json doc = base;
+        doc["reason"] = nullptr;
+        error.clear();
+        assert(!session_from_json(doc.dump(), out, error));
+        assert(!error.empty());
+    }
+
+    // The writer's own game_over payload reads back whole.
+    SessionSnapshot back;
+    error.clear();
+    assert(session_from_json(session_to_json(done), back, error) && error.empty());
+    assert(back.token == "ab" && back.status == "game_over");
+    assert(back.winner == "black" && back.reason == "five");
+    assert(back.player_color == done.player_color);
+    assert(back.timeout_ms == done.timeout_ms && back.max_depth == done.max_depth);
+    assert(back.created_ms == done.created_ms && back.updated_ms == done.updated_ms);
+    std::cout << "test_rejects_non_string_envelope_fields passed" << std::endl;
+}
+
+// R86 P2: the config fields' bounds as seen from the envelope. timeout_ms keeps
+// 0 as the "not set" sentinel; any other value must sit inside [100, 120000],
+// the range the set_config clamp uses. max_depth is [0, 20]. A legal value must
+// read back exactly as written - clamping here would resume on a value the file
+// never stated.
+void test_session_config_range_edges() {
+    struct Case {
+        long long timeout;
+        long long depth;
+        bool ok;
+    };
+    const Case cases[] = {
+        {0, 4, true},       // the "not set" sentinel stays legal
+        {50, 4, false},     // below the clamp's floor
+        {99, 4, false},
+        {100, 4, true},     // the floor itself
+        {120000, 4, true},  // the ceiling itself
+        {120001, 4, false},
+        {-1000, 4, false},
+        {1000, 0, true},    // the "not set" depth sentinel
+        {1000, 1, true},
+        {1000, 20, true},
+        {1000, 21, false},
+        {1000, -1, false},
+    };
+    const json base = json::parse(session_to_json(sample("ab")));
+    SessionSnapshot out;
+    std::string error;
+    for (const Case& c : cases) {
+        json doc = base;
+        doc["timeout_ms"] = c.timeout;
+        doc["max_depth"] = c.depth;
+        error.clear();
+        const bool ok = session_from_json(doc.dump(), out, error);
+        assert(ok == c.ok);
+        if (ok) {
+            assert(out.timeout_ms == c.timeout);
+            assert(out.max_depth == c.depth);
+            assert(error.empty());
+        }
+    }
+    std::cout << "test_session_config_range_edges passed" << std::endl;
+}
+
 void test_files_are_written_atomically() {
     const auto dir = scratch_dir("atomic");
     std::string error;
@@ -262,6 +398,56 @@ void test_files_are_written_atomically() {
     assert(!std::filesystem::exists(dir / "cafe1234.json"));
     std::filesystem::remove_all(dir, ec);
     std::cout << "test_files_are_written_atomically passed" << std::endl;
+}
+
+// R86 P5: save_session writes through <token>.json.tmp and renames it over the
+// session file. A failure early in that dance used to return with a partial tmp
+// still on disk - only the rename failure swept it - and the next process-level
+// retry would find a stale half-file next to the old one. The true mid-write
+// failure needs the filesystem to fail inside the write (ENOSPC), which a test
+// cannot stage, so what is pinned here is the reachable half of the invariant:
+// the normal save leaves exactly the session file and no tmp, and the refusal
+// path never creates the directory or a file at all.
+void test_save_session_leaves_no_tmp() {
+    const auto dir = scratch_dir("save_tmp");
+    std::string error;
+
+    assert(save_session(dir.string(), sample("cafe1234"), error));
+    assert(error.empty());
+    // After a normal save the directory holds exactly the session file.
+    int files = 0;
+    std::string only;
+    for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+        ++files;
+        only = entry.path().filename().string();
+    }
+    assert(files == 1);
+    assert(only == "cafe1234.json");
+    assert(!std::filesystem::exists(dir / "cafe1234.json.tmp"));
+
+    // Overwriting keeps the invariant: the rename consumed the tmp.
+    SessionSnapshot snap = sample("cafe1234");
+    snap.updated_ms = 42;
+    assert(save_session(dir.string(), snap, error));
+    files = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+        (void)entry;
+        ++files;
+    }
+    assert(files == 1);
+    assert(!std::filesystem::exists(dir / "cafe1234.json.tmp"));
+
+    // An illegal token is refused before the directory or any file exists.
+    const auto untouchable = scratch_dir("save_tmp_illegal");
+    error.clear();
+    assert(!save_session(untouchable.string(), sample("../escape"), error));
+    assert(!error.empty());
+    assert(!std::filesystem::exists(untouchable));
+    assert(list_sessions(untouchable.string()).empty());
+
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    std::cout << "test_save_session_leaves_no_tmp passed" << std::endl;
 }
 
 void test_listing_and_corrupt_files() {
@@ -522,7 +708,10 @@ int main() {
     test_envelope_round_trip();
     test_rejects_damaged_files();
     test_envelope_rejects_damaged_flags();
+    test_rejects_non_string_envelope_fields();
+    test_session_config_range_edges();
     test_files_are_written_atomically();
+    test_save_session_leaves_no_tmp();
     test_listing_and_corrupt_files();
     test_delete_session_is_idempotent();
     test_delete_session_reports_main_failure();

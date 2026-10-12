@@ -1443,6 +1443,60 @@ void test_sample_from_json_rejects_damaged() {
     std::cout << "test_sample_from_json_rejects_damaged passed" << std::endl;
 }
 
+// R86 P3: the move colour is the label's side, so only the writer's own two
+// spellings may read back. Anything else - "BLACK", "b", the empty string, a
+// CJK word - used to fall through to WHITE and load a sample whose label says
+// the wrong player moved. The coordinate gates above the colour read are
+// pinned alongside, so a fix cannot trade one for another.
+void test_sample_move_color_must_be_exact() {
+    const auto features = [](int count) {
+        std::string out = "[";
+        for (int i = 0; i < count; ++i) {
+            if (i) out += ",";
+            out += "0";
+        }
+        return out + "]";
+    };
+    const int n = DataCollector::FEATURE_COUNT;
+    const auto sample_text = [&](const std::string& color_json) {
+        return "{\"features\":" + features(n) + ",\"value\":0.5,\"weight\":1.0," +
+               "\"move\":{\"row\":7,\"col\":7,\"color\":" + color_json + "}}";
+    };
+
+    TrainingSample sample;
+    std::string error;
+    assert(TrainingSample::from_json(sample_text("\"black\""), sample, error) && error.empty());
+    assert(sample.move == Move(7, 7, BLACK));
+    assert(sample.move.color == BLACK);
+    error.clear();
+    assert(TrainingSample::from_json(sample_text("\"white\""), sample, error) && error.empty());
+    assert(sample.move == Move(7, 7, WHITE));
+    assert(sample.move.color == WHITE);
+
+    for (const char* bad : {"\"BLACK\"", "\"b\"", "\"\"", "\"\\u767d\""}) {
+        error.clear();
+        assert(!TrainingSample::from_json(sample_text(bad), sample, error));
+        assert(!error.empty());
+    }
+
+    // The coordinate gates stay where they were: an off-board row and a 64-bit
+    // row a truncating read would fold onto the board both still refuse.
+    error.clear();
+    assert(!TrainingSample::from_json(
+        "{\"features\":" + features(n) +
+            ",\"value\":0.5,\"weight\":1.0,"
+            "\"move\":{\"row\":15,\"col\":7,\"color\":\"black\"}}",
+        sample, error));
+    error.clear();
+    assert(!TrainingSample::from_json(
+        "{\"features\":" + features(n) +
+            ",\"value\":0.5,\"weight\":1.0,"
+            "\"move\":{\"row\":4294967303,\"col\":7,\"color\":\"black\"}}",
+        sample, error));
+
+    std::cout << "test_sample_move_color_must_be_exact passed" << std::endl;
+}
+
 // Round 72: play_game() discards an INVALID game, and the discarded game must
 // not inflate games_played_ - every checkpoint and status line would otherwise
 // overstate the work done. The counter is private and only alive through
@@ -2485,6 +2539,7 @@ int main() {
     test_trainer_checkpoint_seed_and_counters();
     test_readers_reject_out_of_range_numbers();
     test_sample_from_json_rejects_damaged();
+    test_sample_move_color_must_be_exact();
     test_play_game_counts_only_valid_games();
     test_parameter_save_replaces_atomically();
     test_checkpoint_save_replaces_atomically();
