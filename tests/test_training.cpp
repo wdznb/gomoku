@@ -2089,7 +2089,8 @@ void test_buffered_write_failures_are_caught() {
     std::cout << "  record/elo/collector saves -> " << error << std::endl;
 
     // The two rename guards: point the temporary at /dev/full and the old file
-    // has to survive byte for byte, with the failed temporary still in place.
+    // has to survive byte for byte. The params guard now also drops the failed
+    // temporary; the checkpoint guard still documents one being left behind.
     std::error_code ec;
     const std::filesystem::path params = temp_path("flush_params.json");
     const std::string params_tmp = params.string() + ".tmp";
@@ -2104,7 +2105,12 @@ void test_buffered_write_failures_are_caught() {
     assert(!error.empty());
     assert(!std::filesystem::is_symlink(params));
     assert(file_bytes(params.string()) == params_before);
-    assert(std::filesystem::is_symlink(params_tmp));
+    // Round 88, S8: a write that died at flush no longer leaves its temporary
+    // behind, so the poisoned symlink the test planted is gone. The rename never
+    // ran, which the two asserts above still prove. The checkpoint writer below
+    // was not given the same cleanup, so it still keeps its failed temporary.
+    assert(!std::filesystem::is_symlink(params_tmp));
+    assert(!std::filesystem::exists(params_tmp));
     ThreatCoefficients loaded;
     assert(CoefficientVector::load(params.string(), loaded, error));
     assert(CoefficientVector::to_vector(loaded) ==

@@ -760,6 +760,15 @@ void test_forced_move() {
         }
     }
 
+    // Round 88 S2 conflict, reported not hidden: this Phase-2 filler position
+    // has 213 stones and is already decided (check_winner()==WHITE, 28 black and
+    // 24 white fives on the board), so the new two-completion-point rule rightly
+    // answers it with resign and an empty best_move. The case is about the
+    // crowded-board move path, so the resign switch is turned off here and the
+    // new resign behaviour is pinned by
+    // test_search_engine_resigns_on_two_enemy_five_points instead.
+    engine.set_resign_detection(false);
+
     std::atomic<bool> stop(false);
     SearchResult result = engine.search(board, BLACK, 4, 3000, stop);
 
@@ -1278,6 +1287,124 @@ void test_search_engine_no_legal_move_and_resign_switch() {
     }
 
     std::cout << "test_search_engine_no_legal_move_and_resign_switch passed" << std::endl;
+}
+
+// Round 88, S2: WHITE holds two distinct completion points here, so no single
+// block survives the turn and the engine may declare the loss up front. With the
+// switch off the same position still gets the block (不打开认输就不要静默认输),
+// and a four whose second end already carries a black stone must never trigger
+// the resignation at all.
+void test_search_engine_resigns_on_two_enemy_five_points() {
+    Board board;
+    board.place_stone(2, 3, WHITE);
+    board.place_stone(2, 4, WHITE);
+    board.place_stone(2, 5, WHITE);
+    board.place_stone(2, 6, WHITE);
+    board.place_stone(10, 10, BLACK);
+    board.place_stone(12, 12, BLACK);
+
+    // The premise: two different cells each complete a WHITE five, and BLACK has
+    // no five of its own to take instead.
+    for (int col : {2, 7}) {
+        assert(board.is_empty(2, col));
+        const PositionPattern pattern =
+            PatternRecognizer::recognize_position(board, 2, col, WHITE);
+        bool makes_five = false;
+        for (int d = 0; d < 4; ++d) {
+            if (pattern.directions[d].type == PatternType::FIVE) makes_five = true;
+        }
+        assert(makes_five);
+    }
+
+    std::atomic<bool> stop(false);
+    {
+        SearchEngine engine;  // resignation detection is on by default
+        SearchResult result = engine.search(board, BLACK, 2, 3000, stop);
+        assert(result.resigned);
+        assert(result.method == "resign");
+        assert(!result.best_move.pos.is_valid());
+        std::cout << "  two five points, resign on: method=" << result.method << std::endl;
+    }
+    {
+        SearchEngine engine;
+        engine.set_resign_detection(false);
+        SearchResult result = engine.search(board, BLACK, 2, 3000, stop);
+        assert(!result.resigned);
+        assert(result.method == "must_block");
+        assert(result.best_move.pos.is_valid());
+        const bool blocks_a_five_point = result.best_move.pos == Position(2, 2) ||
+                                        result.best_move.pos == Position(2, 7);
+        assert(blocks_a_five_point);
+        std::cout << "  two five points, resign off: block "
+                  << result.best_move.pos.row << "," << result.best_move.pos.col << std::endl;
+    }
+    {
+        // One completion point only: (0,6) already holds a black stone, so the
+        // four is dead at that end and a block still saves the turn.
+        Board single;
+        single.place_stone(0, 2, WHITE);
+        single.place_stone(0, 3, WHITE);
+        single.place_stone(0, 4, WHITE);
+        single.place_stone(0, 5, WHITE);
+        single.place_stone(0, 6, BLACK);
+        single.place_stone(10, 10, BLACK);
+
+        SearchEngine engine;
+        SearchResult result = engine.search(single, BLACK, 2, 3000, stop);
+        assert(!result.resigned);
+        assert(result.method == "must_block");
+        assert(result.best_move.pos == Position(0, 1));
+    }
+
+    std::cout << "test_search_engine_resigns_on_two_enemy_five_points passed" << std::endl;
+}
+
+// Round 88, S3: a board with no empty cell at all has an empty root candidate
+// list before any search starts. The engine must report that there is nothing to
+// play with an invalid move - the centre point it used to hand back is occupied
+// here, so a caller that committed it would corrupt the board.
+void test_search_engine_full_board_has_no_legal_move() {
+    Board board;
+    for (int r = 0; r < BOARD_SIZE; ++r) {
+        for (int c = 0; c < BOARD_SIZE; ++c) {
+            assert(board.place_stone(r, c, (r + c) % 2 == 0 ? BLACK : WHITE));
+        }
+    }
+    assert(board.move_count() == BOARD_SIZE * BOARD_SIZE);
+    assert(board.active_empty().empty());
+
+    std::atomic<bool> stop(false);
+    SearchEngine engine;
+    SearchResult result = engine.search(board, WHITE, 8, 1000, stop);
+
+    assert(result.method == "no_legal_move");
+    assert(!result.best_move.pos.is_valid());
+    assert(!result.resigned);
+
+    std::cout << "test_search_engine_full_board_has_no_legal_move passed" << std::endl;
+}
+
+// Round 88, S3 anti-overreach: the other end of the same candidate list. With no
+// stone on the board rebuild_active_empty() seeds all 225 cells
+// (board.cpp:281-293), so the first move is still an ordinary search that opens
+// at 天元 and is not reported as an empty list.
+void test_search_engine_empty_board_still_opens_at_center() {
+    Board board;
+    assert(board.move_count() == 0);
+    assert(board.active_empty().size() == static_cast<size_t>(BOARD_SIZE * BOARD_SIZE));
+
+    std::atomic<bool> stop(false);
+    SearchEngine engine;
+    engine.set_vcf_enabled(false);
+    engine.set_vct_enabled(false);
+    SearchResult result = engine.search(board, BLACK, 2, 3000, stop);
+
+    assert(result.method != "no_legal_move");
+    assert(result.best_move.pos.is_valid());
+    assert(result.best_move.pos == Position(7, 7));
+
+    std::cout << "test_search_engine_empty_board_still_opens_at_center passed (method: "
+              << result.method << ")" << std::endl;
 }
 
 // Round 79, A2: the generators now test forbidden from the pattern they already
@@ -1881,6 +2008,78 @@ void test_alphabeta_expired_deadline_returns_root_fallback() {
               << result.pos.row << "," << result.pos.col << ")" << std::endl;
 }
 
+// Round 88, S6: once the node budget trips, every return above that point is a
+// short-circuit static evaluation, so the value the aborted node assembled is no
+// longer a bound on anything. The node used to write it out as a LOWERBOUND, and
+// the next search trusts a LOWERBOUND the way it trusts its own completed work.
+// The quiet board has no five in sight, so the +/-100000 store gate cannot be
+// what keeps the table empty: only the abort can.
+void test_alphabeta_aborted_search_stores_no_bound() {
+    Board board;
+    board.place_stone(7, 7, BLACK);
+    board.place_stone(7, 8, WHITE);
+    board.place_stone(8, 8, BLACK);
+    board.place_stone(6, 6, WHITE);
+
+    Evaluator evaluator;
+    std::atomic<bool> stop(false);
+
+    // The hash the first root child stores under, rebuilt the way the search
+    // builds it: generate, dedup by symmetry (none here), heuristic sort.
+    Move first_root;
+    uint64_t child_hash = 0;
+    {
+        TranspositionTable scratch;
+        AlphaBetaSearch order(evaluator, scratch);
+        std::vector<Move> roots = order.generate_moves(board, BLACK);
+        const std::vector<int> symmetries = self_symmetries(board);
+        if (symmetries.size() > 1) {
+            roots.erase(std::remove_if(roots.begin(), roots.end(),
+                                       [&](const Move& m) {
+                                           return !is_symmetry_representative(symmetries, m.pos);
+                                       }),
+                        roots.end());
+        }
+        order.sort_moves(roots, board, BLACK);
+        assert(!roots.empty());
+        first_root = roots[0];
+        Board child = board;
+        child.place_stone(first_root.pos.row, first_root.pos.col, BLACK);
+        child_hash = child.zobrist_hash();
+    }
+
+    const int node_limit = 200;
+    TranspositionTable aborted_tt;
+    AlphaBetaSearch aborted(evaluator, aborted_tt);
+    aborted.set_node_limit(node_limit);
+    aborted.search(board, BLACK, 2, 600000, stop);
+    const SearchInfo aborted_info = aborted.last_search_info();
+    // The search really was cut short, and the child is on the abort path.
+    assert(aborted_info.nodes_searched > node_limit);
+    assert(aborted_info.depth < 2);
+    assert(aborted_tt.lookup(child_hash) == nullptr);
+
+    // Control: the same board and depth with a budget the whole tree fits must
+    // still write that entry, so the check above is not looking at a position
+    // the table never records.
+    TranspositionTable full_tt;
+    AlphaBetaSearch completed(evaluator, full_tt);
+    completed.set_node_limit(2000000);
+    completed.search(board, BLACK, 2, 600000, stop);
+    const SearchInfo full_info = completed.last_search_info();
+    assert(full_info.depth == 2);
+    assert(full_info.nodes_searched < node_limit * 10);
+    const TTEntry* entry = full_tt.lookup(child_hash);
+    assert(entry != nullptr);
+
+    std::cout << "test_alphabeta_aborted_search_stores_no_bound passed (aborted nodes: "
+              << aborted_info.nodes_searched << ", control nodes: " << full_info.nodes_searched
+              << ", control entry value: " << (entry ? entry->value : 0)
+              << ", flag: " << static_cast<int>(entry ? entry->flag : TTFlag::NONE)
+              << ", first root: " << first_root.pos.row << "," << first_root.pos.col << ")"
+              << std::endl;
+}
+
 // J1: without a deadline the per-search slice remains the only bound: a 200 ms
 // budget on a deep request must return a normal searched move inside a generous
 // wall-clock ceiling.
@@ -2078,6 +2277,9 @@ int main() {
     test_search_engine_resigns_on_proven_loss();
     test_search_engine_no_false_resign();
     test_search_engine_no_legal_move_and_resign_switch();
+    test_search_engine_resigns_on_two_enemy_five_points();
+    test_search_engine_full_board_has_no_legal_move();
+    test_search_engine_empty_board_still_opens_at_center();
     test_generators_keep_five_points_and_drop_forbidden();
     test_greedy_method_and_move_unchanged();
     test_game_manager_resign_state();
@@ -2094,6 +2296,7 @@ int main() {
     test_alphabeta_huge_timeout_does_not_overflow_node_budget();
     test_alphabeta_absolute_deadline_stops_search();
     test_alphabeta_expired_deadline_returns_root_fallback();
+    test_alphabeta_aborted_search_stores_no_bound();
     test_alphabeta_large_depth_bounded_by_slice_without_deadline();
     test_sort_moves_pins_tt_move_already_at_front();
     test_sort_moves_promotes_tt_move_from_tail();

@@ -1155,9 +1155,12 @@ std::shared_ptr<GameServer::TrackedGame> GameServer::open_session(const SessionS
             // The file keeps its own birth time across a cold rebuild, otherwise
             // every resume would rewrite the header of the record it just read.
             if (from->created_ms > 0) entry->created_ms = from->created_ms;
-            if (from->timeout_ms > 0 && from->max_depth > 0) {
-                game->set_config(from->timeout_ms, from->max_depth);
-            }
+            // 0 means the file never stated the key (round-86 P2 sentinel), so each
+            // half is restored on its own. set_config clamps both arguments, so the
+            // absent half is fed the value this game already has, never 0.
+            const int restored_timeout = from->timeout_ms > 0 ? from->timeout_ms : game->timeout_ms();
+            const int restored_depth = from->max_depth > 0 ? from->max_depth : game->max_depth();
+            game->set_config(restored_timeout, restored_depth);
             SessionSnapshot probe = *from;
             probe.created_ms = 0;
             probe.updated_ms = 0;

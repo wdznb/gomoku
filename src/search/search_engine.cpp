@@ -40,8 +40,10 @@ SearchResult SearchEngine::search(const Board& board, int color,
 
     auto root_moves = board.active_empty();
     if (root_moves.empty()) {
-        result.best_move = Move(BOARD_SIZE / 2, BOARD_SIZE / 2, color);
-        result.method = "default";
+        // Only a full board gets here: rebuild_active_empty() seeds all 225 cells
+        // when move_count_ is 0 (board.cpp:281-293). The centre may well hold a
+        // stone, so hand back an invalid move and the caller commits nothing.
+        result.method = "no_legal_move";
         return result;
     }
 
@@ -118,6 +120,31 @@ SearchResult SearchEngine::search(const Board& board, int color,
             board, pos.row, pos.col, opp);
         for (int d = 0; d < 4; ++d) {
             if (pattern.directions[d].type == PatternType::FIVE) {
+                // A second completion point means no single block survives the
+                // turn. The scan runs over board.active_empty(), not root_moves:
+                // for BLACK the root list is forbidden-filtered, which hides the
+                // very second point being looked for.
+                bool second_five_point = false;
+                for (const auto& other : board.active_empty()) {
+                    if (other.row == pos.row && other.col == pos.col) continue;
+                    if (!board.is_empty(other.row, other.col)) continue;
+                    PositionPattern theirs = PatternRecognizer::recognize_position(
+                        board, other.row, other.col, opp);
+                    for (int e = 0; e < 4; ++e) {
+                        if (theirs.directions[e].type == PatternType::FIVE) {
+                            second_five_point = true;
+                            break;
+                        }
+                    }
+                    if (second_five_point) break;
+                }
+                // Two points and resignation switched off still gets the single
+                // block: 不打开认输就不要静默认输.
+                if (second_five_point && resign_detection_) {
+                    result.resigned = true;
+                    result.method = "resign";
+                    return result;
+                }
                 result.best_move = Move(pos, color);
                 result.score = 99000;
                 result.method = "must_block";
@@ -220,6 +247,24 @@ SearchResult SearchEngine::search(const Board& board, int color,
 
         int depth = (max_depth > 0) ? max_depth : alphabeta_max_depth_;
         Move ab_move = ab.search(board, color, depth, remaining_time, stop_flag);
+
+        // A search that found nothing to search returns an invalid move. The
+        // fallback takes the first legal candidate root_moves still holds rather
+        // than greedy_.search, which reads the same active_empty() window and
+        // hands back the centre point when that window has no legal cell.
+        if (!ab_move.pos.is_valid() || !board.is_empty(ab_move.pos.row, ab_move.pos.col)) {
+            Move fallback;
+            for (const auto& pos : root_moves) {
+                if (!board.is_empty(pos.row, pos.col)) continue;
+                if (color == BLACK &&
+                    PatternRecognizer::is_forbidden(board, pos.row, pos.col, BLACK)) continue;
+                fallback = Move(pos, color);
+                break;
+            }
+            result.best_move = fallback;
+            result.method = fallback.pos.is_valid() ? "greedy" : "no_legal_move";
+            return result;
+        }
 
         SearchInfo info = ab.last_search_info();
         result.best_move = ab_move;

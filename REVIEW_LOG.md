@@ -1771,3 +1771,89 @@ exit **1** naming the flag (`Invalid --params (must not be empty)` is the log ta
 `--book`/`--sessions`/`--records`/`--params` given `""` print `Server started` and never name the flag (only
 `--web-dir ""` exited 1, and for the pre-existing "not a directory" reason).
 
+## 轮次88 送到旧局面的推荐、必输的那一手堵、被当成界存下来的静态值 — bugfix round 88 batch S
+
+**Found.** Seven defects plus one stale comment, all re-read against `README.md` before dispatch:
+**S1** 求招 computed on a snapshot (`game_manager.cpp:310`) and delivered later (`:320-324`) while `make_move`
+gates only on GAME_OVER and `ai_thinking_`, so a recommendation could name a square the player had already
+taken; **S2** `search_engine.cpp:113-127` returned the first five-completion point it found as `must_block`
+even when the opponent had **two** of them - blocking either leaves the other intact, because a completion
+point's five-cell window cannot contain the square just played - which contradicts README:39's 强制失败证明与
+自动认输; **S3** an empty root candidate list produced `Move(7,7,color)` in two places (`alphabeta.cpp` root
+and `search_engine.cpp:42`), i.e. a square that is occupied by definition on a full board, and AlphaBeta's
+answer was committed without a validity test; **S4** `vct.cpp:83-108` ran `is_forbidden` + `evaluate_position`
+over *every* active candidate before the Chebyshev window test threw most of them away; **S5** `server.cpp:1157`
+restored `timeout_ms` and `max_depth` only when **both** were non-zero, so README:451's legal `timeout_ms: 0`
+sentinel silently discarded a saved depth; **S6** the abort shortcuts return a bare static evaluation, not a
+bound, yet the interrupted node stored the assembled score as LOWERBOUND/EXACT - and since `new_search()` only
+bumps the age and `lookup` ignores it (round-80 B8), those unsound entries survived into the next AI move;
+**S8** `params.cpp:343-347` returned on a flush failure with `<path>.tmp` left on disk, the same class as
+round-86 P5; **S9** `main.cpp:103-105` still described the server as answering every GET with "Not found".
+
+**Fixed.** S1 remembers `move_count()` at the snapshot and re-reads it under `thinking_mutex_` before delivery,
+passing a default-constructed `Move()` when the position moved, which the existing `server.cpp` handler turns
+into an error frame - no new protocol field. S2 keeps the first block when the count is one and, on a second
+five point, resigns through the existing `resigned`/`method = "resign"` shape when resignation detection is on
+and keeps today's single block when it is off (opening a resignation the player disabled is not our call); the
+count runs over `board.active_empty()`, not the BLACK-forbidden-filtered `root_moves`, which would drop a five
+point black itself may not occupy. S3 returns an invalid `Move()` at the AlphaBeta root, validates the returned
+move at the SearchEngine root, and falls back to the first still-legal `root_moves` candidate rather than to
+`greedy_.search`, which reads the same `active_empty()` window and hands back the centre when it holds no legal
+cell. S4 hoists only the two side-effect-free predicates (`dist > 4`, the duplicate scan) above the forbidden
+test - the two loops deliberately keep their different interfaces, so this is a pure reordering. S5 fills each
+half independently, feeding the unset one from `game->timeout_ms()` / `game->max_depth()` so `set_config`'s
+double clamp never receives a 0. S6 adds an `aborted_` member reset at the top of `search()`, set at all four
+abort short-circuits, gating `tt_.store`; the table is *not* made age-aware and `new_search()` does not clear
+it. S8 removes the temp through the `error_code` overload on both failure branches with the error text and the
+write→flush→rename order untouched.
+
+**Test-side.** Two pre-existing asserts disagreed with the new contract and both are **用例假设错, not
+implementation bugs**. `test_search.cpp:766` (`test_forced_move`) asserts a playable move, but its Phase-2
+filler position carries 213 stones and is already decided (`check_winner() == WHITE`, 28 black and 24 white
+fives on the board), so S2's new rule rightly answers it with a resignation; the case now calls
+`set_resign_detection(false)` with the reason written in place, keeping its original board and its
+`must_block (7,8)` coverage, and the resignation itself is pinned by
+`test_search_engine_resigns_on_two_enemy_five_points`. `test_training.cpp:2107` pinned the *residue* of a failed
+params write - the behaviour S8 exists to remove - so the params arm now asserts the poisoned temp is gone while
+the checkpoint arm below it keeps its old expectation (that writer was not given the cleanup).
+
+**My own dispatch error, recorded because it is the second time this round:** I told the fixer that
+`active_empty()` can be empty only on a full board and that an empty board therefore needed the centre move back.
+The premise is wrong twice over - `rebuild_active_empty()` (`board.cpp:281-293`) seeds all 225 cells when
+`move_count_ == 0`, and every path reaching zero stones goes through it (`reset()` :55, take-back :106-108,
+first stone :235-239), so an empty board never reaches a "no candidates" branch and the guard I asked for was
+dead code. The fixer read the code, reported the contradiction instead of shipping it, and the branch went back
+to `no_legal_move`. Consequence worth knowing: `method == "default"` now has no producer anywhere in `src/`,
+which is correct - at HEAD its only producer was a full board handing back an occupied centre - and
+`data_collector.cpp:129`'s filter keeps working over historical records only.
+
+**Refuted this round.** S7 (memoise GA fitness per gene vector): production fitness is a *stochastic* self-play
+match, so sharing one score between identical vectors changes the optimizer's noise model and can bias elitism -
+a design change, not a defect fix. A board/bitboard audit produced zero defects: the active list cannot diverge
+(`activate` early-returns on a non-negative index, `deactivate` fixes the swapped-in entry before `pop_back`),
+`neighbor_count_` moves symmetrically on place and undo, `has_neighbor_` is dead state with no reader, and
+Zobrist's lack of a side-to-move key is harmless because the side is the parity of the stone count. A
+static-serving/CLI audit produced nothing beyond S8. Evaluator/pattern rows cleared too: no cross-window four
+double payout (`match_pattern:316-317` collapses four-over-three), BLACK's overline is never scored as five
+(`pattern.cpp:383-385` demotes to LONG_FIVE), WHITE's overline is never forbidden, and `recognize_combined`'s
+duplicated 禁手 logic has no production caller. Four items are **carried to the next batch**: the phantom
+forbidden-shape payout inside `candidate_value` / `evaluate_position_pair` / `evaluate_position` (the rule
+`evaluate_board` applies at `:154`/`:157` does not exist on the per-square path that move ordering and greedy
+consume), `forbidden_penalty` being inert in every production path while `params.cpp:221-223` justifies its
+range guard with an argument that never runs (comment-side fix only), the missing `reserve` in the innermost
+quiescence loop, and `alphabeta.cpp:62`'s claim that `is_forbidden` re-runs `recognize_combined`.
+
+**Verified.** Gate over the identical tree: `ctest` **8/8** (bare `cmake ..`) and
+`node tests/web_frontend_check.js` **30/30**. Negative proofs in `build/neg88s` (`git archive a9c7899` plus the
+current `tests/`) - S1 `tests/test_server.cpp:1340` `hint_results == 0`, S2 `tests/test_search.cpp:1323`
+`result.resigned`, S3 `tests/test_search.cpp:1380` `result.method == "no_legal_move"`, S5
+`tests/test_server.cpp:1431` `depth == 3`, S6 `tests/test_search.cpp:2060`
+`aborted_tt.lookup(child_hash) == nullptr`, S8 `tests/test_training.cpp:2112`
+`!std::filesystem::is_symlink(params_tmp)`; HEAD's full `ctest` run fails exactly three targets
+(`test_search` / `test_server` / `test_training`) on those cases. Anti-overreach pins that stayed green on both
+trees: an empty board still opens at the centre through the normal path, round-78's 终止 handling, round-80 B8's
+cross-move TT reuse and round-81's far-counter VCT case. S3(a)(b), S4 and S9 are reported as **无可观察差异**
+with the code shapes grepped instead of invented negatives, and `build/r88s_cli.sh` shows the two trees agreeing
+byte for byte on every CLI-level line (`e1`/`e2`/`e3`/`s9a`/`s9b` stderr md5 and exit codes equal, no residue,
+the repo's `data/` untouched).
+

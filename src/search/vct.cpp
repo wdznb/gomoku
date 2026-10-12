@@ -82,7 +82,6 @@ std::vector<Move> VCTSearch::generate_defenses(const Board& board, int color,
     // Chebyshev note below).
     for (const auto& pos : candidates) {
         if (!board.is_empty(pos.row, pos.col)) continue;
-        if (opp == BLACK && PatternRecognizer::is_forbidden(board, pos.row, pos.col, opp)) continue;
         // Chebyshev, not Manhattan: the unique completion cell of a four the
         // attacker just threatens is at most 4 steps ALONG the line, and a
         // diagonal line puts that cell at Manhattan distance 8 (e.g. 4 diagonal
@@ -94,18 +93,22 @@ std::vector<Move> VCTSearch::generate_defenses(const Board& board, int color,
         // (monotone-safe: strictly reduces false wins, never invents one).
         int dist = std::max(std::abs(pos.row - attack_row),
                             std::abs(pos.col - attack_col));
-        if (dist <= 4) {
-            bool already_listed = false;
-            for (const auto& d : scored_defenses) {
-                if (d.second.pos.row == pos.row && d.second.pos.col == pos.col) {
-                    already_listed = true;
-                    break;
-                }
+        if (dist > 4) continue;
+        bool already_listed = false;
+        for (const auto& d : scored_defenses) {
+            if (d.second.pos.row == pos.row && d.second.pos.col == pos.col) {
+                already_listed = true;
+                break;
             }
-            if (already_listed) continue;
-            int score = evaluator_.evaluate_position(board, pos.row, pos.col, opp);
-            scored_defenses.emplace_back(score, Move(pos.row, pos.col, opp));
         }
+        if (already_listed) continue;
+        // Both tests above are side-effect-free, so the two cheap ones now run
+        // before this one: is_forbidden re-scans the four directions per call,
+        // and the squares it is asked about are down to the 9x9 window around
+        // the attack point instead of every candidate.
+        if (opp == BLACK && PatternRecognizer::is_forbidden(board, pos.row, pos.col, opp)) continue;
+        int score = evaluator_.evaluate_position(board, pos.row, pos.col, opp);
+        scored_defenses.emplace_back(score, Move(pos.row, pos.col, opp));
     }
 
     std::sort(scored_defenses.begin(), scored_defenses.end(),

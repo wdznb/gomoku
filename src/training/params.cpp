@@ -343,13 +343,16 @@ bool CoefficientVector::save(const std::string& path, const ThreatCoefficients& 
         file.flush();
         if (!file.good()) {
             error = "failed while writing " + tmp;
+            std::error_code remove_ec;
+            std::filesystem::remove(tmp, remove_ec);
             return false;
         }
     }
     std::error_code ec;
     std::filesystem::rename(tmp, path, ec);
     if (ec) {
-        std::filesystem::remove(tmp);
+        std::error_code remove_ec;
+        std::filesystem::remove(tmp, remove_ec);
         error = "cannot replace " + path + ": " + ec.message();
         return false;
     }

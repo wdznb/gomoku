@@ -308,9 +308,10 @@ bool GameManager::request_hint(int timeout_ms, int max_depth) {
     discard_pending_.store(false);
     int turn = current_turn();
     Board board_snapshot = board_;
+    const int snapshot_move_count = board_snapshot.move_count();
 
     hint_thread_ = std::make_unique<std::thread>(
-        [this, board_snapshot, turn, timeout_ms, max_depth]() mutable {
+        [this, board_snapshot, turn, timeout_ms, max_depth, snapshot_move_count]() mutable {
             SearchResult result = engine_.search(board_snapshot, turn, max_depth, timeout_ms, stop_flag_);
 
             // A user stop_thinking only raises stop_flag_, so delivering on the
@@ -318,6 +319,21 @@ bool GameManager::request_hint(int timeout_ms, int max_depth) {
             // client's 求招 button; reset / resign / the destructor set
             // discard_pending_ first and must stay silent.
             if (!discard_pending_.load() && hint_callback_) {
+                // The answer describes board_snapshot. make_move and undo do not
+                // wait for an in-flight hint, so a stone landed in the meantime
+                // makes it advice about a board that no longer exists; compare
+                // under thinking_mutex_, which is what the AI commit path takes
+                // when it changes board_.
+                int move_count_now = 0;
+                {
+                    std::lock_guard<std::mutex> commit_guard(thinking_mutex_);
+                    move_count_now = board_.move_count();
+                }
+                if (move_count_now != snapshot_move_count) {
+                    hint_callback_(Move(), 0);
+                    hint_active_.store(false);
+                    return;
+                }
                 // Deliver even when best_move is invalid (timeout with no PV):
                 // the server distinguishes valid (hint_result) from invalid
                 // (error) so the client is never left waiting on silence.

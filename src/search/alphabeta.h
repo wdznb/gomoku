@@ -53,6 +53,10 @@ private:
     int node_limit_;
     int move_time_limit_ms_;
     int nodes_searched_;
+    // Set by any abort short-circuit. Those returns hand the tree a static
+    // evaluation, which is not a bound, so once one has fired nothing further
+    // from this search may enter the transposition table.
+    bool aborted_ = false;
     SearchInfo info_;
     std::function<void(int depth, int nodes, int elapsed_ms)> progress_callback_;
 

@@ -92,6 +92,7 @@ int AlphaBetaSearch::quiescence(Board& board, int alpha, int beta, int color,
     // an unbounded quiescence subtree.
     nodes_searched_++;
     if (nodes_searched_ > node_limit_ || stop_flag.load() || is_timeout()) {
+        aborted_ = true;
         return evaluator_.evaluate_board(board, color);
     }
 
@@ -141,7 +142,10 @@ int AlphaBetaSearch::quiescence(Board& board, int alpha, int beta, int color,
 
     for (const auto& entry : scored) {
         const Move& move = entry.second;
-        if (stop_flag.load() || is_timeout()) break;
+        if (stop_flag.load() || is_timeout()) {
+            aborted_ = true;
+            break;
+        }
 
         board.place_stone(move.pos.row, move.pos.col, color);
 
@@ -169,6 +173,7 @@ int AlphaBetaSearch::alphabeta(Board& board, int depth, int alpha, int beta, int
                                 std::atomic<bool>& stop_flag) {
     nodes_searched_++;
     if (nodes_searched_ > node_limit_ || stop_flag.load() || is_timeout()) {
+        aborted_ = true;
         // Only the last-placed stone can have produced a five; check_winner()
         // would scan all 225 cells and then is_game_over() would scan them
         // again. This abort path fires very frequently during iterative
@@ -218,9 +223,10 @@ int AlphaBetaSearch::alphabeta(Board& board, int depth, int alpha, int beta, int
 
     for (const auto& move : moves) {
         if (stop_flag.load() || is_timeout() || nodes_searched_ > node_limit_) {
-            // Search aborted: siblings went unsearched, so only a LOWERBOUND
-            // on the true value is sound. Never store EXACT or UPPERBOUND here.
-            flag = TTFlag::LOWERBOUND;
+            // Search aborted: the scores that made up best_score came out of
+            // short-circuit static evaluations, so not even a LOWERBOUND is
+            // sound and this search stores nothing further (see aborted_).
+            aborted_ = true;
             break;
         }
 
@@ -244,7 +250,7 @@ int AlphaBetaSearch::alphabeta(Board& board, int depth, int alpha, int beta, int
         }
     }
 
-    if (best_score > -100000 && best_score < 100000) {
+    if (!aborted_ && best_score > -100000 && best_score < 100000) {
         tt_.store(hash, depth, best_score, best_move, flag);
     }
 
@@ -255,6 +261,7 @@ Move AlphaBetaSearch::search(const Board& board, int color, int max_depth,
                               int time_limit_ms, std::atomic<bool>& stop_flag) {
     move_time_limit_ms_ = time_limit_ms;
     nodes_searched_ = 0;
+    aborted_ = false;
     // Reset the reported info each search. An aborted or early-return search
     // must not hand the caller the previous search's depth/score.
     info_ = SearchInfo{};
@@ -273,7 +280,9 @@ Move AlphaBetaSearch::search(const Board& board, int color, int max_depth,
 
     auto root_moves = generate_moves(board, color);
     if (root_moves.empty()) {
-        return Move(BOARD_SIZE / 2, BOARD_SIZE / 2, color);
+        // An invalid move says "nothing to play". The centre square may already
+        // be occupied, or be a forbidden point for BLACK.
+        return Move();
     }
 
     if (root_moves.size() == 1) {

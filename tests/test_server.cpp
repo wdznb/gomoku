@@ -1283,6 +1283,180 @@ void test_resume_takeover_notifies_the_loser() {
     std::cout << "test_resume_takeover_notifies_the_loser passed" << std::endl;
 }
 
+// Round 88, S1: a hint answers the board as it looked when 求招 was pressed.
+// make_move and undo do not wait for the in-flight search, so a stone that lands
+// while the engine thinks makes its result advice about a position that no longer
+// exists. The delivery slot then carries an invalid Move, which is exactly the
+// shape server.cpp turns into the error frame instead of a hint_result the client
+// would highlight on a stale board.
+void test_hint_answer_for_a_superseded_position() {
+    const auto dir = scratch("stale_hint_sessions");
+    const auto records = scratch("stale_hint_records.jsonl");
+    {
+        Harness h(dir, records);
+        GameManager& game = *h.entry->game;
+        assert(game.restore_game(playing_restore(1)));  // one black stone, WHITE to move
+        assert(game.current_turn() == WHITE);
+        assert(game.board().move_count() == 1);
+
+        size_t seen = 0;
+        const auto requested = std::chrono::steady_clock::now();
+        h.server.handle_request_hint(h.socket, json{{"timeout_ms", 3000}, {"max_depth", 8}});
+        assert(game.hint_active_.load());
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        int undone_count = -1;
+        GameStatus undone_status = GameStatus::WAITING;
+        assert(game.undo(undone_count, undone_status));
+        assert(undone_count == 0);
+        // The undo must not have armed an AI worker either, or the answer would
+        // be dropped at the discard gate rather than at the stale-position check.
+        assert(!game.is_ai_thinking());
+
+        for (int i = 0; i < 300 && game.hint_active_.load(); ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        assert(!game.hint_active_.load());
+        const long long delivery_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - requested).count();
+        // The premise of this case: the stone was given back while the search was
+        // still running, not after it had already answered.
+        assert(delivery_ms > 500);
+
+        int hint_results = 0;
+        std::string answer_type;
+        std::string answer_message;
+        for (const std::string& frame : drain_frames(h.server, h.socket, seen)) {
+            const json parsed = json::parse(frame, nullptr, false);
+            if (parsed.is_discarded() || !parsed.contains("type")) continue;
+            const std::string type = parsed["type"].get<std::string>();
+            if (type != "hint_result" && type != "error") continue;
+            if (type == "hint_result") ++hint_results;
+            answer_type = type;
+            if (parsed.contains("message") && parsed["message"].is_string()) {
+                answer_message = parsed["message"].get<std::string>();
+            }
+        }
+        assert(hint_results == 0);
+        assert(answer_type == "error");
+        assert(answer_message == "No hint available");
+        std::cout << "  stale hint: " << answer_type << " / " << answer_message
+                  << " after " << delivery_ms << " ms" << std::endl;
+
+        // Anti-overreach: with nothing touching the board the next hint is still a
+        // hint_result on a legal point.
+        h.server.handle_request_hint(h.socket, json{{"timeout_ms", 3000}, {"max_depth", 8}});
+        assert(game.hint_active_.load());
+        for (int i = 0; i < 300 && game.hint_active_.load(); ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        assert(!game.hint_active_.load());
+
+        int clean_results = 0;
+        int clean_errors = 0;
+        int clean_row = -1;
+        int clean_col = -1;
+        for (const std::string& frame : drain_frames(h.server, h.socket, seen)) {
+            const json parsed = json::parse(frame, nullptr, false);
+            if (parsed.is_discarded() || !parsed.contains("type")) continue;
+            const std::string type = parsed["type"].get<std::string>();
+            if (type == "error") ++clean_errors;
+            if (type != "hint_result") continue;
+            ++clean_results;
+            clean_row = parsed.value("row", -1);
+            clean_col = parsed.value("col", -1);
+        }
+        assert(clean_errors == 0);
+        assert(clean_results == 1);
+        assert(clean_row >= 0 && clean_row < BOARD_SIZE);
+        assert(clean_col >= 0 && clean_col < BOARD_SIZE);
+        assert(game.board().is_empty(clean_row, clean_col));
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    std::filesystem::remove(records, ec);
+    std::cout << "test_hint_answer_for_a_superseded_position passed" << std::endl;
+}
+
+// Round 88, S5: the two halves of a resumed session's search config stand on their
+// own. A file that states max_depth but never states timeout_ms - 0 is the
+// round-86 P2 sentinel for "key absent" - used to lose both at once, because one
+// absent key skipped set_config entirely and the game silently kept its defaults.
+void test_resume_restores_each_config_half() {
+    const auto dir = scratch("config_half_sessions");
+    {
+        GameManager untouched;
+        const int default_timeout = untouched.timeout_ms();
+        const int default_depth = untouched.max_depth();
+        std::cout << "  [r88s] default_config=" << default_timeout << "/"
+                  << default_depth << std::endl;
+
+        GameServer server(0, std::string(), std::string(), nullptr, dir.string(),
+                          std::string());
+
+        // Build each document with the writer itself, then patch the two config
+        // keys, so the record schema is never re-implemented here. A json null in
+        // the patch erases the key; the writer's own 0 is the round-86 P2
+        // "never declared" sentinel.
+        auto resume_with = [&server](const char* token, const json& stated,
+                                     int& timeout, int& depth) {
+            SessionSnapshot writable;
+            writable.token = token;
+            writable.player_color = "black";
+            writable.status = "playing";
+            json doc = json::parse(session_to_json(writable));
+            for (auto it = stated.begin(); it != stated.end(); ++it) {
+                if (it.value().is_null()) doc.erase(it.key());
+                else doc[it.key()] = it.value();
+            }
+            SessionSnapshot snap;
+            std::string error;
+            const std::string text = doc.dump();
+            if (!session_from_json(text, snap, error)) {
+                std::cout << "  [r88s] " << token << " rejected: " << error << std::endl;
+            }
+            assert(session_from_json(text, snap, error));
+            const std::shared_ptr<GameServer::TrackedGame> entry = server.open_session(&snap);
+            assert(entry->rebuilt);
+            timeout = entry->game->timeout_ms();
+            depth = entry->game->max_depth();
+        };
+
+        int timeout = 0;
+        int depth = 0;
+
+        // Only the depth is stated, with the timeout left at the writer's 0.
+        resume_with("aa01", {{"max_depth", 3}}, timeout, depth);
+        assert(timeout == default_timeout);
+        assert(depth == 3);
+
+        // Only the timeout is stated.
+        resume_with("aa02", {{"timeout_ms", 7000}}, timeout, depth);
+        assert(timeout == 7000);
+        assert(depth == default_depth);
+
+        // Anti-overreach: neither stated, in both of the ways a file can say
+        // that - the 0 sentinel and the key being absent outright. The absent
+        // half must be fed the value this game already has, never a 0 that the
+        // clamps would turn into 100 ms and depth 1.
+        resume_with("aa03", json::object(), timeout, depth);
+        assert(timeout == default_timeout);
+        assert(depth == default_depth);
+        resume_with("aa05", {{"timeout_ms", nullptr}, {"max_depth", nullptr}},
+                    timeout, depth);
+        assert(timeout == default_timeout);
+        assert(depth == default_depth);
+
+        // Both stated: both come back.
+        resume_with("aa04", {{"timeout_ms", 7000}, {"max_depth", 4}}, timeout, depth);
+        assert(timeout == 7000);
+        assert(depth == 4);
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    std::cout << "test_resume_restores_each_config_half passed" << std::endl;
+}
+
 }  // namespace
 
 int main() {
@@ -1306,6 +1480,8 @@ int main() {
     test_set_position_restamps_session_created_ms();
     test_unreadable_resume_gets_a_fresh_token();
     test_resume_takeover_notifies_the_loser();
+    test_hint_answer_for_a_superseded_position();
+    test_resume_restores_each_config_half();
 
     std::cout << "All server tests passed!" << std::endl;
     return 0;
