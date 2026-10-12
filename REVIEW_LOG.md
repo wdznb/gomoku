@@ -1398,3 +1398,59 @@ creating the session dir and re-opening persistence for `--no-sessions --records
 sequences that previously printed zero frames in 15 s now answer in 11.2 s and 19.9 s. The repo diff is
 confined to `tests/` (+318/-2 in four files); no `src/`, `web/`, `README.md`, `CMakeLists.txt` or `data/`
 file was touched by the test session, and no `gomoku_server` process was left behind.
+
+## 轮次78 摆棋开局的那一手、被中止推翻的认输与读文件的最后一扇门 — bugfix round 78 (phase5-bugfix)
+
+**Found.** Eight verified defects, all read line by line by the orchestrator before dispatch. N1: a
+`position` string that parses as a JSON *array* was moved into the position document as-is, so merging the
+top-level `encoding` indexed an array with a string and threw a `type_error` straight out of the handler -
+the client got no frame at all for a 识别/确认 click (README:517/519). N2: README:283-284 allows the player to
+start a hand-set position by *playing a stone* instead of choosing a side, but `player_color_` was still the
+constructor default BLACK, so a white-to-move template refused every white move with a generic
+`Invalid move`. N3: the AI worker's `result.resigned` branch required `!stop_flag_`, so pressing 终止 during a
+proved loss neither resigned nor played nor answered - the session was left with `ai_color_` to move and every
+later `make_move` refused. M1: `CoefficientVector::from_json_string` validated only the twelve keys it
+recognised, so a file of nothing but typos loaded "successfully" as pure defaults (the code's own comment at
+:142-144 described the hole). M2: a verification game discarded as INVALID returned 0.5 and stayed in
+`play_match`'s denominator, i.e. a candidate that lost the board got a draw credit toward the promotion bar
+(README:190/193). M3: `GameRecord::from_json` defaulted a missing/non-string `winner` to a draw and
+`reason_from_name` mapped any typo to INVALID, silently rewriting outcomes - README:209 permits defaults for
+metadata only. M4: README:176/:201 documented `--resume` as a bare switch while `main_trainer.cpp:52` and
+`:206-207` require a PATH. M5: `load_checkpoint` compared the elo player list and the version list by
+*length*, and `EloSystem::add_player` aliases duplicate names, so a shifted name column kept the same length
+and attributed later results to the wrong version.
+
+**Refuted before dispatch.** "A cold resume of an unreadable session file returns `resumed:false` while
+keeping the old token, so the next flush overwrites the record round-75 E4 preserved" - `open_session`
+(`server.cpp:1126-1137`) stamps `saved_payload` with exactly the empty-game payload so the dedup returns
+early, and README:475-477's "new token" branch is about an unknown or malformed token, not about a record
+that cannot be rebuilt. Recorded; a related hole did survive and is listed under 轮次79.
+
+**Fixed.** N1: an array text payload now becomes `{"board": <array>}`, so the document is always an object
+before `encoding` is merged. N2: `make_move` claims the side (`player_color_ = current_turn()`,
+`ai_color_ = opponent`) while `position_pending_` is set, before the colour guard; the existing
+clear-pending/`WAITING→PLAYING`/AI-arming tail at :181-192 then does the rest, and `handle_make_move` reads
+`player_color()` after the move instead of guessing it beforehand. N3: the resignation gate is now
+`!discard_pending_ && status_ == PLAYING`, so interruption cannot overturn a refutation while reset / resign /
+destruction stay silent. M1: zero recognised keys is an error, and an unrecognised key names the first
+offender (our own `to_json_string` writes exactly the twelve, so the round trip is unaffected). M2:
+`play_game` gained a `played` out-parameter, an INVALID game returns 0.0 and leaves the denominator, and a
+match with no valid game returns 0.0; `games_played_` and the `fitness_override_` shortcut are unchanged.
+M3: `winner` and `reason` must be present, be strings, and be names the writer can produce, with `"invalid"`
+still legal as itself. M4: both README lines now say `--resume PATH`. M5: every restored player must equal
+`version_name(i)`, not merely match the count.
+
+**Verified.** The test session wrote the cases and the orchestrator re-ran the gate on the same tree: plain
+`cmake .. && make -j4`, no new warnings, `ctest` **8/8**, `node tests/web_frontend_check.js` **18/18**.
+New cases: `test_position_array_string_payload_answers` (N1, both `check_position` and `set_position` plus the
+document-string and text-grid controls), `test_pending_position_direct_move_claims_side` (N2, including the
+already-chosen-side rejection path that must not regress), `test_resign_survives_interruption` (N3),
+`test_game_record_requires_outcome` (M3), `test_params_rejects_unrecognised_keys` (M1),
+`test_play_game_counts_only_valid_games` (M2 - it pins the valid side, the null out-parameter, the
+denominator identity and the injected-objective path, and records honestly that an INVALID game is not
+reachable through `play_game`, since every move generator filters forbidden points), and M5's shifted-name
+checkpoint rejection inside `test_trainer_rejects_bad_checkpoint`. Two pre-existing session expectations broke
+under M3's stricter reader; the test session gave those fixtures a legal outcome instead of loosening the
+assertion, so each case still exercises its own check (status, base, config bounds, wide integers). Repo diff
+is confined to the eight named files plus `tests/` (+595/-24); `data/` untouched, no `gomoku_server` left
+running.

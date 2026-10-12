@@ -115,6 +115,29 @@ std::string read_text(const std::filesystem::path& path) {
     return out.str();
 }
 
+// Run the handler sends that were posted onto the io_context (the one thread
+// the tests never start), then read back every frame the socket was handed
+// since the previous call. The write side of an unconnected socket fails, and
+// the failed write leaves its frame in the queue, so frames accumulate and
+// `seen` is the read cursor.
+std::vector<std::string> drain_frames(GameServer& server,
+                                      const std::shared_ptr<WebSocketSession>& socket,
+                                      size_t& seen) {
+    server.ioc_.restart();
+    for (int i = 0; i < 8; ++i) {
+        if (server.ioc_.poll() == 0) break;
+    }
+    std::queue<std::string> queue = socket->send_queue_;
+    std::vector<std::string> all;
+    while (!queue.empty()) {
+        all.push_back(std::move(queue.front()));
+        queue.pop();
+    }
+    std::vector<std::string> fresh(all.begin() + static_cast<std::ptrdiff_t>(seen), all.end());
+    seen = all.size();
+    return fresh;
+}
+
 // A finished game the manager can rebuild exactly: alternating colours, no
 // repeats, and the last stone completing a five on row 7 for `winner`
 // (black's line takes nine plies, white's ten).
@@ -504,6 +527,325 @@ void test_request_hint_clears_stale_discard() {
     std::cout << "test_request_hint_clears_stale_discard passed" << std::endl;
 }
 
+// R78 N1, read_position_payload: `position` accepts the canonical document or
+// the board as text, and a board matrix serialised as a string at the sender is
+// an array. The old code copied any parsed JSON into doc and then merged the
+// top-level `encoding` into it - doc["encoding"] on an array throws
+// type_error.305, the throw escaped handle_check_position / handle_set_position
+// and the read loop swallowed it: the socket went silent, no preview and no
+// error. The array is now wrapped as {"board": [...]} before the merge.
+void test_position_array_string_payload_answers() {
+    json matrix = json::array();
+    for (int r = 0; r < BOARD_SIZE; ++r) {
+        json row = json::array();
+        for (int c = 0; c < BOARD_SIZE; ++c) row.push_back(0);
+        matrix.push_back(std::move(row));
+    }
+    matrix[7][3] = 1;  // black
+    matrix[7][4] = 2;  // white
+    const std::string payload = matrix.dump();
+    const json encoding = {{"black", 1}, {"white", 2}, {"empty", 0}};
+
+    const auto dir = scratch("n1_sessions");
+    {
+        Harness h(dir, std::string());
+        size_t seen = 0;
+
+        // (a) The array-as-string with the top-level encoding the UI states:
+        // exactly one position_preview frame, not silence.
+        h.server.handle_check_position(
+            h.socket, json{{"position", payload}, {"encoding", encoding}});
+        std::vector<std::string> frames = drain_frames(h.server, h.socket, seen);
+        assert(frames.size() == 1);
+        const json preview = json::parse(frames[0]);
+        assert(preview["type"] == "position_preview");
+        assert(preview["ok"] == true);
+        assert(preview["black_count"] == 1);
+        assert(preview["white_count"] == 1);
+        assert(preview["side_to_move"] == "black");
+        assert(preview["encoding"]["black"] == "1");
+        assert(preview["encoding"]["white"] == "2");
+        assert(preview["encoding"]["empty"] == "0");
+        assert(preview["board"][7][3] == 1);
+        assert(preview["board"][7][4] == 2);
+
+        // (b) Same payload without the encoding: the wrapped board still reads
+        // (tokens detected as the 0/1/2 alphabet), not "局面文档必须是 JSON 对象".
+        h.server.handle_check_position(h.socket, json{{"position", payload}});
+        frames = drain_frames(h.server, h.socket, seen);
+        assert(frames.size() == 1);
+        const json detected = json::parse(frames[0]);
+        assert(detected["type"] == "position_preview");
+        assert(detected["ok"] == true);
+        assert(detected["black_count"] == 1);
+        assert(detected["side_to_move"] == "black");
+
+        // (c) Control: the same board as a document string is untouched.
+        json doc;
+        doc["board"] = matrix;
+        doc["encoding"] = encoding;
+        h.server.handle_check_position(h.socket, json{{"position", doc.dump()}});
+        frames = drain_frames(h.server, h.socket, seen);
+        assert(frames.size() == 1);
+        const json from_doc = json::parse(frames[0]);
+        assert(from_doc["type"] == "position_preview");
+        assert(from_doc["ok"] == true);
+        assert(from_doc["black_count"] == 1);
+        assert(from_doc["white_count"] == 1);
+
+        // (d) Control: the text grid path is untouched.
+        std::string grid;
+        for (int r = 0; r < BOARD_SIZE; ++r) {
+            for (int c = 0; c < BOARD_SIZE; ++c) {
+                grid += (r == 7 && c == 3) ? "1" : (r == 7 && c == 4) ? "2" : "0";
+                grid += (c == BOARD_SIZE - 1) ? '\n' : ' ';
+            }
+        }
+        h.server.handle_check_position(h.socket, json{{"position", grid}});
+        frames = drain_frames(h.server, h.socket, seen);
+        assert(frames.size() == 1);
+        const json from_grid = json::parse(frames[0]);
+        assert(from_grid["type"] == "position_preview");
+        assert(from_grid["ok"] == true);
+        assert(from_grid["black_count"] == 1);
+        assert(from_grid["white_count"] == 1);
+
+        // (e) set_position on the same payload: the position is installed, one
+        // position_set frame, and the session is in the pending state.
+        h.server.handle_set_position(
+            h.socket, json{{"position", payload}, {"encoding", encoding}});
+        frames = drain_frames(h.server, h.socket, seen);
+        assert(frames.size() == 1);
+        const json installed = json::parse(frames[0]);
+        assert(installed["type"] == "position_set");
+        assert(installed["position_pending"] == true);
+        assert(installed["current_turn"] == "black");
+        assert(installed["black_count"] == 1);
+        assert(installed["white_count"] == 1);
+        assert(h.entry->game->position_pending());
+        assert(h.entry->game->board().move_count() == 2);
+        assert(h.entry->game->board().get(7, 3) == BLACK);
+        assert(h.entry->game->board().get(7, 4) == WHITE);
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    std::cout << "test_position_array_string_payload_answers passed" << std::endl;
+}
+
+// R78 N2, make_move's pending-position claim + handle_make_move's colour read:
+// README lets 落子 start a hand-set game instead of choose_side ("玩家随后选择
+// 执子颜色或直接落子"). The old make_move compared the turn against the default
+// player_color_ (BLACK) before any claim, so a white-to-move position could
+// never be started by playing; and handle_make_move read player_color() before
+// the move, which would report the stale colour once the claim moved into
+// make_move. This drives the whole thing through the socket handlers.
+void test_pending_position_direct_move_claims_side() {
+    const auto dir = scratch("n2_sessions");
+    {
+        // (A) White to move (3 black / 2 white), no choose_side: the white
+        // stone claims WHITE for the player and hands BLACK to the AI.
+        Harness h(dir, std::string());
+        size_t seen = 0;
+        h.server.handle_set_position(
+            h.socket, json{{"position", {{"version", 1},
+                                         {"moves", {{0, 0}, {14, 0}, {0, 2}, {14, 2}, {0, 4}}}}}});
+        std::vector<std::string> frames = drain_frames(h.server, h.socket, seen);
+        assert(frames.size() == 1);
+        assert(json::parse(frames[0])["type"] == "position_set");
+        assert(h.entry->game->position_pending());
+        assert(h.entry->game->status() == GameStatus::WAITING);
+        assert(h.entry->game->current_turn() == WHITE);
+        assert(h.entry->game->board().move_count() == 5);
+
+        // (D) undo is still refused while a hand-set position is pending.
+        h.server.handle_undo(h.socket);
+        frames = drain_frames(h.server, h.socket, seen);
+        assert(frames.size() == 1);
+        assert(json::parse(frames[0])["type"] == "error");
+        assert(h.entry->game->position_pending());
+        assert(h.entry->game->board().move_count() == 5);
+
+        // A long budget so the armed black worker cannot finish and commit
+        // during the assertions; it is halted before the board is read again.
+        h.entry->game->set_config(120000, 20);
+        h.server.handle_make_move(h.socket, json{{"row", 7}, {"col", 7}});
+        const bool armed = h.entry->game->is_ai_thinking();
+        h.entry->game->halt_search();
+
+        frames = drain_frames(h.server, h.socket, seen);
+        int move_frames = 0;
+        for (const std::string& frame : frames) {
+            const json parsed = json::parse(frame);
+            if (parsed["type"] == "move_made") {
+                ++move_frames;
+                assert(parsed["row"] == 7);
+                assert(parsed["col"] == 7);
+                assert(parsed["color"] == "white");
+            }
+            assert(parsed["type"] != "error");
+        }
+        assert(move_frames == 1);
+
+        assert(h.entry->game->player_color() == WHITE);
+        assert(h.entry->game->ai_color() == BLACK);
+        assert(!h.entry->game->position_pending());
+        assert(h.entry->game->status() == GameStatus::PLAYING);
+        assert(h.entry->side_chosen);
+        assert(h.entry->game->board().move_count() == 6);
+        // Black is to move and was the side the AI got.
+        assert(h.entry->game->current_turn() == BLACK);
+        assert(armed);
+        // The stopped worker committed nothing: the claim stone is the 6th.
+        assert(h.entry->game->board().get(7, 7) == WHITE);
+    }
+    {
+        // (B) Reverse control: choose_side first clears the pending flag, and a
+        // white point in a session whose player is BLACK is still refused by
+        // the colour guard.
+        Harness h(dir, std::string());
+        size_t seen = 0;
+        h.server.handle_set_position(
+            h.socket, json{{"position", {{"version", 1},
+                                         {"moves", {{0, 0}, {14, 0}, {0, 2}, {14, 2}, {0, 4}}}}}});
+        h.entry->game->set_config(120000, 20);
+        h.server.handle_choose_side(h.socket, json{{"color", "black"}});
+        assert(h.entry->game->is_ai_thinking());
+        h.entry->game->halt_search();
+        assert(!h.entry->game->position_pending());
+        assert(h.entry->game->player_color() == BLACK);
+        assert(h.entry->game->ai_color() == WHITE);
+        assert(h.entry->game->board().move_count() == 5);
+        drain_frames(h.server, h.socket, seen);
+
+        h.server.handle_make_move(h.socket, json{{"row", 7}, {"col", 7}});
+        const std::vector<std::string> frames = drain_frames(h.server, h.socket, seen);
+        assert(frames.size() == 1);
+        const json refused = json::parse(frames[0]);
+        assert(refused["type"] == "error");
+        assert(refused["message"] == "Invalid move");
+        assert(h.entry->game->board().move_count() == 5);
+        assert(h.entry->game->board().is_empty(7, 7));
+    }
+    {
+        // (C) Regression: a black-to-move pending position started by playing
+        // black behaved this way before the fix too (the default player colour
+        // was already BLACK); the claim must not change any of it.
+        Harness h(dir, std::string());
+        size_t seen = 0;
+        h.server.handle_set_position(
+            h.socket, json{{"position", {{"version", 1},
+                                         {"moves", {{0, 0}, {14, 0}, {0, 2}, {14, 2}}}}}});
+        drain_frames(h.server, h.socket, seen);
+        assert(h.entry->game->position_pending());
+        assert(h.entry->game->current_turn() == BLACK);
+        h.entry->game->set_config(120000, 20);
+
+        h.server.handle_make_move(h.socket, json{{"row", 7}, {"col", 7}});
+        const bool armed = h.entry->game->is_ai_thinking();
+        h.entry->game->halt_search();
+
+        const std::vector<std::string> frames = drain_frames(h.server, h.socket, seen);
+        int move_frames = 0;
+        for (const std::string& frame : frames) {
+            const json parsed = json::parse(frame);
+            if (parsed["type"] == "move_made") ++move_frames;
+            assert(parsed["type"] != "error");
+        }
+        assert(move_frames == 1);
+        assert(h.entry->game->player_color() == BLACK);
+        assert(h.entry->game->ai_color() == WHITE);
+        assert(!h.entry->game->position_pending());
+        assert(h.entry->game->status() == GameStatus::PLAYING);
+        assert(h.entry->game->board().move_count() == 5);
+        assert(h.entry->game->current_turn() == WHITE);
+        assert(armed);
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    std::cout << "test_pending_position_direct_move_claims_side passed" << std::endl;
+}
+
+// R78 N3, ai_thinking_worker's resigned branch: the old gate was
+// !discard_pending_ && !stop_flag_ && PLAYING, so a user 终止 (stop_thinking only
+// raises stop_flag_) turned the engine's proven loss - search() returning
+// resigned=true because every remaining cell is forbidden for BLACK - into
+// silence: the game stayed PLAYING with ai_color_ to move and no frame coming,
+// and every later make_move was rejected by the colour guard. The stop term is
+// gone; only the discard paths (reset / set_position / resign / destructor)
+// may suppress the ending. The board below makes that loss unavoidable and
+// stop-independent: (7,7) is the last empty cell and a black stone there is a
+// six-in-a-row (overline), so the black candidate filter empties root_moves
+// before any stop check and search() resigns by itself.
+void test_resign_survives_interruption() {
+    Board full;
+    for (int r = 0; r < BOARD_SIZE; ++r) {
+        for (int c = 0; c < BOARD_SIZE; ++c) {
+            if (r == 7 && c == 7) continue;
+            const bool line = (r == 7) || (c == 7) || (r - c == 0) || (r + c == 14);
+            int color = line ? WHITE : ((r + c) % 2 == 0 ? BLACK : WHITE);
+            if (r == 7 && c >= 2 && c <= 6) color = BLACK;
+            assert(full.place_stone(r, c, color));
+        }
+    }
+    assert(full.move_count() == MAX_MOVES - 1);
+    assert(full.is_empty(7, 7));
+    assert(PatternRecognizer::is_forbidden(full, 7, 7, BLACK));
+
+    int frames = 0;
+    int frame_winner = EMPTY;
+    std::string frame_reason;
+    {
+        GameManager game;
+        game.set_player_color(WHITE);  // the AI plays BLACK
+        assert(game.ai_color() == BLACK);
+        assert(game.set_position(full));
+        // The state a game armed by start_ai_thinking has: playing, not
+        // pending, no discard mark.
+        game.status_ = GameStatus::PLAYING;
+        game.position_pending_ = false;
+        game.discard_pending_.store(false);
+        game.set_game_over_callback([&](int winner, const std::string& reason) {
+            ++frames;
+            frame_winner = winner;
+            frame_reason = reason;
+        });
+
+        // 终止 arrived: stop_flag_ is up when the worker decides, and the
+        // worker is driven directly so the window is deterministic.
+        game.stop_flag_.store(true);
+        std::thread worker(&GameManager::ai_thinking_worker, &game, 2000, 2);
+        worker.join();
+
+        assert(game.status() == GameStatus::GAME_OVER);
+        assert(game.winner() == WHITE);
+        assert(frames == 1);
+        assert(frame_winner == WHITE);
+        assert(frame_reason == "resign");
+        // The game is over, so the human's next move is refused by the
+        // game-over status rather than by the colour guard in a game that
+        // still looks playable.
+        assert(!game.make_move(7, 7));
+    }
+
+    // Control: the discard path (reset / set_position / resign / destructor)
+    // must stay silent - a game the user threw away does not end itself.
+    {
+        GameManager game;
+        game.set_player_color(WHITE);
+        assert(game.set_position(full));
+        game.status_ = GameStatus::PLAYING;
+        game.position_pending_ = false;
+        game.discard_pending_.store(true);
+        game.set_game_over_callback([&](int, const std::string&) { ++frames; });
+        game.stop_flag_.store(true);
+        std::thread worker(&GameManager::ai_thinking_worker, &game, 2000, 2);
+        worker.join();
+        assert(game.status() == GameStatus::PLAYING);
+        assert(frames == 1);  // unchanged: no second callback
+    }
+    std::cout << "test_resign_survives_interruption passed" << std::endl;
+}
+
 }  // namespace
 
 int main() {
@@ -518,6 +860,9 @@ int main() {
     test_check_position_skips_session_creation();
     test_failed_export_retries_records_append();
     test_request_hint_clears_stale_discard();
+    test_position_array_string_payload_answers();
+    test_pending_position_direct_move_claims_side();
+    test_resign_survives_interruption();
 
     std::cout << "All server tests passed!" << std::endl;
     return 0;

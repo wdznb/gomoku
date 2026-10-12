@@ -149,6 +149,14 @@ bool GameManager::make_move(int row, int col) {
     if (ai_thinking_.load()) return false;
     
     int turn = current_turn();
+    // While a hand-set position is still pending, no side has been claimed yet,
+    // so this stone is the claim (README lets 落子 start the game instead of
+    // choose_side). It has to happen before the colour guard below, which would
+    // otherwise compare the turn against the default player_color_.
+    if (position_pending_) {
+        player_color_ = turn;
+        ai_color_ = opponent(turn);
+    }
     // Only the human side may call make_move. If stop_thinking aborted the AI
     // worker before it placed a stone, the board still shows AI's color to
     // move; without this guard the human's next make_move would silently
@@ -370,7 +378,10 @@ void GameManager::ai_thinking_worker(int timeout_ms, int max_depth) {
 
     if (result.resigned) {
         std::lock_guard<std::mutex> lock(thinking_mutex_);
-        if (!discard_pending_.load() && !stop_flag_.load() && status_ == GameStatus::PLAYING) {
+        // Interruption is not a refutation: the proven loss is the engine's own
+        // conclusion, so 终止 must still end the game. Skipping it here would
+        // leave the session with ai_color_ to move and no frame coming.
+        if (!discard_pending_.load() && status_ == GameStatus::PLAYING) {
             resign_now(ai_color_);
         }
         ai_thinking_.store(false);

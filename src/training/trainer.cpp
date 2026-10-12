@@ -48,7 +48,8 @@ SearchEngine& Trainer::prepare(SearchEngine& engine) const {
     return engine;
 }
 
-double Trainer::play_game(SearchEngine& black, SearchEngine& white, int black_owner) {
+double Trainer::play_game(SearchEngine& black, SearchEngine& white, int black_owner,
+                          bool* played) {
     SelfPlayConfig settings;
     settings.max_depth = config_.search_depth;
     settings.timeout_ms = config_.timeout_ms;
@@ -56,13 +57,16 @@ double Trainer::play_game(SearchEngine& black, SearchEngine& white, int black_ow
 
     SelfPlay play(black, white, settings);
     GameRecord record = play.run(std::vector<Move>(), nullptr, nullptr);
+    const bool valid = record.reason != GameEndReason::INVALID;
+    if (played) *played = valid;
     // Same yardstick as the data side: an INVALID game is discarded, so it
     // must not inflate games_played_ in the checkpoint or the progress line.
-    if (record.reason != GameEndReason::INVALID) games_played_++;
+    if (valid) games_played_++;
+    if (!valid) return 0.0;
 
     if (record.winner == EMPTY) {
-        // Unfinished or discarded games score half: they must not hand either
-        // side a result the board does not show.
+        // Unfinished games score half: they must not hand either side a result
+        // the board does not show.
         return 0.5;
     }
     const int winner_owner = record.winner == BLACK ? black_owner : 3 - black_owner;
@@ -94,11 +98,25 @@ double Trainer::play_match(const ThreatCoefficients& candidate,
     // the next even count, as the config comment promises.
     const int pairs = std::max(1, (games + 1) / 2);
     double score = 0.0;
+    int played_games = 0;
     for (int i = 0; i < pairs; ++i) {
-        score += play_game(candidate_engine, reference_engine, 1);
-        score += play_game(reference_engine, candidate_engine, 2);
+        bool valid = false;
+        const double first = play_game(candidate_engine, reference_engine, 1, &valid);
+        if (valid) {
+            score += first;
+            ++played_games;
+        }
+        valid = false;
+        const double second = play_game(reference_engine, candidate_engine, 2, &valid);
+        if (valid) {
+            score += second;
+            ++played_games;
+        }
     }
-    return score / (2.0 * pairs);
+    // A discarded game has no result to average, so it leaves the denominator
+    // rather than counting as a half; one that never got played cannot promote.
+    if (played_games == 0) return 0.0;
+    return score / played_games;
 }
 
 std::vector<Move> Trainer::random_opening_line(int plies, uint64_t seed) {
@@ -465,11 +483,19 @@ bool Trainer::load_checkpoint(const std::string& path, std::string& error) {
     } else {
         for (size_t i = 0; i < restored_versions.size(); ++i) restored_elo.add_player(version_name(i));
     }
-    // Player ids are used as version indices, so the two lists must stay the same
-    // length or later results would be attributed to the wrong version.
+    // Player ids are used as version indices, so the two lists must agree by name
+    // and not merely by length: equal lengths with the names shifted would
+    // attribute results to another version, and every later checkpoint would then
+    // be unreadable.
     if (restored_elo.players().size() != restored_versions.size()) {
         error = "checkpoint ratings and versions disagree";
         return false;
+    }
+    for (size_t i = 0; i < restored_versions.size(); ++i) {
+        if (restored_elo.players()[i].name != version_name(i)) {
+            error = "checkpoint ratings and versions disagree";
+            return false;
+        }
     }
 
     // Everything is read into locals and only assigned once the whole file

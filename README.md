@@ -173,7 +173,7 @@ stdout，不会打断对局。`data/sessions/` 与 `data/training/` 都在 `.git
 2. 让候选与当前冠军对战（每对组合执黑白各一次），得到验证分；
 3. 验证分 ≥ `--accept-score`（默认 0.56）才晋升为新冠军，并写入 `--out`；
 4. 生成若干盘自我对弈作为训练数据（对局记录 + 特征样本，JSONL 追加）；
-5. 保存 checkpoint，中断后可 `--resume` 继续。
+5. 保存 checkpoint，中断后可 `--resume PATH`（断点文件路径）继续。
 
 ```bash
 cd build
@@ -198,7 +198,7 @@ cd build
 | `--out` | `data/training/best_params.json` | 冠军参数输出位置 |
 | `--records` / `--samples` | 空 | 对局记录 / 训练样本 JSONL |
 | `--checkpoint` | `data/training/checkpoint.json` | 断点文件 |
-| `--resume` | — | 从断点继续训练 |
+| `--resume` | — | 从断点继续训练，需要一个断点文件路径 |
 
 产物目录 `data/training/` 已被 `.gitignore` 忽略，训练不会污染仓库。
 

@@ -272,6 +272,92 @@ void test_game_record_roundtrip() {
     std::cout << "test_game_record_roundtrip passed" << std::endl;
 }
 
+// Round 78, M3: winner and reason are outcomes, not metadata. Defaulting a
+// missing one turned a win into a draw in every sample derived from the record;
+// an unknown name would read as INVALID and quietly drop a decided game. Both
+// are refused, "invalid" itself stays a legal reason, and a rejected parse must
+// leave the caller's record untouched.
+void test_game_record_requires_outcome() {
+    std::string error;
+
+    GameRecord sentinel;
+    sentinel.winner = WHITE;
+    sentinel.reason = GameEndReason::RESIGN;
+
+    const char* rejected[] = {
+        R"({"moves":[]})",                                    // no winner at all
+        R"({"moves":[],"reason":"five"})",                    // reason but no winner
+        R"({"moves":[],"winner":"black"})",                   // winner but no reason
+        R"({"moves":[],"winner":1,"reason":"five"})",         // winner is not a string
+        R"({"moves":[],"winner":"black","reason":1})",        // reason is not a string
+        R"({"moves":[],"winner":"grey","reason":"five"})",    // winner name not written
+        R"({"moves":[],"winner":"black","reason":"fiv"})",    // reason name not written
+        R"({"moves":[],"winner":"black","reason":"fiveinarow"})",
+    };
+    for (const char* text : rejected) {
+        GameRecord out = sentinel;
+        error.clear();
+        assert(!GameRecord::from_json(text, out, error));
+        assert(!error.empty());
+        // The failed parse may not leave half of itself in the caller's record.
+        assert(out.winner == WHITE && out.reason == GameEndReason::RESIGN);
+        assert(out.moves.empty());
+        std::cout << "  rejected " << text << " -> " << error << std::endl;
+    }
+
+    // The three refusal messages are distinct, so a caller can tell "missing"
+    // from "misspelled".
+    GameRecord out;
+    error.clear();
+    assert(!GameRecord::from_json(R"({"moves":[]})", out, error));
+    assert(error.find("must state winner") != std::string::npos);
+    error.clear();
+    assert(!GameRecord::from_json(R"({"moves":[],"winner":"black"})", out, error));
+    assert(error.find("must state reason") != std::string::npos);
+    error.clear();
+    assert(!GameRecord::from_json(R"({"moves":[],"winner":"grey","reason":"five"})", out, error));
+    assert(error.find("unknown winner colour") != std::string::npos);
+    error.clear();
+    assert(!GameRecord::from_json(R"({"moves":[],"winner":"black","reason":"fiv"})", out, error));
+    assert(error.find("unknown end reason") != std::string::npos);
+
+    // Legal: "invalid" is itself one of the written reason names, and every
+    // written name round-trips through the writer unchanged.
+    error.clear();
+    assert(GameRecord::from_json(
+        R"({"moves":[],"winner":"draw","reason":"invalid"})", out, error));
+    assert(out.winner == EMPTY && out.reason == GameEndReason::INVALID);
+
+    const GameEndReason reasons[] = {
+        GameEndReason::FIVE,    GameEndReason::FORBIDDEN, GameEndReason::RESIGN,
+        GameEndReason::BOARD_FULL, GameEndReason::MOVE_LIMIT, GameEndReason::INVALID,
+    };
+    const int winners[] = {BLACK, WHITE, WHITE, EMPTY, EMPTY, EMPTY};
+    for (size_t i = 0; i < sizeof(reasons) / sizeof(reasons[0]); ++i) {
+        GameRecord written;
+        written.winner = winners[i];
+        written.reason = reasons[i];
+        GameRecord back;
+        error.clear();
+        assert(GameRecord::from_json(written.to_json(), back, error));
+        assert(back.winner == winners[i]);
+        assert(back.reason == reasons[i]);
+    }
+
+    // A record a real game produces round-trips whole through the same door.
+    SearchEngine engine;
+    SelfPlay play(engine, engine, quick_play_config());
+    const GameRecord played = play.run(std::vector<Move>(), nullptr, nullptr);
+    assert(played.reason != GameEndReason::INVALID);
+    GameRecord restored;
+    error.clear();
+    assert(GameRecord::from_json(played.to_json(), restored, error));
+    assert(restored.winner == played.winner && restored.reason == played.reason);
+    assert(restored.moves.size() == played.moves.size());
+
+    std::cout << "test_game_record_requires_outcome passed" << std::endl;
+}
+
 void test_elo_system() {
     EloSystem elo(1500.0, 32.0);
     assert(EloSystem::expected_score(1500, 1500) == 0.5);
@@ -1064,6 +1150,32 @@ void test_trainer_rejects_bad_checkpoint() {
     assert(!trainer.load_checkpoint(path.string(), error));
     assert(error.find("disagree") != std::string::npos);
 
+    // Round 78, M5: equal lengths are not agreement. Names shifted by one
+    // attribute the results to another version, so the pair is checked name by
+    // name, index by index.
+    {
+        std::ofstream file(path);
+        file << "{\"versions\":[" << CoefficientVector::to_json_string(ThreatCoefficients())
+             << "," << CoefficientVector::to_json_string(ThreatCoefficients())
+             << "],\"elo\":{\"players\":[{\"name\":\"v1\"},{\"name\":\"v0\"}]}}";
+    }
+    error.clear();
+    assert(!trainer.load_checkpoint(path.string(), error));
+    assert(error.find("disagree") != std::string::npos);
+    assert(trainer.versions().size() == 1);
+
+    // Control: the same shape with the names in index order loads, so the
+    // refusal above is the shift and not the file shape.
+    {
+        std::ofstream file(path);
+        file << "{\"versions\":[" << CoefficientVector::to_json_string(ThreatCoefficients())
+             << "," << CoefficientVector::to_json_string(ThreatCoefficients())
+             << "],\"elo\":{\"players\":[{\"name\":\"v0\"},{\"name\":\"v1\"}]}}";
+    }
+    assert(trainer.load_checkpoint(path.string(), error));
+    assert(trainer.versions().size() == 2);
+    assert(trainer.ratings().players().size() == 2);
+
     assert(!trainer.load_checkpoint((path.string() + ".missing").c_str(), error));
 
     std::cout << "test_trainer_rejects_bad_checkpoint passed" << std::endl;
@@ -1113,10 +1225,12 @@ void test_readers_reject_out_of_range_numbers() {
     assert(error.find("32-bit") != std::string::npos);
 
     // Coordinates decide the position, so an unusable one rejects the whole record
-    // instead of replaying whatever the low half of the number points at.
+    // instead of replaying whatever the low half of the number points at. The
+    // record states its outcome so the off-board check is the one that fires.
     GameRecord record;
     assert(!GameRecord::from_json(
-        "{\"moves\":[{\"row\":99999999999,\"col\":3,\"color\":\"black\"}]}", record, error));
+        "{\"moves\":[{\"row\":99999999999,\"col\":3,\"color\":\"black\"}],"
+        "\"winner\":\"black\",\"reason\":\"five\"}", record, error));
     assert(error.find("off the board") != std::string::npos);
 
     TrainingSample sample;
@@ -1130,7 +1244,9 @@ void test_readers_reject_out_of_range_numbers() {
 
     // Metadata decides nothing, so it falls back to its default instead.
     GameRecord metadata;
-    assert(GameRecord::from_json("{\"moves\":[],\"total_nodes\":99999999999}", metadata, error));
+    assert(GameRecord::from_json(
+        "{\"moves\":[],\"winner\":\"draw\",\"reason\":\"invalid\",\"total_nodes\":99999999999}",
+        metadata, error));
     assert(metadata.total_nodes == 0);
 
     EloSystem elo;
@@ -1144,6 +1260,16 @@ void test_readers_reject_out_of_range_numbers() {
 // not inflate games_played_ - every checkpoint and status line would otherwise
 // overstate the work done. The counter is private and only alive through
 // play_game(), so the test drives it directly and pins the ordinary counting.
+//
+// Round 78, M2: play_match() counts its games through the same `played`
+// out-parameter, so a discarded game leaves the denominator instead of
+// counting as a half. An INVALID record cannot be produced deterministically
+// through this door: play_game passes an empty prefix and a null stop flag
+// (trainer.cpp:59), SelfPlay::run only reports INVALID for an illegal prefix
+// (self_play.cpp:32-42), an external stop (:122-131) or an engine illegal move
+// (:71-82), and every move generator filters forbidden points. So the out-
+// parameter is pinned on the valid side here and through the denominator
+// identity below; the negative proof for the exclusion is at compile level.
 void test_play_game_counts_only_valid_games() {
     TrainingConfig config = fast_training_config();
     config.search_depth = 1;
@@ -1157,12 +1283,42 @@ void test_play_game_counts_only_valid_games() {
     // One stone then the move cap: a MOVE_LIMIT game, not INVALID, so it counts
     // once, and an unfinished game scores half.
     assert(trainer.games_played() == 0);
-    assert(trainer.play_game(black, white, 1) == 0.5);
+    bool played = false;
+    assert(trainer.play_game(black, white, 1, &played) == 0.5);
+    assert(played);
     assert(trainer.games_played() == 1);
     SearchEngine black_b;
     SearchEngine white_b;
     assert(trainer.play_game(black_b, white_b, 2) == 0.5);
     assert(trainer.games_played() == 2);
+
+    // An explicit null out-parameter is not a crash and not a behaviour change.
+    SearchEngine black_c;
+    SearchEngine white_c;
+    assert(trainer.play_game(black_c, white_c, 1, nullptr) == 0.5);
+    assert(trainer.games_played() == 3);
+
+    // Every game in a match is undecided (MOVE_LIMIT), so the average is 0.5
+    // and cannot cross the promotion line: an undecided game must never read
+    // as a win.
+    Trainer matcher(ThreatCoefficients(), config);
+    const double match = matcher.play_match(ThreatCoefficients(), ThreatCoefficients(), 2);
+    assert(match == 0.5);
+    assert(match < config.accept_score);
+    assert(matcher.games_played() == 2);
+
+    // The injected-objective fast path is untouched by the counting change:
+    // win, loss and draw are still decided by the two scores.
+    Trainer fast(ThreatCoefficients(), config);
+    fast.set_fitness_override([](const ThreatCoefficients& c) { return c.live_four > 15000 ? 1.0 : 0.0; });
+    ThreatCoefficients strong;
+    strong.live_four = 20000;
+    ThreatCoefficients weak;
+    weak.live_four = 5000;
+    assert(fast.play_match(strong, weak, 2) == 1.0);
+    assert(fast.play_match(weak, strong, 2) == 0.0);
+    assert(fast.play_match(strong, strong, 2) == 0.5);
+    assert(fast.games_played() == 0);
 
     std::cout << "test_play_game_counts_only_valid_games passed" << std::endl;
 }
@@ -1726,12 +1882,15 @@ void test_params_rejects_broken_rule_constants() {
         std::cout << "  rejected " << text << " -> " << error << std::endl;
     }
 
-    // Accepted: the defaults when neither key is present, the boundary values,
-    // and a round-trip through the writer.
+    // Accepted: a file that names a known key but keeps the two constants out
+    // of it (round 78, M1: a file naming no known key at all is now refused as
+    // the wrong file - see test_params_rejects_unrecognised_keys), the boundary
+    // values, and a round-trip through the writer.
     const ThreatCoefficients defaults;
     ThreatCoefficients parsed;
     error.clear();
-    assert(CoefficientVector::from_json_string("{}", parsed, error));
+    assert(CoefficientVector::from_json_string(R"({"live_four":16000})", parsed, error));
+    assert(parsed.live_four == 16000);
     assert(parsed.five == defaults.five);
     assert(parsed.forbidden_penalty == defaults.forbidden_penalty);
 
@@ -1753,6 +1912,64 @@ void test_params_rejects_broken_rule_constants() {
     std::cout << "  round-tripped 88888/77777 through the writer" << std::endl;
 
     std::cout << "test_params_rejects_broken_rule_constants passed" << std::endl;
+}
+
+// Round 78, M1: a parameter file that names none of the twelve coefficients is
+// the wrong file (or a wholesale rename), and the old reader loaded it as a
+// successful load of pure defaults - training ran against parameters the file
+// never stated. An unrecognised key next to real ones is a typo (live_fourx)
+// that would silently leave its coefficient at the default. Both are refused,
+// the second naming the key; a partial but well-spelled file stays legal.
+void test_params_rejects_unrecognised_keys() {
+    std::string error;
+    ThreatCoefficients parsed;
+
+    const char* no_known[] = {
+        R"({"live_fourx":1})",
+        R"({"foo":1,"bar":2})",
+        R"({"coefficients":{}})",
+        R"({"coefficients":{"live_fourx":1500,"rush_fourx":300}})",
+    };
+    for (const char* text : no_known) {
+        error.clear();
+        assert(!CoefficientVector::from_json_string(text, parsed, error));
+        assert(error == "no known coefficient key found in the file");
+        std::cout << "  rejected " << text << " -> " << error << std::endl;
+    }
+
+    // A known key that is also out of range must not mask the unknown-key
+    // report: the file is checked for shape before its values are trusted.
+    error.clear();
+    assert(!CoefficientVector::from_json_string(
+        R"({"coefficients":{"five":1000,"junk":1}})", parsed, error));
+    assert(error == "unknown coefficient key: junk");
+    std::cout << "  rejected {\"coefficients\":{\"five\":1000,\"junk\":1}} -> " << error
+              << std::endl;
+
+    error.clear();
+    assert(!CoefficientVector::from_json_string(
+        R"({"coefficients":{"live_four":16000,"live_fourx":1}})", parsed, error));
+    assert(error == "unknown coefficient key: live_fourx");
+
+    // Controls: the writer's own output still loads whole, a partial file naming
+    // real keys still loads with the rest at their defaults, and the bare-root
+    // form is unchanged.
+    ThreatCoefficients written;
+    written.live_four = 20000;
+    written.five = 32411;
+    error.clear();
+    assert(CoefficientVector::from_json_string(
+        CoefficientVector::to_json_string(written), parsed, error));
+    assert(parsed.live_four == 20000 && parsed.five == 32411);
+
+    const ThreatCoefficients defaults;
+    error.clear();
+    assert(CoefficientVector::from_json_string(R"({"live_three":321})", parsed, error));
+    assert(parsed.live_three == 321);
+    assert(parsed.live_four == defaults.live_four);
+    assert(parsed.five == defaults.five);
+
+    std::cout << "test_params_rejects_unrecognised_keys passed" << std::endl;
 }
 
 // R77 L2: stod() parses "nan"/"inf" with used == text.size(), and a NaN then
@@ -1812,6 +2029,7 @@ int main() {
     test_self_symmetries_and_canonical_cells();
     test_transform_board();
     test_game_record_roundtrip();
+    test_game_record_requires_outcome();
     test_elo_system();
     test_coefficient_vector();
     test_self_play_records_legal_game();
@@ -1842,6 +2060,7 @@ int main() {
     test_buffered_write_failures_are_caught();
     test_params_rejects_non_object_coefficients();
     test_params_rejects_broken_rule_constants();
+    test_params_rejects_unrecognised_keys();
     test_trainer_cli_rejects_non_finite_accept_score();
 
     std::cout << "All training tests passed" << std::endl;

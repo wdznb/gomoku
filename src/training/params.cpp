@@ -161,8 +161,10 @@ bool CoefficientVector::from_json_string(const std::string& text, ThreatCoeffici
                      &coeffs.double_four, &coeffs.double_three, &coeffs.four_three,
                      &coeffs.forbidden_penalty, &coeffs.position_weight_scale};
 
+    int matched = 0;
     for (int i = 0; i < 12; ++i) {
         if (!body->contains(names[i])) continue;
+        ++matched;
         const json& value = (*body)[names[i]];
         if (!value.is_number_integer()) {
             error = std::string(names[i]) + " must be an integer";
@@ -176,6 +178,28 @@ bool CoefficientVector::from_json_string(const std::string& text, ThreatCoeffici
             return false;
         }
         *fields[i] = parsed;
+    }
+
+    // A file that names none of the twelve is not a subset of the defaults, it is
+    // the wrong file; loading it would report success while training nothing.
+    if (matched == 0) {
+        error = "no known coefficient key found in the file";
+        return false;
+    }
+    // An unrecognised key is a typo (live_fourx) that would otherwise be silently
+    // ignored while the real coefficient kept its default.
+    for (auto it = body->begin(); it != body->end(); ++it) {
+        bool known = false;
+        for (int i = 0; i < 12; ++i) {
+            if (it.key() == names[i]) {
+                known = true;
+                break;
+            }
+        }
+        if (!known) {
+            error = "unknown coefficient key: " + it.key();
+            return false;
+        }
     }
 
     // `five` is load-bearing for mate detection, so a file that moves it above the

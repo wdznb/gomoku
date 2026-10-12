@@ -86,14 +86,27 @@ bool GameRecord::from_json(const std::string& text, GameRecord& out, std::string
     }
 
     GameRecord record;
-    if (root.contains("winner") && root["winner"].is_string()) {
-        if (!color_from_name(root["winner"].get<std::string>(), record.winner)) {
-            error = "unknown winner colour in game record";
-            return false;
-        }
+    // Winner and end reason are outcomes, not metadata: defaulting them would
+    // turn a win into a draw in every sample derived from the record.
+    if (!root.contains("winner") || !root["winner"].is_string()) {
+        error = "game record must state winner as black, white or draw";
+        return false;
     }
-    if (root.contains("reason") && root["reason"].is_string()) {
-        record.reason = reason_from_name(root["reason"].get<std::string>());
+    if (!color_from_name(root["winner"].get<std::string>(), record.winner)) {
+        error = "unknown winner colour in game record";
+        return false;
+    }
+    if (!root.contains("reason") || !root["reason"].is_string()) {
+        error = "game record must state reason as an end reason";
+        return false;
+    }
+    const std::string reason = root["reason"].get<std::string>();
+    record.reason = reason_from_name(reason);
+    // reason_from_name maps any unmatched name to INVALID, so a miss has to be
+    // told apart from "invalid", which is itself one of the written names.
+    if (record.reason == GameEndReason::INVALID && reason != "invalid") {
+        error = "unknown end reason in game record: " + reason;
+        return false;
     }
     auto read_metadata = [&root](const char* key, int fallback) {
         int value = fallback;

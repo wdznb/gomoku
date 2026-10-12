@@ -122,29 +122,35 @@ void test_rejects_damaged_files() {
     assert(!session_from_json(R"({"version":1,"token":"ab"})", out, error));
     assert(!session_from_json(R"({"version":1,"token":"ab","record":{}})", out, error));
     assert(error.find("record") != std::string::npos);
+    // Round 78: the record owns winner and reason, so a record without them is
+    // the record case; the status check is only reached by a readable record.
     assert(!session_from_json(
                R"({"version":1,"token":"ab","status":"paused","record":{"moves":[]}})", out, error));
+    assert(error.find("对局记录") != std::string::npos);
+    assert(!session_from_json(
+               R"({"version":1,"token":"ab","status":"paused","record":{"moves":[],"winner":"draw","reason":"invalid"}})",
+               out, error));
     assert(error.find("状态") != std::string::npos);
 
     // Base stones are what makes a hand-set position resumable, so a file whose
     // base cannot be read exactly is refused instead of resuming the player into
     // a position they never left.
-    const char* skeleton = R"({"version":1,"token":"ab","status":"playing","record":{"moves":[]},)";
+    const char* skeleton = R"({"version":1,"token":"ab","status":"playing","record":{"moves":[],"winner":"draw","reason":"invalid"},)";
     const std::string ok_base = std::string(skeleton) + R"("base":[{"row":0,"col":14,"color":"black"}]})";
     assert(session_from_json(ok_base, out, error));
     assert(out.base.size() == 1 && out.base[0] == Move(0, 14, BLACK));
-    for (const char* bad : {R"({"version":1,"token":"ab","status":"playing","record":{"moves":[]},"base":{}})",
-                            R"({"version":1,"token":"ab","status":"playing","record":{"moves":[]},"base":"7,7"})",
-                            R"({"version":1,"token":"ab","status":"playing","record":{"moves":[]},"base":[{"row":15,"col":0,"color":"black"}]})",
-                            R"({"version":1,"token":"ab","status":"playing","record":{"moves":[]},"base":[{"row":0,"color":"black"}]})",
-                            R"({"version":1,"token":"ab","status":"playing","record":{"moves":[]},"base":[{"row":0,"col":0,"color":"purple"}]})",
-                            R"({"version":1,"token":"ab","status":"playing","record":{"moves":[]},"base":[{"row":0,"col":0}]})",
-                            R"({"version":1,"token":"ab","status":"playing","record":{"moves":[]},"base":[null]})"}) {
+    for (const char* bad : {R"({"version":1,"token":"ab","status":"playing","record":{"moves":[],"winner":"draw","reason":"invalid"},"base":{}})",
+                            R"({"version":1,"token":"ab","status":"playing","record":{"moves":[],"winner":"draw","reason":"invalid"},"base":"7,7"})",
+                            R"({"version":1,"token":"ab","status":"playing","record":{"moves":[],"winner":"draw","reason":"invalid"},"base":[{"row":15,"col":0,"color":"black"}]})",
+                            R"({"version":1,"token":"ab","status":"playing","record":{"moves":[],"winner":"draw","reason":"invalid"},"base":[{"row":0,"color":"black"}]})",
+                            R"({"version":1,"token":"ab","status":"playing","record":{"moves":[],"winner":"draw","reason":"invalid"},"base":[{"row":0,"col":0,"color":"purple"}]})",
+                            R"({"version":1,"token":"ab","status":"playing","record":{"moves":[],"winner":"draw","reason":"invalid"},"base":[{"row":0,"col":0}]})",
+                            R"({"version":1,"token":"ab","status":"playing","record":{"moves":[],"winner":"draw","reason":"invalid"},"base":[null]})"}) {
         assert(!session_from_json(bad, out, error));
     }
     // Absent is not damaged: a game from an empty board simply has none.
     assert(session_from_json(
-               R"({"version":1,"token":"ab","status":"playing","record":{"moves":[]}})", out, error));
+               R"({"version":1,"token":"ab","status":"playing","record":{"moves":[],"winner":"draw","reason":"invalid"}})", out, error));
     assert(out.base.empty());
 
     // A finished session keeps its ending; the record owns winner and reason.
@@ -259,23 +265,23 @@ void test_session_config_validation() {
     std::string error;
 
     // Negative timeout_ms should be rejected
-    const char* neg_timeout = R"({"version":1,"token":"ab","status":"playing","record":{"moves":[],"total_nodes":0,"max_depth":0},"timeout_ms":-1000,"max_depth":4})";
+    const char* neg_timeout = R"({"version":1,"token":"ab","status":"playing","record":{"moves":[],"winner":"draw","reason":"invalid","total_nodes":0,"max_depth":0},"timeout_ms":-1000,"max_depth":4})";
     assert(!session_from_json(neg_timeout, out, error));
 
     // Excessively large timeout_ms (>120s) should be rejected
-    const char* huge_timeout = R"({"version":1,"token":"ab","status":"playing","record":{"moves":[],"total_nodes":0,"max_depth":0},"timeout_ms":999999999,"max_depth":4})";
+    const char* huge_timeout = R"({"version":1,"token":"ab","status":"playing","record":{"moves":[],"winner":"draw","reason":"invalid","total_nodes":0,"max_depth":0},"timeout_ms":999999999,"max_depth":4})";
     assert(!session_from_json(huge_timeout, out, error));
 
     // Negative max_depth should be rejected
-    const char* neg_depth = R"({"version":1,"token":"ab","status":"playing","record":{"moves":[],"total_nodes":0,"max_depth":0},"timeout_ms":5000,"max_depth":-5})";
+    const char* neg_depth = R"({"version":1,"token":"ab","status":"playing","record":{"moves":[],"winner":"draw","reason":"invalid","total_nodes":0,"max_depth":0},"timeout_ms":5000,"max_depth":-5})";
     assert(!session_from_json(neg_depth, out, error));
 
     // Excessively large max_depth (>20) should be rejected
-    const char* huge_depth = R"({"version":1,"token":"ab","status":"playing","record":{"moves":[],"total_nodes":0,"max_depth":0},"timeout_ms":5000,"max_depth":999})";
+    const char* huge_depth = R"({"version":1,"token":"ab","status":"playing","record":{"moves":[],"winner":"draw","reason":"invalid","total_nodes":0,"max_depth":0},"timeout_ms":5000,"max_depth":999})";
     assert(!session_from_json(huge_depth, out, error));
 
     // Valid values within bounds should still work
-    const char* valid_config = R"({"version":1,"token":"ab","status":"playing","record":{"moves":[],"total_nodes":0,"max_depth":0},"timeout_ms":5000,"max_depth":8})";
+    const char* valid_config = R"({"version":1,"token":"ab","status":"playing","record":{"moves":[],"winner":"draw","reason":"invalid","total_nodes":0,"max_depth":0},"timeout_ms":5000,"max_depth":8})";
     assert(session_from_json(valid_config, out, error));
     assert(out.timeout_ms == 5000 && out.max_depth == 8);
 
@@ -299,15 +305,16 @@ void test_rejects_wide_integer_fields() {
     assert(error.find("版本") != std::string::npos);
 
     // A base stone row of 2^32 + 3 truncates to 3, moving the stone. The file is
-    // refused wholesale rather than read with a wrong square.
+    // refused wholesale rather than read with a wrong square. (The record is
+    // valid so the refusal really is the base check, not the record parse.)
     const char* wide_row =
-        R"({"version":1,"token":"ab","status":"playing","record":{"moves":[]},"base":[{"row":4294967299,"col":7,"color":"black"}]})";
+        R"({"version":1,"token":"ab","status":"playing","record":{"moves":[],"winner":"draw","reason":"invalid"},"base":[{"row":4294967299,"col":7,"color":"black"}]})";
     error.clear();
     assert(!session_from_json(wide_row, out, error));
     assert(error.find("摆棋") != std::string::npos);
     // The column door as well.
     assert(!session_from_json(
-        R"({"version":1,"token":"ab","status":"playing","record":{"moves":[]},"base":[{"row":7,"col":4294967304,"color":"black"}]})",
+        R"({"version":1,"token":"ab","status":"playing","record":{"moves":[],"winner":"draw","reason":"invalid"},"base":[{"row":7,"col":4294967304,"color":"black"}]})",
         out, error));
 
     // Same for the two config fields, whose bounds the truncated value would

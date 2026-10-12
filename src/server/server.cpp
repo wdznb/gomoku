@@ -54,8 +54,14 @@ bool read_position_payload(const json& msg, json& doc, std::string& error) {
     } else if (value.is_string()) {
         const std::string text = value.get<std::string>();
         json parsed = json::parse(text, nullptr, false);
-        if (parsed.is_object() || parsed.is_array()) {
+        if (parsed.is_object()) {
             doc = std::move(parsed);
+        } else if (parsed.is_array()) {
+            // A bare array is the board matrix, not a document: merging
+            // `encoding` into it would index an array with a string and throw out
+            // of the handler before any frame goes back.
+            doc = json::object();
+            doc["board"] = std::move(parsed);
         } else {
             // Not a document, so a grid: CSV, txt, or one long flat run of
             // symbols. A numeric grid parses as a JSON *number* ("100...0" is a
@@ -840,16 +846,17 @@ void GameServer::handle_make_move(std::shared_ptr<WebSocketSession> session, con
         return;
     }
 
-    // make_move only ever commits a stone for player_color_ (it rejects any
-    // call when current_turn() != player_color_). Reading player_color_ avoids
-    // touching board state here: current_turn() would read move_count on the
-    // io thread outside make_move's ai_thinking_ handshake, racing the AI
-    // worker's board write under thinking_mutex_.
-    int placed_color = game->player_color();
+    // make_move only ever commits a stone for player_color_ (it rejects any call
+    // when current_turn() != player_color_), and on a pending position that call
+    // is also what claims the side, so the colour is read once the move is in.
+    // current_turn() is still not read here: it would touch board state outside
+    // make_move's ai_thinking_ handshake, racing the AI worker's board write under
+    // thinking_mutex_.
     if (!game->make_move(row, col)) {
         send_error(session, "Invalid move");
         return;
     }
+    const int placed_color = game->player_color();
     // A played stone claims a side even without choose_side: resume/takeover
     // guards and snapshots key off side_chosen, and a game the AI is actually
     // playing in must be re-armed after a reconnect.
