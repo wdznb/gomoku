@@ -166,6 +166,73 @@ void test_rejects_damaged_files() {
     std::cout << "test_rejects_damaged_files passed" << std::endl;
 }
 
+// Round 79, A4: the envelope reader now refuses a file whose position_pending is
+// not a boolean (a 1 would quietly resume a setup board as a live game) and one
+// whose player_color or winner names a side the game does not have. Keys that
+// are simply absent keep the old defaults, and the writer's own payload must
+// still read back whole.
+void test_envelope_rejects_damaged_flags() {
+    SessionSnapshot out;
+    std::string error;
+
+    const std::string head =
+        R"({"version":1,"token":"ab","status":"playing","record":{"moves":[],"winner":"draw","reason":"invalid"},)";
+
+    // position_pending present but not a boolean: both a number and a string
+    // refuse, because either would read as the flag.
+    error.clear();
+    assert(!session_from_json(head + R"("position_pending":1})", out, error));
+    assert(error.find("摆棋待定") != std::string::npos);
+    assert(!session_from_json(head + R"("position_pending":"true"})", out, error));
+    assert(error.find("摆棋待定") != std::string::npos);
+
+    // A player colour the game does not have.
+    error.clear();
+    assert(!session_from_json(head + R"("player_color":"red"})", out, error));
+    assert(error.find("玩家颜色") != std::string::npos);
+    assert(error.find("red") != std::string::npos);
+
+    // A winner outside ""/black/white/draw.
+    error.clear();
+    assert(!session_from_json(head + R"("winner":"none"})", out, error));
+    assert(error.find("胜者") != std::string::npos);
+    assert(error.find("none") != std::string::npos);
+
+    // Absent is not damaged: the three keys keep their old defaults.
+    error.clear();
+    assert(session_from_json(
+        R"({"version":1,"token":"ab","status":"playing","record":{"moves":[],"winner":"draw","reason":"invalid"}})",
+        out, error));
+    assert(!out.position_pending && out.player_color.empty() && out.winner.empty());
+    // The listed values of each key are still accepted.
+    assert(session_from_json(head + R"("position_pending":false,"player_color":"black","winner":"draw"})",
+                             out, error));
+
+    // Positive: a payload session_to_json wrote reads back with the guarded
+    // fields intact.
+    SessionSnapshot live = sample("ab");
+    live.position_pending = true;
+    live.player_color = "white";
+    SessionSnapshot live_back;
+    error.clear();
+    assert(session_from_json(session_to_json(live), live_back, error) && error.empty());
+    assert(live_back.position_pending);
+    assert(live_back.player_color == "white");
+
+    SessionSnapshot done = sample("ab");
+    done.status = "game_over";
+    done.winner = "white";
+    done.reason = "five";
+    done.record.winner = WHITE;
+    done.record.reason = GameEndReason::FIVE;
+    SessionSnapshot done_back;
+    error.clear();
+    assert(session_from_json(session_to_json(done), done_back, error) && error.empty());
+    assert(done_back.winner == "white" && done_back.status == "game_over");
+
+    std::cout << "test_envelope_rejects_damaged_flags passed" << std::endl;
+}
+
 void test_files_are_written_atomically() {
     const auto dir = scratch_dir("atomic");
     std::string error;
@@ -454,6 +521,7 @@ int main() {
     test_token_and_path();
     test_envelope_round_trip();
     test_rejects_damaged_files();
+    test_envelope_rejects_damaged_flags();
     test_files_are_written_atomically();
     test_listing_and_corrupt_files();
     test_delete_session_is_idempotent();

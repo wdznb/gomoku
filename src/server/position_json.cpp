@@ -82,7 +82,11 @@ bool word_of(const json& value, uint64_t& out, std::string& error) {
         }
         try {
             size_t consumed = 0;
-            out = std::stoull(text, &consumed, 0);
+            // Not base 0: that reads a leading zero as octal, so a zero-padded
+            // decimal word would move every stone to another square and still
+            // validate. Only 0x/0X is hexadecimal, everything else is decimal.
+            const bool hex = text.size() > 2 && text[0] == '0' && (text[1] == 'x' || text[1] == 'X');
+            out = std::stoull(text, &consumed, hex ? 16 : 10);
             // Trailing junk would otherwise read as a different mask than the
             // file says ("0xFF " and "0xFF0" both parse to something).
             while (consumed < text.size() && std::isspace(static_cast<unsigned char>(text[consumed]))) ++consumed;

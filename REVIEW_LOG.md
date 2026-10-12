@@ -1454,3 +1454,80 @@ under M3's stricter reader; the test session gave those fixtures a legal outcome
 assertion, so each case still exercises its own check (status, base, config bounds, wide integers). Repo diff
 is confined to the eight named files plus `tests/` (+595/-24); `data/` untouched, no `gomoku_server` left
 running.
+
+## 轮次79 空候选表认输、两遍棋型扫描与读文件的最后一道缝 — bugfix round 79 (phase5-bugfix)
+
+**Found.** Eight verified defects (A1-A8), each read line by line by the orchestrator before dispatch. A1:
+`SearchEngine::search` treated an *empty candidate list* as "BLACK has nowhere legal left" and resigned
+(`search_engine.cpp:48-56`), but the list is `board.active_empty()` - only cells within Chebyshev distance 2 of
+a stone - while forbidden-ness is itself local, so an emptied active list says nothing about the other 200
+squares; and with `--no-resign` (README:196) the branch fell *through* with a zero-length root list, which the
+later phases answer from, so the caller could receive a move the root filter had already refused. A2: both
+threat generators called `is_forbidden(board, ...)` and then `recognize_position(...)` on the same cell
+(`vcf.cpp:13-19`, `vct.cpp:13-19`) - two full 4-direction window scans per candidate inside the hottest loop of
+a VCF/VCT pass, when `is_forbidden` is exactly `recognize_position` + `is_forbidden_from_pattern`. A3:
+`greedy_.search()` ran unconditionally in the prologue (`search_engine.cpp:64`) although every phase after it
+returns before the one line (`:256`) that consumes its result, so most searches paid for a full candidate
+ranking and threw it away. A4: `session_from_json` read `position_pending` only `if is_boolean()`, so
+`"position_pending":1` loaded as *false*, and `player_color` / `winner` were copied with no value set at all
+(only `status` was checked), so `"player_color":"red"` resumed a session and announced a side nobody chose. A5:
+`TrainingSample::from_json` accepted a line with no `move` (keeping the default `Move()` - (0,0) BLACK, a label
+from no game), a `features` array of any length (README:46 fixes the layout at 52; another length is another
+model), and a missing `value` / `weight` (silently 0.0 / 1.0, a draw label attached to an unknown outcome). A6:
+round-75 E4's "keep the unreadable record" stamp survived only until the next flush that *changed* the payload -
+and choosing a side changes it, so `flush_entry`'s empty-board branch deleted the very file the token names, the
+residue README:553 says is left for a human. A7: a forced encoding from **确认** was trusted as stated and the
+coverage test ran *after* it (`position_setup.cpp:329-345`), so `black == white` read every white stone as black
+and an `empty` colliding with either colour deleted a side - producing counts that then "proved" the position
+legal. A8: `word_of` parsed with `std::stoull(text, &consumed, 0)`, and base 0 takes a leading zero to mean
+*octal*, so the documented form "字可以是十进制整数" (README:221) was wrong for every zero-padded word -
+`"010"` became 8 and moved the stone off (0,1) while the position still validated.
+
+**Refuted before dispatch.** Three of the audit's own candidates did not survive the read: `confirmInFlight`
+does not soft-lock on a `resumed:false` reply (every path that sets the flag clears it in the same handler or is
+followed by a `session` frame, and 摆棋 stays reachable); `validate_position`'s per-stone board rebuild is ~ms on
+a full board and runs only on **确认**, where the API has to know *which* stone is forbidden to report it; and
+`flush_entry`'s per-tick re-serialisation is bounded, because `on_flush_tick` evicts detached sessions into
+`cold_sessions_` (`server.cpp:1427-1428`) instead of letting `sessions_` grow. The flagship rule-layer defect -
+no board-level LIVE_THREE correction, so a `±4` window that cannot see the stone which makes a four *live*
+reports a false 三三 forbidden (README:28/29) - was confirmed by the test session's scratch probe and the
+orchestrator's own window arithmetic, and is dispatched as 轮次80 B1 rather than patched inside this batch.
+
+**Fixed.** A1: the empty-candidate branch now scans the whole board for non-forbidden empty cells and plays
+from that set; only when that too is empty does it end the game - resignation when `resign_detection_` is on,
+otherwise `method == "no_legal_move"` with an invalid `best_move`, which `ai_thinking_worker`'s
+`best_move.pos.is_valid()` guard already treats as "commit nothing". A2/A3: recognition is computed once per
+candidate and tested through `is_forbidden_from_pattern`; the greedy search moved to the single line that
+consumes it. A4: a present `position_pending` must be boolean, and `player_color` / `winner` must be in the
+writer's own set (`""`/black/white, plus draw) with the offending value named - checked against
+`server.cpp:1298-1330` so nothing the server writes is ever refused. A5: `move`, `value`, `weight` and the
+52-long vector are mandatory; `to_json` always writes all four, so our own files are unaffected. A6:
+`TrackedGame` gained `unreadable_record` (set in `open_session`'s unreadable branch) and the empty-board branch
+keeps the file and commits the stamp while it is set - the file is still replaced the moment the game has
+content. A7: the three tokens must name three different things, compared *after* normalisation (so `b`/`B`
+clash too), each message quoting the clashing symbol. A8: only `0x` / `0X` is hexadecimal, everything else is
+decimal.
+
+**Verified.** The test session's first two turns failed mid-way; a fresh session continued from the surviving
+`tests/` diff instead of redoing it, and the orchestrator re-ran the gate on the same tree: plain
+`cmake .. && make -j4`, no new warnings, `ctest` **8/8**, `node tests/web_frontend_check.js` **18/18** (this
+batch touches no `web/` file, confirmed from `git status`). New cases:
+`test_search_engine_no_legal_move_and_resign_switch` (A1, on the nearly-full board where the only empty cell is
+an overline point, so the far scan genuinely finds nothing - both switch positions pinned),
+`test_generators_keep_five_points_and_drop_forbidden` (A2: a double-four cross stays out of both generators and
+an exact-five point stays in both), `test_greedy_method_and_move_unchanged` (A3: method `greedy` with exactly
+the move `GreedySearch` returns, mid-game and simple), `test_envelope_rejects_damaged_flags` (A4, including the
+absent-keys-keep-defaults side and a writer round trip), `test_sample_from_json_rejects_damaged` (A5),
+`test_unreadable_record_file_survives` (A6: `resume` -> `choose_side` -> `detach_socket`, and the damaged file
+must still be there byte for byte), `test_forced_encoding_rejects_collisions` (A7, three clashes plus the
+`b`/`B` normalised clash and the two unaffected paths), `test_bitboard_words_are_decimal` (A8, pinning the
+*cells* rather than the numbers, on the first and the last word). One `tests/`-only compile fix was needed: A3's
+pin calls `build_midgame`, defined lower in the file, so it is forward-declared. HEAD negative proofs were run
+in a `/tmp` copy by re-linking one test target against `git show HEAD:<file>` at a time (no fix line was deleted
+in the repo): A1 `test_search.cpp:993 Assertion '!result.resigned' failed`, A4 `test_session.cpp:184`, A5
+`test_training.cpp:1286`, A6 `test_server.cpp:888 Assertion 'exists(dir/"deadbeef.json")' failed`, A7
+`test_position.cpp:753`, A8 `test_position.cpp:833 Assertion 'padded.ok()' failed` (`"010"` read as octal 8, the
+white stone then colliding). A2 and A3 passed at HEAD *by design*: they are behaviour-preserving pins of the
+observable set and the observable move, not fix detectors. Repo diff is 9 `src/` files plus 5 `tests/` files
+(+665/-40); the only file outside the dispatch list is `src/server/server.h`, which A6 needs for the new
+member. `data/`, `web/`, `README.md` and `CMakeLists.txt` untouched, no `gomoku_server` left running.

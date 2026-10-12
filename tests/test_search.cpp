@@ -7,15 +7,17 @@
 #include <chrono>
 #include <vector>
 #include <algorithm>
-// J2 drives sort_moves and generate_moves directly, and both are private. Every
-// header alphabeta.h pulls in is included above, so the macro rewrites
-// alphabeta.h's class body and nothing else (same trick as test_training.cpp).
+// J2 drives sort_moves and generate_moves directly, and both are private; the
+// round-79 generator checks drive generate_rush_fours / generate_attacks the
+// same way. Every header the alpha-beta header pulls in is included above, so
+// the macro rewrites only this project's class bodies (same trick as
+// test_training.cpp).
 #define private public
 #include "search/alphabeta.h"
-#undef private
-#include "search/greedy.h"
 #include "search/vcf.h"
 #include "search/vct.h"
+#undef private
+#include "search/greedy.h"
 #include "search/search_engine.h"
 #include "search/controller.h"
 #include "optimization/opening_book.h"
@@ -29,6 +31,9 @@
 using namespace gomoku;
 
 namespace {
+
+// Defined further down, next to the J1/J2 tests that share the shape.
+void build_midgame(Board& board);
 
 // Resident set size in KiB, for pinning the default table's real footprint.
 bool read_rss_kb(long long& kb) {
@@ -951,6 +956,168 @@ void test_search_engine_no_false_resign() {
               << result.method << ")" << std::endl;
 }
 
+// Round 79, A1: when BLACK's forbidden-point filter empties the active list,
+// the branch now scans the whole board for legal points first, and the ending
+// it declares depends on resign_detection_: with the switch off the caller is
+// told "no_legal_move" with an invalid move instead of being resigned. The board
+// reuses the round-78 server shape: every cell but (7,7) is occupied and a black
+// stone at (7,7) is a six-in-a-row overline, so the filtered root list is empty
+// and there is no other empty cell anywhere - the far scan finds nothing.
+void test_search_engine_no_legal_move_and_resign_switch() {
+    Board board;
+    for (int r = 0; r < BOARD_SIZE; ++r) {
+        for (int c = 0; c < BOARD_SIZE; ++c) {
+            if (r == 7 && c == 7) continue;
+            const bool line = (r == 7) || (c == 7) || (r - c == 0) || (r + c == 14);
+            int color = line ? WHITE : ((r + c) % 2 == 0 ? BLACK : WHITE);
+            if (r == 7 && c >= 2 && c <= 6) color = BLACK;
+            assert(board.place_stone(r, c, color));
+        }
+    }
+    assert(board.is_empty(7, 7));
+    assert(PatternRecognizer::is_forbidden(board, 7, 7, BLACK));
+
+    std::atomic<bool> stop(false);
+    {
+        SearchEngine engine;
+        SearchResult result = engine.search(board, BLACK, 2, 2000, stop);
+        assert(result.resigned);
+        assert(result.method == "resign");
+    }
+    {
+        // Resignation is off: no ending may be declared by this branch, and the
+        // invalid best move is how the caller learns to commit nothing.
+        SearchEngine engine;
+        engine.set_resign_detection(false);
+        SearchResult result = engine.search(board, BLACK, 2, 2000, stop);
+        assert(!result.resigned);
+        assert(result.method == "no_legal_move");
+        assert(!result.best_move.pos.is_valid());
+    }
+
+    std::cout << "test_search_engine_no_legal_move_and_resign_switch passed" << std::endl;
+}
+
+// Round 79, A2: the generators now test forbidden from the pattern they already
+// recognized instead of re-scanning the board (is_forbidden ->
+// is_forbidden_from_pattern). The observable set may not change: a black
+// double-four point that shape-wise looks like an attack stays out of both
+// generators, and a point that completes exactly five stays in both.
+void test_generators_keep_five_points_and_drop_forbidden() {
+    Evaluator evaluator;
+    TranspositionTable tt;
+    VCFSearch vcf(evaluator, tt);
+    VCTSearch vct(evaluator, tt);
+
+    // (7,7) closes a row four and a column four for BLACK at once: placing there
+    // is a forbidden double-four, while the recognition sees the fours that
+    // would otherwise qualify the cell as an attack.
+    Board cross;
+    cross.place_stone(7, 4, BLACK);
+    cross.place_stone(7, 5, BLACK);
+    cross.place_stone(7, 6, BLACK);
+    cross.place_stone(7, 3, WHITE);
+    cross.place_stone(4, 7, BLACK);
+    cross.place_stone(5, 7, BLACK);
+    cross.place_stone(6, 7, BLACK);
+    cross.place_stone(3, 7, WHITE);
+    assert(cross.is_empty(7, 7));
+    assert(PatternRecognizer::is_forbidden(cross, 7, 7, BLACK));
+    const PositionPattern cross_pattern =
+        PatternRecognizer::recognize_position(cross, 7, 7, BLACK);
+    assert(cross_pattern.has_four_four);
+    assert(PatternRecognizer::is_forbidden_from_pattern(cross_pattern));
+    bool cross_has_four = false;
+    for (int d = 0; d < 4; ++d) {
+        const PatternType t = cross_pattern.directions[d].type;
+        if (t == PatternType::RUSH_FOUR || t == PatternType::LIVE_FOUR ||
+            t == PatternType::FIVE) {
+            cross_has_four = true;
+        }
+    }
+    assert(cross_has_four);
+
+    const auto drop = [](const std::vector<Move>& moves, int row, int col) {
+        for (const Move& m : moves) {
+            if (m.pos.row == row && m.pos.col == col) return false;
+        }
+        return true;
+    };
+    const auto keep = [](const std::vector<Move>& moves, int row, int col) {
+        for (const Move& m : moves) {
+            if (m.pos.row == row && m.pos.col == col) return true;
+        }
+        return false;
+    };
+    assert(drop(vcf.generate_rush_fours(cross, BLACK), 7, 7));
+    assert(drop(vct.generate_attacks(cross, BLACK), 7, 7));
+
+    // (7,7) here completes an exact five on the row (and would be a rush four on
+    // the column): the five exemption keeps the cell legal and both generators
+    // must offer it.
+    Board five;
+    five.place_stone(7, 3, BLACK);
+    five.place_stone(7, 4, BLACK);
+    five.place_stone(7, 5, BLACK);
+    five.place_stone(7, 6, BLACK);
+    five.place_stone(4, 7, WHITE);
+    five.place_stone(5, 7, BLACK);
+    five.place_stone(6, 7, BLACK);
+    five.place_stone(8, 7, BLACK);
+    assert(five.is_empty(7, 7));
+    assert(!PatternRecognizer::is_forbidden(five, 7, 7, BLACK));
+    const PositionPattern five_pattern =
+        PatternRecognizer::recognize_position(five, 7, 7, BLACK);
+    assert(PatternRecognizer::is_forbidden_from_pattern(five_pattern) == false);
+    bool row_is_five = false;
+    for (int d = 0; d < 4; ++d) {
+        if (five_pattern.directions[d].type == PatternType::FIVE) row_is_five = true;
+    }
+    assert(row_is_five);
+    assert(keep(vcf.generate_rush_fours(five, BLACK), 7, 7));
+    assert(keep(vct.generate_attacks(five, BLACK), 7, 7));
+
+    std::cout << "test_generators_keep_five_points_and_drop_forbidden passed" << std::endl;
+}
+
+// Round 79, A3: greedy_.search moved from an unconditional precompute to the
+// point where it is consumed (the final return). With every other phase off, the
+// observable answer must be exactly what greedy returns by itself: method
+// "greedy" and the same move.
+void test_greedy_method_and_move_unchanged() {
+    std::atomic<bool> stop(false);
+
+    Board mid;
+    build_midgame(mid);
+    Board simple;
+    simple.place_stone(7, 7, BLACK);
+    simple.place_stone(7, 8, WHITE);
+    simple.place_stone(8, 8, BLACK);
+    simple.place_stone(6, 6, WHITE);
+
+    SearchEngine engine;
+    engine.set_book_enabled(false);
+    engine.set_vcf_enabled(false);
+    engine.set_vct_enabled(false);
+    engine.set_alphabeta_enabled(false);
+    GreedySearch greedy;
+
+    SearchResult mid_result = engine.search(mid, WHITE, 2, 2000, stop);
+    assert(mid_result.method == "greedy");
+    assert(mid_result.best_move == greedy.search(mid, WHITE));
+    assert(mid_result.best_move.pos.row == 9 && mid_result.best_move.pos.col == 5);
+
+    SearchResult simple_result = engine.search(simple, WHITE, 2, 2000, stop);
+    assert(simple_result.method == "greedy");
+    assert(simple_result.best_move == greedy.search(simple, WHITE));
+    assert(simple_result.best_move.pos.row == 8 && simple_result.best_move.pos.col == 7);
+
+    std::cout << "test_greedy_method_and_move_unchanged passed (mid "
+              << mid_result.best_move.pos.row << "," << mid_result.best_move.pos.col
+              << "; simple " << simple_result.best_move.pos.row << ","
+              << simple_result.best_move.pos.col << ")" << std::endl;
+}
+
 void test_game_manager_resign_state() {
     GameManager game;
     game.set_player_color(BLACK);
@@ -1623,6 +1790,9 @@ int main() {
     test_vcf_defense_own_live_four_survives();
     test_search_engine_resigns_on_proven_loss();
     test_search_engine_no_false_resign();
+    test_search_engine_no_legal_move_and_resign_switch();
+    test_generators_keep_five_points_and_drop_forbidden();
+    test_greedy_method_and_move_unchanged();
     test_game_manager_resign_state();
     test_game_manager_rejects_forbidden_human_move();
     test_game_manager_rejects_move_on_ai_turn();

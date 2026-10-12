@@ -108,6 +108,9 @@ private:
         // Already appended to records_path, so a resumed game does not export a
         // second copy of the same ending.
         bool exported = false;
+        // The file behind this token could not be read, so it stays on disk for a
+        // human to look at even while the fresh game here is still stone-less.
+        bool unreadable_record = false;
         // The last flushed payload with its timestamps zeroed: unchanged means
         // nothing to write, which is what keeps a quiet session off the disk.
         std::string saved_payload;

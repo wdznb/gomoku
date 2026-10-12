@@ -1124,6 +1124,7 @@ std::shared_ptr<GameServer::TrackedGame> GameServer::open_session(const SessionS
     }
     sessions_[entry->token] = entry;
     if (unreadable_record) {
+        entry->unreadable_record = true;
         // Stamp the fresh empty game with exactly what a flush would write for
         // it, so flush_entry's dedup returns early instead of taking its
         // empty-board branch - that branch deletes the residue file, and this
@@ -1344,6 +1345,13 @@ void GameServer::flush_entry(const std::shared_ptr<TrackedGame>& entry) {
     // kept, even if a side was chosen and the game resigned at move zero. A
     // settled previous game on restart always has stones, so it still lands.
     if (snap.base.empty() && snap.record.moves.empty()) {
+        // A token that opened on an unreadable record keeps that file until this
+        // game has content: choosing a side is not content, and the stamp stops
+        // the next tick from re-entering here.
+        if (entry->unreadable_record) {
+            entry->saved_payload = payload;
+            return;
+        }
         // And a file from an earlier game on this token must not outlive the
         // wipe: undo back to an empty board deletes the residue, or a restart
         // would resurrect the undone game. Only commit the dedup stamp once the

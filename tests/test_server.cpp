@@ -846,6 +846,54 @@ void test_resign_survives_interruption() {
     std::cout << "test_resign_survives_interruption passed" << std::endl;
 }
 
+// Round 79, A6: a session file whose record cannot be rebuilt (open_session
+// falls back to a fresh empty game) must stay on disk byte for byte while the
+// game is still stone-less: choosing a side alone changes the flushed payload,
+// which used to send flush_entry's empty-board branch into delete_session - the
+// very file the token names.
+void test_unreadable_record_file_survives() {
+    const auto dir = scratch("unreadable_sessions");
+    const auto records = scratch("unreadable_records.jsonl");
+    std::filesystem::create_directories(dir);
+
+    // A valid envelope (so load_saved_sessions admits the token) whose record
+    // repeats a cell, which restore_game's replay rejects.
+    const std::string damaged =
+        R"({"version":1,"type":"gomoku_session","token":"deadbeef","status":"playing",)"
+        R"("record":{"moves":[{"row":7,"col":7,"color":"black","method":"human"},)"
+        R"({"row":7,"col":7,"color":"white","method":"human"}],)"
+        R"("winner":"draw","reason":"invalid"}})";
+    { std::ofstream file(dir / "deadbeef.json"); file << damaged; }
+
+    {
+        Harness h(dir, records);
+        h.server.load_saved_sessions();  // start() does this; handlers are driven directly here
+        h.server.handle_resume(h.socket, json{{"token", "deadbeef"}});
+
+        const auto it = h.server.sessions_.find("deadbeef");
+        assert(it != h.server.sessions_.end());
+        const std::shared_ptr<GameServer::TrackedGame>& resumed = it->second;
+        assert(resumed->token == "deadbeef");
+        assert(!resumed->rebuilt);
+        // The caller gets an empty game, not a half-replayed one.
+        assert(resumed->game->replay_snapshot().move_count == 0);
+
+        // Only a side is chosen - no stone is placed, so the board stays empty
+        // while the payload the next flush would write has changed.
+        h.server.handle_choose_side(h.socket, json{{"color", "black"}});
+        assert(resumed->side_chosen);
+
+        h.server.detach_socket(h.socket.get());  // flushes the session on the way out
+
+        assert(std::filesystem::exists(dir / "deadbeef.json"));
+        assert(read_text(dir / "deadbeef.json") == damaged);
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    std::filesystem::remove(records, ec);
+    std::cout << "test_unreadable_record_file_survives passed" << std::endl;
+}
+
 }  // namespace
 
 int main() {
@@ -863,6 +911,7 @@ int main() {
     test_position_array_string_payload_answers();
     test_pending_position_direct_move_claims_side();
     test_resign_survives_interruption();
+    test_unreadable_record_file_survives();
 
     std::cout << "All server tests passed!" << std::endl;
     return 0;

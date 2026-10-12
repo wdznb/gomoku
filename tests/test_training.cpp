@@ -1256,6 +1256,96 @@ void test_readers_reject_out_of_range_numbers() {
     std::cout << "test_readers_reject_out_of_range_numbers passed" << std::endl;
 }
 
+// Round 79, A5: TrainingSample::from_json now requires the label (move object,
+// numeric value, numeric weight) and the 52-long feature vector, so a damaged
+// line is refused whole instead of training on a half-read sample. The writer's
+// own payload must still read back.
+void test_sample_from_json_rejects_damaged() {
+    const auto features = [](int count) {
+        std::string out = "[";
+        for (int i = 0; i < count; ++i) {
+            if (i) out += ",";
+            out += "0";
+        }
+        return out + "]";
+    };
+    const int n = DataCollector::FEATURE_COUNT;
+    const std::string move = "\"move\":{\"row\":7,\"col\":7,\"color\":\"black\"}";
+
+    TrainingSample sample;
+    std::string error;
+    const std::string ok =
+        "{\"features\":" + features(n) + ",\"value\":0.5,\"weight\":1.0," + move + "}";
+    assert(TrainingSample::from_json(ok, sample, error) && error.empty());
+    assert(static_cast<int>(sample.features.size()) == n);
+    assert(sample.move == Move(7, 7, BLACK));
+    assert(sample.value == 0.5f && sample.weight == 1.0f);
+
+    // No move at all: the features describe a label that is missing.
+    error.clear();
+    assert(!TrainingSample::from_json(
+        "{\"features\":" + features(n) + ",\"value\":0.5,\"weight\":1.0}", sample, error));
+    assert(error.find("move") != std::string::npos);
+
+    // move present but not an object.
+    error.clear();
+    assert(!TrainingSample::from_json(
+        "{\"features\":" + features(n) + ",\"value\":0.5,\"weight\":1.0,\"move\":5}", sample, error));
+    assert(error.find("move") != std::string::npos);
+
+    // Missing value / weight, and their non-numeric shapes.
+    error.clear();
+    assert(!TrainingSample::from_json(
+        "{\"features\":" + features(n) + ",\"weight\":1.0," + move + "}", sample, error));
+    assert(error.find("value") != std::string::npos);
+    assert(!TrainingSample::from_json(
+        "{\"features\":" + features(n) + ",\"value\":\"high\",\"weight\":1.0," + move + "}",
+        sample, error));
+    assert(error.find("value") != std::string::npos);
+    error.clear();
+    assert(!TrainingSample::from_json(
+        "{\"features\":" + features(n) + ",\"value\":0.5," + move + "}", sample, error));
+    assert(error.find("weight") != std::string::npos);
+    assert(!TrainingSample::from_json(
+        "{\"features\":" + features(n) + ",\"value\":0.5,\"weight\":null," + move + "}",
+        sample, error));
+    assert(error.find("weight") != std::string::npos);
+
+    // A feature vector of the wrong length is another model layout.
+    error.clear();
+    assert(!TrainingSample::from_json(
+        "{\"features\":" + features(n - 1) + ",\"value\":0.5,\"weight\":1.0," + move + "}",
+        sample, error));
+    assert(error.find("51 features, needs 52") != std::string::npos);
+    assert(!TrainingSample::from_json(
+        "{\"features\":" + features(n + 1) + ",\"value\":0.5,\"weight\":1.0," + move + "}",
+        sample, error));
+    assert(error.find("53 features, needs 52") != std::string::npos);
+
+    // Positive round trip: the writer's own payload reads back whole.
+    TrainingSample written;
+    written.features.assign(n, 0.25f);
+    written.value = -1.0f;
+    written.weight = 0.5f;
+    written.move = Move(3, 12, WHITE);
+    written.search_score = 42;
+    written.search_depth = 3;
+    written.nodes = 99;
+    written.game_id = 7;
+    written.move_index = 5;
+    TrainingSample back;
+    error.clear();
+    assert(TrainingSample::from_json(written.to_json(), back, error) && error.empty());
+    assert(static_cast<int>(back.features.size()) == n);
+    assert(back.features[0] == 0.25f && back.features[n - 1] == 0.25f);
+    assert(back.move == Move(3, 12, WHITE));
+    assert(back.value == -1.0f && back.weight == 0.5f);
+    assert(back.search_score == 42 && back.search_depth == 3 && back.nodes == 99);
+    assert(back.game_id == 7 && back.move_index == 5);
+
+    std::cout << "test_sample_from_json_rejects_damaged passed" << std::endl;
+}
+
 // Round 72: play_game() discards an INVALID game, and the discarded game must
 // not inflate games_played_ - every checkpoint and status line would otherwise
 // overstate the work done. The counter is private and only alive through
@@ -2049,6 +2139,7 @@ int main() {
     test_trainer_rejects_bad_checkpoint();
     test_trainer_checkpoint_seed_and_counters();
     test_readers_reject_out_of_range_numbers();
+    test_sample_from_json_rejects_damaged();
     test_play_game_counts_only_valid_games();
     test_parameter_save_replaces_atomically();
     test_checkpoint_save_replaces_atomically();

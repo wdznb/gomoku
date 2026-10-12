@@ -329,6 +329,21 @@ SetupResult position_from_grid(const GridCells& cells, const GridEncoding* force
         encoding.black = normalize(encoding.black);
         encoding.white = normalize(encoding.white);
         encoding.empty = normalize(encoding.empty);
+        // The three tokens have to name three different things: black == white
+        // reads every white stone as black, and an empty that collides with either
+        // makes that side's stones vanish.
+        if (encoding.black == encoding.white) {
+            result.error = "指定的标志里黑和白共用 \"" + encoding.black + "\"，无法分出双方";
+            return result;
+        }
+        if (encoding.black == encoding.empty) {
+            result.error = "指定的标志里黑和空共用 \"" + encoding.black + "\"，黑子会被读成空位";
+            return result;
+        }
+        if (encoding.white == encoding.empty) {
+            result.error = "指定的标志里白和空共用 \"" + encoding.white + "\"，白子会被读成空位";
+            return result;
+        }
         // An explicitly supplied mapping is trusted as stated, but every token
         // still has to be covered by it - otherwise a stray symbol would be read
         // as empty and quietly delete a stone.

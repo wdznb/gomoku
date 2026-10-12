@@ -48,10 +48,30 @@ SearchResult SearchEngine::search(const Board& board, int color,
         }
         root_moves.swap(legal);
         if (root_moves.empty()) {
-            // Every remaining cell is illegal for BLACK; treat as resignation.
-            result.resigned = true;
-            result.method = "resign";
-            return result;
+            // A forbidden shape needs a friendly stone within two cells, so an
+            // emptied active list says nothing about the rest of the board: legal
+            // points may exist, just outside the window active_empty() covers.
+            std::vector<Position> far_legal;
+            for (int r = 0; r < BOARD_SIZE; ++r) {
+                for (int c = 0; c < BOARD_SIZE; ++c) {
+                    if (board.is_empty(r, c) &&
+                        !PatternRecognizer::is_forbidden(board, r, c, BLACK)) {
+                        far_legal.push_back(Position(r, c));
+                    }
+                }
+            }
+            if (!far_legal.empty()) {
+                root_moves.swap(far_legal);
+            } else if (resign_detection_) {
+                result.resigned = true;
+                result.method = "resign";
+                return result;
+            } else {
+                // Nothing to play and no resignation asked for: an invalid move is
+                // how the caller is told to commit nothing this turn.
+                result.method = "no_legal_move";
+                return result;
+            }
         }
     }
 
@@ -60,8 +80,6 @@ SearchResult SearchEngine::search(const Board& board, int color,
         result.method = "forced";
         return result;
     }
-
-    Move greedy_move = greedy_.search(board, color);
 
     // Own-win must be checked across every legal root candidate, not just the
     // top greedy move. Greedy ranks by attack + defense, so a purely
@@ -235,7 +253,9 @@ SearchResult SearchEngine::search(const Board& board, int color,
         return result;
     }
 
-    result.best_move = greedy_move;
+    // The full candidate ranking is only paid for when it is actually consumed:
+    // every path above returned, and alphabeta never reaches here without one.
+    result.best_move = greedy_.search(board, color);
     result.method = "greedy";
     return result;
 }

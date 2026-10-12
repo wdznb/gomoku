@@ -131,7 +131,13 @@ bool session_from_json(const std::string& text, SessionSnapshot& out, std::strin
         error = "会话里的搜索深度不合法";
         return false;
     }
-    if (root.contains("position_pending") && root["position_pending"].is_boolean()) {
+    // Absent means "not a hand-set position"; present has to be the flag itself,
+    // or a 1 would quietly resume a setup board as a live game.
+    if (root.contains("position_pending")) {
+        if (!root["position_pending"].is_boolean()) {
+            error = "会话里的摆棋待定标记不是布尔值";
+            return false;
+        }
         snap.position_pending = root["position_pending"].get<bool>();
     }
 
@@ -142,6 +148,19 @@ bool session_from_json(const std::string& text, SessionSnapshot& out, std::strin
     }
     if (snap.status != "waiting" && snap.status != "playing" && snap.status != "game_over") {
         error = "会话状态不认识: " + snap.status;
+        return false;
+    }
+    // An empty player colour is the writer's "nobody has chosen yet"; anything
+    // else outside that set would resume the player on the wrong side.
+    if (snap.player_color != "" && snap.player_color != "black" && snap.player_color != "white") {
+        error = "会话里的玩家颜色不认识: " + snap.player_color;
+        return false;
+    }
+    // Same for the winner: an unreadable one is not a missing result, it is a
+    // damaged file, and the resumed session would announce a different ending.
+    if (snap.winner != "" && snap.winner != "black" && snap.winner != "white" &&
+        snap.winner != "draw") {
+        error = "会话里的胜者不认识: " + snap.winner;
         return false;
     }
     // Validate config values to prevent corrupted files from loading extreme

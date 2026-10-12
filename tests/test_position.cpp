@@ -731,12 +731,171 @@ void test_undo_rejected_in_position_pending() {
     std::cout << "test_undo_rejected_in_position_pending passed" << std::endl;
 }
 
+// Round 79, A7: a forced encoding used to be trusted as stated, so a mapping that
+// names the same token twice read every white stone as black (black == white) or
+// quietly deleted a side (an empty that collides with either colour). The three
+// tokens have to be three different things before the coverage test runs, and the
+// message has to say which symbol clashed.
+void test_forced_encoding_rejects_collisions() {
+    GridCells cells;
+    std::string error;
+    assert(parse_grid_text(grid_text(kBlack, kWhite, "1", "2", "0", ","), cells, error));
+
+    // black == white: the clash is reported before the grid's own "1"/"2"/"0"
+    // tokens get a chance to turn it into a coverage error.
+    {
+        GridEncoding forced;
+        forced.black = "X";
+        forced.white = "X";
+        forced.empty = ".";
+        SetupResult r = position_from_grid(cells, &forced);
+        assert(!r.ok());
+        assert(r.error.find("X") != std::string::npos);
+        assert(r.error.find("黑和白") != std::string::npos);
+    }
+    // black == empty.
+    {
+        GridEncoding forced;
+        forced.black = "*";
+        forced.white = "2";
+        forced.empty = "*";
+        SetupResult r = position_from_grid(cells, &forced);
+        assert(!r.ok());
+        assert(r.error.find("*") != std::string::npos);
+        assert(r.error.find("黑和空") != std::string::npos);
+    }
+    // white == empty.
+    {
+        GridEncoding forced;
+        forced.black = "1";
+        forced.white = "#";
+        forced.empty = "#";
+        SetupResult r = position_from_grid(cells, &forced);
+        assert(!r.ok());
+        assert(r.error.find("#") != std::string::npos);
+        assert(r.error.find("白和空") != std::string::npos);
+    }
+    // The clash is the normalized reading, not the typed one: "b" against "B" is
+    // one token, and the message shows the folded form.
+    {
+        GridEncoding forced;
+        forced.black = "b";
+        forced.white = "B";
+        forced.empty = ".";
+        SetupResult r = position_from_grid(cells, &forced);
+        assert(!r.ok());
+        assert(r.error.find("B") != std::string::npos);
+        assert(r.error.find("黑和白") != std::string::npos);
+    }
+    // Three distinct tokens keep behaving exactly as before, including the
+    // opposite reading detection would not pick.
+    {
+        GridEncoding forced;
+        forced.black = "1";
+        forced.white = "2";
+        forced.empty = "0";
+        SetupResult r = position_from_grid(cells, &forced);
+        assert(r.ok());
+        assert(r.black_count == 3 && r.white_count == 2);
+        assert(r.board.get(9, 9) == BLACK && r.board.get(7, 8) == WHITE);
+    }
+    // And a stated mapping that is internally distinct but does not cover the
+    // grid still gives the coverage error, not a clash error.
+    {
+        GridEncoding forced;
+        forced.black = "B";
+        forced.white = "W";
+        forced.empty = ".";
+        SetupResult r = position_from_grid(cells, &forced);
+        assert(!r.ok());
+        assert(r.error.find("不含") != std::string::npos);
+    }
+
+    std::cout << "test_forced_encoding_rejects_collisions passed" << std::endl;
+}
+
+// Round 79, A8: a bitboard word was read with std::stoull's base 0, which takes a
+// leading zero to mean octal, so "010" became 8 and every stone landed on another
+// square while the position still validated. Only 0x / 0X is hexadecimal now;
+// everything else is decimal.
+void test_bitboard_words_are_decimal() {
+    // 10 decimal sets cells (0,1) and (0,3); octal 010 is 8, which sets only
+    // (0,3) - the stone at (0,1) is what the old read dropped.
+    std::array<uint64_t, BITBOARD_WORDS> black{};
+    std::array<uint64_t, BITBOARD_WORDS> white{};
+    black[0] = 10;
+    white[0] = 5;
+    SetupResult direct = position_from_bitboard(black, white);
+    assert(direct.ok());
+
+    SetupResult padded = position_from_json(json::parse(
+        R"({"bitboard":{"black":["010","0","0","0"],"white":["5","0","0","0"]}})"));
+    assert(padded.ok());
+    assert(padded.board.get(0, 1) == BLACK);
+    assert(padded.board.get(0, 3) == BLACK);
+    assert(padded.board.get(0, 0) == WHITE);
+    assert(padded.board.get(0, 2) == WHITE);
+    assert(same_cells(direct, padded));
+
+    // A longer zero pad lands nowhere near the octal reading: 0016 is decimal 16,
+    // cell (0,4), where octal 0016 would be 14 - cells (0,1), (0,2) and (0,3).
+    std::array<uint64_t, BITBOARD_WORDS> one{};
+    one[0] = 16;
+    std::array<uint64_t, BITBOARD_WORDS> none{};
+    SetupResult as_sixteen = position_from_bitboard(one, none);
+    assert(as_sixteen.ok());
+    SetupResult zero_padded = position_from_json(json::parse(
+        R"({"bitboard":{"black":["0016","0","0","0"],"white":["0","0","0","0"]}})"));
+    assert(zero_padded.ok());
+    assert(zero_padded.board.get(0, 4) == BLACK);
+    assert(zero_padded.board.is_empty(0, 1));
+    assert(zero_padded.board.is_empty(0, 2));
+    assert(zero_padded.board.is_empty(0, 3));
+    assert(same_cells(as_sixteen, zero_padded));
+
+    // 0x and 0X still mean hexadecimal, and both spellings of one mask agree.
+    SetupResult lower_hex = position_from_json(json::parse(
+        R"({"bitboard":{"black":["0x10","0","0","0"],"white":["0","0","0","0"]}})"));
+    SetupResult upper_hex = position_from_json(json::parse(
+        R"({"bitboard":{"black":["0X10","0","0","0"],"white":["0","0","0","0"]}})"));
+    assert(lower_hex.ok() && upper_hex.ok());
+    assert(same_cells(as_sixteen, lower_hex));
+    assert(same_cells(as_sixteen, upper_hex));
+
+    // An unadorned decimal is unchanged.
+    SetupResult plain = position_from_json(json::parse(
+        R"({"bitboard":{"black":["10","0","0","0"],"white":["5","0","0","0"]}})"));
+    assert(plain.ok());
+    assert(same_cells(direct, plain));
+
+    // The zero-padded mask moves no stone into a neighbour on the last word
+    // either: word 3 covers the final rows, and reading it as octal would both
+    // drop (13,1) and collide a white stone with a black one.
+    std::array<uint64_t, BITBOARD_WORDS> high_black{};
+    std::array<uint64_t, BITBOARD_WORDS> high_white{};
+    high_black[3] = 10;   // cells 193 and 195
+    high_white[3] = 16;   // cell 196
+    SetupResult high_direct = position_from_bitboard(high_black, high_white);
+    assert(high_direct.ok());
+    SetupResult high_padded = position_from_json(json::parse(
+        R"({"bitboard":{"black":["0","0","0","000010"],"white":["0","0","0","000016"]}})"));
+    assert(high_padded.ok());
+    assert(high_padded.board.get(12, 13) == BLACK);
+    assert(high_padded.board.get(13, 0) == BLACK);
+    assert(high_padded.board.get(13, 1) == WHITE);
+    assert(same_cells(high_direct, high_padded));
+
+    std::cout << "test_bitboard_words_are_decimal passed" << std::endl;
+}
+
 int main() {
     std::cout << "Running position setup tests..." << std::endl;
     test_grid_parsing();
     test_flat_strings();
     test_encoding_detection();
+    test_forced_encoding_rejects_collisions();
     test_bitboard_form();
+    test_bitboard_words_are_decimal();
     test_moves_form();
     test_validation_rules();
     test_canonical_document();

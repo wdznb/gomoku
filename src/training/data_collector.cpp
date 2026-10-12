@@ -200,28 +200,45 @@ bool TrainingSample::from_json(const std::string& text, TrainingSample& out, std
     if (root.contains("weight") && root["weight"].is_number()) sample.weight = root["weight"].get<float>();
     sample.game_id = read_int("game_id", sample.game_id);
     sample.move_index = read_int("move_index", sample.move_index);
-    if (root.contains("move") && root["move"].is_object()) {
-        const json& move = root["move"];
-        // Validated rather than defaulted: a file with a malformed move would
-        // otherwise silently hand back a sample whose move belongs to the wrong
-        // colour.
-        if (!move.contains("row") || !move["row"].is_number_integer() ||
-            !move.contains("col") || !move["col"].is_number_integer() ||
-            !move.contains("color") || !move["color"].is_string()) {
-            error = "sample move needs integer row/col and a color string";
-            return false;
-        }
-        int row = 0;
-        int col = 0;
-        if (!read_json_int(move["row"], row) || !read_json_int(move["col"], col)) {
-            error = "sample move coordinates are outside the supported range";
-            return false;
-        }
-        sample.move = Move(row, col, move["color"].get<std::string>() == "black" ? BLACK : WHITE);
-        if (!sample.move.pos.is_valid()) {
-            error = "sample move is off the board";
-            return false;
-        }
+    // The move is the label the features describe, so a sample without one is not
+    // a sample; only the engine numbers may fall back to defaults.
+    if (!root.contains("move") || !root["move"].is_object()) {
+        error = "sample needs a move object";
+        return false;
+    }
+    const json& move = root["move"];
+    if (!move.contains("row") || !move["row"].is_number_integer() ||
+        !move.contains("col") || !move["col"].is_number_integer() ||
+        !move.contains("color") || !move["color"].is_string()) {
+        error = "sample move needs integer row/col and a color string";
+        return false;
+    }
+    int row = 0;
+    int col = 0;
+    if (!read_json_int(move["row"], row) || !read_json_int(move["col"], col)) {
+        error = "sample move coordinates are outside the supported range";
+        return false;
+    }
+    sample.move = Move(row, col, move["color"].get<std::string>() == "black" ? BLACK : WHITE);
+    if (!sample.move.pos.is_valid()) {
+        error = "sample move is off the board";
+        return false;
+    }
+
+    // The vector length is the model input and the two floats are the outcome, so
+    // neither may be absent: a short vector would train on another layout.
+    if (sample.features.size() != static_cast<size_t>(DataCollector::FEATURE_COUNT)) {
+        error = "sample has " + std::to_string(sample.features.size()) + " features, needs " +
+                std::to_string(DataCollector::FEATURE_COUNT);
+        return false;
+    }
+    if (!root.contains("value") || !root["value"].is_number()) {
+        error = "sample needs a numeric value";
+        return false;
+    }
+    if (!root.contains("weight") || !root["weight"].is_number()) {
+        error = "sample needs a numeric weight";
+        return false;
     }
 
     out = sample;

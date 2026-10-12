@@ -13,9 +13,10 @@ std::vector<Move> VCFSearch::generate_rush_fours(const Board& board, int color) 
 
     for (const auto& pos : candidates) {
         if (!board.is_empty(pos.row, pos.col)) continue;
-        if (color == BLACK && PatternRecognizer::is_forbidden(board, pos.row, pos.col, color)) continue;
-
+        // Recognize once and reuse: is_forbidden would run the same 4-direction
+        // scan a second time on a cell this loop already needs the pattern for.
         PositionPattern pattern = PatternRecognizer::recognize_position(board, pos.row, pos.col, color);
+        if (color == BLACK && PatternRecognizer::is_forbidden_from_pattern(pattern)) continue;
 
         bool has_four = false;
         for (int d = 0; d < 4; ++d) {
