@@ -1158,3 +1158,176 @@ downstream semantic guards at `main_trainer.cpp:213` and `:224` — which is the
 behaviour, so `require_int` deliberately leaves them to those guards. Main session re-ran the gate
 independently: plain `cmake ..` (asserts live), `make -j4` clean apart from the known `server_reason_of`
 warning, `ctest` 8/8, `node tests/web_frontend_check.js` 9/9.
+
+## 轮次75 整数截断、会话身份与不可悔的 base — bugfix round 75 (phase5-bugfix)
+
+**Found.** Three read-only audit domains (snapshot/record integrity, protocol/input boundary, frontend
+display layer) plus the orchestrator's own pass produced twenty-plus candidates; the headliner class is
+`get<int>()` truncation. `json_int.h:10-14` already documents that a JSON integer wider than 32 bits
+"reads back as 3", and `src/training/params.cpp` uses `read_json_int` for exactly that reason - yet the
+server's own `get_int` (server.cpp:21-24), `session_from_json`'s `version`/`timeout_ms`/`max_depth`/base
+row-col, and `position_json`'s coordinate reader all still cast. So `{"row":4294967304}` became row 8,
+passed the 0-14 check at server.cpp:822 and put a stone on a square the client never named; a session
+file with `version: 4294967297` was accepted as v1; a hand-edited base stone silently moved a cell before
+being resumed as the player's own position. Second class: the write-then-rename sites
+(`trainer.cpp:396`, `params.cpp:210`) and the four plain writers (`data_collector.cpp:241`,
+`elo.cpp:176`, `game_record.cpp:152` and `:177`) checked `file.good()` on an unflushed stream, so a
+buffered failure that only surfaces at close was reported as success - the truncated `.tmp` then renamed
+over the good checkpoint, and a failed `append_to_jsonl` let `flush_entry` mark the game `exported`,
+losing the record forever. Third class: `open_session`'s restore-failure branch promised in its own
+comment that the unreadable file "stays on disk for a human", but left `saved_payload` empty, so the next
+`flush_entry` took the no-stones branch and deleted exactly the file it meant to preserve; `undo` popped
+base stones whenever `board_.move_count() > 0` even with `analyses_` empty, mutilating a hand-set position
+after `choose_side`; a cold rebuild overwrote `created_ms` with the resume instant; and
+`handle_set_config`/`handle_request_hint` fed missing keys through hardcoded fallbacks, so asking to
+change only `max_depth` silently reset the session's timeout to 5000. Front end: an undo aborts an
+in-flight hint whose callback is then suppressed, and nothing on the undo path cleared `hintInFlight`,
+locking 求招 off for the rest of the game; a live stone arriving during a replay view left the board
+looking current while clicks were swallowed by `app.js:845` with no message.
+
+**Refuted before dispatch.** The audits' highest-severity frontend row - "a resumed 摆棋 game greys out
+both side buttons and cannot be started" - is a polarity misread: `setSideButtons(blackDisabled,
+whiteDisabled)` (`app.js:1346-1349`) takes disable flags, so `gameStatus==='playing' && chosen` yields
+`false,false` = enabled. `valid_token`'s 1-64 length is deliberate back-compat (README:476 states the
+generator's 16), `five`'s upper bound already guards the mate threshold, and the io-thread flush cost,
+`validate_position`'s per-stone rebuild, opening-book line bounds and the search's per-node allocations
+are recorded as performance items for a later round, not dispatched here.
+
+**Fixed.** E1-E3: all three integer readers now go through `read_json_int` and refuse an out-of-range
+value instead of reinterpreting it (missing/non-integer keeps the existing fallback semantics). E4: the
+restore-failure branch stamps `saved_payload` with what this flush would otherwise have written, so the
+dedup returns before the delete branch - and once the player actually moves, the payload differs again and
+the session is saved normally. E5: `analyses_.empty()` returns false and `undo_count` is clamped to
+`analyses_.size()`, so board stones and analysis entries are always given back in pairs. E6: `flush()`
+before `good()` at all six sites. E7: `created_ms` is inherited on a successful rebuild only. F1: a
+non-object `coefficients` is an error, so `--params` cannot claim success while running defaults. F2: a
+new `get_int_or` applies only keys the message actually carries, taking the rest from the game's current
+`timeout_ms()`/`max_depth()`. F3-F4: undo releases the hint control, and `handleMoveMade`/`handleAIMove`
+call the existing `exitReplay()` while a swallowed replay click now warns. F5: `load_session` compares the
+token inside the file with the token the filename claims and refuses the mismatch, so a renamed file can no
+longer make a resume serve a different game than its URL promised - and the refusal leaves the user's file on
+disk. G1: the position document's `version` is read through `read_json_int`, so `4294967297` is a refusal
+instead of a truncation into `1`. H1: the opening-book reader refuses a line whose coordinate or weight does
+not fit an int rather than building a shifted entry from the truncated pair, and only that line - the other
+lines of the same file still load.
+
+**Verified.** Batch E ran first in the WSL test session: `test_rejects_wide_integer_fields` (E2), the
+rewritten `test_snapshot_round_trip` (E5 - the four assertions that had recorded "undo eats a base stone" as
+expected now assert the refusal, plus a base+1-move control group), `test_buffered_write_failures_are_caught`
+with a `/dev/full` control probe that shows `good()` is true before the flush and false after (E6), a
+`--records /dev/full` server probe that shows the failed export is reported and retried on later ticks while
+`exported` is never set (E6), and the E1/E3/E4/E7 WS probes: a wide `row` answers `Invalid move position` and
+leaves `(8,7)` empty instead of truncating into a stone, a wide restore failure keeps the session file
+byte-identical across three flush ticks and then overwrites it normally once a stone is played, and two cold
+rebuilds keep the original `created_ms` while `updated_ms` advances. Batch F/G/H then ran in the same session:
+`test_params_rejects_non_object_coefficients` (F1, with the CLI proof that both `gomoku_server --params` and
+`gomoku_train --params` exit 1 and stop claiming a loaded parameter set, and the partial-key control group
+still loading), the F2 probe (a `set_config` that only carries `max_depth` keeps the session's 60000 ms
+timeout, and a keyless `request_hint` runs the session budget instead of resetting to 5000),
+`test_load_refuses_token_mismatch` (F5, file left on disk), `test_opening_book_rejects_wide_numbers` (H1, the
+bad line refused while the same file's legal line still loads and the built-in book stays at 45 lines / 109
+prefix keys), the G1 probe (`version 4294967297` refused where the previous round's run had measured it being
+accepted as v1, `version 2` still refused, a missing key still accepted), and the F3/F4 harness cases. For the
+negative proof the test session copied `web/app.js` and the harness into `/tmp` and deleted the fix lines
+there, because the round-76 batch was editing `web/app.js` concurrently: 11/11 with the lines, `FAIL F3 ...`
+and two distinct `FAIL F4 ...` without them, and `web/app.js`'s md5 unchanged throughout. Main session
+re-ran the gate over the tree that also holds the round-76 J batch: plain `cmake ..` (asserts live), clean
+build with only the known `server_reason_of` warning, `ctest` 8/8, `node tests/web_frontend_check.js` 11/11.
+
+One brief-writing error is worth recording: the F3 instruction told the test session to delete a line in
+`web/app.js` to prove the case fails, which contradicts its own "never touch web/" constraint and would have
+clobbered the concurrent batch. It was retracted mid-run and the `/tmp` copy method above substituted; the
+test session had already confined every negative proof to `/tmp`, so no repo file was ever written by it.
+
+## 轮次76 搜索时序、回放视图与不再沉默的求招 — bugfix round 76 (phase5-bugfix)
+
+**Found.** Two audit domains (search timing/ordering behaviour, frontend interaction plus the hint protocol
+that drives it) produced nine dispatched defects. Search side: `SearchEngine::search` already owned one
+absolute `search_deadline` and handed it to the VCF and VCT phases, but the AlphaBeta phase was given only
+a slice (`remaining_time`, floored at 100 ms) and its `is_timeout()` measured that slice from its own
+`start_time_` - so a move whose tactics phases had already spent the whole budget still bought another
+slice, and `timeout_ms` was a suggestion rather than a wall (`alphabeta.cpp:13`, `search_engine.cpp:154`).
+Second: `sort_moves` pinned the transposition-table move only when it had to swap it forward
+(`if (it != moves.begin() && it != moves.end())`), so in the common case - the TT move already sitting first
+because the previous iteration just promoted it - `tt_swapped` stayed false and the heuristic re-ordering
+started at index 0 and was free to push it back; because the clock-out path answers with `root_moves[0]`,
+that also changed which stone the AI hands over when time runs short. Front end: `handleSession` rebuilt
+`baseStones`, `analysis` and `replayIndex` from the server's frame but never cleared `moveHistory`, so a
+resumed page kept the previous game's ply list under the new board; `resumedStatusText()` then reported
+that local list as the resume line even though the same frame carries `move_count`; 悔棋/求招 were
+enabled and disabled from four different places with three different rules, so an ended game could show
+armed buttons and a finished search could leave them greyed; the board click handler turned raw pixels into
+a cell with `Math.round((y - pad) / cell)` and only range-checked the result, so a click inside the
+coordinate-label ring - pixels outside the grid that are not a cell at all - rounded to row/column 0 (or 14)
+and installed a real stone where the player had pointed at nothing; the replay view leaked four ways
+(auto-play at the last ply called `stopReplayAuto()`, which leaves `replayIndex` on the final move, so the
+board looked live while every click was dropped; a dropped replay click said nothing; a live `move_made` or
+`ai_move` arriving during a replay never left it; `game_over` composed its ending text over a historical
+view); and `hint_result` was painted unconditionally, so a hint searched on one position and answered after
+the position changed marked a square that was occupied by then, or one that no longer existed. Server side:
+a hint interrupted by 终止 answered nothing at all, because the worker's delivery predicate was
+`!stop_flag_.load()` while `stop_thinking()` only raises `stop_flag_` - the client's `hintInFlight` stayed
+true and 求招 was dead until a reload (round 75 had only freed it on the undo path).
+
+**Refuted before dispatch.** The audits' two highest-severity search rows were wrong on the code: "the
+shared deadline can strand the AI with no move" - `alphabeta.cpp:360-362` still falls back to
+`root_moves[0]`, so the worst case is a shallow move, not silence (kept as a test case instead); and "the
+hint thread and the AI thread race on the engine transposition table" - `start_ai_thinking` calls
+`stop_thinking()` and then joins *both* `search_thread_` and `hint_thread_` (`game_manager.cpp:319-326`), so
+the two searches never overlap. Also refuted: a `ai_move` frame before the player has chosen a side (the
+server arms the AI only from `choose_side`/`set_position`), unclamped client `timeout_ms`/`max_depth`
+(`clamp_timeout_ms`/`clamp_max_depth` at `game_manager.cpp:288-289`, re-clamped in `handle_request_hint`),
+the io thread blocking while a search is joined (measured and accepted in round 42), a race on the websocket
+write (`WebSocketSession::send` posts onto the stream executor, `server.cpp:318-336`), and duplicate
+coordinate keys in the opening book.
+
+**Fixed.** J1: `AlphaBetaSearch::set_deadline` plus a `has_deadline_` branch in `is_timeout()`, wired to the
+same `search_deadline` the tactics phases use - the slice stays as the no-deadline fallback, and the floor
+and the `remaining_time * 200` node budget are untouched. J2: the pin now tests only `it != moves.end()` and
+swaps inside, so an already-first TT move keeps `tt_swapped` true and stays at index 0. J3-J8 in
+`web/app.js`: `handleSession` clears `moveHistory`; the resume line takes the server's `move_count` (with a
+`Number.isInteger` guard, so a missing field falls back to the local list); the undo/hint enable rule is now
+one expression (`playerColor === null || gameStatus === 'game_over'`) applied by `handleSession`,
+`handleThinkingProgress`, `handle_ai_move`/stop, `handleUndoSuccess` and `handleHintResult`; clicks outside
+the grid rectangle (`x < pad`, `x > size - pad`, same for `y`) return before anything else, in play mode and
+in 摆棋 alike; auto-play's last ply calls `exitReplay()`, a replay click now warns 正在回放历史，先退出回放才能落子,
+`handleMoveMade`/`handleAIMove`/`handleGameOver` leave the replay view first, and `hint_result` is dropped
+as 建议已失效 when the ply count no longer matches the one recorded by `requestHint`. K1: the hint worker
+delivers on `!discard_pending_.load()` instead of `!stop_flag_.load()`, so a user stop still answers
+(`server.cpp:1463-1475` turns a valid move into `hint_result` and an invalid one into
+`error: No hint available`, which the client already releases the button on) while reset / resign / the
+destructor - the paths that set `discard_pending_` through `halt_search()` - stay silent, and
+`hint_active_.store(false)` still runs on every branch.
+
+**Verified.** The test session ran the J1-J8 + K1 regression in WSL against the plain `cmake ..` build and
+the orchestrator re-ran the whole gate over the same tree: `ctest` 8/8 (test_board, test_pattern,
+test_evaluator, test_search, test_position, test_session, test_server, test_training) and
+`node tests/web_frontend_check.js` **17/17**, which now includes `J3 resumed session drops the previous move
+record`, `J4 resumed status reports the server ply count`, `J5 undo/hint buttons follow the chosen-side rule
+on every path`, `J6 clicks on the label ring never reach the board`, `J7 replay view exits on end-of-play and
+live moves`, `J8 stale hint replies are refused` and the three `C7` cases that pin K1 (the hint is sent once
+and released by `hint_result`, a resumed session releases an in-flight hint, a non-resumed session recovers
+through `chooseSide`). The J1 deadline and the J2 pin are covered inside `test_search`, which stayed green
+with its 4.97 s of search cases.
+
+The same session then ran two read-only evidence probes for the *next* round, and both came back 属实, so
+they are recorded here as round-77 candidates rather than as regressions of this batch:
+
+- **K2 - a stale `discard_pending_` swallows 求招 forever.** On one socket and one token, a
+  `set_position` → `choose_side` (human to move, so no `start_ai_thinking`, which is the only other site that
+  clears the flag) → `request_hint{20000,8}` sequence printed **zero** frames in 15 s and still none after
+  `stop_thinking`: the search ran (one `thinking_progress` at 3,133,223 nodes) and K1's
+  `!discard_pending_.load()` predicate at `game_manager.cpp:308` discarded the answer without an `error`
+  reply. `restart` → `reset()` reproduced it the same way, while a fresh manager on the same port answered in
+  10.67 s with the identical 20000/8 request - the single-factor control the brief asked for. Rescue paths
+  exist but only via other frames (`error: Cannot undo` during 摆棋, `game_restarted` + a rotated-token
+  `session` after restart), so the silence itself never releases the button.
+- **R1 - a gap shape whose hole fills to an overline is still scored as a BLACK four.** With black stones at
+  (7,2)-(7,5) and (7,6) empty, recognising (7,7) answers `RUSH_FOUR`, and playing (7,7) then filling (7,6)
+  measures `run_length == 6` - the completion point is a 长连, which README:29 says is not a four at all
+  (`X_XXXX_X 不算四`). Removing (7,2) makes the same probe a true rush four (`run_length == 5`), so the
+  labelling is what is wrong, not the geometry. `pattern.cpp:416-419` exempts gap shapes from the
+  exactly-five completion scan on the strength of a comment claiming `match_gapped_run` already proved it,
+  while `match_gapped_run` (`:257-259`) only counts stones: `stones == 4` becomes `RUSH_FOUR` with no board
+  check. The consequence is not limited to the evaluation - a phantom four feeds `four_count`, so a legal
+  black move can be rejected as 双四/四三.

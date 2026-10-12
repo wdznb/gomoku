@@ -238,6 +238,9 @@ bool DataCollector::write_jsonl(const std::vector<TrainingSample>& samples,
     for (const auto& sample : samples) {
         file << sample.to_json() << "\n";
     }
+    // Buffered writes only report a full disk at close, which is after this
+    // check would have called the append a success.
+    file.flush();
     if (!file.good()) {
         error = "failed while writing " + path;
         return false;

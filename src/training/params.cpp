@@ -139,8 +139,15 @@ bool CoefficientVector::from_json_string(const std::string& text, ThreatCoeffici
         return false;
     }
 
+    // A present `coefficients` that is not an object is a malformed file, not an
+    // absent one: falling through to the root would find none of the twelve names
+    // there and report a successful load of nothing but the defaults.
     const json* body = &root;
-    if (root.contains("coefficients") && root["coefficients"].is_object()) {
+    if (root.contains("coefficients")) {
+        if (!root["coefficients"].is_object()) {
+            error = "coefficients must be an object";
+            return false;
+        }
         body = &root["coefficients"];
     }
 
@@ -207,6 +214,10 @@ bool CoefficientVector::save(const std::string& path, const ThreatCoefficients& 
             return false;
         }
         file << json::parse(to_json_string(coeffs)).dump(2);
+        // The rename may only replace a good file once these bytes left the
+        // stream buffer: an error that surfaces at close would be reported as a
+        // successful save of a truncated parameter file.
+        file.flush();
         if (!file.good()) {
             error = "failed while writing " + tmp;
             return false;

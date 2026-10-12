@@ -282,6 +282,121 @@ void test_session_config_validation() {
     std::cout << "test_session_config_validation passed" << std::endl;
 }
 
+// Round 75, E2: 64-bit integers that only a truncating cast could love. JSON
+// holds integers in 64 bits and get<int> casts, so version 2^32+1 read back as 1
+// and the file was taken for this format, base row 2^32+3 became 3, and the two
+// config fields bypassed their bounds outright. Every one of those must now
+// refuse the whole file instead of resuming on a value the writer never meant.
+void test_rejects_wide_integer_fields() {
+    SessionSnapshot out;
+    std::string error;
+
+    // 2^32 + 1 truncates to 1: the old reader accepted this as version 1.
+    error.clear();
+    assert(!session_from_json(
+        R"({"version":4294967297,"token":"ab","status":"playing","record":{"moves":[]}})",
+        out, error));
+    assert(error.find("版本") != std::string::npos);
+
+    // A base stone row of 2^32 + 3 truncates to 3, moving the stone. The file is
+    // refused wholesale rather than read with a wrong square.
+    const char* wide_row =
+        R"({"version":1,"token":"ab","status":"playing","record":{"moves":[]},"base":[{"row":4294967299,"col":7,"color":"black"}]})";
+    error.clear();
+    assert(!session_from_json(wide_row, out, error));
+    assert(error.find("摆棋") != std::string::npos);
+    // The column door as well.
+    assert(!session_from_json(
+        R"({"version":1,"token":"ab","status":"playing","record":{"moves":[]},"base":[{"row":7,"col":4294967304,"color":"black"}]})",
+        out, error));
+
+    // Same for the two config fields, whose bounds the truncated value would
+    // otherwise sail past.
+    error.clear();
+    assert(!session_from_json(
+        R"({"version":1,"token":"ab","status":"playing","record":{"moves":[]},"timeout_ms":4294967297,"max_depth":4})",
+        out, error));
+    assert(error.find("超时") != std::string::npos);
+    error.clear();
+    assert(!session_from_json(
+        R"({"version":1,"token":"ab","status":"playing","record":{"moves":[]},"timeout_ms":5000,"max_depth":4294967300})",
+        out, error));
+    assert(error.find("深度") != std::string::npos);
+
+    // Through the file door as well: load_session refuses the whole file, and
+    // nothing of it reaches the caller.
+    const auto dir = scratch_dir("wide");
+    std::filesystem::create_directories(dir);
+    const std::string token = "abcdef0123456789";
+    { std::ofstream(dir / (token + ".json")) << wide_row; }
+    SessionSnapshot loaded;
+    error.clear();
+    assert(!load_session(dir.string(), token, loaded, error));
+    assert(!error.empty());
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+
+    // The 64-bit timestamps are not meant to become ints and still round-trip
+    // whole: a cast would fold 2^32 + 5 down to 5.
+    SessionSnapshot snap = sample("ab");
+    snap.created_ms = 4294967301LL;
+    snap.updated_ms = 4294967302LL;
+    error.clear();
+    assert(session_from_json(session_to_json(snap), out, error) && error.empty());
+    assert(out.created_ms == 4294967301LL && out.updated_ms == 4294967302LL);
+
+    std::cout << "test_rejects_wide_integer_fields passed" << std::endl;
+}
+
+// Round 75, F5: a session file is addressable by its own name, and load_session
+// compares the token inside against the name it read. A file renamed under a
+// different token would resume as a game the URL never promised, and every
+// later write would go to a name this file can never be - so the load is
+// refused whole. The file itself is the user's data and stays on disk.
+void test_load_refuses_token_mismatch() {
+    const auto dir = scratch_dir("token_mismatch");
+    std::string error;
+    std::error_code ec;
+
+    assert(save_session(dir.string(), sample("bbbb"), error));
+    std::filesystem::rename(dir / "bbbb.json", dir / "aaaa.json", ec);
+    assert(!ec);
+
+    SessionSnapshot out;
+    error.clear();
+    assert(!load_session(dir.string(), "aaaa", out, error));
+    assert(error.find("token") != std::string::npos);
+    assert(std::filesystem::exists(dir / "aaaa.json"));
+
+    // The name the file used to answer to is gone: nothing loads under it, and
+    // the mismatch was not resolved by inventing a second file.
+    error.clear();
+    assert(!load_session(dir.string(), "bbbb", out, error));
+    assert(!std::filesystem::exists(dir / "bbbb.json"));
+
+    // Control: the same envelope under its own name loads exactly as before.
+    assert(save_session(dir.string(), sample("cccc"), error));
+    error.clear();
+    assert(load_session(dir.string(), "cccc", out, error));
+    assert(out.token == "cccc");
+
+    // A half-written temporary never counts as a session in the listing, and
+    // the refused file is still listed under the name it does not match - the
+    // listing reports files, the loader is what validates them.
+    { std::ofstream(dir / "dddd.json.tmp") << "half written"; }
+    const auto found = list_sessions(dir.string());
+    assert(found.size() == 2);
+    bool saw_renamed = false;
+    for (const std::string& path : found) {
+        assert(path.find(".json.tmp") == std::string::npos);
+        if (path.find("aaaa.json") != std::string::npos) saw_renamed = true;
+    }
+    assert(saw_renamed);
+
+    std::filesystem::remove_all(dir, ec);
+    std::cout << "test_load_refuses_token_mismatch passed" << std::endl;
+}
+
 // Round 73, delete_session: a real failure on the main file must come back as
 // false with a message. The old code shared one error_code between the main
 // remove and the .tmp sweep, so an absent .tmp cleared the error and a session
@@ -337,6 +452,8 @@ int main() {
     test_delete_session_is_idempotent();
     test_delete_session_reports_main_failure();
     test_session_config_validation();
+    test_rejects_wide_integer_fields();
+    test_load_refuses_token_mismatch();
     std::cout << "All session store tests passed!" << std::endl;
     return 0;
 }

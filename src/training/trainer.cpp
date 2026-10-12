@@ -393,6 +393,10 @@ bool Trainer::save_checkpoint(const std::string& path, std::string& error) const
             return false;
         }
         file << root.dump(2);
+        // The rename below is only safe once the bytes are really on the device:
+        // a buffered failure would surface at close, after the good() check and
+        // after the truncated .tmp had replaced a working checkpoint.
+        file.flush();
         if (!file.good()) {
             error = "failed while writing " + tmp;
             return false;

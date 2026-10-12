@@ -31,6 +31,15 @@ public:
 
     void set_node_limit(int limit) { node_limit_ = limit; }
 
+    // Absolute wall-clock deadline shared with the VCF/VCT phases (see
+    // VCFSearch::set_deadline). The time_limit_ms handed to search() is only
+    // this phase's slice, so without the shared deadline a phase that starts
+    // after the budget is already spent still gets its whole slice.
+    void set_deadline(std::chrono::steady_clock::time_point deadline) {
+        deadline_ = deadline;
+        has_deadline_ = true;
+    }
+
 private:
     const Evaluator& evaluator_;
     TranspositionTable& tt_;
@@ -40,6 +49,8 @@ private:
     SearchInfo info_;
 
     std::chrono::time_point<std::chrono::high_resolution_clock> start_time_;
+    std::chrono::steady_clock::time_point deadline_{};
+    bool has_deadline_ = false;
 
     int alphabeta(Board& board, int depth, int alpha, int beta, int color,
                   std::atomic<bool>& stop_flag);

@@ -52,6 +52,8 @@ class GomokuGame {
         // the view is a display-only rotation / mirror that every stone, marker,
         // label and click passes through.
         this.geom = { size: BOARD_MAX, cell: 38, pad: 28, stone: 15, font: 11 };
+        // One queued resize layout at a time.
+        this.layoutPending = false;
         this.view = { rot: 0, flipH: false };
         this.dpr = window.devicePixelRatio || 1;
         
@@ -65,6 +67,9 @@ class GomokuGame {
         // replaced): the server answers a second concurrent hint with an error,
         // so the click still being answered disarms its own button.
         this.hintInFlight = false;
+        // Ply count when 求招 left: a reply for a position the player has since
+        // changed must not be painted as advice.
+        this.hintMoveCount = 0;
         this.lastMove = null;
         // Engine numbers for the current game, index-aligned with moveHistory.
         // Filled by the server's "replay" reply (4.4), not by the live messages.
@@ -96,7 +101,7 @@ class GomokuGame {
         this.initWebSocket();
         this.initUI();
         this.layout();
-        window.addEventListener('resize', () => this.layout());
+        window.addEventListener('resize', () => this.scheduleLayout());
     }
     
     initWebSocket() {
@@ -234,6 +239,7 @@ class GomokuGame {
         // cannot give back.
         this.baseStones = [];
         this.stopReplayAuto();
+        this.moveHistory = [];
         this.analysis = [];
         this.analysisEnded = false;
         this.replayIndex = null;
@@ -243,8 +249,10 @@ class GomokuGame {
         this.refreshReplayControls();
         this.setSideButtons(this.gameStatus === 'playing' && this.playerColor !== null,
                            this.gameStatus === 'playing' && this.playerColor !== null);
-        document.getElementById('btn-undo').disabled = this.playerColor === null;
-        document.getElementById('btn-hint').disabled = this.playerColor === null;
+        document.getElementById('btn-undo').disabled =
+            this.playerColor === null || this.gameStatus === 'game_over';
+        document.getElementById('btn-hint').disabled =
+            this.playerColor === null || this.gameStatus === 'game_over';
         // A resumed or re-synced game replaces whatever position the hint was
         // searched on, so an in-flight request from before cannot answer here.
         this.hintInFlight = false;
@@ -259,14 +267,16 @@ class GomokuGame {
         // line; flag it so it reports the resume rather than a replay the player
         // never asked for.
         this.resumeApplied = true;
-        this.updateStatus(this.resumedStatusText(),
+        this.updateStatus(this.resumedStatusText(msg.move_count),
                           this.gameStatus === 'game_over' ? 'idle' : 'ok');
     }
 
     // What a resumed session is worth saying, from the state the server just
     // described: an ending, a position nobody has taken a side of, an empty board
-    // with a side claimed, or a game in progress.
-    resumedStatusText() {
+    // with a side claimed, or a game in progress. The count is the server's ply
+    // count - the local list belongs to whatever game this page last drew.
+    resumedStatusText(moveCount) {
+        const count = Number.isInteger(moveCount) ? moveCount : this.moveHistory.length;
         const turn = `轮到${this.currentTurn === BLACK ? '黑' : '白'}方`;
         if (this.gameStatus === 'game_over' && this.gameOverText) return this.gameOverText;
         if (this.gameStatus === 'waiting') {
@@ -278,11 +288,11 @@ class GomokuGame {
         // A game can be "playing" with an empty move list: a hand-set position whose
         // side has been taken but which nobody has added to yet. Reporting that as
         // "0 手" under four stones reads as a bug, so say what is on the board.
-        if (this.moveHistory.length === 0) {
+        if (count === 0) {
             const installed = this.board.flat().filter(v => v !== 0).length;
             if (installed > 0) return `已恢复摆好的局面：${installed} 子，${turn}`;
         }
-        return `已恢复对局：${this.moveHistory.length} 手 · ${turn}`;
+        return `已恢复对局：${count} 手 · ${turn}`;
     }
     
     initUI() {
@@ -446,6 +456,18 @@ class GomokuGame {
     // horizontal band for the two side panels, then centre the largest square
     // board that is left. The panels take the inscribed rectangle of their
     // trapezoid, so nothing they hold is cut by the diagonal divider.
+    // layout() tears the SVG down, resizes both canvas backbuffers and repaints
+    // the whole board, so one resize drag would otherwise run it per event.
+    // Coalesce the events into a single layout per frame.
+    scheduleLayout() {
+        if (this.layoutPending) return;
+        this.layoutPending = true;
+        requestAnimationFrame(() => {
+            this.layoutPending = false;
+            this.layout();
+        });
+    }
+
     layout() {
         const width = window.innerWidth;
         const height = window.innerHeight;
@@ -673,7 +695,10 @@ class GomokuGame {
         }
         this.replayTimer = setInterval(() => {
             if (this.replayIndex >= this.moveHistory.length - 1) {
-                this.stopReplayAuto();
+                // Reaching the last ply ends the playback, and the view has to
+                // come back with it: leaving replayIndex on the final move looks
+                // like the live board while the click guards still reject it.
+                this.exitReplay();
                 return;
             }
             this.stepReplay(1);
@@ -823,6 +848,13 @@ class GomokuGame {
         const x = e.clientX - rect.left;
         const y = e.clientY - rect.top;
 
+        // The label ring outside the grid is edge information, not a cell: its
+        // pixels round into row/column 0 (and 14), so a click half-way to the
+        // first intersection used to land a stone there. Nothing lives to click
+        // out there, so it is ignored rather than answered with an error.
+        const grid_max = this.geom.size - this.geom.pad;
+        if (x < this.geom.pad || x > grid_max || y < this.geom.pad || y > grid_max) return;
+
         // The click lands on the displayed grid, so it is mapped back to the
         // logical cell before anything else touches it.
         const shown = this.logicalOf(Math.round((y - this.geom.pad) / this.geom.cell),
@@ -841,8 +873,12 @@ class GomokuGame {
 
         if (this.gameStatus !== 'playing' || this.aiThinking) return;
         // A replayed position is a read-only view of the past; clicking there
-        // must not send a move for the live turn.
-        if (this.replayIndex !== null) return;
+        // must not send a move for the live turn. Say so, because the click
+        // otherwise vanishes and the board looks like it is ignoring the player.
+        if (this.replayIndex !== null) {
+            this.updateStatus('正在回放历史，先退出回放才能落子', 'warn');
+            return;
+        }
         if (this.currentTurn !== this.playerColor) return;
         
         if (row >= 0 && row < BOARD_SIZE && col >= 0 && col < BOARD_SIZE) {
@@ -905,6 +941,7 @@ class GomokuGame {
             max_depth: depth
         })) return;
         this.hintInFlight = true;
+        this.hintMoveCount = this.moveHistory.length;
         document.getElementById('btn-hint').disabled = true;
     }
     
@@ -920,6 +957,12 @@ class GomokuGame {
         // leave the control armed while the worker winds down.
         this.aiThinking = false;
         document.getElementById('btn-stop').disabled = true;
+        // The thinking controls went grey with aiThinking, so they come back with
+        // it; the player is owed the ordinary rules, not a stuck board.
+        document.getElementById('btn-undo').disabled =
+            this.playerColor === null || this.gameStatus === 'game_over';
+        document.getElementById('btn-hint').disabled =
+            this.playerColor === null || this.gameStatus === 'game_over';
     }
     
     // ---- 摆棋 (position setup) ---------------------------------------
@@ -1539,6 +1582,10 @@ class GomokuGame {
     }
     
     handleMoveMade(msg) {
+        // A live stone ends any historical view: staying on the replayed ply would
+        // paint the board from the past while the game moved on, and every click
+        // would then be dropped by the replay guard.
+        if (this.replayIndex !== null) this.exitReplay();
         this.placeStone(msg.row, msg.col, msg.color === 'black' ? BLACK : WHITE);
         this.currentTurn = this.currentTurn === BLACK ? WHITE : BLACK;
         this.updateTurnInfo();
@@ -1546,10 +1593,16 @@ class GomokuGame {
     }
     
     handleAIMove(msg) {
+        if (this.replayIndex !== null) this.exitReplay();
         this.placeStone(msg.row, msg.col, msg.color === 'black' ? BLACK : WHITE);
         this.currentTurn = this.currentTurn === BLACK ? WHITE : BLACK;
         this.aiThinking = false;
         document.getElementById('btn-stop').disabled = true;
+        // Thinking greyed these out; the finished search owes them back.
+        document.getElementById('btn-undo').disabled =
+            this.playerColor === null || this.gameStatus === 'game_over';
+        document.getElementById('btn-hint').disabled =
+            this.playerColor === null || this.gameStatus === 'game_over';
         // ai_move is the only live message that carries the engine's verdict for
         // the stone it just placed, so surface it in the status line.
         this.updateStatus(`AI ${this.coordName(msg.row, msg.col)} · 分值 ${msg.score} · ${msg.thinking_time_ms}ms`,
@@ -1611,17 +1664,32 @@ class GomokuGame {
         this.updateTurnInfo();
         this.refreshReplayControls();
         this.drawBoard();
+        // An undo interrupts a hint search that is still running, and the aborted
+        // search answers with neither hint_result nor an error, so this is where
+        // the control comes back - otherwise 求招 stays greyed for the whole game.
+        this.hintInFlight = false;
+        document.getElementById('btn-hint').disabled =
+            this.playerColor === null || this.gameStatus === 'game_over';
     }
     
     handleHintResult(msg) {
         this.hintInFlight = false;
+        document.getElementById('btn-hint').disabled =
+            this.playerColor === null || this.gameStatus === 'game_over';
+        // The server searched the position as it was when 求招 left; every path
+        // that changes the position pushes onto moveHistory, so a different ply
+        // count means the answer can name a square that is occupied now, or one
+        // that no longer exists. Release the control, say the hint is void, and
+        // leave the board alone.
+        if (this.moveHistory.length !== this.hintMoveCount) {
+            this.updateStatus('建议已失效', 'idle');
+            return;
+        }
         // The ring marks a square of the live position; leave any replay view
         // first so it is not drawn on a historical board.
         if (this.replayIndex !== null) {
             this.exitReplay();
         }
-        document.getElementById('btn-hint').disabled =
-            this.playerColor === null || this.gameStatus === 'game_over';
         this.highlightMove(msg.row, msg.col);
         this.updateStatus(`建议 ${this.coordName(msg.row, msg.col)} · 分值 ${msg.score}`, 'ok');
     }
@@ -1635,6 +1703,10 @@ class GomokuGame {
         if (this.gameStatus === 'playing' && this.currentTurn !== this.playerColor) {
             this.aiThinking = true;
             document.getElementById('btn-stop').disabled = false;
+            // The server refuses both while it is thinking, so a click there is
+            // only a red error line; grey them out until the search is over.
+            document.getElementById('btn-undo').disabled = true;
+            document.getElementById('btn-hint').disabled = true;
             this.refreshReplayControls();
         }
     }
@@ -1643,6 +1715,10 @@ class GomokuGame {
         this.gameStatus = 'game_over';
         this.aiThinking = false;
         this.hintInFlight = false;
+        // The ending belongs to the live board. Left in a replay view the player
+        // keeps staring at a historical position with no way back, because every
+        // click is still rejected by the replay guard.
+        if (this.replayIndex !== null) this.exitReplay();
         let statusText = '游戏结束 - ';
         let kind = 'idle';
         if (msg.winner === 'draw') {

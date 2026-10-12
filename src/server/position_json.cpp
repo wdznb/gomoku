@@ -1,5 +1,7 @@
 #include "position_json.h"
 
+#include "training/json_int.h"
+
 #include <array>
 #include <cctype>
 #include <cstdlib>
@@ -116,13 +118,21 @@ bool read_words(const json& list, std::array<uint64_t, BITBOARD_WORDS>& out, con
 bool position_of(const json& entry, Position& out, size_t index, std::string& error) {
     int row = -1;
     int col = -1;
+    // get<int> only casts, so 4294967304 would read as 8 and put a stone on a
+    // square no document named. Both shapes are range-checked instead; a
+    // coordinate that does not fit an int rejects the document rather than
+    // clamping to the nearest legal one.
     if (entry.is_array() && entry.size() == 2 && entry[0].is_number_integer() && entry[1].is_number_integer()) {
-        row = entry[0].get<int>();
-        col = entry[1].get<int>();
+        if (!read_json_int(entry[0], row) || !read_json_int(entry[1], col)) {
+            error = "第 " + std::to_string(index + 1) + " 个坐标超出可表示的行列范围";
+            return false;
+        }
     } else if (entry.is_object() && entry.contains("row") && entry.contains("col") &&
                entry["row"].is_number_integer() && entry["col"].is_number_integer()) {
-        row = entry["row"].get<int>();
-        col = entry["col"].get<int>();
+        if (!read_json_int(entry["row"], row) || !read_json_int(entry["col"], col)) {
+            error = "第 " + std::to_string(index + 1) + " 个坐标超出可表示的行列范围";
+            return false;
+        }
     } else {
         error = "第 " + std::to_string(index + 1) + " 个坐标需为 [row, col] 或 {\"row\":…,\"col\":…}";
         return false;
@@ -215,7 +225,8 @@ SetupResult moves_form(const json& doc) {
 SetupResult position_from_json(const json& doc) {
     if (!doc.is_object()) return rejected("局面文档必须是 JSON 对象");
     if (doc.contains("version")) {
-        if (!doc["version"].is_number_integer() || doc["version"].get<int>() != 1) {
+        int version = 0;
+        if (!read_json_int(doc["version"], version) || version != 1) {
             return rejected("不支持的局面版本，当前只认 version 1");
         }
     }

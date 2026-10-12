@@ -2,21 +2,29 @@
 #include "core/pattern.h"
 #include "core/evaluator.h"
 #include "core/transforms.h"
+#include "optimization/transposition.h"
+#include <atomic>
+#include <chrono>
+#include <vector>
+#include <algorithm>
+// J2 drives sort_moves and generate_moves directly, and both are private. Every
+// header alphabeta.h pulls in is included above, so the macro rewrites
+// alphabeta.h's class body and nothing else (same trick as test_training.cpp).
+#define private public
+#include "search/alphabeta.h"
+#undef private
 #include "search/greedy.h"
 #include "search/vcf.h"
 #include "search/vct.h"
-#include "search/alphabeta.h"
 #include "search/search_engine.h"
 #include "search/controller.h"
-#include "optimization/transposition.h"
 #include "optimization/opening_book.h"
 #include "server/game_manager.h"
 #include <iostream>
 #include <cassert>
-#include <atomic>
+#include <filesystem>
 #include <fstream>
 #include <thread>
-#include <chrono>
 
 using namespace gomoku;
 
@@ -571,6 +579,14 @@ void test_opening_book_load_json() {
     assert(!book.empty());
     assert(book.line_count() > 20);
     assert(book.entry_count() > book.line_count());
+    // Round 75, H1 parity: the fixed reader accepts exactly the 45 lines and
+    // 109 weighted prefix keys the pre-fix reader did. Every coordinate and
+    // weight in this file fits an int with room to spare, so no cast ever
+    // truncated and the two readers must agree number for number (the old logic
+    // replayed over the same file in build/r75b_book_parity.py gives the same
+    // two counts).
+    assert(book.line_count() == 45);
+    assert(book.entry_count() == 109);
 
     std::vector<Move> hist = {Move(7, 7, BLACK), Move(7, 8, WHITE)};
     Move response;
@@ -579,6 +595,51 @@ void test_opening_book_load_json() {
 
     std::cout << "test_opening_book_load_json passed (lines: " << book.line_count()
               << ", entries: " << book.entry_count() << ")" << std::endl;
+}
+
+// Round 75, H1: a line whose coordinate or weight is wider than an int used to
+// be cast by get<int>() - 2^32+8 became row 8, 2^32 became column 0, 2^32+2
+// became weight 2 - so a malformed line entered the book aiming at a square
+// nobody wrote. Such a line is now refused whole. The legal lines beside it in
+// the same file must still load, or one malformed entry would poison the book.
+void test_opening_book_rejects_wide_numbers() {
+    const std::filesystem::path path =
+        std::filesystem::temp_directory_path() / "gomoku_book_wide.json";
+    {
+        std::ofstream file(path);
+        file << R"({"lines":[)"
+             << R"({"name":"bad_row","weight":5,"moves":[[4294967304,7],[7,8],[6,8]]},)"
+             << R"({"name":"bad_col","weight":5,"moves":[[1,1],[1,4294967296],[2,2]]},)"
+             << R"({"name":"bad_weight","weight":4294967298,"moves":[[0,0],[0,1],[1,1]]},)"
+             << R"({"name":"good","weight":5,"moves":[[3,3],[3,4],[4,4]]})"
+             << R"(]})";
+    }
+
+    OpeningBook book;
+    std::string error;
+    assert(book.load(path.string(), error));
+    assert(book.line_count() == 1);
+    // The one legal line expands to its 8 symmetries: 4 first-move keys and 8
+    // two-ply keys, 12 unique keys in all.
+    assert(book.entry_count() == 12);
+
+    // The squares a truncating cast would have created are not in the book:
+    // row 8 from 2^32+8, column 0 from 2^32, and the weight-2 copy of (0,0).
+    assert(!book.has_entry({Move(8, 7, BLACK)}));
+    assert(!book.has_entry({Move(1, 1, BLACK)}));
+    assert(!book.has_entry({Move(1, 1, BLACK), Move(1, 0, WHITE)}));
+    assert(!book.has_entry({Move(0, 0, BLACK)}));
+
+    // The legal line answers, prefix for prefix.
+    assert(book.has_entry({Move(3, 3, BLACK)}));
+    assert(book.has_entry({Move(3, 3, BLACK), Move(3, 4, WHITE)}));
+    Move response;
+    assert(book.query({Move(3, 3, BLACK)}, WHITE, response));
+    assert(response.pos == Position(3, 4) || response.pos == Position(4, 3));
+
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+    std::cout << "test_opening_book_rejects_wide_numbers passed" << std::endl;
 }
 
 void test_opening_book_rejects_occupied() {
@@ -1263,6 +1324,265 @@ void test_alphabeta_huge_timeout_does_not_overflow_node_budget() {
     std::cout << "test_alphabeta_huge_timeout_does_not_overflow_node_budget passed" << std::endl;
 }
 
+namespace {
+
+// J1/J2 share one midgame shape: twelve stones, both sides holding a live three
+// (BLACK's row 7 is open at (7,6)/(7,10), WHITE's row 9 at (9,5)/(9,9)). Deep
+// enough that a real search runs for a while, not a tactic the engine sees at
+// once.
+void build_midgame(Board& board) {
+    board.place_stone(7, 7, BLACK);
+    board.place_stone(7, 8, BLACK);
+    board.place_stone(7, 9, BLACK);
+    board.place_stone(9, 6, WHITE);
+    board.place_stone(9, 7, WHITE);
+    board.place_stone(9, 8, WHITE);
+    board.place_stone(5, 5, BLACK);
+    board.place_stone(10, 4, BLACK);
+    board.place_stone(11, 11, BLACK);
+    board.place_stone(4, 9, WHITE);
+    board.place_stone(3, 11, WHITE);
+    board.place_stone(2, 2, WHITE);
+    assert(board.move_count() == 12);
+}
+
+std::vector<std::pair<int, int>> cell_multiset(const std::vector<Move>& moves) {
+    std::vector<std::pair<int, int>> cells;
+    cells.reserve(moves.size());
+    for (const Move& m : moves) cells.emplace_back(m.pos.row, m.pos.col);
+    std::sort(cells.begin(), cells.end());
+    return cells;
+}
+
+std::vector<int> heuristic_scores(const std::vector<Move>& moves, const Board& board,
+                                  const Evaluator& evaluator, int color) {
+    std::vector<int> scores;
+    scores.reserve(moves.size());
+    for (const Move& m : moves) {
+        scores.push_back(evaluator.evaluate_position_pair(board, m.pos.row, m.pos.col, color));
+    }
+    return scores;
+}
+
+}  // namespace
+
+// J1: the deadline is the engine's one absolute budget, not a slice measured
+// from this phase's own start. The phase's own time limit here is 5000 ms while
+// the shared deadline is 50 ms away; before the fix AlphaBeta ignored the
+// deadline (is_timeout() only knew move_time_limit_ms_) and ran the whole
+// 5000 ms slice.
+void test_alphabeta_absolute_deadline_stops_search() {
+    Board board;
+    build_midgame(board);
+    Evaluator evaluator;
+    TranspositionTable tt;
+
+    AlphaBetaSearch ab(evaluator, tt);
+    std::atomic<bool> stop(false);
+    ab.set_deadline(std::chrono::steady_clock::now() + std::chrono::milliseconds(50));
+
+    const auto t0 = std::chrono::steady_clock::now();
+    Move result = ab.search(board, WHITE, 8, 5000, stop);
+    const long long elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+
+    assert(result.pos.is_valid());
+    assert(board.is_empty(result.pos.row, result.pos.col));
+    assert(elapsed < 1000);
+
+    std::cout << "test_alphabeta_absolute_deadline_stops_search passed (" << elapsed
+              << " ms, depth " << ab.last_search_info().depth << ")" << std::endl;
+}
+
+// J1: a deadline already in the past must still hand back a legal move. The
+// first iteration breaks before any node is visited, best_move stays invalid
+// and the root fallback answers with root_moves[0]; the reported depth stays 0
+// so the caller cannot mistake it for a searched move.
+void test_alphabeta_expired_deadline_returns_root_fallback() {
+    Board board;
+    build_midgame(board);
+    Evaluator evaluator;
+    TranspositionTable tt;
+
+    AlphaBetaSearch ab(evaluator, tt);
+    std::atomic<bool> stop(false);
+    ab.set_deadline(std::chrono::steady_clock::now() - std::chrono::seconds(1));
+
+    const auto t0 = std::chrono::steady_clock::now();
+    Move result = ab.search(board, WHITE, 8, 5000, stop);
+    const long long elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+
+    assert(result.pos.is_valid());
+    assert(board.is_empty(result.pos.row, result.pos.col));
+    SearchInfo info = ab.last_search_info();
+    assert(info.depth == 0);
+    assert(elapsed < 1000);
+
+    // The fallback is the first root candidate: regenerating the root list the
+    // same way (generate + heuristic sort; this asymmetric board has no
+    // symmetries to dedup) must name the same cell.
+    std::vector<Move> root = ab.generate_moves(board, WHITE);
+    assert(!root.empty());
+    ab.sort_moves(root, board, WHITE);
+    assert(result.pos == root[0].pos);
+
+    std::cout << "test_alphabeta_expired_deadline_returns_root_fallback passed ("
+              << elapsed << " ms, fallback "
+              << result.pos.row << "," << result.pos.col << ")" << std::endl;
+}
+
+// J1: without a deadline the per-search slice remains the only bound: a 200 ms
+// budget on a deep request must return a normal searched move inside a generous
+// wall-clock ceiling.
+void test_alphabeta_large_depth_bounded_by_slice_without_deadline() {
+    Board board;
+    build_midgame(board);
+    Evaluator evaluator;
+    TranspositionTable tt;
+
+    AlphaBetaSearch ab(evaluator, tt);
+    std::atomic<bool> stop(false);
+
+    const auto t0 = std::chrono::steady_clock::now();
+    Move result = ab.search(board, WHITE, 6, 200, stop);
+    const long long elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+
+    assert(result.pos.is_valid());
+    assert(board.is_empty(result.pos.row, result.pos.col));
+    assert(elapsed < 1500);
+
+    std::cout << "test_alphabeta_large_depth_bounded_by_slice_without_deadline passed ("
+              << elapsed << " ms, depth " << ab.last_search_info().depth << ")" << std::endl;
+}
+
+// J2: the TT move already at index 0 used to be repainted as an ordinary
+// candidate - the heuristic re-sort covered index 0 too, so a later move with a
+// higher score displaced the one move the previous search paid to know. Here
+// moves[3] is the strict heuristic maximum and moves[0] is the TT move with a
+// lower score; after sort_moves, index 0 must still be the TT move and the tail
+// must open with that maximum.
+void test_sort_moves_pins_tt_move_already_at_front() {
+    Board board;
+    build_midgame(board);
+    Evaluator evaluator;
+    TranspositionTable tt;
+    AlphaBetaSearch ab(evaluator, tt);
+
+    std::vector<Move> generated = ab.generate_moves(board, WHITE);
+    assert(generated.size() > 8);
+    const std::vector<std::pair<int, int>> multiset = cell_multiset(generated);
+
+    const std::vector<int> scores = heuristic_scores(generated, board, evaluator, WHITE);
+    const size_t max_i = static_cast<size_t>(
+        std::max_element(scores.begin(), scores.end()) - scores.begin());
+    const size_t min_i = static_cast<size_t>(
+        std::min_element(scores.begin(), scores.end()) - scores.begin());
+    assert(max_i != min_i);
+    assert(scores[max_i] > scores[min_i]);
+    const Move tt_move = generated[min_i];
+
+    std::vector<Move> ordered;
+    ordered.reserve(generated.size());
+    ordered.push_back(tt_move);  // index 0 already holds the TT move
+    for (const Move& m : generated) {
+        if (m.pos == generated[min_i].pos || m.pos == generated[max_i].pos) continue;
+        ordered.push_back(m);
+        if (ordered.size() == 3) ordered.push_back(generated[max_i]);  // index 3: the best
+    }
+    assert(ordered.size() == generated.size());
+    assert(ordered[0].pos == tt_move.pos);
+    assert(ordered[3].pos == generated[max_i].pos);
+
+    ab.sort_moves(ordered, board, WHITE, tt_move);
+
+    assert(ordered[0].pos == tt_move.pos);
+    assert(cell_multiset(ordered) == multiset);
+    const std::vector<int> after = heuristic_scores(ordered, board, evaluator, WHITE);
+    assert(after.size() == generated.size());
+    assert(after[1] == scores[max_i]);
+    for (size_t i = 2; i < after.size(); ++i) assert(after[i] <= after[i - 1]);
+
+    std::cout << "test_sort_moves_pins_tt_move_already_at_front passed (tt "
+              << tt_move.pos.row << "," << tt_move.pos.col << ", scores "
+              << scores[min_i] << " vs tail-max " << scores[max_i] << ")" << std::endl;
+}
+
+// J2: a TT move found deeper in the list is swapped to the front and the pin
+// holds there; the tail behind it is non-increasing and no cell is lost or
+// duplicated.
+void test_sort_moves_promotes_tt_move_from_tail() {
+    Board board;
+    build_midgame(board);
+    Evaluator evaluator;
+    TranspositionTable tt;
+    AlphaBetaSearch ab(evaluator, tt);
+
+    std::vector<Move> generated = ab.generate_moves(board, WHITE);
+    assert(generated.size() > 8);
+    const std::vector<std::pair<int, int>> multiset = cell_multiset(generated);
+
+    const std::vector<int> scores = heuristic_scores(generated, board, evaluator, WHITE);
+    const size_t max_i = static_cast<size_t>(
+        std::max_element(scores.begin(), scores.end()) - scores.begin());
+
+    // The strict maximum, worst case for the pin, starts at index 5.
+    std::vector<Move> ordered;
+    ordered.reserve(generated.size());
+    for (size_t i = 0; i < generated.size(); ++i) {
+        if (i == max_i) continue;
+        if (ordered.size() == 5) ordered.push_back(generated[max_i]);
+        ordered.push_back(generated[i]);
+    }
+    assert(ordered.size() == generated.size());
+    assert(ordered[5].pos == generated[max_i].pos);
+    const Move tt_move = generated[max_i];
+
+    ab.sort_moves(ordered, board, WHITE, tt_move);
+
+    assert(ordered[0].pos == tt_move.pos);
+    assert(cell_multiset(ordered) == multiset);
+    const std::vector<int> after = heuristic_scores(ordered, board, evaluator, WHITE);
+    assert(after[0] == scores[max_i]);
+    for (size_t i = 2; i < after.size(); ++i) assert(after[i] <= after[i - 1]);
+
+    std::cout << "test_sort_moves_promotes_tt_move_from_tail passed (tt "
+              << tt_move.pos.row << "," << tt_move.pos.col << ", tail "
+              << after[1] << ".." << after.back() << ")" << std::endl;
+}
+
+// J2: without a TT move (invalid) nothing is pinned and the whole list is
+// re-ordered, so index 0 is the heuristic maximum and the array is
+// non-increasing from the front.
+void test_sort_moves_full_order_without_tt_move() {
+    Board board;
+    build_midgame(board);
+    Evaluator evaluator;
+    TranspositionTable tt;
+    AlphaBetaSearch ab(evaluator, tt);
+
+    assert(!Move().pos.is_valid());
+
+    std::vector<Move> generated = ab.generate_moves(board, WHITE);
+    assert(generated.size() > 8);
+    const std::vector<std::pair<int, int>> multiset = cell_multiset(generated);
+
+    const std::vector<int> scores = heuristic_scores(generated, board, evaluator, WHITE);
+    const int best = *std::max_element(scores.begin(), scores.end());
+
+    std::vector<Move> ordered = generated;
+    ab.sort_moves(ordered, board, WHITE, Move());
+
+    assert(cell_multiset(ordered) == multiset);
+    const std::vector<int> after = heuristic_scores(ordered, board, evaluator, WHITE);
+    assert(after.size() == generated.size());
+    assert(after[0] == best);
+    for (size_t i = 1; i < after.size(); ++i) assert(after[i] <= after[i - 1]);
+
+    std::cout << "test_sort_moves_full_order_without_tt_move passed" << std::endl;
+}
+
 int main() {
     std::cout << "Running search tests..." << std::endl;
 
@@ -1284,6 +1604,7 @@ int main() {
     test_opening_book_symmetry();
     test_opening_book_miss();
     test_opening_book_load_json();
+    test_opening_book_rejects_wide_numbers();
     test_opening_book_rejects_occupied();
     test_opening_book_rejects_swapped_colours();
     test_opening_book_large_weight_no_overflow();
@@ -1314,6 +1635,12 @@ int main() {
     test_vct_far_counter_does_not_fabricate_win();
     test_search_engine_resigns_when_alphabeta_proves_mate();
     test_alphabeta_huge_timeout_does_not_overflow_node_budget();
+    test_alphabeta_absolute_deadline_stops_search();
+    test_alphabeta_expired_deadline_returns_root_fallback();
+    test_alphabeta_large_depth_bounded_by_slice_without_deadline();
+    test_sort_moves_pins_tt_move_already_at_front();
+    test_sort_moves_promotes_tt_move_from_tail();
+    test_sort_moves_full_order_without_tt_move();
 
     std::cout << "All search tests passed!" << std::endl;
     return 0;

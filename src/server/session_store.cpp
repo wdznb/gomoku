@@ -1,5 +1,7 @@
 #include "session_store.h"
 
+#include "training/json_int.h"
+
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -86,8 +88,11 @@ bool session_from_json(const std::string& text, SessionSnapshot& out, std::strin
         error = "会话文件不是合法 JSON";
         return false;
     }
-    if (!root.is_object() || !root.contains("version") || !root["version"].is_number_integer() ||
-        root["version"].get<int>() != 1) {
+    // get<int> only casts, so a 64-bit version like 4294967297 would read back
+    // as 1 and be accepted as this format.
+    int version = 0;
+    if (!root.is_object() || !root.contains("version") ||
+        !read_json_int(root["version"], version) || version != 1) {
         error = "会话文件版本不认识";
         return false;
     }
@@ -110,7 +115,7 @@ bool session_from_json(const std::string& text, SessionSnapshot& out, std::strin
         if (root.contains(key) && root[key].is_number_integer()) dst = root[key].get<long long>();
     };
     auto read_int = [&root](const char* key, int& dst) {
-        if (root.contains(key) && root[key].is_number_integer()) dst = root[key].get<int>();
+        return !root.contains(key) || read_json_int(root[key], dst);
     };
     read_string("player_color", snap.player_color);
     read_string("status", snap.status);
@@ -118,8 +123,14 @@ bool session_from_json(const std::string& text, SessionSnapshot& out, std::strin
     read_string("reason", snap.reason);
     read_number("created_ms", snap.created_ms);
     read_number("updated_ms", snap.updated_ms);
-    read_int("timeout_ms", snap.timeout_ms);
-    read_int("max_depth", snap.max_depth);
+    if (!read_int("timeout_ms", snap.timeout_ms)) {
+        error = "会话里的超时时间不合法";
+        return false;
+    }
+    if (!read_int("max_depth", snap.max_depth)) {
+        error = "会话里的搜索深度不合法";
+        return false;
+    }
     if (root.contains("position_pending") && root["position_pending"].is_boolean()) {
         snap.position_pending = root["position_pending"].get<bool>();
     }
@@ -154,10 +165,14 @@ bool session_from_json(const std::string& text, SessionSnapshot& out, std::strin
             return false;
         }
         for (const auto& entry : root["base"]) {
-            if (!entry.is_object() || !entry.contains("row") || !entry.contains("col") ||
-                !entry["row"].is_number_integer() || !entry["col"].is_number_integer() ||
-                entry["row"].get<int>() < 0 || entry["row"].get<int>() >= BOARD_SIZE ||
-                entry["col"].get<int>() < 0 || entry["col"].get<int>() >= BOARD_SIZE) {
+            if (!entry.is_object() || !entry.contains("row") || !entry.contains("col")) {
+                error = "会话里的摆棋棋子读不出来";
+                return false;
+            }
+            int row = -1;
+            int col = -1;
+            if (!read_json_int(entry["row"], row) || !read_json_int(entry["col"], col) ||
+                row < 0 || row >= BOARD_SIZE || col < 0 || col >= BOARD_SIZE) {
                 error = "会话里的摆棋棋子读不出来";
                 return false;
             }
@@ -169,7 +184,7 @@ bool session_from_json(const std::string& text, SessionSnapshot& out, std::strin
                 error = "会话里的摆棋棋子没有颜色";
                 return false;
             }
-            snap.base.emplace_back(entry["row"].get<int>(), entry["col"].get<int>(), color);
+            snap.base.emplace_back(row, col, color);
         }
     }
     out = std::move(snap);
@@ -221,7 +236,17 @@ bool load_session(const std::string& dir, const std::string& token, SessionSnaps
     }
     std::string text;
     if (!read_file(path, text, error)) return false;
-    return session_from_json(text, out, error);
+    if (!session_from_json(text, out, error)) return false;
+    // A file stands for the session whose token it names: writes and deletes
+    // both go by that name, so a renamed file would be indexed under a name no
+    // later write can ever reach, and the resume would hand back a different
+    // game than the URL promised. Refuse it and leave the file alone - it is the
+    // user's data, not ours to remove.
+    if (out.token != token) {
+        error = "会话文件的文件名与内容里的 token 不一致";
+        return false;
+    }
+    return true;
 }
 
 std::vector<std::string> list_sessions(const std::string& dir) {

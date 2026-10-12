@@ -1,5 +1,6 @@
 #include "server.h"
 #include "position_json.h"
+#include "training/json_int.h"
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -17,10 +18,25 @@ namespace {
 // type_error, which unwinds past the handler's own validation into do_read's
 // generic catch and leaves the client with no reply. Read integers defensively
 // so a malformed field is treated as the default and the handler still
-// validates and responds.
+// validates and responds. The same reasoning covers width: get<int> only casts,
+// so {"row":4294967304} would arrive as 8 and pass the 0-14 square check, while
+// read_json_int refuses anything that does not fit an int and the fallback lets
+// the handler reject the move instead of playing a truncated square.
 int get_int(const json& msg, const char* key, int fallback) {
-    if (!msg.contains(key) || !msg[key].is_number_integer()) return fallback;
-    return msg[key].get<int>();
+    int value = 0;
+    if (!msg.contains(key) || !read_json_int(msg[key], value)) return fallback;
+    return value;
+}
+
+// Config fields are per-message overrides: one the frame does not carry keeps the
+// value the session already has, so a client that sends only max_depth does not
+// have the timeout it chose earlier reset under it. A value that is present but
+// not a representable integer counts as not sent, which is also what stops the
+// 64-bit truncation get_int defends against from reaching the game.
+int get_int_or(const json& msg, const char* key, int current) {
+    int value = 0;
+    if (!msg.contains(key) || !read_json_int(msg[key], value)) return current;
+    return value;
 }
 
 // Pull the position payload out of a check_position / set_position message.
@@ -928,9 +944,9 @@ void GameServer::handle_request_hint(std::shared_ptr<WebSocketSession> session, 
     if (it == games_.end()) return;
     
     auto& game = it->second;
-    int timeout_ms = get_int(msg, "timeout_ms", 5000);
-    int max_depth = get_int(msg, "max_depth", 6);
-    
+    const int timeout_ms = get_int_or(msg, "timeout_ms", game->timeout_ms());
+    const int max_depth = get_int_or(msg, "max_depth", game->max_depth());
+
     if (!game->request_hint(timeout_ms, max_depth)) {
         send_error(session, "No hint available");
     }
@@ -970,8 +986,8 @@ void GameServer::handle_set_config(std::shared_ptr<WebSocketSession> session, co
     if (it == games_.end()) return;
     
     auto& game = it->second;
-    int timeout_ms = get_int(msg, "timeout_ms", 5000);
-    int max_depth = get_int(msg, "max_depth", 8);
+    const int timeout_ms = get_int_or(msg, "timeout_ms", game->timeout_ms());
+    const int max_depth = get_int_or(msg, "max_depth", game->max_depth());
     game->set_config(timeout_ms, max_depth);
 }
 
@@ -1048,6 +1064,7 @@ std::shared_ptr<GameServer::TrackedGame> GameServer::open_session(const SessionS
     if (use_loaded_coefficients_) game->set_coefficients(coefficients_);
     game->set_opening_book(&book_);
 
+    bool unreadable_record = false;
     if (from) {
         GameRestore restore;
         restore.base = from->base;
@@ -1066,10 +1083,16 @@ std::shared_ptr<GameServer::TrackedGame> GameServer::open_session(const SessionS
         if (!game->restore_game(restore)) {
             std::cerr << "会话 " << from->token << " 的记录摆不出来，改为新开一局" << std::endl;
             game->reset();
+            // A new game on a fresh clock: the file's own creation time belongs
+            // to the record that could not be rebuilt, not to this one.
+            unreadable_record = true;
         } else {
             entry->side_chosen = !from->player_color.empty();
             entry->exported = from->record.is_decisive();
             entry->rebuilt = true;
+            // The file keeps its own birth time across a cold rebuild, otherwise
+            // every resume would rewrite the header of the record it just read.
+            if (from->created_ms > 0) entry->created_ms = from->created_ms;
             if (from->timeout_ms > 0 && from->max_depth > 0) {
                 game->set_config(from->timeout_ms, from->max_depth);
             }
@@ -1093,6 +1116,18 @@ std::shared_ptr<GameServer::TrackedGame> GameServer::open_session(const SessionS
         entry->token = std::move(token);
     }
     sessions_[entry->token] = entry;
+    if (unreadable_record) {
+        // Stamp the fresh empty game with exactly what a flush would write for
+        // it, so flush_entry's dedup returns early instead of taking its
+        // empty-board branch - that branch deletes the residue file, and this
+        // token's file is the unreadable record a human is meant to be able to
+        // open. Once the player actually moves here the payloads differ again and
+        // the session is written as usual.
+        SessionSnapshot empty_probe = snapshot_of(*entry);
+        empty_probe.created_ms = 0;
+        empty_probe.updated_ms = 0;
+        entry->saved_payload = session_to_json(empty_probe);
+    }
     return entry;
 }
 

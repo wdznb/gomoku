@@ -1,5 +1,6 @@
 #include "opening_book.h"
 #include "../core/pattern.h"
+#include "../training/json_int.h"
 #include <nlohmann/json.hpp>
 #include <fstream>
 #include <algorithm>
@@ -96,20 +97,29 @@ bool OpeningBook::load(const std::string& path, std::string& error) {
         std::vector<Position> line;
         bool valid = true;
         for (const auto& m : entry["moves"]) {
-            if (!m.is_array() || m.size() != 2 || !m[0].is_number() || !m[1].is_number()) {
+            if (!m.is_array() || m.size() != 2) {
                 valid = false;
                 break;
             }
-            line.push_back(Position(m[0].get<int>(), m[1].get<int>()));
+            int row = 0;
+            int col = 0;
+            if (!read_json_int(m[0], row) || !read_json_int(m[1], col)) {
+                valid = false;
+                break;
+            }
+            line.push_back(Position(row, col));
         }
 
         if (!valid || line.size() < 2) continue;
 
+        // A weight that does not fit an int is refused with its line: both the
+        // truncated value and a silent fall-back to the default would move the
+        // entry inside the sampling distribution the author never meant.
+        int weight = 1;
+        if (entry.contains("weight") && !read_json_int(entry["weight"], weight)) continue;
+
         // Clamp the per-entry weight: a malformed book with a huge weight would
         // otherwise overflow the int total_weight sum in query() into UB.
-        int weight = entry.contains("weight") && entry["weight"].is_number()
-                         ? entry["weight"].get<int>()
-                         : 1;
         if (weight < 1) weight = 1;
         if (weight > 1000000) weight = 1000000;
         std::string name = entry.contains("name") && entry["name"].is_string()

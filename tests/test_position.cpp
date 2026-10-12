@@ -622,6 +622,27 @@ void test_snapshot_round_trip() {
     // Nothing has been played, so every stone on the board is a base stone.
     assert(snap.moves.empty() && snap.base.size() == 5);
 
+    // Base stones are not a history and cannot be undone: a record that is
+    // nothing but base stones has no analysed move to give back, so the undo is
+    // refused and the setup stays exactly as it was installed. Status is PLAYING
+    // on purpose - the position_pending_ guard would mask the refusal.
+    GameManager pure;
+    GameRestore base_only;
+    base_only.base = snap.base;
+    base_only.player_color = BLACK;
+    base_only.status = GameStatus::PLAYING;
+    assert(pure.restore_game(base_only));
+    assert(!pure.position_pending());
+    const std::vector<int> installed = cells_of(pure.board());
+    int refused_count = 12345;
+    GameStatus refused_status = GameStatus::GAME_OVER;
+    assert(!pure.undo(refused_count, refused_status));
+    assert(refused_count == 12345 && refused_status == GameStatus::GAME_OVER);
+    assert(pure.board().move_count() == 5);
+    assert(cells_of(pure.board()) == installed);
+    snap = pure.replay_snapshot();
+    assert(snap.move_count == 5 && snap.moves.empty() && snap.base.size() == 5);
+
     // The player took the position up as BLACK and the AI answered one stone, so
     // the session is five installed stones plus one played move - and only the
     // played move carries engine numbers.
@@ -639,17 +660,21 @@ void test_snapshot_round_trip() {
     assert(snap.move_count == 6);
     assert(snap.moves.size() == 1 && snap.base.size() == 5);
 
-    // Undo walks the played stone and then a base stone off the board, and the
-    // split follows it: two rounds take back the AI answer and one installed
-    // stone, so the record of the undone session rebuilds four stones, not the
-    // five that were installed.
+    // Undo takes back the analysed move that was played and nothing else: with
+    // only one analysed stone behind five installed ones, the clamping keeps the
+    // pop on that stone and the split does not grow past it. move_count returns
+    // to the installed count, and feeding the record back rebuilds five stones.
+    second.set_config(60000, 8);
     int move_count = -1;
-    GameStatus status = GameStatus::PLAYING;
+    GameStatus status = GameStatus::WAITING;
     assert(second.undo(move_count, status));
-    assert(move_count == 4 && !second.is_ai_thinking());
+    // The undone AI stone re-arms the worker for the square it just lost; halt
+    // it before asserting so it cannot commit a replacement under the checks.
+    second.halt_search();
+    assert(move_count == 5 && status == GameStatus::PLAYING && !second.is_ai_thinking());
     snap = second.replay_snapshot();
-    assert(snap.move_count == 4);
-    assert(snap.moves.empty() && snap.base.size() == 4);
+    assert(snap.move_count == 5);
+    assert(snap.moves.empty() && snap.base.size() == 5);
     for (const Move& stone : snap.base) {
         assert(second.board().get(stone.pos.row, stone.pos.col) == stone.color);
     }
@@ -660,9 +685,10 @@ void test_snapshot_round_trip() {
     again.player_color = BLACK;
     GameManager third;
     assert(third.restore_game(again));
-    assert(third.board().move_count() == 4);
+    assert(third.board().move_count() == 5);
     assert(third.board().get(5, 5) == EMPTY);
-    assert(third.replay_snapshot().base.size() == 4);
+    assert(third.board().get(9, 9) == BLACK);
+    assert(third.replay_snapshot().base.size() == 5);
 
     std::cout << "test_snapshot_round_trip passed" << std::endl;
 }

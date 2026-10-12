@@ -1,7 +1,8 @@
-// Regression probes for the round-73 (A6-A10) and round-74 (C6/C7) web/app.js
-// fixes. The real file is loaded read-only into a vm context with DOM/browser
-// stubs, then the methods the fixes touch are driven directly. No browser and
-// no server are needed; run it with `node tests/web_frontend_check.js`.
+// Regression probes for the round-73 (A6-A10), round-74 (C6/C7), round-75
+// (F3/F4) and round-76 (J3-J8) web/app.js fixes. The real file is loaded
+// read-only into a vm context with DOM/browser stubs, then the methods the
+// fixes touch are driven directly. No browser and no server are needed; run it
+// with `node tests/web_frontend_check.js`.
 'use strict';
 
 const fs = require('fs');
@@ -387,6 +388,513 @@ check('C7 non-resumed session recovers via chooseSide', () => {
     game.chooseSide('white');
     assert(game.hintInFlight === false, 'claiming a side must release the flag');
     assert(el('btn-hint').disabled === false, 'the hint button must come back');
+});
+
+// F3: an undo stops the hint search in flight, and the aborted search answers
+// with neither hint_result nor an error - the undo handler is where the button
+// comes back. Old code left hintInFlight armed and 求招 greyed for the game.
+// (C7a below is the control that the hint_result path still releases normally.)
+check('F3 undo releases an in-flight hint', () => {
+    const game = newGame();
+    game.playerColor = BLACK;
+    game.gameStatus = 'playing';
+    const sent = [];
+    game.sendMessage = (msg) => { sent.push(msg); return true; };
+    el('timeout').value = '5';
+    el('depth').value = '6';
+
+    game.requestHint();
+    assert(game.hintInFlight === true, 'armed before the undo');
+    assert(el('btn-hint').disabled === true, 'the button must be held');
+
+    game.handleUndoSuccess({ move_count: 0, game_status: 'waiting' });
+    assert(game.hintInFlight === false, 'the undo must release the flag');
+    assert(el('btn-hint').disabled === false, 'the hint button must come back');
+
+    // No side chosen: the flag is released but the button stays disabled.
+    const idle = newGame();
+    idle.playerColor = null;
+    idle.gameStatus = 'playing';
+    idle.hintInFlight = true;
+    el('btn-hint').disabled = true;
+    idle.handleUndoSuccess({ move_count: 0, game_status: 'waiting' });
+    assert(idle.hintInFlight === false, 'the flag is released regardless');
+    assert(el('btn-hint').disabled === true, 'no side chosen leaves 求招 disabled');
+
+    // A finished game keeps it disabled too.
+    const over = newGame();
+    over.playerColor = BLACK;
+    over.gameStatus = 'game_over';
+    over.hintInFlight = true;
+    el('btn-hint').disabled = true;
+    over.handleUndoSuccess({ move_count: 0, game_status: 'game_over' });
+    assert(over.hintInFlight === false, 'the flag is released on a finished game too');
+    assert(el('btn-hint').disabled === true, 'a finished game leaves 求招 disabled');
+});
+
+// F4: a live stone ends the replay view instead of painting history while the
+// game moves on, and a board click on a historical ply says why it is refused.
+check('F4 live moves exit replay and replay clicks warn', () => {
+    const game = newGame();
+    game.playerColor = BLACK;
+    game.gameStatus = 'playing';
+    game.aiThinking = false;
+    game.moveHistory = [
+        { row: 7, col: 7, color: BLACK },
+        { row: 7, col: 8, color: WHITE },
+    ];
+    game.board[7][7] = BLACK;
+    game.board[7][8] = WHITE;
+    game.replayIndex = 0;
+
+    game.handleAIMove({ row: 5, col: 5, color: 'white', score: 0, thinking_time_ms: 1 });
+    assert(game.replayIndex === null, 'ai_move must exit the replay view');
+    assert(game.board[5][5] === WHITE, 'the live stone must be placed');
+    assert(game.moveHistory.length === 3, 'the live stone joins the record');
+    assert(game.board[7][7] === BLACK && game.board[7][8] === WHITE,
+           'the whole live position stays on the board');
+
+    const human = newGame();
+    human.playerColor = WHITE;
+    human.gameStatus = 'playing';
+    human.aiThinking = false;
+    human.replayIndex = 2;
+    human.handleMoveMade({ row: 4, col: 4, color: 'black' });
+    assert(human.replayIndex === null, 'move_made must exit the replay view');
+    assert(human.board[4][4] === BLACK, 'the human stone must be placed');
+
+    // A click on a historical ply: no move leaves, the refusal is a warning.
+    const viewing = newGame();
+    viewing.playerColor = BLACK;
+    viewing.gameStatus = 'playing';
+    viewing.aiThinking = false;
+    viewing.moveHistory = [
+        { row: 7, col: 7, color: BLACK },
+        { row: 7, col: 8, color: WHITE },
+    ];
+    viewing.board[7][7] = BLACK;
+    viewing.board[7][8] = WHITE;
+    viewing.replayIndex = 0;
+    let statusText = null;
+    let statusKind = null;
+    const original = viewing.updateStatus.bind(viewing);
+    viewing.updateStatus = (text, kind) => { statusText = text; statusKind = kind; original(text, kind); };
+    let sentMoves = 0;
+    viewing.sendMove = () => { sentMoves++; };
+    const x = viewing.geom.pad + 7 * viewing.geom.cell;
+    viewing.handleCanvasClick({ clientX: x, clientY: x });
+    assert(sentMoves === 0, 'no move may leave from a replay view');
+    assert(statusKind === 'warn' && statusText !== null && statusText.indexOf('回放') !== -1,
+           'the refusal must surface as a warning, got: ' + statusText);
+});
+
+// J3: a resumed session frame resets the per-game residue (move list, engine
+// numbers, base stones, replay view) before painting the server's board. Old
+// code left the previous game's move list on screen while the board already
+// showed the resumed position.
+check('J3 resumed session drops the previous move record', () => {
+    const game = newGame();
+    game.moveHistory = [
+        { row: 0, col: 0, color: BLACK },
+        { row: 0, col: 1, color: WHITE },
+    ];
+    game.analysis = [{ depth: 1, nodes: 10, score: 0, elapsed_ms: 1, method: 'alphabeta' }];
+    game.baseStones = [{ row: 1, col: 1, color: BLACK }];
+    game.replayIndex = 1;
+    game.sendMessage = () => true;
+
+    const board = emptyBoard();
+    board[7][7] = BLACK;
+    game.handleServerMessage({
+        type: 'session',
+        token: 'd'.repeat(16),
+        resumed: true,
+        player_color: 'black',
+        game_status: 'playing',
+        current_turn: 'white',
+        move_count: 1,
+        max_depth: 6,
+        timeout_ms: 5000,
+        winner: '',
+        reason: '',
+        board: board,
+    });
+
+    assert(game.moveHistory.length === 0, 'the old move record must be dropped');
+    assert(game.analysis.length === 0, 'the old engine numbers must be dropped');
+    assert(game.baseStones.length === 0, 'the old base stones must be dropped');
+    assert(game.replayIndex === null, 'the replay view must be closed');
+    assert(game.board[7][7] === BLACK, 'the server board must be painted');
+});
+
+// J4: the resumed status line reports the server's ply count, falls back to the
+// local list when the frame carries no usable number, and describes an
+// installed position instead of "0 手" under four stones.
+check('J4 resumed status reports the server ply count', () => {
+    // move_count=7 -> the server's number, not whatever the local list holds
+    const server = newGame();
+    let status = null;
+    const original = server.updateStatus.bind(server);
+    server.updateStatus = (text, kind) => { status = text; original(text, kind); };
+    server.sendMessage = () => true;
+    server.handleServerMessage({
+        type: 'session',
+        token: 'e'.repeat(16),
+        resumed: true,
+        player_color: 'black',
+        game_status: 'playing',
+        current_turn: 'white',
+        move_count: 7,
+        max_depth: 6,
+        timeout_ms: 5000,
+        winner: '',
+        reason: '',
+        board: emptyBoard(),
+    });
+    assert(status !== null && status.indexOf('已恢复对局：7 手') !== -1,
+           'the server count must be reported, got: ' + status);
+
+    // missing or non-numeric -> the local record is the only count left
+    const local = newGame();
+    local.gameStatus = 'playing';
+    local.moveHistory = [
+        { row: 7, col: 7, color: BLACK },
+        { row: 7, col: 8, color: WHITE },
+        { row: 6, col: 8, color: BLACK },
+    ];
+    local.currentTurn = WHITE;
+    assert(local.resumedStatusText(undefined).indexOf('已恢复对局：3 手') !== -1,
+           'a missing count must fall back to the local list');
+    assert(local.resumedStatusText('7').indexOf('已恢复对局：3 手') !== -1,
+           'a string count must not be trusted');
+
+    // 0 plies with stones on the board -> describe the installed position
+    const installed = newGame();
+    const board = emptyBoard();
+    board[7][7] = BLACK;
+    board[7][8] = WHITE;
+    board[8][8] = BLACK;
+    board[8][7] = WHITE;
+    installed.board = board;
+    installed.currentTurn = BLACK;
+    // A hand-set position whose side has been taken is "playing" with an empty
+    // move list; a fresh game would be "waiting" and take the waiting branch,
+    // which would leave the 0-ply wording below untested.
+    installed.gameStatus = 'playing';
+    const text = installed.resumedStatusText(0);
+    assert(text.indexOf('已恢复摆好的局面：4 子') !== -1, 'got: ' + text);
+});
+
+// J5: 悔棋/求招 follow one rule everywhere - held while no side is chosen or
+// the game is over - and every exit path (session, thinking, ai_move, stop,
+// undo_success) restores that rule instead of leaving the wholesale greying
+// behind.
+check('J5 undo/hint buttons follow the chosen-side rule on every path', () => {
+    // session, game over -> both held
+    const over = newGame();
+    over.sendMessage = () => true;
+    el('btn-undo').disabled = false;
+    el('btn-hint').disabled = false;
+    over.handleServerMessage({
+        type: 'session',
+        token: 'f'.repeat(16),
+        resumed: true,
+        player_color: 'black',
+        game_status: 'game_over',
+        current_turn: 'white',
+        move_count: 3,
+        max_depth: 6,
+        timeout_ms: 5000,
+        winner: 'white',
+        reason: 'five',
+        board: emptyBoard(),
+    });
+    assert(el('btn-undo').disabled === true, 'a finished game holds 悔棋');
+    assert(el('btn-hint').disabled === true, 'a finished game holds 求招');
+
+    // session, playing with a side -> both open
+    const play = newGame();
+    play.sendMessage = () => true;
+    el('btn-undo').disabled = true;
+    el('btn-hint').disabled = true;
+    play.handleServerMessage({
+        type: 'session',
+        token: 'g'.repeat(16),
+        resumed: true,
+        player_color: 'black',
+        game_status: 'playing',
+        current_turn: 'black',
+        move_count: 0,
+        max_depth: 6,
+        timeout_ms: 5000,
+        winner: '',
+        reason: '',
+        board: emptyBoard(),
+    });
+    assert(el('btn-undo').disabled === false, 'playing with a side opens 悔棋');
+    assert(el('btn-hint').disabled === false, 'playing with a side opens 求招');
+
+    // thinking -> both held, 停止 comes up
+    const thinking = newGame();
+    thinking.playerColor = BLACK;
+    thinking.gameStatus = 'playing';
+    thinking.currentTurn = WHITE;
+    thinking.handleThinkingProgress({ depth: 1, nodes: 1, elapsed_ms: 1 });
+    assert(thinking.aiThinking === true, 'the progress frame arms thinking');
+    assert(el('btn-stop').disabled === false, '停止 comes up with the search');
+    assert(el('btn-undo').disabled === true && el('btn-hint').disabled === true,
+           'thinking holds both live controls');
+
+    // ai_move -> the finished search owes them back by the rule
+    thinking.handleAIMove({ row: 5, col: 5, color: 'white', score: 0, thinking_time_ms: 1 });
+    assert(thinking.aiThinking === false, 'ai_move ends thinking');
+    assert(el('btn-stop').disabled === true, '停止 goes back down');
+    assert(el('btn-undo').disabled === false && el('btn-hint').disabled === false,
+           'ai_move restores both by the rule');
+
+    // stop_thinking -> same rule; an unclaimed side keeps them held
+    const stopped = newGame();
+    stopped.playerColor = BLACK;
+    stopped.gameStatus = 'playing';
+    stopped.aiThinking = true;
+    el('btn-undo').disabled = true;
+    el('btn-hint').disabled = true;
+    stopped.sendMessage = () => true;
+    stopped.stopThinking();
+    assert(stopped.aiThinking === false, 'stop_thinking disarms locally');
+    assert(el('btn-undo').disabled === false && el('btn-hint').disabled === false,
+           'stop restores both by the rule');
+
+    const idle = newGame();
+    idle.playerColor = null;
+    idle.gameStatus = 'playing';
+    idle.sendMessage = () => true;
+    idle.stopThinking();
+    assert(el('btn-undo').disabled === true && el('btn-hint').disabled === true,
+           'no side chosen keeps them held');
+
+    // undo_success -> releases an in-flight hint and follows the rule
+    const undone = newGame();
+    undone.playerColor = BLACK;
+    undone.gameStatus = 'playing';
+    undone.baseStones = [];
+    undone.moveHistory = [];
+    undone.board = emptyBoard();
+    undone.hintInFlight = true;
+    el('btn-hint').disabled = true;
+    undone.handleUndoSuccess({ move_count: 0, game_status: 'playing' });
+    assert(undone.hintInFlight === false, 'the undo releases an in-flight hint');
+    assert(el('btn-hint').disabled === false, 'and the button comes back by the rule');
+
+    const undoneOver = newGame();
+    undoneOver.playerColor = BLACK;
+    undoneOver.gameStatus = 'playing';
+    undoneOver.baseStones = [];
+    undoneOver.moveHistory = [];
+    undoneOver.board = emptyBoard();
+    undoneOver.hintInFlight = true;
+    el('btn-hint').disabled = true;
+    undoneOver.handleUndoSuccess({ move_count: 0, game_status: 'game_over' });
+    assert(el('btn-hint').disabled === true, 'a finished game keeps 求招 held');
+});
+
+// J6: the label ring outside the grid is edge information, not a cell. Its
+// pixels round into row/column 0 (and 14), so a click half-way to the first
+// intersection used to land a stone there; the grid guard drops them before
+// any mapping instead.
+check('J6 clicks on the label ring never reach the board', () => {
+    const game = newGame();
+    game.playerColor = BLACK;
+    game.gameStatus = 'playing';
+    game.aiThinking = false;
+    game.currentTurn = BLACK;
+    const sent = [];
+    game.sendMove = (row, col) => { sent.push([row, col]); };
+    let statusCalls = 0;
+    const original = game.updateStatus.bind(game);
+    game.updateStatus = (text, kind) => { statusCalls++; original(text, kind); };
+
+    const pad = game.geom.pad;
+    const cell = game.geom.cell;
+    const gridMax = game.geom.size - pad;
+
+    // left of the grid, level with a row
+    game.handleCanvasClick({ clientX: pad - 6, clientY: pad + 7 * cell });
+    assert(sent.length === 0 && statusCalls === 0,
+           'the ring must be ignored, not answered');
+
+    // below the grid, level with a column
+    game.handleCanvasClick({ clientX: pad + 7 * cell, clientY: gridMax + 6 });
+    assert(sent.length === 0 && statusCalls === 0, 'the ring must be ignored vertically');
+
+    // inside the grid the corner cell still lands normally
+    game.handleCanvasClick({ clientX: pad + 2, clientY: pad + 2 });
+    assert(sent.length === 1 && sent[0][0] === 0 && sent[0][1] === 0,
+           'an in-grid click must still send its cell, got: ' + JSON.stringify(sent));
+
+    // in 摆棋 the ring pixels must not paint the working board either
+    game.setup.active = true;
+    let painted = 0;
+    game.paintSetupCell = () => { painted++; };
+    game.handleCanvasClick({ clientX: pad - 6, clientY: pad + 7 * cell });
+    assert(painted === 0, 'the ring must not paint the setup board');
+    game.handleCanvasClick({ clientX: pad + 2, clientY: pad + 2 });
+    assert(painted === 1, 'an in-grid click does paint the setup board');
+    game.setup.active = false;
+});
+
+// J7: every way out of the replay view leaves it properly. Auto-play reaching
+// the last ply exits instead of stranding the index there, a click on the
+// historical board explains itself, and live messages (ai_move, game_over)
+// pull the view back to the live position.
+check('J7 replay view exits on end-of-play and live moves', () => {
+    const sandbox = bundle.sandbox;
+    const realSetInterval = sandbox.setInterval;
+    const realClearInterval = sandbox.clearInterval;
+    const timers = [];
+    sandbox.setInterval = (fn) => { timers.push(fn); return timers.length; };
+    sandbox.clearInterval = (id) => { if (id) timers[id - 1] = null; };
+    try {
+        // (i) auto-play at the last ply exits the view
+        const auto = newGame();
+        auto.playerColor = BLACK;
+        auto.gameStatus = 'playing';
+        auto.aiThinking = false;
+        auto.moveHistory = [
+            { row: 7, col: 7, color: BLACK },
+            { row: 7, col: 8, color: WHITE },
+            { row: 6, col: 8, color: BLACK },
+        ];
+        auto.replayIndex = 1;
+        const before = timers.length;
+        auto.toggleReplayAuto();
+        assert(timers.length === before + 1, '自动 must arm one interval');
+        const tick = timers[timers.length - 1];
+        tick();
+        assert(auto.replayIndex === 2, 'the tick must advance to the last ply');
+        tick();
+        assert(auto.replayIndex === null, 'the end of the record must exit the replay');
+        assert(el('btn-replay-play').textContent === '自动', '自动 must be labelled back');
+    } finally {
+        sandbox.setInterval = realSetInterval;
+        sandbox.clearInterval = realClearInterval;
+    }
+
+    // (ii) a click on the historical board refuses and says why
+    const viewing = newGame();
+    viewing.playerColor = BLACK;
+    viewing.gameStatus = 'playing';
+    viewing.aiThinking = false;
+    viewing.currentTurn = BLACK;
+    viewing.moveHistory = [
+        { row: 7, col: 7, color: BLACK },
+        { row: 7, col: 8, color: WHITE },
+    ];
+    viewing.replayIndex = 1;
+    let statusText = null;
+    let statusKind = null;
+    const original = viewing.updateStatus.bind(viewing);
+    viewing.updateStatus = (text, kind) => {
+        statusText = text;
+        statusKind = kind;
+        original(text, kind);
+    };
+    let sentMoves = 0;
+    viewing.sendMove = () => { sentMoves++; };
+    viewing.handleCanvasClick({ clientX: viewing.geom.pad + 5 * viewing.geom.cell,
+                                clientY: viewing.geom.pad + 5 * viewing.geom.cell });
+    assert(sentMoves === 0, 'no move may leave from a replay view');
+    assert(statusKind === 'warn' && statusText !== null && statusText.indexOf('回放') !== -1,
+           'the refusal must surface as a warning, got: ' + statusText);
+
+    // (iii) an ai_move pulls the view back to the live position
+    const live = newGame();
+    live.playerColor = BLACK;
+    live.gameStatus = 'playing';
+    live.aiThinking = false;
+    live.moveHistory = [
+        { row: 7, col: 7, color: BLACK },
+        { row: 7, col: 8, color: WHITE },
+    ];
+    live.board[7][7] = BLACK;
+    live.board[7][8] = WHITE;
+    live.replayIndex = 0;
+    live.handleAIMove({ row: 5, col: 5, color: 'white', score: 0, thinking_time_ms: 1 });
+    assert(live.replayIndex === null, 'ai_move must exit the replay view');
+    assert(live.board[5][5] === WHITE, 'the live stone must land');
+
+    // (iv) game_over pulls it back too
+    const ended = newGame();
+    ended.playerColor = BLACK;
+    ended.gameStatus = 'playing';
+    ended.aiThinking = false;
+    ended.moveHistory = [
+        { row: 7, col: 7, color: BLACK },
+        { row: 7, col: 8, color: WHITE },
+    ];
+    ended.board[7][7] = BLACK;
+    ended.board[7][8] = WHITE;
+    ended.replayIndex = 1;
+    ended.handleGameOver({ winner: 'white', reason: 'five' });
+    assert(ended.replayIndex === null, 'game_over must exit the replay view');
+    assert(ended.gameStatus === 'game_over', 'the game must be over');
+});
+
+// J8: a hint answer describes the position the search began on. Every path that
+// changes the position pushes onto moveHistory, so a reply whose ply count no
+// longer matches the request is stale: release the control, say so, and leave
+// the board alone.
+check('J8 stale hint replies are refused', () => {
+    const stale = newGame();
+    stale.playerColor = BLACK;
+    stale.gameStatus = 'playing';
+    stale.aiThinking = false;
+    stale.moveHistory = [
+        { row: 7, col: 7, color: BLACK },
+        { row: 7, col: 8, color: WHITE },
+    ];
+    stale.board[7][7] = BLACK;
+    stale.board[7][8] = WHITE;
+    stale.hintInFlight = true;
+    stale.hintMoveCount = 2;
+    el('btn-hint').disabled = true;
+    let highlight = null;
+    stale.highlightMove = (row, col) => { highlight = [row, col]; };
+    let status = null;
+    const original = stale.updateStatus.bind(stale);
+    stale.updateStatus = (text, kind) => { status = text; original(text, kind); };
+
+    // a stone landed while 求招 was out
+    stale.moveHistory.push({ row: 5, col: 5, color: BLACK });
+    stale.handleHintResult({ row: 0, col: 0, score: 42 });
+
+    assert(status === '建议已失效', 'the stale answer must say so, got: ' + status);
+    assert(highlight === null, 'the ring must not move for a dead position');
+    assert(stale.hintInFlight === false, 'the flag must be released');
+    assert(el('btn-hint').disabled === false, 'the button comes back by the rule');
+
+    // the same answer against the position it was asked for lands normally
+    const fresh = newGame();
+    fresh.playerColor = BLACK;
+    fresh.gameStatus = 'playing';
+    fresh.aiThinking = false;
+    fresh.moveHistory = [
+        { row: 7, col: 7, color: BLACK },
+        { row: 7, col: 8, color: WHITE },
+    ];
+    fresh.hintInFlight = true;
+    fresh.hintMoveCount = 2;
+    el('btn-hint').disabled = true;
+    let landed = null;
+    fresh.highlightMove = (row, col) => { landed = [row, col]; };
+    let freshStatus = null;
+    const originalFresh = fresh.updateStatus.bind(fresh);
+    fresh.updateStatus = (text, kind) => { freshStatus = text; originalFresh(text, kind); };
+
+    fresh.handleHintResult({ row: 7, col: 7, score: 100 });
+    assert(landed !== null && landed[0] === 7 && landed[1] === 7,
+           'the ring must mark the advised cell, got: ' + JSON.stringify(landed));
+    assert(freshStatus === '建议 H8 · 分值 100', 'got: ' + freshStatus);
 });
 
 let failed = 0;

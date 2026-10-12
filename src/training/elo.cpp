@@ -173,6 +173,9 @@ bool EloSystem::save(const std::string& path, std::string& error) const {
         return false;
     }
     file << to_json();
+    // A buffered failure only shows up when the stream closes, which is after
+    // this check would have called the write a success.
+    file.flush();
     if (!file.good()) {
         error = "failed while writing " + path;
         return false;

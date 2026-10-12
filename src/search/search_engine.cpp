@@ -151,6 +151,10 @@ SearchResult SearchEngine::search(const Board& board, int color,
 
     if (alphabeta_enabled_ && !stop_flag.load()) {
         AlphaBetaSearch ab(evaluator_, tt_alphabeta_);
+        // Same absolute deadline the VCF/VCT phases were given: remaining_time
+        // below is only this phase's slice, so on its own it lets the move
+        // overshoot by that whole slice once the tactics phases spent it.
+        if (has_deadline) ab.set_deadline(search_deadline);
         int remaining_time = time_limit_ms;
         auto elapsed = std::chrono::high_resolution_clock::now() - start;
         int used_ms = static_cast<int>(

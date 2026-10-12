@@ -149,6 +149,9 @@ bool GameRecord::save(const std::string& path, std::string& error) const {
         return false;
     }
     file << to_json();
+    // Buffered writes report a full disk only at close, after this check would
+    // have called the file saved.
+    file.flush();
     if (!file.good()) {
         error = "failed while writing " + path;
         return false;
@@ -174,6 +177,9 @@ bool GameRecord::append_to_jsonl(const std::string& path, std::string& error) co
         return false;
     }
     file << to_json() << "\n";
+    // The server marks the game exported on this return value, so a failure that
+    // the buffer only reveals at close would silently drop the record.
+    file.flush();
     if (!file.good()) {
         error = "failed while appending to " + path;
         return false;

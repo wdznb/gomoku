@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -23,6 +24,10 @@
 #include <sstream>
 #include <string>
 #include <vector>
+
+#ifndef _WIN32
+#include <sys/wait.h>
+#endif
 
 // Trainer::play_game() is private, and the games_played counter can only be
 // observed first-hand by playing one. Every header trainer.h pulls in is
@@ -1467,6 +1472,229 @@ void test_write_failures_report_to_stderr() {
     std::cout << "test_write_failures_report_to_stderr passed" << std::endl;
 }
 
+// Round 75, E6: the six file.flush() sites. A buffered stream reports a full
+// disk only when its buffer leaves for the device, so a good() read right after
+// the last << could call a write that reached nothing a success: the record was
+// silently dropped and the parameter file was renamed over by a truncated .tmp.
+// /dev/full fails every write with ENOSPC, which is the cheapest full disk
+// there is.
+void test_buffered_write_failures_are_caught() {
+    if (!std::filesystem::exists("/dev/full")) {
+        std::cout << "test_buffered_write_failures_are_caught skipped: /dev/full missing"
+                  << std::endl;
+        return;
+    }
+    auto file_bytes = [](const std::string& p) {
+        std::ifstream in(p, std::ios::binary);
+        std::string content;
+        char buffer[512];
+        while (in.read(buffer, sizeof(buffer)) || in.gcount() > 0) {
+            content.append(buffer, static_cast<size_t>(in.gcount()));
+        }
+        return content;
+    };
+    std::string error;
+
+    // Control experiment for the mechanism the fix addresses: one small write to
+    // /dev/full still reads as good() until the buffer is flushed; the flush is
+    // what the six sites gained, and what makes the failures below observable.
+    {
+        std::ofstream probe("/dev/full", std::ios::binary | std::ios::trunc);
+        probe << "x";
+        const bool good_before_flush = probe.good();
+        probe.flush();
+        std::cout << "  /dev/full probe: good() before flush="
+                  << (good_before_flush ? "true" : "false") << " after="
+                  << (probe.good() ? "true" : "false") << std::endl;
+        assert(!probe.good());
+    }
+
+    // append_to_jsonl: the server marks a game exported on this return value, so
+    // a record that never left the buffer must come back as a failure.
+    GameRecord record;
+    record.winner = WHITE;
+    record.reason = GameEndReason::FIVE;
+    error.clear();
+    assert(!record.append_to_jsonl("/dev/full", error));
+    assert(!error.empty());
+    std::cout << "  append_to_jsonl -> " << error << std::endl;
+
+    // The single-file writers report their failure the same way.
+    error.clear();
+    assert(!record.save("/dev/full", error));
+    assert(!error.empty());
+    EloSystem elo;
+    error.clear();
+    assert(!elo.save("/dev/full", error));
+    assert(!error.empty());
+    const std::vector<TrainingSample> one_sample(1);
+    DataCollector collector;
+    error.clear();
+    assert(!collector.write_jsonl(one_sample, "/dev/full", error));
+    assert(!error.empty());
+    std::cout << "  record/elo/collector saves -> " << error << std::endl;
+
+    // The two rename guards: point the temporary at /dev/full and the old file
+    // has to survive byte for byte, with the failed temporary still in place.
+    std::error_code ec;
+    const std::filesystem::path params = temp_path("flush_params.json");
+    const std::string params_tmp = params.string() + ".tmp";
+    std::filesystem::remove_all(params_tmp, ec);
+    error.clear();
+    assert(CoefficientVector::save(params.string(), target_coefficients(), error));
+    const std::string params_before = file_bytes(params.string());
+    std::filesystem::create_symlink("/dev/full", params_tmp, ec);
+    assert(!ec);
+    error.clear();
+    assert(!CoefficientVector::save(params.string(), ThreatCoefficients(), error));
+    assert(!error.empty());
+    assert(!std::filesystem::is_symlink(params));
+    assert(file_bytes(params.string()) == params_before);
+    assert(std::filesystem::is_symlink(params_tmp));
+    ThreatCoefficients loaded;
+    assert(CoefficientVector::load(params.string(), loaded, error));
+    assert(CoefficientVector::to_vector(loaded) ==
+           CoefficientVector::to_vector(target_coefficients()));
+    std::cout << "  params save with a poisoned temporary -> " << error << std::endl;
+    std::filesystem::remove(params_tmp, ec);
+    std::filesystem::remove(params, ec);
+
+    TrainingConfig ckpt_config = fast_training_config();
+    ckpt_config.params_path = temp_path("flush_ckpt_params.json").string();
+    const std::filesystem::path ckpt = temp_path("flush_checkpoint.json");
+    const std::string ckpt_tmp = ckpt.string() + ".tmp";
+    std::filesystem::remove_all(ckpt_tmp, ec);
+    Trainer trainer(ThreatCoefficients(), ckpt_config);
+    error.clear();
+    assert(trainer.save_checkpoint(ckpt.string(), error));
+    const std::string ckpt_before = file_bytes(ckpt.string());
+    std::filesystem::create_symlink("/dev/full", ckpt_tmp, ec);
+    assert(!ec);
+    error.clear();
+    assert(!trainer.save_checkpoint(ckpt.string(), error));
+    assert(!error.empty());
+    assert(!std::filesystem::is_symlink(ckpt));
+    assert(file_bytes(ckpt.string()) == ckpt_before);
+    assert(std::filesystem::is_symlink(ckpt_tmp));
+    std::cout << "  checkpoint save with a poisoned temporary -> " << error << std::endl;
+    std::filesystem::remove(ckpt_tmp, ec);
+    std::filesystem::remove(ckpt, ec);
+
+    std::cout << "test_buffered_write_failures_are_caught passed" << std::endl;
+}
+
+// Round 75, F1: a present `coefficients` that is not an object is a malformed
+// parameter file, not an absent one. The old reader fell through to the root,
+// found none of the twelve names there and reported a successful load of pure
+// defaults - the server then printed "Parameters loaded" for a file it had
+// never honored. A file that carries only part of the keys is still legal:
+// absent keys keep their defaults and are not an error.
+void test_params_rejects_non_object_coefficients() {
+    ThreatCoefficients parsed;
+    std::string error;
+    const char* malformed[] = {R"({"coefficients":[]})", R"({"coefficients":"x"})",
+                               R"({"coefficients":null})"};
+
+    for (const char* text : malformed) {
+        error.clear();
+        assert(!CoefficientVector::from_json_string(text, parsed, error));
+        assert(error == "coefficients must be an object");
+    }
+
+    // Through the file door as well: load() refuses the same three shapes.
+    for (const char* text : malformed) {
+        const std::filesystem::path path = temp_path("bad_coefficients.json");
+        { std::ofstream(path) << text; }
+        error.clear();
+        assert(!CoefficientVector::load(path.string(), parsed, error));
+        assert(error == "coefficients must be an object");
+    }
+
+    // Control 1: an object holding only some of the twelve keys loads, and the
+    // keys it does not name keep their defaults.
+    error.clear();
+    assert(CoefficientVector::from_json_string(R"({"coefficients":{"live_four":12345}})",
+                                               parsed, error));
+    assert(error.empty());
+    assert(parsed.live_four == 12345);
+    const ThreatCoefficients defaults;
+    assert(parsed.rush_four == defaults.rush_four);
+    assert(parsed.five == defaults.five);
+
+    // Control 2: the partial file form works through load() too.
+    const std::filesystem::path partial = temp_path("partial_coefficients.json");
+    { std::ofstream(partial) << R"({"coefficients":{"double_four":54321}})"; }
+    error.clear();
+    assert(CoefficientVector::load(partial.string(), parsed, error));
+    assert(parsed.double_four == 54321);
+    assert(parsed.live_four == defaults.live_four);
+
+    // Control 3: the bare root form (no `coefficients` wrapper) is unchanged.
+    error.clear();
+    assert(CoefficientVector::from_json_string(R"({"live_three":321})", parsed, error));
+    assert(parsed.live_three == 321);
+
+#ifndef _WIN32
+    // The CLI doors: a malformed --params file makes both binaries exit 1 with
+    // their own refusal, and neither may print the success line (README:154:
+    // the server exits rather than falling back to defaults).
+    if (std::filesystem::exists("gomoku_server") &&
+        std::filesystem::exists("gomoku_train")) {
+        const std::filesystem::path bad = temp_path("params_bad_cli.json");
+        { std::ofstream(bad) << R"({"coefficients":[]})"; }
+        const std::filesystem::path out = temp_path("params_cli_stdout.txt");
+        const std::filesystem::path err = temp_path("params_cli_stderr.txt");
+        auto read_all = [](const std::filesystem::path& p) {
+            std::ifstream in(p);
+            std::ostringstream text;
+            text << in.rdbuf();
+            return text.str();
+        };
+        auto run = [&](const std::string& command) {
+            const int status = std::system(command.c_str());
+            assert(status != -1);
+            return WEXITSTATUS(status);
+        };
+        const std::string redirect = " > '" + out.string() + "' 2> '" + err.string() + "'";
+        std::error_code ec;
+        std::filesystem::remove(out, ec);
+
+        assert(run("./gomoku_server --params '" + bad.string() + "' --no-book" + redirect) == 1);
+        assert(read_all(out).find("Parameters loaded") == std::string::npos);
+        const std::string server_err = read_all(err);
+        assert(server_err.find("Cannot load --params") != std::string::npos);
+        std::cout << "  server --params: "
+                  << server_err.substr(0, server_err.find('\n')) << std::endl;
+
+        assert(run("./gomoku_train --params '" + bad.string() + "'" + redirect) == 1);
+        assert(read_all(out).find("Starting from") == std::string::npos);
+        const std::string trainer_err = read_all(err);
+        assert(trainer_err.find("cannot use --params") != std::string::npos);
+        std::cout << "  trainer --params: "
+                  << trainer_err.substr(0, trainer_err.find('\n')) << std::endl;
+
+#if defined(__linux__)
+        // Positive control: the same reader accepts a partial object file and
+        // the server says so before `timeout` ends it, so the absence of the
+        // line above is a refusal, not an inability to ever print it.
+        const std::filesystem::path good = temp_path("params_good_cli.json");
+        { std::ofstream(good) << R"({"coefficients":{"live_four":12345}})"; }
+        std::filesystem::remove(out, ec);
+        std::system(("timeout 3 ./gomoku_server --params '" + good.string() +
+                     "' --no-book --port 8123 > '" + out.string() + "' 2>&1").c_str());
+        assert(read_all(out).find("Parameters loaded:") != std::string::npos);
+        std::cout << "  server --params control: the partial file prints Parameters loaded"
+                  << std::endl;
+#endif
+    } else {
+        std::cout << "  CLI --params probes skipped: binaries not in the working directory"
+                  << std::endl;
+    }
+#endif
+
+    std::cout << "test_params_rejects_non_object_coefficients passed" << std::endl;
+}
+
 int main() {
     std::cout << "Running training tests..." << std::endl;
 
@@ -1503,6 +1731,8 @@ int main() {
     test_data_game_ids_unique_across_batches();
     test_play_match_rounds_up_to_even();
     test_write_failures_report_to_stderr();
+    test_buffered_write_failures_are_caught();
+    test_params_rejects_non_object_coefficients();
 
     std::cout << "All training tests passed" << std::endl;
     return 0;

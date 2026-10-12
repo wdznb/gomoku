@@ -11,6 +11,13 @@ AlphaBetaSearch::AlphaBetaSearch(const Evaluator& evaluator, TranspositionTable&
       move_time_limit_ms_(5000), nodes_searched_(0) {}
 
 bool AlphaBetaSearch::is_timeout() const {
+    // The engine shares one absolute budget between VCF, VCT and this phase and
+    // hands us only the slice left. Once that deadline has passed the whole
+    // move is over budget, so stop instead of running another slice. Without a
+    // deadline the per-search limit is all we have.
+    if (has_deadline_) {
+        return std::chrono::steady_clock::now() >= deadline_;
+    }
     auto now = std::chrono::high_resolution_clock::now();
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         now - start_time_).count();
@@ -32,12 +39,16 @@ std::vector<Move> AlphaBetaSearch::generate_moves(const Board& board, int color)
 
 void AlphaBetaSearch::sort_moves(std::vector<Move>& moves, const Board& board, int color,
                                   const Move& tt_move) {
+    // The TT move earns its place by the previous search, so it must stay at
+    // index 0 and out of the heuristic re-ordering below. Looking for it
+    // anywhere but the front used to leave it unpinned when it already was the
+    // first move, which is exactly the common case.
     bool tt_swapped = false;
     if (tt_move.pos.is_valid()) {
         auto it = std::find_if(moves.begin(), moves.end(),
             [&](const Move& m) { return m.pos.row == tt_move.pos.row && m.pos.col == tt_move.pos.col; });
-        if (it != moves.begin() && it != moves.end()) {
-            std::iter_swap(moves.begin(), it);
+        if (it != moves.end()) {
+            if (it != moves.begin()) std::iter_swap(moves.begin(), it);
             tt_swapped = true;
         }
     }

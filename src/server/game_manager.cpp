@@ -190,10 +190,19 @@ bool GameManager::undo(int& out_move_count, GameStatus& out_status) {
     if (ai_thinking_.load()) return false;
     if (position_pending_) return false;
     if (board_.move_count() == 0) return false;
-    
+    // Base stones are not a history: 摆棋 put them there and only another 摆棋
+    // takes them off. With no analysed move to give back there is nothing to
+    // undo, so a board of nothing but pre-placed stones refuses.
+    if (analyses_.empty()) return false;
+
     int undo_count = 1;
     if (board_.move_count() >= 2 && current_turn() == player_color_) {
         undo_count = 2;
+    }
+    // Never pop more board stones than the replay list can account for, or the
+    // two views of the same history would drift apart.
+    if (undo_count > static_cast<int>(analyses_.size())) {
+        undo_count = static_cast<int>(analyses_.size());
     }
     
     int undone = 0;
@@ -292,7 +301,11 @@ bool GameManager::request_hint(int timeout_ms, int max_depth) {
         [this, board_snapshot, turn, timeout_ms, max_depth]() mutable {
             SearchResult result = engine_.search(board_snapshot, turn, max_depth, timeout_ms, stop_flag_);
 
-            if (!stop_flag_.load() && hint_callback_) {
+            // A user stop_thinking only raises stop_flag_, so delivering on the
+            // discard flag alone still answers a stopped hint and releases the
+            // client's 求招 button; reset / resign / the destructor set
+            // discard_pending_ first and must stay silent.
+            if (!discard_pending_.load() && hint_callback_) {
                 // Deliver even when best_move is invalid (timeout with no PV):
                 // the server distinguishes valid (hint_result) from invalid
                 // (error) so the client is never left waiting on silence.
