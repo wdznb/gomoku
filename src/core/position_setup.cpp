@@ -298,8 +298,11 @@ bool parse_grid_text(const std::string& text, GridCells& out, std::string& error
 
     // Rows that are all 15 cells wide but the wrong number of them: say so, that
     // is the honest complaint. Otherwise the document was meant to be flat, so
-    // count its cells instead of blaming a row width.
-    if (!ragged) {
+    // count its cells instead of blaming a row width. A ragged grid that still has
+    // exactly 15 rows is reported by row as well (README:261-262): 第 N 行有 M 格
+    // names the line to fix, where a cell total could not tell a layout slip apart
+    // from a truncated flat dump. row_error is non-empty whenever ragged is set.
+    if (!ragged || static_cast<int>(rows.size()) == BOARD_SIZE) {
         error = row_error;
         return false;
     }

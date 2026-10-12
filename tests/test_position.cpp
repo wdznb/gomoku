@@ -923,6 +923,47 @@ void test_bitboard_words_are_decimal() {
     std::cout << "test_bitboard_words_are_decimal passed" << std::endl;
 }
 
+// Round 90, U3: fifteen rows of which one is the wrong width is a layout slip on
+// a grid, and 第 N 行有 M 格 names the line to fix. Until now the row complaint
+// was only kept when nothing was ragged, so this document fell through to the
+// flat reading and came back as a cell total - which cannot tell one short line
+// apart from a truncated dump.
+void test_ragged_row_in_a_fifteen_row_grid_names_the_row() {
+    GridCells cells;
+    std::string error;
+
+    // The third line loses its last cell: 224 cells over 15 rows.
+    std::string short_row;
+    for (int r = 0; r < BOARD_SIZE; ++r) {
+        for (int c = 0; c < BOARD_SIZE; ++c) {
+            if (r == 2 && c == BOARD_SIZE - 1) continue;
+            if (c) short_row += ",";
+            short_row += "0";
+        }
+        short_row += '\n';
+    }
+    assert(!parse_grid_text(short_row, cells, error));
+    assert(cells.empty());
+    assert(error.find("第 3 行有 14 格") != std::string::npos);
+
+    // The mirror image, one cell too many on the same line, is named the same
+    // way: the reading is about the row, not about how far the total is off.
+    std::string long_row;
+    for (int r = 0; r < BOARD_SIZE; ++r) {
+        for (int c = 0; c < BOARD_SIZE + (r == 2 ? 1 : 0); ++c) {
+            if (c) long_row += ",";
+            long_row += "0";
+        }
+        long_row += '\n';
+    }
+    assert(!parse_grid_text(long_row, cells, error));
+    assert(cells.empty());
+    assert(error.find("第 3 行有 16 格") != std::string::npos);
+
+    std::cout << "test_ragged_row_in_a_fifteen_row_grid_names_the_row passed ("
+              << error << ")" << std::endl;
+}
+
 int main() {
     std::cout << "Running position setup tests..." << std::endl;
     test_grid_parsing();
@@ -940,6 +981,7 @@ int main() {
     test_restore_game();
     test_snapshot_round_trip();
     test_undo_rejected_in_position_pending();
+    test_ragged_row_in_a_fifteen_row_grid_names_the_row();
     std::cout << "All position setup tests passed!" << std::endl;
     return 0;
 }

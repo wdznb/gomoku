@@ -159,7 +159,7 @@ cd build
 ```bash
 ./gomoku_server --sessions data/sessions        # 会话文件目录（默认值）
 ./gomoku_server --records data/x/records.jsonl  # 完局追加到的训练记录流
-./gomoku_server --no-sessions                   # 完全关闭落盘，对局只活在 socket 里
+./gomoku_server --no-sessions                   # 关闭落盘：不写会话文件，对局只活在这个进程的内存里（同进程重挂仍可续，进程一停就无可恢复）
 ```
 
 每局一个文件 `data/sessions/<token>.json`，内容见「会话与断线续局」。目录建不出来时服务器打印
@@ -540,7 +540,7 @@ ctest --output-on-failure
 
 `set_position` 抹掉上一局之前会先把它结算回它自己的会话文件：上一局有内容（落过子、摆过子或选过边）
 时按 `重开` 同款换一个新 token——旧文件留在旧 token 名下不再被覆写，客户端从随后的 `session` 帧里
-拿到新 token；只有没动过的空局才原地接着用。摆棋开局的上一局按已有导出规则不进 `records.jsonl`，
+拿到新 token；只有没动过的空局才原地接着用——摆棋摆了一份**全空**的局面同样算没动过，它一颗子都没摆。摆棋开局的上一局按已有导出规则不进 `records.jsonl`，
 只留在会话文件里。新局的会话文件 `created_ms` 从这一刻重新起算。
 
 ### 连接保活与重连
@@ -605,7 +605,7 @@ ctest --output-on-failure
 - ✅ 训练主循环与断点续训（3.6）
 
 > 说明：训练对象是**威胁系数**，`five` 与 `forbidden_penalty` 不参与调参——前者是 AlphaBeta
-> 的将杀阈值（硬编码 100000）与静态评估上限的公共基准，后者是规则而非棋力。
+> 的将杀阈值（硬编码 100000）与静态评估上限的公共基准，后者是规则而非棋力。轮内给候选算 fitness 时这两个常量一律取**冠军**的取值，比较的双方永远同一条规则。
 > “悔棋再战”从最靠近终局、且还有未尝试分支的那一步重新展开，配合 D4 对称类去重，
 > 使重复的镜像变化不占用探索预算。
 

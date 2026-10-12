@@ -827,13 +827,14 @@ void GameServer::handle_set_position(std::shared_ptr<WebSocketSession> session, 
     // the detach can both land after the reset, and a game with stones is its
     // own only copy - a hand-set base keeps its record out of records.jsonl, so
     // <token>.json is all there is. Rotating it onto its own token first is the
-    // same reuse-vs-rotate decision handle_restart makes; an untouched board has
-    // nothing to keep and is merely flushed in place.
+    // same reuse-vs-rotate decision handle_restart makes; README:541-543 counts
+    // content as 落子/摆子/选边, so a board with none of the three - which includes
+    // a position hand-set with zero stones - has nothing to keep and is merely
+    // flushed in place.
     if (const std::shared_ptr<TrackedGame> previous = entry_locked(session.get())) {
         const ReplaySnapshot replay = previous->game->replay_snapshot();
         const bool nothing_to_keep = replay.move_count == 0 && replay.base.empty() &&
-                                     !previous->side_chosen &&
-                                     !previous->game->position_pending();
+                                     !previous->side_chosen;
         if (nothing_to_keep) {
             flush_entry(previous);
         } else {
@@ -1062,10 +1063,12 @@ void GameServer::handle_restart(std::shared_ptr<WebSocketSession> session) {
             previous ? previous->game->replay_snapshot() : ReplaySnapshot();
         // 重开 on a board nobody has touched needs no new session: the token and
         // the file already describe nothing, so reusing them keeps a page that
-        // presses the button twice from leaving a trail of empty sessions.
+        // presses the button twice from leaving a trail of empty sessions. Nothing
+        // touched is README:541-543's three-way test - no stone played, no stone
+        // hand-set, no side chosen - and a position hand-set empty is precisely
+        // that, so it stays on its own token instead of rotating one per click.
         const bool nothing_to_keep = replay.move_count == 0 && replay.base.empty() &&
-                                     previous && !previous->side_chosen &&
-                                     !previous->game->position_pending();
+                                     previous && !previous->side_chosen;
         if (nothing_to_keep) {
             previous->game->reset();
             // Back to "nobody has claimed a side", which is also what the client's

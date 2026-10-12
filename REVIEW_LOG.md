@@ -1919,3 +1919,62 @@ across four runs on both trees with `forbidden_penalty: 40000` written back unch
 **无可观察差异** with the two-tree diff and the `candidate_value` / `evaluate_position_with_pattern` greps
 (4-parameter declaration, definition, three internal uses, four coloured call sites, no leftover 3-argument
 shape).
+
+## 轮次90 候选和冠军不在同一条规则上比 — bugfix round 90 batch U
+
+**Found.** Batch T took the evaluator, so this round audited the layers that had not been re-read since
+batch S: the training loop's fitness path, the session handlers, and the position text domain. Three rows
+survived my own line-by-line re-read. **U1** `trainer.cpp:37-40` handed the optimiser's candidate straight to
+`play_match`, and every optimiser rebuilds its members through `CoefficientVector::from_vector`
+(`hill_climbing.cpp:40,:63`, `genetic.cpp:57,:167`), which default-constructs `ThreatCoefficients` and writes
+only the 10 tunables (`params.cpp:62-68`). README:607-608 states those two constants are *not* genes, and
+round 74's carry at `:330-331` only covers the post-hoc verification match, so every intra-round pairing
+compared a candidate on the compiled-in baseline (`five` 100000, `forbidden_penalty` 50000 — the cap at
+`evaluator.cpp:175` and the five bonus at `:108` both move with `five`) against a champion on the parameter
+file's. Measured by `build/r90u_probe4.cpp` over one hill-climbing round: 22 objective calls, **19 of them off
+the champion's baseline** (`90000/40000` champion vs `100000/50000` candidate), only `trainer.cpp:283`'s own
+champion read and the round-end re-read on it. **U2** both `nothing_to_keep` predicates (`server.cpp:834`,
+`:1066`) counted `position_pending()` as content. `validate_position` accepts an entirely empty board, so
+摆棋→清空→确认 rotated a token per click and detached a game holding *nothing* into the 30-minute reattach
+window, where it keeps an engine and its transposition table alive — against README:541-543's 落过子/摆过子/
+选过边 list and against the predicate's own comment at `:1063-1065` («a trail of empty sessions»). **U3**
+`position_setup.cpp:302` kept `row_error` only when nothing was ragged, and `ragged` is set by the same row-width
+test (`:232-238`), so a 15-row grid whose 3rd row carries 14 cells dropped the row message and reported
+「棋盘有 224 格，需要 225 格…」 — precisely the "cannot tell a layout slip from a truncated dump" case
+README:261-262 says the row message exists to prevent.
+
+**Fixed.** `measure_fitness` copies the candidate and rebases `five`/`forbidden_penalty` on `champion()` before
+either branch, so the `fitness_override_` hook sees the same pairing the games do; `from_vector`'s default
+construction is left alone (sanitize depends on it) and no `CoefficientVector` API was added. The two session
+predicates drop the `position_pending()` clause — `previous &&` stays at `:1066` because `previous` can be null
+there, while `:834`'s is guaranteed by the `if` initialiser — and both comments now cite README:541-543's
+three-way test. `parse_grid_text` reports `row_error` when the grid is ragged **and** 15 rows deep
+(`:305`), which is safe because `row_error` is non-empty whenever `ragged` is set (`:234-237`); the 16 MB
+early-stop guards at `:245-252`, the flat-success paths and the symbol-kind-first ordering were not touched.
+README side: `:543` gained the 全空摆棋 clarification and `:608` the intra-round baseline rule.
+
+**Not defects / deliberately left.** The server audit's «`--no-sessions` still resumes a detached game in-process,
+so the flag is broken» stays refuted as a wording problem, and it is the text that moved: `flush_entry`
+(`server.cpp:1403`) refuses every write when `sessions_dir_` is empty, while `on_flush_tick` shelves the game
+into `cold_sessions_` (`:1496-1500`) and resume rebuilds from that **in-memory** snapshot (`:1317-1325`), so
+README:161's «对局只活在 socket 里» was the inaccurate line and is now «只活在这个进程的内存里». The bare-`[`
+asymmetry between `position_from_text` and `read_position_payload` remains two documented intents
+(README:225 defines the full-board form as a `board` field). Round-88's carries stayed refuted, and no
+behaviour-preserving claim was invented for U1's CLI surface: the `five: 90000` run legitimately differs in gene
+values, which is not an output contract.
+
+**Verified.** Gate over the identical tree: `ctest` **8/8** (bare `cmake ..`) and
+`node tests/web_frontend_check.js` **30/30**. HEAD negatives in `build/neg90u` (`git archive 0c56dbb` plus the
+current `tests/`) fail **3 out of 8** and nothing else: `tests/test_training.cpp:2704`
+`call.first == 90000`, `tests/test_server.cpp:1489` `again.get() == first.get()`, `tests/test_position.cpp:947`
+`error.find("第 3 行有 14 格") != npos`; the three aborted binaries had already printed 15 / 18 / 46 ` passed`
+lines of existing cases first. Anti-overreach pins green on both trees: `defaults.five` stays zero-change
+(`test_measure_fitness_leaves_default_rule_constants_alone`, 38 pairings all `100000/50000` on HEAD as well), the
+three contentful token rotations `test_server.cpp:282/:1078/:1142` plus `:330`/`:695`, and `test_position.cpp:150`
+/`:161-166` with byte-identical messages (`棋盘有 224 格…`, `棋盘有超过 15 行（读到 16 行）…`, `第 1 行有 3 格…`).
+`build/r90u_cli.sh` at `--timeout-ms 5000 --seed 11`: default-parameter output is the same 330 bytes with md5
+`d3130f8411414342b2c465e8cd023c1c` on **both** trees (empty stderr, 19 stdout lines), which is U1's zero-change
+half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene values while both trees write
+`five: 90000` back, stderr empty on both. No `data/training/checkpoint.json` residue. The tester's diff is
+additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
+no existing assertion was edited.

@@ -35,8 +35,16 @@ void Trainer::set_fitness_override(CoefficientFitness fitness) {
 }
 
 double Trainer::measure_fitness(const ThreatCoefficients& coefficients) {
-    if (fitness_override_) return fitness_override_(coefficients);
-    return play_match(coefficients, champion(), config_.fitness_games);
+    // Rule constants are not genes (README:607-608): from_vector default-constructs
+    // on purpose because sanitize relies on those defaults, so a candidate arrives
+    // carrying the compiled-in five and forbidden_penalty while the champion carries
+    // the parameter file's. Flatten the baseline before comparing - the override
+    // included, so a test hook measures the same pairing the games do.
+    ThreatCoefficients scored = coefficients;
+    scored.five = champion().five;
+    scored.forbidden_penalty = champion().forbidden_penalty;
+    if (fitness_override_) return fitness_override_(scored);
+    return play_match(scored, champion(), config_.fitness_games);
 }
 
 SearchEngine& Trainer::prepare(SearchEngine& engine) const {

@@ -2669,6 +2669,75 @@ void test_trainer_cli_rejects_non_finite_accept_score() {
     std::cout << "test_trainer_cli_rejects_non_finite_accept_score passed" << std::endl;
 }
 
+// Round 90, U1: the optimisers hand candidates back as gene vectors, and
+// from_vector default-constructs on purpose, so a candidate arrived at the
+// objective carrying the compiled-in five and forbidden_penalty while the
+// champion carried this run's. Every pairing measure_fitness makes has to be
+// rule-identical on both sides - which is observable as the constants the
+// injected objective is called with.
+void test_measure_fitness_flattens_rule_constants_for_candidates() {
+    TrainingConfig config = fast_training_config();
+    config.params_path = temp_path("u1_flat_params.json").string();
+    config.checkpoint_path = temp_path("u1_flat_checkpoint.json").string();
+
+    ThreatCoefficients base;
+    base.five = 90000;
+    base.forbidden_penalty = 40000;
+    // The point of the two numbers above is that they are not the defaults.
+    assert(base.five != ThreatCoefficients().five);
+    assert(base.forbidden_penalty != ThreatCoefficients().forbidden_penalty);
+
+    std::vector<std::pair<int, int>> seen;  // five / forbidden_penalty per call
+    Trainer trainer(base, config);
+    trainer.set_fitness_override([&seen](const ThreatCoefficients& coeffs) {
+        seen.emplace_back(coeffs.five, coeffs.forbidden_penalty);
+        return deviation_score(coeffs);
+    });
+
+    trainer.run_round();
+
+    // run_round reads the champion itself (that call is not a candidate and is
+    // the same on both trees), then the walk evaluates at least its starting
+    // point, so there is more than one pairing to look at.
+    assert(seen.size() >= 2);
+    for (const std::pair<int, int>& call : seen) {
+        assert(call.first == 90000);
+        assert(call.second == 40000);
+    }
+
+    std::cout << "test_measure_fitness_flattens_rule_constants_for_candidates passed ("
+              << seen.size() << " pairings, all " << seen.front().first << "/"
+              << seen.front().second << ")" << std::endl;
+}
+
+// Anti-overreach: a run that starts from the compiled defaults has nothing to
+// flatten, so the pairing stays exactly what it was - defaults in, defaults out.
+void test_measure_fitness_leaves_default_rule_constants_alone() {
+    TrainingConfig config = fast_training_config();
+    config.params_path = temp_path("u1_default_params.json").string();
+    config.checkpoint_path = temp_path("u1_default_checkpoint.json").string();
+
+    const ThreatCoefficients defaults;
+    std::vector<std::pair<int, int>> seen;
+    Trainer trainer(defaults, config);
+    trainer.set_fitness_override([&seen](const ThreatCoefficients& coeffs) {
+        seen.emplace_back(coeffs.five, coeffs.forbidden_penalty);
+        return deviation_score(coeffs);
+    });
+
+    trainer.run_round();
+
+    assert(seen.size() >= 2);
+    for (const std::pair<int, int>& call : seen) {
+        assert(call.first == defaults.five);
+        assert(call.second == defaults.forbidden_penalty);
+    }
+
+    std::cout << "test_measure_fitness_leaves_default_rule_constants_alone passed ("
+              << seen.size() << " pairings, all " << defaults.five << "/"
+              << defaults.forbidden_penalty << ")" << std::endl;
+}
+
 int main() {
     std::cout << "Running training tests..." << std::endl;
 
@@ -2720,6 +2789,8 @@ int main() {
     test_params_rejects_out_of_range_tunables();
     test_params_rejects_cross_key_rewrites();
     test_trainer_cli_rejects_non_finite_accept_score();
+    test_measure_fitness_flattens_rule_constants_for_candidates();
+    test_measure_fitness_leaves_default_rule_constants_alone();
 
     std::cout << "All training tests passed" << std::endl;
     return 0;

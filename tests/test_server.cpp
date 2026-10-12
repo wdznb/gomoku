@@ -1457,6 +1457,56 @@ void test_resume_restores_each_config_half() {
     std::cout << "test_resume_restores_each_config_half passed" << std::endl;
 }
 
+// Round 90, U2: 摆棋 with zero stones is not content. README:541-543 counts a
+// session as worth keeping by 落子 / 摆子 / 选边, and position_pending() - which
+// hand-setting any position raises until someone takes a side - is none of those
+// three. It used to sit in the reuse-vs-rotate test, so a page that loaded an
+// empty board twice was handed a new token every click.
+void test_zero_stone_position_keeps_the_token() {
+    const auto dir = scratch("zero_stone_sessions");
+    {
+        Harness h(dir, std::filesystem::path());
+        const json empty_position = {
+            {"position", {{"version", 1}, {"moves", json::array()}}}};
+
+        h.server.handle_set_position(h.socket, empty_position);
+        const std::shared_ptr<GameServer::TrackedGame> first =
+            h.server.entry_locked(h.socket.get());
+        assert(first);
+        assert(first->game->position_pending());
+        assert(!first->side_chosen);
+        // The board this session started on had nothing to keep either, so the
+        // position landed on the token the socket already had.
+        assert(first->token == h.entry->token);
+        const std::string token = first->token;
+
+        // A second 摆棋 of the same nothing, with the pending mark up: same entry,
+        // same token.
+        h.server.handle_set_position(h.socket, empty_position);
+        const std::shared_ptr<GameServer::TrackedGame> again =
+            h.server.entry_locked(h.socket.get());
+        assert(again);
+        assert(again.get() == first.get());
+        assert(again->token == token);
+        assert(again->game->position_pending());
+
+        // 重开 answers the same way on the same untouched board.
+        h.server.handle_restart(h.socket);
+        const std::shared_ptr<GameServer::TrackedGame> restarted =
+            h.server.entry_locked(h.socket.get());
+        assert(restarted);
+        assert(restarted.get() == first.get());
+        assert(restarted->token == token);
+        assert(!restarted->game->position_pending());
+
+        // And none of this wrote a session file: an empty game is not kept.
+        assert(!std::filesystem::exists(dir / (token + ".json")));
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    std::cout << "test_zero_stone_position_keeps_the_token passed" << std::endl;
+}
+
 }  // namespace
 
 int main() {
@@ -1482,6 +1532,7 @@ int main() {
     test_resume_takeover_notifies_the_loser();
     test_hint_answer_for_a_superseded_position();
     test_resume_restores_each_config_half();
+    test_zero_stone_position_keeps_the_token();
 
     std::cout << "All server tests passed!" << std::endl;
     return 0;
