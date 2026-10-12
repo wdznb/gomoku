@@ -958,6 +958,214 @@ check('L7 stop_thinking keeps 求招 held while a hint is in flight', () => {
     assert(el('btn-hint').disabled === false, 'the undo hands 求招 back by the rule');
 });
 
+// B2: 摆棋 installs a position without dropping the previous game's 落子记录.
+// While nobody has chosen a side, that list belongs to the game the position
+// replaced, so no replay entry point may step into it.
+check('B2 unclaimed position locks replay', () => {
+    const game = newGame();
+    game.playerColor = BLACK;
+    game.gameStatus = 'playing';
+    game.setup.active = false;
+    game.aiThinking = false;
+    game.moveHistory = [
+        { row: 7, col: 7, color: BLACK },
+        { row: 7, col: 8, color: WHITE },
+    ];
+    game.analysis = [
+        { method: 'alphabeta', score: 40, depth: 4, nodes: 100, elapsed_ms: 5 },
+        { method: 'alphabeta', score: -40, depth: 4, nodes: 100, elapsed_ms: 5 },
+    ];
+    game.analysisEnded = true;
+    game.replayIndex = null;
+
+    const board = emptyBoard();
+    board[10][10] = WHITE;
+    game.handlePositionSet({ board, current_turn: 'black' });
+    assert(game.gameStatus === 'waiting', 'position_set leaves the game waiting');
+    assert(game.playerColor === null, 'position_set clears the chosen side');
+    assert(game.moveHistory.length === 2, 'the old 落子记录 stays until a side is chosen');
+    assert(game.replayIndex === null, 'position_set exits any replay view');
+
+    // The 落子记录 row click handler is showReplayMove(index); the nav buttons
+    // go through stepReplay -> showReplayMove as well.
+    game.showReplayMove(0);
+    assert(game.replayIndex === null, 'an unclaimed position must not enter replay');
+    game.stepReplay(1);
+    assert(game.replayIndex === null, 'the nav buttons must not enter replay either');
+    const nav = ['btn-replay-first', 'btn-replay-prev', 'btn-replay-play',
+                 'btn-replay-next', 'btn-replay-last'];
+    game.refreshReplayControls();
+    for (const id of nav) {
+        assert(el(id).disabled === true, id + ' must stay disabled on an unclaimed position');
+    }
+    assert(el('btn-replay').disabled === true, '载入回放 must stay disabled as well');
+
+    // A frame that hands the position a side unlocks the very same click.
+    game.chooseSide('black');
+    assert(game.playerColor === BLACK, 'choose_side claims the side');
+    game.gameStatus = 'playing';
+    game.refreshReplayControls();
+    for (const id of nav) {
+        assert(el(id).disabled === false, id + ' must be usable once a side is chosen');
+    }
+    game.showReplayMove(1);
+    assert(game.replayIndex === 1, 'the same click enters replay after a side is chosen');
+    game.exitReplay();
+});
+
+// B2/B3: btn-replay keeps its own stale-record rule, and the three disconnect
+// texts are errors while a lost 上一局 stays a warning.
+check('B2 btn-replay still follows only the stale judgment', () => {
+    const game = newGame();
+    game.setup.active = false;
+    game.aiThinking = false;
+    game.playerColor = BLACK;
+    game.gameStatus = 'playing';
+    game.moveHistory = [
+        { row: 7, col: 7, color: BLACK },
+        { row: 7, col: 8, color: WHITE },
+    ];
+
+    // Analysis shorter than the record: stale, so 载入回放 is offered.
+    game.analysis = [{ method: 'alphabeta', score: 40, depth: 4, nodes: 100, elapsed_ms: 5 }];
+    game.analysisEnded = false;
+    game.refreshReplayControls();
+    assert(el('btn-replay').disabled === false, 'a stale record keeps 载入回放 available');
+
+    // Fully analysed game: not stale, so it is held - independent of the side.
+    game.analysis = [
+        { method: 'alphabeta', score: 40, depth: 4, nodes: 100, elapsed_ms: 5 },
+        { method: 'alphabeta', score: -40, depth: 4, nodes: 100, elapsed_ms: 5 },
+    ];
+    game.analysisEnded = true;
+    game.refreshReplayControls();
+    assert(el('btn-replay').disabled === true, 'a fresh record has nothing to reload');
+
+    // No side chosen at all on an empty board: the plain no-moves rule still holds.
+    const fresh = newGame();
+    fresh.setup.active = false;
+    fresh.moveHistory = [];
+    fresh.analysis = [];
+    fresh.playerColor = null;
+    fresh.gameStatus = 'waiting';
+    fresh.refreshReplayControls();
+    assert(el('btn-replay').disabled === true, 'no moves means no 载入回放');
+    assert(el('btn-replay-first').disabled === true, 'no moves means no replay nav');
+});
+
+// B3: 断线 texts are errors (red), 上一局找不回来了 stays a warning.
+check('B3 disconnect statuses are errors', () => {
+    const game = newGame();
+
+    game.ws.readyState = bundle.sandbox.WebSocket.CLOSED;
+    game.wsReconnect = null;
+    game.scheduleReconnect();
+    assert(el('status').className === 'status error',
+           '重连倒计时 must be an error, got ' + el('status').className);
+
+    game.restart();
+    assert(el('status').className === 'status error',
+           '未连接，重开没有生效 must be an error, got ' + el('status').className);
+
+    game.sendMessage({ type: 'undo' });
+    assert(el('status').className === 'status error',
+           '消息未发出 must be an error, got ' + el('status').className);
+
+    const lost = newGame();
+    lost.resumeAsked = true;
+    lost.handleServerMessage({ type: 'session', token: null, resumed: false });
+    assert(el('status').className === 'status warn',
+           'a lost previous game is only a warning, got ' + el('status').className);
+});
+
+// B4: a typed 0 is out of range, not empty: the depth clamps to 2 and the
+// timeout range follows it, instead of silently jumping to the default 8.
+check('B4 typed depth zero clamps to two', () => {
+    const game = newGame();
+    const depthEl = el('depth');
+    const timeoutEl = el('timeout');
+
+    depthEl.value = '0';
+    game.syncTimeoutBounds('min');
+    assert(depthEl.value === '2', 'a typed 0 clamps to the minimum depth 2, got ' + depthEl.value);
+    assert(timeoutEl.min === '4' && timeoutEl.max === '8',
+           `the range must follow depth 2, got ${timeoutEl.min}..${timeoutEl.max}`);
+    assert(timeoutEl.value === '4', 'min mode lands on the new minimum, got ' + timeoutEl.value);
+
+    // Above the top still clamps to 20, and an emptied box still defaults to 8.
+    depthEl.value = '25';
+    game.syncTimeoutBounds('min');
+    assert(depthEl.value === '20', '25 clamps to 20, got ' + depthEl.value);
+    assert(timeoutEl.min === '40' && timeoutEl.max === '80',
+           `the range must follow depth 20, got ${timeoutEl.min}..${timeoutEl.max}`);
+
+    depthEl.value = '';
+    game.syncTimeoutBounds('min');
+    assert(depthEl.value === '8', 'an empty box falls back to the default 8, got ' + depthEl.value);
+    assert(timeoutEl.min === '16' && timeoutEl.max === '32',
+           `the range must follow depth 8, got ${timeoutEl.min}..${timeoutEl.max}`);
+});
+
+// B5: the curve clips at +/-2000, so only a proven win/loss earns a red dot.
+check('B5 eval graph dots only for mate scores', () => {
+    const game = newGame();
+    const canvas = el('eval-graph');
+    const ctx = canvas.getContext();
+    let dots = [];
+    let line = [];
+    ctx.arc = (x, y, r) => { dots.push({ x, y, r }); };
+    ctx.moveTo = (x, y) => { line.push({ x, y }); };
+    ctx.lineTo = (x, y) => { line.push({ x, y }); };
+
+    // The stub canvas has no clientWidth/clientHeight, so drawEvalGraph falls back
+    // to 200x64: y = 32 - (clamped / 2000) * 26, i.e. 6 on the top clip edge and 58
+    // on the bottom one. The mid axis is captured too, so each ply's point is found
+    // by its own x = width * (i + 0.5) / n.
+    const plot = (scores, colors) => {
+        dots = [];
+        line = [];
+        game.moveHistory = colors.map(color => ({ row: 7, col: 7, color }));
+        game.analysis = scores.map(score => ({
+            method: 'alphabeta', score, depth: 4, nodes: 10, elapsed_ms: 1,
+        }));
+        game.drawEvalGraph();
+        const ys = scores.map((unused, i) => {
+            const want = 200 * (i + 0.5) / scores.length;
+            const hit = line.filter(p => Math.abs(p.x - want) < 1e-9);
+            assert(hit.length === 1, 'no single curve point at x=' + want);
+            return hit[0].y;
+        });
+        return { dots: dots.slice(), ys };
+    };
+
+    const big = plot([3000], [BLACK]);
+    assert(big.dots.length === 0, 'a big searched score earns no dot');
+    assert(Math.abs(big.ys[0] - 6) < 1e-9, '+3000 sits clipped on the top edge, y=' + big.ys[0]);
+
+    const mate = plot([99999], [BLACK]);
+    assert(mate.dots.length === 1, '+99999 earns the win dot');
+    assert(Math.abs(mate.ys[0] - 6) < 1e-9,
+           'a mated point is pinned to the clip edge, not mid-scale, y=' + mate.ys[0]);
+
+    const loss = plot([-100000], [BLACK]);
+    assert(loss.dots.length === 1, '-100000 earns the loss dot');
+    assert(Math.abs(loss.ys[0] - 58) < 1e-9,
+           'a mated loss sits on the bottom edge, y=' + loss.ys[0]);
+
+    // WHITE is plotted from BLACK's point of view, so a WHITE mate score mirrors
+    // onto the opposite edge and still gets its dot.
+    const white = plot([99999], [WHITE]);
+    assert(white.dots.length === 1, 'a WHITE mate score still gets a dot');
+    assert(Math.abs(white.ys[0] - 58) < 1e-9,
+           'flipped it sits on the bottom edge, y=' + white.ys[0]);
+
+    const mixed = plot([3000, 99999], [BLACK, BLACK]);
+    assert(mixed.dots.length === 1, 'only the mated ply of a mixed run gets a dot');
+    assert(Math.abs(mixed.dots[0].x - 150) < 1e-9, 'the dot belongs to the mated ply');
+    assert(Math.abs(mixed.ys[0] - 6) < 1e-9 && Math.abs(mixed.ys[1] - 6) < 1e-9,
+           'both clipped plies share the top edge, ys=' + mixed.ys.join(','));
+});
+
 let failed = 0;
 for (const result of results) {
     console.log(`${result.ok ? 'PASS' : 'FAIL'} ${result.label}` +

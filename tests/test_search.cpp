@@ -5,6 +5,7 @@
 #include "optimization/transposition.h"
 #include <atomic>
 #include <chrono>
+#include <climits>
 #include <vector>
 #include <algorithm>
 // J2 drives sort_moves and generate_moves directly, and both are private; the
@@ -115,6 +116,106 @@ void test_transposition_aging() {
     assert(entry->depth == 1);
 
     std::cout << "test_transposition_aging passed" << std::endl;
+}
+
+// B8: lookup() no longer requires the stored age to match the current one, so an
+// entry written by an earlier search is still readable after new_search().
+void test_transposition_cross_search_reuse() {
+    TranspositionTable tt(1024);
+
+    Move m(7, 7, BLACK);
+    tt.store(12345, 3, 500, m, TTFlag::EXACT);
+    assert(tt.lookup(12345) != nullptr);
+
+    tt.new_search();
+    tt.new_search();
+
+    const TTEntry* reuse = tt.lookup(12345);
+    assert(reuse != nullptr);
+    assert(reuse->hash == 12345);
+    assert(reuse->depth == 3);
+    assert(reuse->value == 500);
+    assert(reuse->flag == TTFlag::EXACT);
+    assert(reuse->best_move == m);
+
+    // An empty slot is a miss, and a NONE flag stays a miss across searches.
+    TranspositionTable blank(1024);
+    assert(blank.lookup(12345) == nullptr);
+    blank.store(12345, 3, 500, m, TTFlag::NONE);
+    assert(blank.lookup(12345) == nullptr);
+    blank.new_search();
+    assert(blank.lookup(12345) == nullptr);
+
+    // Same slot, different hash: the full hash is still compared, aging did not
+    // turn the table into a slot-only cache.
+    const TTEntry* collision = tt.lookup(12345 + 1024);
+    assert(collision == nullptr);
+
+    std::cout << "test_transposition_cross_search_reuse passed" << std::endl;
+}
+
+// B8: the age filter moved out of lookup() and the value gate stayed in
+// alphabeta: an entry only supplies its value when it is deep enough, otherwise
+// it is a move-ordering hint and the score is recomputed.
+void test_transposition_depth_gate_still_applies() {
+    Board board;
+    build_midgame(board);
+    Evaluator evaluator;
+    const uint64_t hash = board.zobrist_hash();
+    std::atomic<bool> stop(false);
+
+    // search() is what normally stamps the clock a fresh search starts on; calling
+    // alphabeta() directly has to do the same, or is_timeout() reads an epoch-old
+    // start_time_ and every node takes the abort branch before the table is read.
+    {
+        TranspositionTable tt(1 << 12);
+        AlphaBetaSearch search(evaluator, tt);
+        search.start_time_ = std::chrono::high_resolution_clock::now();
+        tt.store(hash, 4, 123456, Move(7, 6, BLACK), TTFlag::EXACT);
+        tt.new_search();
+        Board work = board;
+        const int score = search.alphabeta(work, 4, -INT_MAX, INT_MAX, BLACK, stop);
+        assert(score == 123456);
+    }
+
+    {
+        TranspositionTable tt(1 << 12);
+        AlphaBetaSearch search(evaluator, tt);
+        search.start_time_ = std::chrono::high_resolution_clock::now();
+        tt.store(hash, 3, 123456, Move(7, 6, BLACK), TTFlag::EXACT);
+        tt.new_search();
+        const TTEntry* hint = tt.lookup(hash);
+        assert(hint != nullptr);
+        assert(hint->depth < 4);
+        Board work = board;
+        const int score = search.alphabeta(work, 4, -INT_MAX, INT_MAX, BLACK, stop);
+        assert(score != 123456);
+        assert(score > -1000000 && score < 1000000);
+    }
+
+    // A bound is a value only when it actually cuts: the deep LOWERBOUND above
+    // beta is returned, and the same bound one ply too shallow is not.
+    {
+        TranspositionTable tt(1 << 12);
+        AlphaBetaSearch search(evaluator, tt);
+        search.start_time_ = std::chrono::high_resolution_clock::now();
+        tt.store(hash, 6, 300, Move(7, 6, BLACK), TTFlag::LOWERBOUND);
+        tt.new_search();
+        Board work = board;
+        assert(search.alphabeta(work, 4, 60, 200, BLACK, stop) == 300);
+    }
+
+    {
+        TranspositionTable tt(1 << 12);
+        AlphaBetaSearch search(evaluator, tt);
+        search.start_time_ = std::chrono::high_resolution_clock::now();
+        tt.store(hash, 3, 300, Move(7, 6, BLACK), TTFlag::LOWERBOUND);
+        tt.new_search();
+        Board work = board;
+        assert(search.alphabeta(work, 4, 60, 200, BLACK, stop) != 300);
+    }
+
+    std::cout << "test_transposition_depth_gate_still_applies passed" << std::endl;
 }
 
 void test_vcf_immediate_five() {
@@ -1758,6 +1859,8 @@ int main() {
     test_transposition_default_size();
     test_transposition_table();
     test_transposition_aging();
+    test_transposition_cross_search_reuse();
+    test_transposition_depth_gate_still_applies();
     test_vcf_immediate_five();
     test_vcf_no_win();
     test_vcf_gap_four_sequence_wins();

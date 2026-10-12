@@ -870,7 +870,7 @@ void test_genetic() {
     assert(generations >= 1 && generations <= settings.max_generations);
     assert(optimizer.population().size() == static_cast<size_t>(settings.population_size));
     assert(optimizer.evaluations() ==
-           settings.population_size * (generations + 1));
+           settings.population_size + generations * (settings.population_size - 1));
     // Elitism: the best member of the final population is the returned answer.
     double strongest = 0.0;
     for (const auto& member : optimizer.population()) {
@@ -913,6 +913,103 @@ void test_genetic() {
     assert(flat_generations == flat_settings.stagnation_generations);
 
     std::cout << "test_genetic passed" << std::endl;
+}
+
+// B6: empty steps (candidate == current) must neither count as evaluations nor
+// trigger stagnation. A multiplier of 1.0 with sanitize makes every neighbor a
+// no-op for the base genes.
+void test_hill_climbing_empty_steps() {
+    ThreatCoefficients base;
+    const std::vector<int> genes = CoefficientVector::to_vector(base);
+    for (size_t g = 0; g < genes.size(); ++g) {
+        assert(HillClimbingOptimizer::neighbor(genes, g, 1.0) == genes);
+    }
+
+    HillClimbingConfig settings;
+    settings.max_iterations = 40;
+    settings.stagnation_limit = 12;
+    settings.multipliers = {1.0};
+    HillClimbingOptimizer optimizer([](const ThreatCoefficients&) { return 0.0; },
+                                    settings, 4242);
+    int iterations = 0;
+    double best = 0.0;
+    optimizer.run(base, iterations, best);
+
+    assert(iterations == 0);
+    assert(optimizer.evaluations() == 1);
+    assert(optimizer.converged() == false);
+    assert(optimizer.best_history().size() == 1);
+
+    std::cout << "test_hill_climbing_empty_steps passed" << std::endl;
+}
+
+// B6: invariant iterations_run == evaluations - 1 == best_history.size() - 1
+// holds when some steps are empty (mixed multipliers 1.0 and 1.6).
+void test_hill_climbing_effective_steps() {
+    ThreatCoefficients base;
+    HillClimbingConfig settings;
+    settings.max_iterations = 40;
+    settings.stagnation_limit = 1000;
+    settings.multipliers = {1.0, 1.6};
+    HillClimbingOptimizer optimizer([](const ThreatCoefficients& c) {
+        long sum = 0;
+        for (int v : CoefficientVector::to_vector(c)) sum += v;
+        return static_cast<double>(sum);
+    }, settings, 7);
+    int iterations = 0;
+    double best = 0.0;
+    optimizer.run(base, iterations, best);
+
+    // Effective steps < raw loop iterations (some 1.0 multipliers produced no-ops).
+    assert(iterations < settings.max_iterations);
+    // Pin the invariant.
+    assert(iterations == optimizer.evaluations() - 1);
+    assert((size_t)iterations == optimizer.best_history().size() - 1);
+    assert(optimizer.converged() == false);
+
+    std::cout << "test_hill_climbing_effective_steps passed" << std::endl;
+}
+
+// B7: elitism means the incumbent is never re-evaluated; it is appended after
+// evaluate(). A counting fitness proves calls per vector.
+void test_genetic_elite_single_evaluation() {
+    ThreatCoefficients base;
+    GeneticConfig settings;
+    settings.population_size = 8;
+    settings.max_generations = 1;
+    settings.stagnation_generations = 50;
+    settings.crossover_ratio = 0.85;
+    settings.mutation_rate = 0.0;
+
+    std::map<std::string, int> calls;
+    auto count_fitness = [&](const ThreatCoefficients& c) -> double {
+        std::string k;
+        for (int v : CoefficientVector::to_vector(c)) k += std::to_string(v) + ",";
+        calls[k]++;
+        long sum = 0;
+        for (int v : CoefficientVector::to_vector(c)) sum += v;
+        return static_cast<double>(sum);
+    };
+
+    GeneticOptimizer optimizer(count_fitness, settings, 3);
+    int generations = 0;
+    double best = 0.0;
+    ThreatCoefficients winner = optimizer.run(base, generations, best);
+
+    // Population is full (elite appended, not pre-filled before evaluate).
+    assert(optimizer.population().size() == static_cast<size_t>(settings.population_size));
+
+    // The elite (winner) is scored exactly 1 time (once in the initial population,
+    // appended without re-evaluation). On HEAD it was scored twice (initial + elite slot).
+    std::string winner_key;
+    for (int v : CoefficientVector::to_vector(winner)) winner_key += std::to_string(v) + ",";
+    assert(calls[winner_key] == 1);
+
+    // Total evaluations = population_size + generations * (population_size - 1).
+    assert(optimizer.evaluations() ==
+           settings.population_size + generations * (settings.population_size - 1));
+
+    std::cout << "test_genetic_elite_single_evaluation passed" << std::endl;
 }
 
 void test_random_opening_line() {
@@ -2131,6 +2228,9 @@ int main() {
     test_data_collector_samples();
     test_hill_climbing();
     test_genetic();
+    test_hill_climbing_empty_steps();
+    test_hill_climbing_effective_steps();
+    test_genetic_elite_single_evaluation();
     test_random_opening_line();
     test_trainer_round_promotes();
     test_trainer_round_rejects_regression();

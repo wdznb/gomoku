@@ -175,7 +175,7 @@ class GomokuGame {
         if (this.wsReconnect) return;
         const wait = Math.min(15000, 1000 * 2 ** this.wsAttempts);
         this.wsAttempts += 1;
-        this.updateStatus(`连接断开，${Math.round(wait / 1000)} 秒后重连（第 ${this.wsAttempts} 次）`, 'warn');
+        this.updateStatus(`连接断开，${Math.round(wait / 1000)} 秒后重连（第 ${this.wsAttempts} 次）`, 'error');
         this.wsReconnect = setTimeout(() => {
             this.wsReconnect = null;
             this.openSocket();
@@ -571,7 +571,10 @@ class GomokuGame {
         const timeoutEl = document.getElementById('timeout');
         // The number inputs accept anything typed, and the bounds are multiples of
         // the depth, so the depth is pinned to its own range before they are read.
-        const depth = Math.min(20, Math.max(2, parseInt(depthEl.value, 10) || 8));
+        // parseInt turns a typed 0 into a number, and 0 is out of range rather
+        // than empty: only a non-number falls back to the default depth.
+        const typed = parseInt(depthEl.value, 10);
+        const depth = Math.min(20, Math.max(2, Number.isInteger(typed) ? typed : 8));
         depthEl.value = String(depth);
         const min = depth * 2;
         const max = depth * 4;
@@ -670,8 +673,18 @@ class GomokuGame {
         return `回放已载入：${this.moveHistory.length} 手 · ${winner}（${this.reasonText(msg.reason)}）`;
     }
 
+    // A hand-set position that nobody has claimed a side for: the replay cluster
+    // still belongs to the game 摆棋 replaced, and stepping through it here would
+    // mix the new base stones with the old plies. Choosing a side is the action
+    // the README says drops that list, not any of these buttons.
+    replayBelongsToOldGame() {
+        return this.gameStatus === 'waiting' && this.playerColor === null &&
+            this.moveHistory.length > 0;
+    }
+
     showReplayMove(index) {
         if (this.moveHistory.length === 0) return;
+        if (this.replayBelongsToOldGame()) return;
         const clamped = Math.max(0, Math.min(this.moveHistory.length - 1, index));
         this.replayIndex = clamped;
         this.refreshReplayControls();
@@ -734,7 +747,8 @@ class GomokuGame {
             // While the AI is thinking, the live board is the thing to watch;
             // while 摆棋 is open, the replay cluster belongs to the game, not
             // the working copy on screen.
-            el.disabled = !hasMoves || this.aiThinking || this.setup.active;
+            el.disabled = !hasMoves || this.aiThinking || this.setup.active ||
+                this.replayBelongsToOldGame();
         }
         document.getElementById('btn-replay-exit').disabled = this.replayIndex === null;
         // Re-enable when the record is behind the game: a move played after the
@@ -742,13 +756,9 @@ class GomokuGame {
         // not in the loaded summary either.
         const stale = this.analysis.length < this.moveHistory.length ||
             (this.gameStatus === 'game_over' && !this.analysisEnded);
-        // A hand-set position that nobody has claimed a side for: the server's
-        // replay is all base stones and no moves, and loading it here would
-        // wipe 落子记录 before 选择执子颜色 — which is the action the README
-        // says clears it, not this button.
-        const unclaimedSetup = this.gameStatus === 'waiting' && this.playerColor === null;
         document.getElementById('btn-replay').disabled =
-            !hasMoves || this.aiThinking || !stale || unclaimedSetup || this.setup.active;
+            !hasMoves || this.aiThinking || !stale ||
+            this.replayBelongsToOldGame() || this.setup.active;
     }
 
     // One engine verdict, formatted. The non-AlphaBeta paths (book / vcf / vct /
@@ -818,7 +828,7 @@ class GomokuGame {
             const clamped = Math.max(-limit, Math.min(limit, blackScore));
             const x = width * (i + 0.5) / this.analysis.length;
             const y = height / 2 - (clamped / limit) * (height / 2 - 6);
-            points.push({ x, y, saturated: Math.abs(blackScore) > limit });
+            points.push({ x, y, saturated: Math.abs(blackScore) >= 99999 });
         });
         if (points.length === 0) return;
 
@@ -832,7 +842,8 @@ class GomokuGame {
         points.forEach((p, i) => i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y));
         ctx.stroke();
 
-        // Points pushed to the edge are a proven win/loss, not a vague advantage.
+        // Only a proven win/loss earns a dot; the curve is clipped at ±2000, so a
+        // big searched score sits at the edge without meaning the game is over.
         ctx.fillStyle = '#c0392b';
         for (const p of points) {
             if (p.saturated) {
@@ -1428,7 +1439,7 @@ class GomokuGame {
         // server never hears it - clearing the board anyway would show an empty
         // game that the stored token resumes back into the old one.
         if (!this.sendMessage({ type: 'restart' })) {
-            this.updateStatus('未连接，重开没有生效', 'warn');
+            this.updateStatus('未连接，重开没有生效', 'error');
             return;
         }
         this.resetGame();
@@ -1487,7 +1498,7 @@ class GomokuGame {
         if (msg.type !== 'ping') {
             // Say it out loud: a click that quietly vanished reads as the AI
             // ignoring the player.
-            this.updateStatus('连接已断开，正在重连：消息未发出', 'warn');
+            this.updateStatus('连接已断开，正在重连：消息未发出', 'error');
         }
         return false;
     }

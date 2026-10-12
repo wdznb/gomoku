@@ -1,7 +1,9 @@
 #include "core/board.h"
 #include "core/pattern.h"
+#include <array>
 #include <iostream>
 #include <random>
+#include <vector>
 #include <cassert>
 
 using namespace gomoku;
@@ -740,6 +742,102 @@ void test_window_edge_gapped_four() {
     std::cout << "test_window_edge_gapped_four passed" << std::endl;
 }
 
+// Round 80, B1: a BLACK LIVE_THREE now gets a board-level correction the same way
+// a BLACK four already did. The recognition window only reads +/-4 cells, so
+// (7,2)(7,5)(7,6)(7,9)(7,10) around the probe (7,7) labels LIVE_THREE even though
+// every fill runs past five - and a fabricated second live three turns the point
+// into a phantom 三三 forbidden. WHITE is not subject to the overline rule.
+static Board b1_board(const std::vector<std::array<int, 3>>& stones) {
+    Board board;
+    for (const std::array<int, 3>& s : stones) board.place_stone(s[0], s[1], s[2]);
+    return board;
+}
+
+void test_black_live_three_board_correction() {
+    const int B = BLACK, W = WHITE;
+
+    // The counterexample: horizontal shape X_XX_XX_X with the probe in the hole,
+    // plus a genuine vertical live three through (6,7)(8,7).
+    const Board counter = b1_board({{7, 2, B}, {7, 5, B}, {7, 6, B}, {7, 9, B}, {7, 10, B},
+                                    {6, 7, B}, {8, 7, B}});
+    const PositionPattern downgraded =
+        PatternRecognizer::recognize_position(counter, 7, 7, BLACK);
+    // All four directions, not just the total: only the horizontal one is demoted.
+    assert(downgraded.directions[0].type == PatternType::SLEEPY_THREE);
+    assert(downgraded.directions[1].type == PatternType::LIVE_THREE);
+    assert(downgraded.directions[2].type == PatternType::NONE);
+    assert(downgraded.directions[3].type == PatternType::NONE);
+    assert(downgraded.live_three_count == 1);
+    assert(downgraded.has_three_three == false);
+    assert(PatternRecognizer::is_forbidden(counter, 7, 7, BLACK) == false);
+
+    // WHITE reads the same shape untouched: the overline is a win there, and the
+    // forbidden rules only ever bind BLACK.
+    const Board white_same = b1_board({{7, 2, W}, {7, 5, W}, {7, 6, W}, {7, 9, W}, {7, 10, W},
+                                       {6, 7, W}, {8, 7, W}});
+    const PositionPattern white =
+        PatternRecognizer::recognize_position(white_same, 7, 7, WHITE);
+    assert(white.directions[0].type == PatternType::LIVE_THREE);
+    assert(white.directions[1].type == PatternType::LIVE_THREE);
+    assert(white.live_three_count == 2);
+    assert(PatternRecognizer::is_forbidden(white_same, 7, 7, WHITE) == false);
+
+    // Positive shapes must not regress: an open _XXX_ on an empty board is still a
+    // live three, and one blocked at both ends is still sleepy.
+    const Board open_three = b1_board({{7, 5, B}, {7, 6, B}});
+    assert(PatternRecognizer::recognize_position(open_three, 7, 7, BLACK)
+               .directions[0].type == PatternType::LIVE_THREE);
+    const Board dead_three = b1_board({{7, 5, B}, {7, 6, B}, {7, 3, W}, {7, 9, W}});
+    assert(PatternRecognizer::recognize_position(dead_three, 7, 7, BLACK)
+               .directions[0].type == PatternType::SLEEPY_THREE);
+
+    // Two real live threes sharing the probe are still a forbidden 三三.
+    const Board real_double = b1_board({{7, 5, B}, {7, 6, B}, {6, 7, B}, {8, 7, B}});
+    const PositionPattern double_three =
+        PatternRecognizer::recognize_position(real_double, 7, 7, BLACK);
+    assert(double_three.directions[0].type == PatternType::LIVE_THREE);
+    assert(double_three.directions[1].type == PatternType::LIVE_THREE);
+    assert(double_three.live_three_count == 2);
+    assert(double_three.has_three_three == true);
+    assert(PatternRecognizer::is_forbidden(real_double, 7, 7, BLACK) == true);
+
+    // The four branch is byte-for-byte the old behaviour.
+    const Board live_four = b1_board({{7, 4, B}, {7, 5, B}, {7, 6, B}});
+    assert(PatternRecognizer::recognize_position(live_four, 7, 7, BLACK)
+               .directions[0].type == PatternType::LIVE_FOUR);
+    const Board hole_four = b1_board({{7, 3, B}, {7, 4, B}, {7, 5, B}, {7, 6, B}, {7, 8, B}});
+    const PositionPattern hole = PatternRecognizer::recognize_position(hole_four, 7, 7, BLACK);
+    assert(hole.directions[0].type == PatternType::LONG_FIVE);
+    assert(PatternRecognizer::is_forbidden(hole_four, 7, 7, BLACK) == true);
+    const Board gapped_four = b1_board({{7, 4, B}, {7, 5, B}, {7, 7, B}, {7, 8, B}});
+    assert(PatternRecognizer::recognize_position(gapped_four, 7, 6, BLACK)
+               .directions[0].type == PatternType::FIVE);
+
+    // The essence is that the blocker is outside the window: (7,2) is exactly five
+    // cells from the probe (7,7), so no window cell reaches it. Same shape without
+    // that stone is a real live three again, because both extensions do make five.
+    const Board with_blocker = b1_board({{7, 5, B}, {7, 6, B}, {7, 10, B},
+                                         {6, 7, B}, {8, 7, B}, {7, 2, B}});
+    const Board without_blocker = b1_board({{7, 5, B}, {7, 6, B}, {7, 10, B},
+                                            {6, 7, B}, {8, 7, B}});
+    assert(PatternRecognizer::recognize_position(without_blocker, 7, 7, BLACK)
+               .directions[0].type == PatternType::LIVE_THREE);
+    assert(PatternRecognizer::recognize_position(without_blocker, 7, 7, BLACK)
+               .live_three_count == 2);
+    assert(PatternRecognizer::is_forbidden(without_blocker, 7, 7, BLACK) == true);
+    assert(PatternRecognizer::recognize_position(with_blocker, 7, 7, BLACK)
+               .directions[0].type == PatternType::SLEEPY_THREE);
+    assert(PatternRecognizer::is_forbidden(with_blocker, 7, 7, BLACK) == false);
+    // A blocker six cells out (7,1) is past the reach of any five the shape can
+    // make, so the same horizontal group keeps its live label.
+    const Board blocker_6 = b1_board({{7, 5, B}, {7, 6, B}, {7, 10, B},
+                                      {6, 7, B}, {8, 7, B}, {7, 1, B}});
+    assert(PatternRecognizer::recognize_position(blocker_6, 7, 7, BLACK)
+               .directions[0].type == PatternType::LIVE_THREE);
+
+    std::cout << "test_black_live_three_board_correction passed" << std::endl;
+}
+
 int main() {
     std::cout << "Running pattern tests..." << std::endl;
     
@@ -763,6 +861,7 @@ int main() {
     test_bitboard_matches_scalar();
     test_asymmetric_live_three();
     test_window_edge_gapped_four();
+    test_black_live_three_board_correction();
     
     std::cout << "All pattern tests passed!" << std::endl;
     return 0;
