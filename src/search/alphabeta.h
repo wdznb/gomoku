@@ -7,6 +7,7 @@
 #include "../optimization/transposition.h"
 #include <atomic>
 #include <chrono>
+#include <functional>
 #include <vector>
 
 namespace gomoku {
@@ -31,10 +32,16 @@ public:
 
     void set_node_limit(int limit) { node_limit_ = limit; }
 
-    // Absolute wall-clock deadline shared with the VCF/VCT phases (see
-    // VCFSearch::set_deadline). The time_limit_ms handed to search() is only
-    // this phase's slice, so without the shared deadline a phase that starts
-    // after the budget is already spent still gets its whole slice.
+    // Same shape as SearchEngine's ProgressCallback: one frame per completed
+    // iteration, so a long think does not go silent between start and return.
+    void set_progress_callback(std::function<void(int depth, int nodes, int elapsed_ms)> cb) {
+        progress_callback_ = cb;
+    }
+
+    // Absolute end-of-move wall-clock deadline (VCF/VCT get their own slices of
+    // the same budget). The time_limit_ms handed to search() is only this
+    // phase's share, so without the deadline a search that starts after the
+    // budget is spent still gets its whole share.
     void set_deadline(std::chrono::steady_clock::time_point deadline) {
         deadline_ = deadline;
         has_deadline_ = true;
@@ -47,6 +54,7 @@ private:
     int move_time_limit_ms_;
     int nodes_searched_;
     SearchInfo info_;
+    std::function<void(int depth, int nodes, int elapsed_ms)> progress_callback_;
 
     std::chrono::time_point<std::chrono::high_resolution_clock> start_time_;
     std::chrono::steady_clock::time_point deadline_{};

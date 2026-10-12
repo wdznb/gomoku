@@ -286,6 +286,41 @@ void test_moves_form() {
     std::cout << "test_moves_form passed" << std::endl;
 }
 
+void test_moves_array_size_is_capped() {
+    // R85 G3: a moves array is an instruction from the client, and one far larger
+    // than the board must be refused on its size - not walked entry by entry
+    // until a coordinate happens to repeat. The cap is MAX_MOVES (the board's own
+    // cell count, core/types.h), so the refusal has to name it.
+    json doc;
+    doc["version"] = 1;
+    doc["type"] = "gomoku_position";
+    json moves = json::array();
+    for (int i = 0; i < 300000; ++i) {
+        // Every entry is a legal coordinate, so only the count can reject this.
+        moves.push_back(json::array({i % BOARD_SIZE, (i / BOARD_SIZE) % BOARD_SIZE}));
+    }
+    doc["moves"] = std::move(moves);
+
+    SetupResult oversized = position_from_json(doc);
+    assert(!oversized.ok());
+    assert(!oversized.error.empty());
+    assert(oversized.error.find(std::to_string(MAX_MOVES)) != std::string::npos);
+
+    // A normal twenty-stone document still goes through untouched.
+    json small;
+    small["version"] = 1;
+    json small_moves = json::array();
+    for (int i = 0; i < 20; ++i) {
+        small_moves.push_back(json::array({i % BOARD_SIZE, i / BOARD_SIZE}));
+    }
+    small["moves"] = std::move(small_moves);
+    SetupResult normal = position_from_json(small);
+    assert(normal.ok());
+    assert(normal.black_count == 10 && normal.white_count == 10);
+
+    std::cout << "test_moves_array_size_is_capped passed" << std::endl;
+}
+
 void test_validation_rules() {
     // Black opens, so the counts may only ever differ by one in black's favour.
     SetupResult skewed =
@@ -897,6 +932,7 @@ int main() {
     test_bitboard_form();
     test_bitboard_words_are_decimal();
     test_moves_form();
+    test_moves_array_size_is_capped();
     test_validation_rules();
     test_canonical_document();
     test_shipped_templates();

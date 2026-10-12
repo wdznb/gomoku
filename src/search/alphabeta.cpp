@@ -11,10 +11,10 @@ AlphaBetaSearch::AlphaBetaSearch(const Evaluator& evaluator, TranspositionTable&
       move_time_limit_ms_(5000), nodes_searched_(0) {}
 
 bool AlphaBetaSearch::is_timeout() const {
-    // The engine shares one absolute budget between VCF, VCT and this phase and
-    // hands us only the slice left. Once that deadline has passed the whole
-    // move is over budget, so stop instead of running another slice. Without a
-    // deadline the per-search limit is all we have.
+    // The engine hands us an absolute move deadline along with the slice of the
+    // budget still left. Once that deadline has passed the whole move is over
+    // budget, so stop instead of running another slice. Without a deadline the
+    // per-search limit is all we have.
     if (has_deadline_) {
         return std::chrono::steady_clock::now() >= deadline_;
     }
@@ -338,6 +338,15 @@ Move AlphaBetaSearch::search(const Board& board, int color, int max_depth,
             info_.depth = depth;
             info_.score = best_score;
             info_.best_move = best_move;
+            // Only a completed layer reports: a layer cut short by stop or
+            // timeout never reaches here, so no frame carries a depth that was
+            // not actually searched.
+            if (progress_callback_) {
+                const int elapsed_ms = static_cast<int>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::high_resolution_clock::now() - start_time_).count());
+                progress_callback_(info_.depth, nodes_searched_, elapsed_ms);
+            }
 
             // Feed the shallow iteration's winner back into the root order so
             // deeper iterations inherit the cutoff / TT-move effect that makes

@@ -211,6 +211,16 @@ SetupResult moves_form(const json& doc) {
         first = side == "black" ? BLACK : WHITE;
     }
 
+    // The wire allows a 16 MiB frame, and a moves list longer than the board
+    // can never place: a 226th coordinate must repeat a cell. Refusing by size
+    // before the walk keeps a giant list from being parsed entry by entry on
+    // the single io thread, the same early reject the grid reader got.
+    if (value.size() > static_cast<size_t>(BOARD_SIZE * BOARD_SIZE)) {
+        return rejected("moves 最多 " + std::to_string(BOARD_SIZE * BOARD_SIZE) +
+                        " 个坐标（15x15 棋盘的最大子数），收到 " +
+                        std::to_string(value.size()) + " 个");
+    }
+
     std::vector<Position> moves;
     moves.reserve(value.size());
     size_t index = 0;

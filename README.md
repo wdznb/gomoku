@@ -173,7 +173,7 @@ stdout，不会打断对局。`data/sessions/` 与 `data/training/` 都在 `.git
 2. 让候选与当前冠军对战（每对组合执黑白各一次），得到验证分；
 3. 验证分 ≥ `--accept-score`（默认 0.56）才晋升为新冠军，并写入 `--out`；
 4. 生成若干盘自我对弈作为训练数据（对局记录 + 特征样本，JSONL 追加）；
-5. 保存 checkpoint，中断后可 `--resume PATH`（断点文件路径）继续。
+5. 保存 checkpoint，中断后可 `--resume PATH`（断点文件路径）继续，续跑进度写回同一个文件。
 
 ```bash
 cd build
@@ -197,8 +197,8 @@ cd build
 | `--params` | 内置默认 | 起始参数文件 |
 | `--out` | `data/training/best_params.json` | 冠军参数输出位置 |
 | `--records` / `--samples` | 空 | 对局记录 / 训练样本 JSONL |
-| `--checkpoint` | `data/training/checkpoint.json` | 断点文件 |
-| `--resume` | — | 从断点继续训练，需要一个断点文件路径 |
+| `--checkpoint` | `data/training/checkpoint.json` | 断点文件；与 `--resume` 同时给出时必须指向同一个文件 |
+| `--resume` | — | 从断点继续训练，需要一个断点文件路径；进度写回该文件，与 `--checkpoint` 路径不同则启动即报错退出（退出码 1） |
 
 产物目录 `data/training/` 已被 `.gitignore` 忽略，训练不会污染仓库。
 
@@ -473,9 +473,10 @@ ctest --output-on-failure
 `position` 可以是局面对象，也可以是文本（粘贴的棋盘——分行、带分隔符或 225 格连写成一串，
 或整份 JSON 文档字符串）；顶层 `encoding` 会并入文档，作为调用方声明的标志映射。
 
-`resume` 是握手后的第一件事：token 认得就接回那局（`resumed: true`），认不得或格式不对就另开一局
-（`resumed: false` + 新 token），任何情况下都回一帧 `session`。token 只允许小写十六进制（它同时是
-文件名），非法值不会碰到磁盘。
+`resume` 是握手后的第一件事：token 认得就接回那局（`resumed: true`）；认不得、格式不对，或记录读得
+出来却重建不出棋盘的，就另开一局（`resumed: false` + 一个新 token）——那种不可读的记录文件原地保留
+在磁盘上、不再被覆写，供人工查看。任何情况下都回一帧 `session`。token 只允许小写十六进制（它同时
+是文件名），非法值不会碰到磁盘。
 
 ### 服务器 → 客户端
 
@@ -491,6 +492,7 @@ ctest --output-on-failure
 {"type": "session", "token": "9af83343549460e1", "resumed": true, "player_color": "black",
  "game_status": "playing", "current_turn": "white", "position_pending": false, "move_count": 6,
  "winner": "", "reason": "", "timeout_ms": 5000, "max_depth": 8, "board": [[...]]}
+{"type": "session_taken_over", "token": "9af83343549460e1"}
 {"type": "replay", "game_over": true, "winner": "white", "reason": "resign",
  "moves": [{"row": 7, "col": 7, "color": "black", "method": "human",
             "score": 0, "depth": 0, "nodes": 0, "elapsed_ms": 0}],
@@ -509,6 +511,11 @@ ctest --output-on-failure
 并没有的子。`thinking_progress` 的 `elapsed_ms` 与 `depth` 随迭代加深推进，`ai_move` 是这一次思考的
 终点。
 
+`session_taken_over` 只在同一个 token 被另一个标签页 `resume` 接管时出现：服务器把它发给被替掉的
+那个连接，随后立即 `close`（见「会话与断线续局」里的后到者接管）。客户端收到后取消重连定时器、
+不再自动重连（`reconnect` / `resume`），但 `localStorage` 里的 token 保留——刷新页面仍可把这局拿
+回来。
+
 `replay` 是本会话对局的逐手分析：`method` 为 `human` 表示玩家落子（无搜索数据），
 其余为引擎返回路径（`book` / `vcf` / `vct` / `alphabeta` / `greedy`）；
 `score` 是**刚落子一方**视角的分值，非 AlphaBeta 路径不填 `depth` / `nodes`。`base` 是摆棋摆上去、
@@ -520,6 +527,11 @@ ctest --output-on-failure
 `set_position` 失败才走 `error`，成功回 `position_set`，其中 `position_pending: true` 表示局面已
 摆好但尚未开局：此时 `choose_side` 仍然可用，AI 不会自己落子。带 `board` 的文档必须说明 `encoding`
 （文件里写好，或 `check_position` 之后由玩家确认再带上），否则会被拒绝。
+
+`set_position` 抹掉上一局之前会先把它结算回它自己的会话文件：上一局有内容（落过子、摆过子或选过边）
+时按 `重开` 同款换一个新 token——旧文件留在旧 token 名下不再被覆写，客户端从随后的 `session` 帧里
+拿到新 token；只有没动过的空局才原地接着用。摆棋开局的上一局按已有导出规则不进 `records.jsonl`，
+只留在会话文件里。新局的会话文件 `created_ms` 从这一刻重新起算。
 
 ### 连接保活与重连
 
@@ -542,8 +554,9 @@ ctest --output-on-failure
 - 连接断开只是 **detach**：停止并 join 那条正在写这个 socket 的搜索线程、清空回调、立刻落一次盘，
   棋局本身留在表里 30 分钟。期间 `resume` 回来是热挂载；超过 30 分钟则退回磁盘态（快照进 cold
   索引、引擎释放掉），再 `resume` 时按记录重建棋盘——token 依旧有效。
-- 同一个 token 被第二个标签页 `resume` 时后到者接管：先关掉旧连接、停下它可能正在跑的思考，再按
-  当前局面重新武装 AI。
+- 同一个 token 被第二个标签页 `resume` 时后到者接管：先给旧连接发一帧 `session_taken_over` 再关掉
+  它、停下它可能正在跑的思考，再按当前局面重新武装 AI；旧标签页收到告知后不再自动重连（token 仍
+  保留，刷新可取回）。
 - 每 10 秒扫一遍会话表，把**内容变了**的会话原子写入 `data/sessions/<token>.json`（先写 `.tmp`
   再 rename，进程死在中途也不会留下半个文件）；一子未落的空会话不写，所以反复点“重开”不会攒出
   垃圾文件。收到退出信号时同样刷一遍，Ctrl+C 不会丢掉最后一个 10 秒。

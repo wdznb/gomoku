@@ -1531,3 +1531,54 @@ white stone then colliding). A2 and A3 passed at HEAD *by design*: they are beha
 observable set and the observable move, not fix detectors. Repo diff is 9 `src/` files plus 5 `tests/` files
 (+665/-40); the only file outside the dispatch list is `src/server/server.h`, which A6 needs for the new
 member. `data/`, `web/`, `README.md` and `CMakeLists.txt` untouched, no `gomoku_server` left running.
+
+## 轮次85 跳键拒绝收窄、分层进度帧与会话接管告知 — bugfix round 85 (phase5-bugfix)
+
+**Found.** Eleven verified defects, dispatched individually after the orchestrator read each site. F1 (round
+84) had narrowed too far the other way: the loader refused any partial params file whose *inherited
+defaults* violated the ladder or the combination floors, so `{"live_four":40000}` failed on the default
+`double_three`/`four_three` it never wrote - the refusal named keys the file did not contain. F2:
+`--resume ck.json` without `--checkpoint` kept writing the default file, so ck.json never advanced and the
+next resume replayed the same rounds and re-appended the same games to `records.jsonl` / `samples.jsonl`.
+F3: the only progress frame was the one at the end of the move, so a 16 s think was silent and the client's
+终止 button never armed. F4: VCF/VCT shared the whole deadline, leaving AlphaBeta the 100 ms floor and a
+depth-0 fallback into `root_moves[0]` still labelled `alphabeta` in the replay panel. F5: a game started by
+playing a stone on a hand-set position never claimed the colour, so `playerColor` stayed null, 悔棋/求招
+stayed disabled and a black win read as a loss. F6: the `games_played_` id base's comment claimed crash
+protection the write order does not give. G1: 摆棋 over a finished hand-set game overwrote that game's only
+file (its `base` keeps it out of `records.jsonl`). G2: a cold rebuild that failed still reused the token,
+contradicting README:476-478's "resumed:false + 新 token" and exposing the unreadable file to the next
+flush. G3: `moves` upload had no size cap before the per-coordinate walk. G4: 摆棋 inherited the replaced
+game's `created_ms`. H1: two tabs resuming one token evicted each other in a loop, every takeover re-running
+`halt_search` plus a flush, so the AI never got a stone down.
+
+**Fixed.** F1/F1b: the eight cross-key checks fire only when the rewritten end was explicitly in the file
+(presence bits recorded in the 12-key parse loop); an out-of-range written value is still refused, inherited
+defaults are left to `sanitize()`, whose body is untouched. F2: `--resume` is also the write-back target;
+an explicit `--checkpoint` naming a different file exits 1 at startup, and `--help` says so. F3:
+`AlphaBetaSearch` gained a progress callback invoked on the completed-layer branch only; the engine forwards
+its own callback (copied to a local first) and the trailing frame is unchanged. F4: named
+`kVcfBudgetPercent = 35` / `kVctBudgetPercent = 55` slices anchored at the search start; AlphaBeta keeps the
+full deadline, and a depth-0 AlphaBeta result reports `method == "greedy"` (README:520 lists greedy as a
+method). F5: `handleMoveMade` claims the side on the `waiting && playerColor === null && baseStones > 0`
+state, mirroring `chooseSide`'s success path and dropping the held-back 落子记录 the way `handleStateSync`
+does. F6: comment-only rewrite stating what the id base really buys. G1: before the wipe, a previous game
+with content is rotated onto its own token via the `handle_restart` mechanism (`detach_socket` +
+`open_session` + `attach_socket`), the new token announced through `send_session_state`; untouched boards
+keep the plain flush. G2: an unreadable record gets a fresh token through the same `make_token` avoidance
+loop; the old file stays on disk untouched. G3: `moves` beyond 225 coordinates is refused before the walk,
+`reserve` moved after the check. G4: the replacing position re-stamps `created_ms`/`updated_ms` to now, the
+same pair the cold-rebuild path sets. H1: the takeover branch sends
+`{"type":"session_taken_over","token":...}` before dropping the loser; `close()` now defers the TCP
+shutdown behind the write queue (Beast's own close handshake preempts queued writes - its close op takes the
+write lock before the write completion handler runs), and the client sets a taken-over flag that blocks
+`scheduleReconnect`, clears the timer, greys the controls and keeps the localStorage token. README was
+synced in the same round (the frame and its client handling, the 摆棋 token rotation, the unreadable-record
+wording, the `--resume` write-back and exit-1 rule).
+
+**Verified.** Fixer-side only at entry time: each item passed its permitted syntax self-check
+(`g++ -fsyntax-only` on the touched translation unit, `node --check web/app.js`), all clean; the F1
+regression that motivated F1b is on record (`test_training.cpp` failed on
+`from_json_string(R"({"live_four":40000})")` before the narrowing). The full `ctest` and web-harness
+regressions belong to the test session and were still pending when this entry was written; the batch was
+uncommitted in the tree.

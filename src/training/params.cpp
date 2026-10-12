@@ -162,9 +162,13 @@ bool CoefficientVector::from_json_string(const std::string& text, ThreatCoeffici
                      &coeffs.forbidden_penalty, &coeffs.position_weight_scale};
 
     int matched = 0;
+    // The keys the file states itself; the cross-key checks below refuse to
+    // rewrite a value the file wrote, never a default (present[] follows names[]).
+    bool present[12] = {};
     for (int i = 0; i < 12; ++i) {
         if (!body->contains(names[i])) continue;
         ++matched;
+        present[i] = true;
         const json& value = (*body)[names[i]];
         if (!value.is_number_integer()) {
             error = std::string(names[i]) + " must be an integer";
@@ -240,6 +244,68 @@ bool CoefficientVector::from_json_string(const std::string& text, ThreatCoeffici
                     ", " + std::to_string(bound.max_value) + "]";
             return false;
         }
+    }
+
+    // Files state these outright; sanitize()'s repairs are for optimizer
+    // candidates. Only a value the file actually wrote can be "rewritten": a
+    // relation whose other end was never named is left to sanitize(), which is
+    // what keeps a partial file legal.
+    const bool wrote_live_four = present[1];
+    const bool wrote_rush_four = present[2];
+    const bool wrote_live_three = present[3];
+    const bool wrote_sleepy_three = present[4];
+    const bool wrote_live_two = present[5];
+    const bool wrote_sleepy_two = present[6];
+    const bool wrote_double_four = present[7];
+    const bool wrote_double_three = present[8];
+    const bool wrote_four_three = present[9];
+    if (coeffs.rush_four > coeffs.live_four && wrote_rush_four) {
+        error = std::string("rush_four ") + std::to_string(coeffs.rush_four) +
+                " must not exceed live_four " + std::to_string(coeffs.live_four) +
+                (wrote_live_four ? "" : "（对端是默认值）");
+        return false;
+    }
+    if (coeffs.live_three > coeffs.rush_four && wrote_live_three) {
+        error = std::string("live_three ") + std::to_string(coeffs.live_three) +
+                " must not exceed rush_four " + std::to_string(coeffs.rush_four) +
+                (wrote_rush_four ? "" : "（对端是默认值）");
+        return false;
+    }
+    if (coeffs.sleepy_three > coeffs.live_three && wrote_sleepy_three) {
+        error = std::string("sleepy_three ") + std::to_string(coeffs.sleepy_three) +
+                " must not exceed live_three " + std::to_string(coeffs.live_three) +
+                (wrote_live_three ? "" : "（对端是默认值）");
+        return false;
+    }
+    if (coeffs.live_two > coeffs.sleepy_three && wrote_live_two) {
+        error = std::string("live_two ") + std::to_string(coeffs.live_two) +
+                " must not exceed sleepy_three " + std::to_string(coeffs.sleepy_three) +
+                (wrote_sleepy_three ? "" : "（对端是默认值）");
+        return false;
+    }
+    if (coeffs.sleepy_two > coeffs.live_two && wrote_sleepy_two) {
+        error = std::string("sleepy_two ") + std::to_string(coeffs.sleepy_two) +
+                " must not exceed live_two " + std::to_string(coeffs.live_two) +
+                (wrote_live_two ? "" : "（对端是默认值）");
+        return false;
+    }
+    if (coeffs.double_four < coeffs.live_four && wrote_double_four) {
+        error = std::string("double_four ") + std::to_string(coeffs.double_four) +
+                " must be at least live_four " + std::to_string(coeffs.live_four) +
+                (wrote_live_four ? "" : "（对端是默认值）");
+        return false;
+    }
+    if (coeffs.double_three < coeffs.live_four && wrote_double_three) {
+        error = std::string("double_three ") + std::to_string(coeffs.double_three) +
+                " must be at least live_four " + std::to_string(coeffs.live_four) +
+                (wrote_live_four ? "" : "（对端是默认值）");
+        return false;
+    }
+    if (coeffs.four_three < coeffs.live_four && wrote_four_three) {
+        error = std::string("four_three ") + std::to_string(coeffs.four_three) +
+                " must be at least live_four " + std::to_string(coeffs.live_four) +
+                (wrote_live_four ? "" : "（对端是默认值）");
+        return false;
     }
 
     sanitize(coeffs);

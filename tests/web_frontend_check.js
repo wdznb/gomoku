@@ -1238,6 +1238,112 @@ check('D4 click sends make_move on a pending position', () => {
     lastMsg = null;
     replaying.handleCanvasClick({ clientX: pad + 7 * cell, clientY: pad + 7 * cell });
     assert(lastMsg === null, 'replay view must still block clicks');
+
+    // F5: the first stone placed on a hand-set position claims the colour it was
+    // played for. The server names that colour on the move_made frame, and the
+    // page must take it up - staying waiting with no colour leaves 悔棋/求招 held
+    // for the whole game and reads a black win as a loss.
+    const claimed = newGame();
+    claimed.sendMessage = () => true;
+    claimed.gameStatus = 'waiting';
+    claimed.playerColor = null;
+    claimed.baseStones = [{ row: 7, col: 7, color: BLACK }];
+    claimed.board[7][7] = BLACK;
+    claimed.aiThinking = false;
+    claimed.replayIndex = null;
+    claimed.currentTurn = BLACK;
+    claimed.moveHistory = [{ row: 7, col: 7, color: BLACK }];
+    // Pre-state set here on purpose: the shared element map keeps whatever the
+    // earlier sub-cases left, and this asserts the handler, not those.
+    el('btn-undo').disabled = true;
+    el('btn-hint').disabled = true;
+    el('btn-resign').disabled = true;
+    el('btn-black').disabled = false;
+    el('btn-white').disabled = false;
+
+    claimed.handleMoveMade({ row: 8, col: 8, color: 'black' });
+    assert(claimed.playerColor === BLACK, 'the first stone claims its colour');
+    assert(claimed.gameStatus === 'playing', 'and the game is playing');
+    assert(el('btn-undo').disabled === false, '悔棋 comes back for the claimed side');
+    assert(el('btn-black').disabled === true && el('btn-white').disabled === true,
+           'the colour choice is over');
+
+    // Anti-regression: an ordinary game that already holds a colour keeps it. A
+    // white reply must not repaint the player's side or the status.
+    const settled = newGame();
+    settled.sendMessage = () => true;
+    settled.gameStatus = 'playing';
+    settled.playerColor = BLACK;
+    settled.baseStones = [];
+    settled.board[9][9] = WHITE;
+    settled.aiThinking = true;
+    settled.replayIndex = null;
+    settled.currentTurn = BLACK;
+
+    settled.handleMoveMade({ row: 9, col: 9, color: 'white' });
+    assert(settled.playerColor === BLACK, 'an ordinary game keeps its colour');
+    assert(settled.gameStatus === 'playing', 'and its status');
+});
+
+// H1: a second tab resuming the same token closes this socket. That close is not
+// a dead network - reconnecting re-sends `resume` with the same token and takes
+// the session back, once a second, with every handover halting the AI search.
+// The takeover notice must stop the retry loop while keeping the token, so a
+// manual refresh can still get the game back.
+check('H1 a session takeover stops the reconnect loop', () => {
+    // The frame the server sends the socket it is replacing. One constant: a
+    // rename on the server side is a one-line change here.
+    const TAKEOVER = 'session_taken_over';
+
+    const sandbox = bundle.sandbox;
+    const realSetTimeout = sandbox.setTimeout;
+    const realClearTimeout = sandbox.clearTimeout;
+    const armed = [];
+    const cleared = [];
+    sandbox.setTimeout = (fn, ms) => { armed.push({ fn, ms }); return 4242; };
+    sandbox.clearTimeout = (id) => { cleared.push(id); };
+    try {
+        const game = newGame();  // its constructor already opened one socket
+        const sent = [];
+        game.sendMessage = (msg) => { sent.push(msg); return true; };
+        game.sessionToken = 'a'.repeat(16);
+        sandbox.localStorage.setItem('gomoku.session.token', game.sessionToken);
+        game.wsAttempts = 0;
+        // A retry already pending, so "dropped" below is not vacuous.
+        game.wsReconnect = 4242;
+        const closeHandler = game.ws.onclose;  // wired by the constructor's openSocket
+        assert(typeof closeHandler === 'function', 'the socket must carry a close handler');
+
+        const socketsBefore = bundle.sockets.length;
+        game.handleServerMessage({ type: TAKEOVER, token: game.sessionToken });
+        assert(game.wsReconnect === null, 'the pending reconnect timer must be dropped');
+
+        // The server closes the socket right after the notice; the page must read
+        // that close as the takeover, not as a lost connection.
+        closeHandler();
+        assert(armed.length === 0, 'no reconnect may be armed after a takeover');
+        assert(bundle.sockets.length === socketsBefore, 'the socket must not be reopened');
+        assert(sent.filter((m) => m.type === 'resume').length === 0,
+               'no resume may go out after a takeover');
+
+        // The token survives: a manual refresh still finds the game.
+        assert(sandbox.localStorage.getItem('gomoku.session.token') === game.sessionToken,
+               'the token must stay for a manual refresh');
+
+        // Anti-false-positive: a plain drop (no notice) still reconnects.
+        armed.length = 0;
+        const normal = newGame();
+        normal.sendMessage = () => true;
+        const socketsBeforeNormal = bundle.sockets.length;
+        normal.ws.onclose();
+        assert(armed.length === 1, 'a plain drop still arms the reconnect');
+        armed[0].fn();
+        assert(bundle.sockets.length === socketsBeforeNormal + 1,
+               'and the retry really reopens the socket');
+    } finally {
+        sandbox.setTimeout = realSetTimeout;
+        sandbox.clearTimeout = realClearTimeout;
+    }
 });
 
 // C2a: the side buttons answer "is a colour still owed?", not "is a game

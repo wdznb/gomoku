@@ -358,11 +358,31 @@ void WebSocketSession::do_write() {
                 return;
             }
             self->send_queue_.pop();
+            if (self->send_queue_.empty() && self->close_after_drain_) {
+                self->drop_socket();
+                return;
+            }
             self->do_write();
         });
 }
 
 void WebSocketSession::close() {
+    // Deferred behind the write queue: a frame sent just before this (the
+    // takeover notice) must leave first. A plain TCP drop here would discard
+    // the queue, and Beast's close handshake cannot order it either - its
+    // close op takes the write lock the moment the in-flight write ends and
+    // runs before the write completion handler (write.hpp unlocks wr_block and
+    // invokes op_close first), preempting everything still queued.
+    net::post(ws_.get_executor(), [self = shared_from_this()] {
+        if (!self->send_queue_.empty()) {
+            self->close_after_drain_ = true;
+            return;
+        }
+        self->drop_socket();
+    });
+}
+
+void WebSocketSession::drop_socket() {
     // Not Beast's closing handshake: that waits for the peer to answer, and this
     // runs from another socket's handler on the one io thread, so a peer that is
     // already gone or never answers would stop the server for every game on it.
@@ -799,15 +819,38 @@ void GameServer::handle_set_position(std::shared_ptr<WebSocketSession> session, 
     auto it = games_.find(session.get());
     if (it == games_.end()) return;
 
-    auto& game = it->second;
-    if (game->is_ai_thinking()) {
+    if (it->second->is_ai_thinking()) {
         send_error(session, "AI 正在思考，请先停止再摆棋");
         return;
     }
     // Settle the previous game before this position wipes it: the 10s tick and
-    // the detach may both land after the reset, losing the finished game from
-    // the session file and from records.jsonl.
-    if (auto entry = entry_locked(session.get())) flush_entry(entry);
+    // the detach can both land after the reset, and a game with stones is its
+    // own only copy - a hand-set base keeps its record out of records.jsonl, so
+    // <token>.json is all there is. Rotating it onto its own token first is the
+    // same reuse-vs-rotate decision handle_restart makes; an untouched board has
+    // nothing to keep and is merely flushed in place.
+    if (const std::shared_ptr<TrackedGame> previous = entry_locked(session.get())) {
+        const ReplaySnapshot replay = previous->game->replay_snapshot();
+        const bool nothing_to_keep = replay.move_count == 0 && replay.base.empty() &&
+                                     !previous->side_chosen &&
+                                     !previous->game->position_pending();
+        if (nothing_to_keep) {
+            flush_entry(previous);
+        } else {
+            // detach_socket flushes the old game under its own token; the fresh
+            // token goes out right away, or the client keeps resuming the
+            // settled record with the token it still holds.
+            detach_socket(session.get());
+            const std::shared_ptr<TrackedGame> fresh = open_session(nullptr);
+            attach_socket(session, fresh);
+            send_session_state(session, fresh, false);
+        }
+    }
+    // The rotation above replaces this socket's game, so the lookup is redone
+    // before the position is installed.
+    it = games_.find(session.get());
+    if (it == games_.end()) return;
+    auto& game = it->second;
     if (!game->set_position(result.board)) {
         send_error(session, "无法摆上此局面");
         return;
@@ -824,6 +867,12 @@ void GameServer::handle_set_position(std::shared_ptr<WebSocketSession> session, 
         // Same for the export stamp: the game that was appended to
         // records.jsonl is over, and the position starts a fresh one.
         entry->exported = false;
+        // This position is a new game on a fresh clock: the old creation time
+        // belongs to the record that was just replaced, and leaving it would
+        // date the new file's header before its own board. The cold-rebuild
+        // path resets the same pair.
+        entry->created_ms = now_ms();
+        entry->updated_ms = entry->created_ms;
     }
     json reply;
     reply["type"] = "position_set";
@@ -1120,8 +1169,13 @@ std::shared_ptr<GameServer::TrackedGame> GameServer::open_session(const SessionS
     // Tokens name files, so a collision would overwrite another session. A
     // session rebuilt from disk keeps the token it was read under: the caller
     // already proved that token is not in sessions_, and the player holding the
-    // old URL must land on this game rather than a blank one.
-    if (from) {
+    // old URL must land on this game rather than a blank one. The two cases only
+    // diverge when the rebuild FAILED: then the token's file is the unreadable
+    // record itself, which stays on disk for a human to look at and must not be
+    // written over by this fresh game's flushes - so that one gets a new token,
+    // and resumed:false with a new token is what README:476 promises for a
+    // record nobody could read.
+    if (from && !unreadable_record) {
         entry->token = from->token;
     } else {
         std::string token = make_token();
@@ -1133,10 +1187,9 @@ std::shared_ptr<GameServer::TrackedGame> GameServer::open_session(const SessionS
         entry->unreadable_record = true;
         // Stamp the fresh empty game with exactly what a flush would write for
         // it, so flush_entry's dedup returns early instead of taking its
-        // empty-board branch - that branch deletes the residue file, and this
-        // token's file is the unreadable record a human is meant to be able to
-        // open. Once the player actually moves here the payloads differ again and
-        // the session is written as usual.
+        // empty-board branch - that branch deletes the file named by the token,
+        // and this game has not created one yet. The unreadable record itself
+        // stays on disk under its own, now unused, token.
         SessionSnapshot empty_probe = snapshot_of(*entry);
         empty_probe.created_ms = 0;
         empty_probe.updated_ms = 0;
@@ -1230,15 +1283,22 @@ void GameServer::handle_resume(std::shared_ptr<WebSocketSession> session, const 
                 entry = hot->second;
                 resumed = true;
                 if (entry->attached && entry->attached != session.get()) {
-                    // Last claim wins, and the tab that loses one gets an error on
-                    // its next read rather than a silent freeze: closing it here is
-                    // what produces that. Its own detach lands later and leaves the
-                    // session alone, because the entry is about to name this socket.
+                    // Last claim wins. The loser is told why before it is dropped:
+                    // without the notice its client reconnects and resumes the
+                    // same token, and the two tabs evict each other in a loop,
+                    // every takeover re-running halt_search and a flush. It then
+                    // gets an error on its next read rather than a silent freeze.
+                    // Its own detach lands later and leaves the session alone,
+                    // because the entry is about to name this socket.
                     WebSocketSession* previous = entry->attached;
                     entry->attached = nullptr;
                     entry->detached_ms = now_ms();
                     games_.erase(previous);
                     socket_tokens_.erase(previous);
+                    json taken_over;
+                    taken_over["type"] = "session_taken_over";
+                    taken_over["token"] = entry->token;
+                    previous->send(taken_over);
                     previous->close();
                     // The search that tab left behind is stopped before this
                     // socket takes over its callbacks: the worker reads them while

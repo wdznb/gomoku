@@ -176,6 +176,43 @@ GameRestore playing_restore(int moves) {
     return restore;
 }
 
+// The document the client's 确认 sends for a two-stone hand-set position: one
+// black stone and one white, so the position is legal and BLACK is to move.
+json hand_set_position_doc() {
+    json matrix = json::array();
+    for (int r = 0; r < BOARD_SIZE; ++r) {
+        json row = json::array();
+        for (int c = 0; c < BOARD_SIZE; ++c) row.push_back(0);
+        matrix.push_back(std::move(row));
+    }
+    matrix[7][3] = 1;  // black
+    matrix[7][4] = 2;  // white
+    return json{{"version", 1},
+                {"type", "gomoku_position"},
+                {"encoding", {{"black", 1}, {"white", 2}, {"empty", 0}}},
+                {"board", matrix}};
+}
+
+// The shape a 摆棋 → 执黑 → 五连 game leaves behind: two base stones on the board
+// and a finished, decisive record. base is non-empty, so the game stays in its
+// session file and out of records.jsonl.
+GameRestore hand_set_finished() {
+    GameRestore restore;
+    restore.base = {Move(7, 3, BLACK), Move(7, 8, WHITE)};
+    restore.player_color = BLACK;
+    restore.status = GameStatus::GAME_OVER;
+    restore.winner = BLACK;
+    restore.reason = "five";
+    const Position line[7] = {{7, 4}, {0, 1}, {7, 5}, {0, 2}, {7, 6}, {0, 3}, {7, 7}};
+    for (int i = 0; i < 7; ++i) {
+        MoveAnalysis analysis;
+        analysis.move = Move(line[i].row, line[i].col, i % 2 == 0 ? BLACK : WHITE);
+        analysis.method = "human";
+        restore.moves.push_back(analysis);
+    }
+    return restore;
+}
+
 // One GameServer with one socket and one fresh session, wired exactly the way
 // ensure_attached wires them after a handshake.
 struct Harness {
@@ -236,8 +273,12 @@ void test_undo_reopens_export() {
 
 // Round 72, handle_set_position: the position starts a fresh game, so the
 // export stamp of the finished one is cleared and the next decisive game on the
-// same token is exported again. An empty hand-set position is the shape that
+// new token is exported again. An empty hand-set position is the shape that
 // keeps the token exportable - base stones suspend the export by design.
+//
+// R85 G1: a session whose game already ended keeps its token and file, and the
+// new position is handed a token of its own - so the state checks below re-read
+// the socket's entry instead of the Harness's construction-time one.
 void test_set_position_reopens_export() {
     const auto dir = scratch("setup_sessions");
     const auto records = scratch("setup_records.jsonl");
@@ -247,23 +288,35 @@ void test_set_position_reopens_export() {
         h.server.flush_entry(h.entry);
         assert(records_lines(records) == 1);
         assert(h.entry->exported);
+        const std::string before = read_text(h.session_file());
 
         h.server.handle_set_position(
             h.socket, json{{"position", {{"version", 1}, {"moves", json::array()}}}});
-        assert(h.entry->game->position_pending());
-        assert(!h.entry->exported);
-        assert(!h.entry->side_chosen);
+        const std::shared_ptr<GameServer::TrackedGame> after =
+            h.server.entry_locked(h.socket.get());
+        assert(after);
+        assert(after->game->position_pending());
+        assert(!after->exported);
+        assert(!after->side_chosen);
+        assert(after->token != h.entry->token);
 
-        // A zero-stone session is not kept: the finished game's file goes with it.
-        h.server.flush_entry(h.entry);
-        assert(!std::filesystem::exists(h.session_file()));
-
-        // A second, different game finishing on the same token exports again.
-        assert(h.entry->game->restore_game(five_restore(WHITE)));
-        h.server.flush_entry(h.entry);
-        assert(records_lines(records) == 2);
-        assert(h.entry->exported);
+        // G1 keeps the finished game's file on purpose: the new position rides
+        // on a token of its own, so nothing overwrote the old one.
         assert(std::filesystem::exists(h.session_file()));
+        assert(read_text(h.session_file()) == before);
+
+        // A zero-stone session is not kept: the new token gets no file of its own.
+        h.server.flush_entry(after);
+        const std::filesystem::path new_file =
+            std::filesystem::path(h.server.sessions_dir_) / (after->token + ".json");
+        assert(!std::filesystem::exists(new_file));
+
+        // A second, different game finishing on the new token exports again.
+        assert(after->game->restore_game(five_restore(WHITE)));
+        h.server.flush_entry(after);
+        assert(records_lines(records) == 2);
+        assert(after->exported);
+        assert(std::filesystem::exists(new_file));
     }
     std::error_code ec;
     std::filesystem::remove_all(dir, ec);
@@ -846,11 +899,13 @@ void test_resign_survives_interruption() {
     std::cout << "test_resign_survives_interruption passed" << std::endl;
 }
 
-// Round 79, A6: a session file whose record cannot be rebuilt (open_session
-// falls back to a fresh empty game) must stay on disk byte for byte while the
-// game is still stone-less: choosing a side alone changes the flushed payload,
-// which used to send flush_entry's empty-board branch into delete_session - the
-// very file the token names.
+// Round 79, A6 (contract updated in R85): a session file whose record cannot be
+// rebuilt (open_session falls back to a fresh empty game) must stay on disk byte
+// for byte while the game is still stone-less: choosing a side alone changes the
+// flushed payload, which used to send flush_entry's empty-board branch into
+// delete_session - the very file the token names. The game the player gets is not
+// the damaged token's any more (README:476-477 hands out a fresh one), so the
+// entry is found through the socket and the old file is what must survive.
 void test_unreadable_record_file_survives() {
     const auto dir = scratch("unreadable_sessions");
     const auto records = scratch("unreadable_records.jsonl");
@@ -870,10 +925,11 @@ void test_unreadable_record_file_survives() {
         h.server.load_saved_sessions();  // start() does this; handlers are driven directly here
         h.server.handle_resume(h.socket, json{{"token", "deadbeef"}});
 
-        const auto it = h.server.sessions_.find("deadbeef");
-        assert(it != h.server.sessions_.end());
-        const std::shared_ptr<GameServer::TrackedGame>& resumed = it->second;
-        assert(resumed->token == "deadbeef");
+        const std::shared_ptr<GameServer::TrackedGame> resumed =
+            h.server.entry_locked(h.socket.get());
+        assert(resumed);
+        assert(resumed->token != "deadbeef");
+        assert(resumed->unreadable_record);
         assert(!resumed->rebuilt);
         // The caller gets an empty game, not a half-replayed one.
         assert(resumed->game->replay_snapshot().move_count == 0);
@@ -1013,6 +1069,220 @@ void test_resign_needs_a_played_ply_not_base_stones() {
     std::cout << "test_resign_needs_a_played_ply_not_base_stones passed" << std::endl;
 }
 
+// R85 G1: 摆棋 replaces the game a session is playing, but a game that already
+// ended is finished business: its file must survive it and the new position must
+// start on a token of its own, which the client is told. HEAD kept the entry - and
+// its token - so the next flush wrote the new position over the finished game's
+// file, destroying the only copy of a game that base stones keep out of
+// records.jsonl.
+void test_set_position_rotates_token_after_finished_game() {
+    const auto dir = scratch("rotate_sessions");
+    const auto records = scratch("rotate_records.jsonl");
+    {
+        Harness h(dir, records);
+        assert(h.entry->game->restore_game(hand_set_finished()));
+        h.server.flush_entry(h.entry);
+
+        const std::string old_token = h.entry->token;
+        const std::filesystem::path old_file =
+            std::filesystem::path(h.server.sessions_dir_) / (old_token + ".json");
+        assert(std::filesystem::exists(old_file));
+        const std::string before = read_text(old_file);
+        SessionSnapshot old_snap;
+        std::string error;
+        assert(load_session(h.server.sessions_dir_, old_token, old_snap, error));
+        assert(!old_snap.base.empty());
+        const size_t old_moves = old_snap.record.moves.size();
+        assert(old_moves == hand_set_finished().moves.size());
+
+        size_t seen = 0;
+        h.server.handle_set_position(h.socket, json{{"position", hand_set_position_doc()}});
+        const std::vector<std::string> frames = drain_frames(h.server, h.socket, seen);
+
+        std::string told_token;
+        for (const std::string& frame : frames) {
+            const json parsed = json::parse(frame);
+            if (parsed["type"] == "session") {
+                told_token = parsed["token"].get<std::string>();
+            }
+        }
+        assert(!told_token.empty());     // the page must learn where the new game is
+        assert(told_token != old_token); // and it is not the finished game's token
+
+        const std::shared_ptr<GameServer::TrackedGame> after =
+            h.server.entry_locked(h.socket.get());
+        assert(after && after->token == told_token);
+        h.server.flush_entry(after);
+
+        // The finished game's file is intact, stone for stone.
+        assert(std::filesystem::exists(old_file));
+        assert(read_text(old_file) == before);
+        SessionSnapshot reread;
+        assert(load_session(h.server.sessions_dir_, old_token, reread, error));
+        assert(!reread.base.empty());
+        assert(reread.record.moves.size() == old_moves);
+
+        // And the new position landed on the new token, with its own base stones.
+        SessionSnapshot fresh_snap;
+        assert(load_session(h.server.sessions_dir_, told_token, fresh_snap, error));
+        assert(fresh_snap.base.size() == 2);
+        assert(fresh_snap.record.moves.empty());
+        assert(records_lines(records) == 0);  // a base game never exports
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    std::filesystem::remove(records, ec);
+    std::cout << "test_set_position_rotates_token_after_finished_game passed" << std::endl;
+}
+
+// R85 G4: the timestamps in a session file say when that file's game began and was
+// last touched. Replacing the game with a hand-set position must re-stamp
+// created_ms - keeping the replaced game's birth time would date the new position
+// from a game that is over.
+void test_set_position_restamps_session_created_ms() {
+    const auto dir = scratch("created_sessions");
+    const auto records = scratch("created_records.jsonl");
+    {
+        Harness h(dir, records);
+        assert(h.entry->game->restore_game(hand_set_finished()));
+        h.server.flush_entry(h.entry);
+
+        SessionSnapshot old_snap;
+        std::string error;
+        assert(load_session(h.server.sessions_dir_, h.entry->token, old_snap, error));
+        assert(old_snap.created_ms > 0);
+
+        const long long placed_ms = static_cast<long long>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch())
+                .count());
+
+        h.server.handle_set_position(h.socket, json{{"position", hand_set_position_doc()}});
+        const std::shared_ptr<GameServer::TrackedGame> after =
+            h.server.entry_locked(h.socket.get());
+        assert(after);
+        h.server.flush_entry(after);
+
+        SessionSnapshot fresh_snap;
+        assert(load_session(h.server.sessions_dir_, after->token, fresh_snap, error));
+        assert(fresh_snap.created_ms != old_snap.created_ms);
+        assert(fresh_snap.created_ms >= old_snap.created_ms);
+        // Within the minute the position was placed in, not last week's game.
+        assert(fresh_snap.created_ms <= placed_ms + 60000);
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    std::filesystem::remove(records, ec);
+    std::cout << "test_set_position_restamps_session_created_ms passed" << std::endl;
+}
+
+// R85 G2: a token whose file cannot be rebuilt is not a game to come back to. The
+// resume must answer resumed:false AND hand the client a different token
+// (README:476-477), leaving the unreadable file on disk untouched - HEAD answered
+// with the same token, so the next flush overwrote the file with the fresh game.
+void test_unreadable_resume_gets_a_fresh_token() {
+    const auto dir = scratch("freshtoken_sessions");
+    const auto records = scratch("freshtoken_records.jsonl");
+    std::filesystem::create_directories(dir);
+
+    // Schema-valid envelope whose record cannot be replayed: cell (7,7) twice.
+    const std::string damaged =
+        R"({"version":1,"type":"gomoku_session","token":"deadbeef","status":"playing",)"
+        R"("record":{"moves":[{"row":7,"col":7,"color":"black","method":"human"},)"
+        R"({"row":7,"col":7,"color":"white","method":"human"}],)"
+        R"("winner":"draw","reason":"invalid"}})";
+    { std::ofstream file(dir / "deadbeef.json"); file << damaged; }
+
+    {
+        Harness h(dir, records);
+        h.server.load_saved_sessions();
+
+        size_t seen = 0;
+        h.server.handle_resume(h.socket, json{{"token", "deadbeef"}});
+        const std::vector<std::string> frames = drain_frames(h.server, h.socket, seen);
+
+        bool saw_unresumed = false;
+        std::string told_token;
+        for (const std::string& frame : frames) {
+            const json parsed = json::parse(frame);
+            if (parsed["type"] != "session") continue;
+            assert(parsed["resumed"] == false);  // it could not be rebuilt
+            saw_unresumed = true;
+            told_token = parsed["token"].get<std::string>();
+        }
+        assert(saw_unresumed);
+        assert(told_token != "deadbeef");  // a token that names nothing usable
+        assert(read_text(dir / "deadbeef.json") == damaged);
+
+        // Playing a stone on the fresh game must not write over the file either.
+        h.server.handle_make_move(h.socket, json{{"row", 9}, {"col", 9}});
+        const std::shared_ptr<GameServer::TrackedGame> live =
+            h.server.entry_locked(h.socket.get());
+        assert(live);
+        h.server.flush_entry(live);
+        assert(read_text(dir / "deadbeef.json") == damaged);
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    std::filesystem::remove(records, ec);
+    std::cout << "test_unreadable_resume_gets_a_fresh_token passed" << std::endl;
+}
+
+// H1: two tabs on one token fight over it, and the loser used to be cut off
+// without a word. A bare close is indistinguishable from a dead network, so the
+// loser reconnects, resumes the same token and takes the game back - once a
+// second, with every handover halting the AI search. The notice has to reach the
+// socket being replaced, before or with the close.
+void test_resume_takeover_notifies_the_loser() {
+    const auto dir = scratch("takeover_sessions");
+    const auto records = scratch("takeover_records.jsonl");
+    {
+        // The frame the server sends the socket it is replacing. One constant:
+        // a rename on the server side is a one-line change here.
+        const std::string kTakeoverFrame = "session_taken_over";
+
+        Harness h(dir, records);  // socket A, attached to the token
+        const std::string token = h.entry->token;
+
+        auto second = std::make_shared<WebSocketSession>(tcp::socket(h.server.ioc_), std::string());
+        size_t seen_second = 0;
+        h.server.handle_resume(second, json{{"token", token}});
+
+        const std::vector<std::string> second_frames = drain_frames(h.server, second, seen_second);
+        bool second_resumed = false;
+        for (const std::string& frame : second_frames) {
+            const json parsed = json::parse(frame);
+            if (parsed["type"] == "session") second_resumed = (parsed["resumed"] == true);
+        }
+        assert(second_resumed);  // the newcomer took the session
+
+        // The replaced socket gets exactly one notice, and it is in its queue
+        // although the socket has already been shut down: the notice was handed
+        // to the writer before the close, which is what makes it observably
+        // different from a dropped connection.
+        size_t seen_first = 0;
+        const std::vector<std::string> first_frames = drain_frames(h.server, h.socket, seen_first);
+        int notices = 0;
+        for (const std::string& frame : first_frames) {
+            const json parsed = json::parse(frame);
+            if (parsed["type"] == kTakeoverFrame) {
+                ++notices;
+                if (parsed.contains("token")) assert(parsed["token"] == token);
+            }
+        }
+        assert(notices == 1);
+        assert(!h.socket->ws_.next_layer().socket().is_open());  // and it is closed
+
+        const auto entry_it = h.server.sessions_.find(token);
+        assert(entry_it != h.server.sessions_.end());
+        assert(entry_it->second->attached == second.get());
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    std::filesystem::remove(records, ec);
+    std::cout << "test_resume_takeover_notifies_the_loser passed" << std::endl;
+}
+
 }  // namespace
 
 int main() {
@@ -1032,6 +1302,10 @@ int main() {
     test_resign_survives_interruption();
     test_unreadable_record_file_survives();
     test_resign_needs_a_played_ply_not_base_stones();
+    test_set_position_rotates_token_after_finished_game();
+    test_set_position_restamps_session_created_ms();
+    test_unreadable_resume_gets_a_fresh_token();
+    test_resume_takeover_notifies_the_loser();
 
     std::cout << "All server tests passed!" << std::endl;
     return 0;

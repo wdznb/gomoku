@@ -52,9 +52,15 @@ private:
     // Queue access and write initiation all run on ws_'s executor (posted
     // from send()), so no separate mutex is needed.
     std::queue<std::string> send_queue_;
+    // Set by close() when the queue was not empty: the shutdown waits for the
+    // drain in do_write() so a frame sent just before close() still leaves.
+    bool close_after_drain_ = false;
     
     void do_read();
     void do_write();
+    // TCP shutdown without a handshake; close() reaches it only once the write
+    // queue is empty.
+    void drop_socket();
     // Slide the socket's idle deadline forward. Beast's tcp_stream expiry is one
     // absolute deadline shared by every later operation, so it has to be re-armed
     // by hand or it caps the connection's lifetime instead of its silence.

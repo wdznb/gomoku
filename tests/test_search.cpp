@@ -520,6 +520,97 @@ void test_search_engine_layered() {
     std::cout << "test_search_engine_layered passed (method: " << result.method << ")" << std::endl;
 }
 
+// R85 F3: the thinking strip is fed by the engine's progress callback. Only the
+// frame at the end of search() used to arrive, so a multi-second think showed one
+// jump at the end. The callback must fire once per completed iterative-deepening
+// layer, with strictly rising depths, while search() is still running (that is
+// what lets 终止 appear during the think rather than after it).
+void test_engine_progress_callback_reports_each_layer() {
+    Board board;
+    build_midgame(board);
+    SearchEngine engine;
+    // The tactical phases can return a proven win before AlphaBeta runs at all,
+    // which would leave no layer frames to check; the callback under test is
+    // AlphaBeta's, so they are switched off for this probe.
+    engine.set_vcf_enabled(false);
+    engine.set_vct_enabled(false);
+
+    std::vector<int> depths;
+    bool search_returned = false;
+    bool any_after_return = false;
+    engine.set_progress_callback([&](int depth, int, int) {
+        if (search_returned) any_after_return = true;
+        depths.push_back(depth);
+    });
+
+    std::atomic<bool> stop(false);
+    SearchResult result = engine.search(board, WHITE, 8, 3000, stop);
+    search_returned = true;
+
+    assert(result.best_move.pos.is_valid());
+    assert(!any_after_return);
+    assert(depths.size() >= 2);
+    // The engine's closing frame repeats the last layer's depth on purpose - it
+    // carries the final node/elapsed totals for the UI - so the sequence is
+    // non-decreasing with at least one real jump between layers.
+    bool rose = false;
+    for (size_t i = 1; i < depths.size(); ++i) {
+        assert(depths[i] >= depths[i - 1]);
+        if (depths[i] > depths[i - 1]) rose = true;
+    }
+    assert(rose);
+
+    std::cout << "test_engine_progress_callback_reports_each_layer passed ("
+              << depths.size() << " layers, last depth " << depths.back() << ")" << std::endl;
+}
+
+// R85 F4: the tactical phases used to share one absolute deadline with AlphaBeta,
+// so a position where VCF/VCT spend the budget left AlphaBeta the 100 ms floor and
+// a depth-0 result. A defender position with rush-four candidates must still come
+// back with at least one completed AlphaBeta layer and not the greedy fallback.
+void test_engine_keeps_alphabeta_time_after_tactics() {
+    // A midgame where the side to move has a rush-four candidate that dead-ends:
+    // WHITE (9,5)(9,6)(9,7) blocked at (9,4) can fill (9,8), but the four that
+    // makes completes only at (9,9), so the tactical phases have work to do and
+    // no win to prove. (build_midgame's WHITE three does win outright - VCF
+    // returns a mate at depth 0 - so it cannot show what AlphaBeta gets.)
+    Board board;
+    board.place_stone(9, 5, WHITE);
+    board.place_stone(9, 6, WHITE);
+    board.place_stone(9, 7, WHITE);
+    board.place_stone(9, 4, BLACK);
+    board.place_stone(7, 7, BLACK);
+    board.place_stone(7, 8, BLACK);
+    board.place_stone(7, 9, BLACK);
+    board.place_stone(5, 5, BLACK);
+    board.place_stone(10, 4, BLACK);
+    board.place_stone(11, 11, BLACK);
+    board.place_stone(4, 9, WHITE);
+    board.place_stone(3, 11, WHITE);
+    board.place_stone(2, 2, WHITE);
+    assert(board.move_count() == 13);
+
+    SearchEngine engine;
+
+    std::atomic<bool> stop(false);
+    SearchResult result = engine.search(board, WHITE, 8, 3000, stop);
+    assert(result.best_move.pos.is_valid());
+    assert(result.depth >= 1);
+    assert(result.method != "greedy");
+    std::cout << "test_engine_keeps_alphabeta_time_after_tactics passed (method "
+              << result.method << ", depth " << result.depth << ")" << std::endl;
+
+    // A budget too small for the tactical phases must not fabricate a deep
+    // answer either: the greedy fallback is allowed, but a depth-0 "alphabeta"
+    // method would claim a search that never completed a layer.
+    SearchResult quick = engine.search(board, WHITE, 8, 120, stop);
+    assert(quick.best_move.pos.is_valid());
+    assert(!(quick.method == "alphabeta" && quick.depth == 0));
+    std::cout << "  short budget: method " << quick.method << ", depth " << quick.depth
+              << ", best (" << quick.best_move.pos.row << "," << quick.best_move.pos.col
+              << ")" << std::endl;
+}
+
 void test_search_engine_finds_five() {
     Board board;
     SearchEngine engine;
@@ -885,7 +976,7 @@ void test_opening_book_large_weight_no_overflow() {
     // Two candidates share one key, each with a weight near 2^31. The old code
     // summed them into a signed int, overflowing into UB and a negative
     // uniform_int_distribution range. The pick must be computed in 64-bit and
-    // still return one of the two legal replies.
+    // still return one of the key's legal replies.
     OpeningBook book;
     const int big = 2000000000;
     book.add_line({{7, 7}, {8, 8}, {6, 6}}, big, "a");
@@ -897,8 +988,14 @@ void test_opening_book_large_weight_no_overflow() {
 
     Move response;
     assert(book.query(board.move_history(), BLACK, response));
-    bool ok = (response.pos.row == 6 && (response.pos.col == 6 || response.pos.col == 7));
-    assert(ok);
+    // The ordered key (7,7),(8,8) is held only by the variants that fix both
+    // stones - identity and transpose - and the transpose mirror of (6,7) is
+    // (7,6), so this key legitimately holds three replies: (6,6), (6,7) and
+    // (7,6). (6,6) is its own mirror and so weighs twice; the weighted pick may
+    // land on any of the three.
+    assert(response.color == BLACK);
+    assert(response.pos == Position(6, 6) || response.pos == Position(6, 7) ||
+           response.pos == Position(7, 6));
 
     std::cout << "test_opening_book_large_weight_no_overflow passed" << std::endl;
 }
@@ -1966,6 +2063,8 @@ int main() {
     test_search_engine_uses_book();
     test_search_engine_ignores_book_midgame();
     test_search_engine_layered();
+    test_engine_progress_callback_reports_each_layer();
+    test_engine_keeps_alphabeta_time_after_tactics();
     test_search_engine_finds_five();
     test_controller_async();
     test_controller_stop();

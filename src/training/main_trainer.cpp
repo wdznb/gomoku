@@ -49,7 +49,9 @@ void print_usage(const char* program) {
         "  --samples PATH              Append training samples as JSONL\n"
         "  --checkpoint PATH           Round-by-round resume state\n"
         "                              (data/training/checkpoint.json)\n"
-        "  --resume PATH               Continue from this checkpoint\n"
+        "  --resume PATH               Continue from this checkpoint, and write the\n"
+        "                              rest of the run back to it; when --checkpoint\n"
+        "                              is given too, the two must name one file\n"
         "  --quiet                     Only print the final result\n"
         "  --help                      Show this text\n";
 }
@@ -139,6 +141,7 @@ int main(int argc, char** argv) {
     // a training run should never dirty the repository.
     std::string out_path = "data/training/best_params.json";
     std::string checkpoint_path = "data/training/checkpoint.json";
+    bool checkpoint_given = false;
     bool quiet = false;
 
     try {
@@ -203,6 +206,7 @@ int main(int argc, char** argv) {
                 config.samples_path = require_value("--samples", i, argc, argv);
             } else if (flag == "--checkpoint") {
                 checkpoint_path = require_value("--checkpoint", i, argc, argv);
+                checkpoint_given = true;
             } else if (flag == "--resume") {
                 resume_path = require_value("--resume", i, argc, argv);
             } else if (flag == "--quiet") {
@@ -231,6 +235,22 @@ int main(int argc, char** argv) {
         std::cerr << "Error: --depth, --timeout-ms and --max-moves must be positive"
                   << " (--max-moves at least 2)" << std::endl;
         return 1;
+    }
+
+    // --resume names the file being read, so it is also the file being written
+    // back: without this, --resume ck.json without --checkpoint kept writing the
+    // default file and ck.json never advanced, so the next resume replayed the
+    // same rounds. When both are given they must agree - silently picking one
+    // would leave the other stale.
+    if (!resume_path.empty()) {
+        if (!checkpoint_given) {
+            checkpoint_path = resume_path;
+        } else if (checkpoint_path != resume_path) {
+            std::cerr << "Error: --checkpoint " << checkpoint_path << " and --resume "
+                      << resume_path << " must name the same file when both are given"
+                      << std::endl;
+            return 1;
+        }
     }
 
     config.params_path = out_path;

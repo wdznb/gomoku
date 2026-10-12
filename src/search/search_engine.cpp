@@ -4,6 +4,16 @@
 
 namespace gomoku {
 
+namespace {
+
+// AlphaBeta keeps the tail of the move budget: while VCF/VCT shared the whole
+// deadline, an expensive tactical phase left AlphaBeta only the 100 ms floor
+// and a depth-0 fallback (README:336 wants deeper searches to get more time).
+constexpr int kVcfBudgetPercent = 35;
+constexpr int kVctBudgetPercent = 55;
+
+}
+
 SearchEngine::SearchEngine()
     : book_enabled_(true),
       vcf_enabled_(true), vct_enabled_(true), alphabeta_enabled_(true),
@@ -128,17 +138,21 @@ SearchResult SearchEngine::search(const Board& board, int color,
         }
     }
 
-    // One absolute wall-clock budget shared by the VCF, VCT and AlphaBeta
-    // phases. VCF/VCT otherwise bound work only by node_limit_ (1M / 500K), so
-    // they can overrun time_limit_ms by seconds before AlphaBeta even starts;
-    // anchoring them to a common deadline keeps the whole move within budget.
+    // One absolute wall-clock budget for AlphaBeta and the resign probe; the
+    // tactical phases get slices of it below, measured from the same start.
+    // VCF/VCT otherwise bound work only by node_limit_ (1M / 500K), so without
+    // any deadline they overrun time_limit_ms by seconds before AlphaBeta starts.
     const bool has_deadline = (time_limit_ms > 0);
-    auto search_deadline = std::chrono::steady_clock::now()
+    const auto search_start = std::chrono::steady_clock::now();
+    auto search_deadline = search_start
                            + std::chrono::milliseconds(has_deadline ? time_limit_ms : 0);
 
     if (vcf_enabled_ && !stop_flag.load()) {
         VCFSearch vcf(evaluator_, tt_alphabeta_);
-        if (has_deadline) vcf.set_deadline(search_deadline);
+        if (has_deadline) {
+            vcf.set_deadline(search_start + std::chrono::milliseconds(
+                static_cast<long long>(time_limit_ms) * kVcfBudgetPercent / 100));
+        }
         VCFMove vcf_result = vcf.search(board, color, vcf_max_depth_, stop_flag);
         if (vcf_result.result == VCFResult::WIN) {
             result.best_move = vcf_result.best_move;
@@ -156,7 +170,10 @@ SearchResult SearchEngine::search(const Board& board, int color,
 
     if (vct_enabled_ && !stop_flag.load()) {
         VCTSearch vct(evaluator_, tt_alphabeta_);
-        if (has_deadline) vct.set_deadline(search_deadline);
+        if (has_deadline) {
+            vct.set_deadline(search_start + std::chrono::milliseconds(
+                static_cast<long long>(time_limit_ms) * kVctBudgetPercent / 100));
+        }
         VCTMove vct_result = vct.search(board, color, vct_max_depth_, stop_flag);
         if (vct_result.result == VCTResult::WIN) {
             result.best_move = vct_result.best_move;
@@ -169,10 +186,20 @@ SearchResult SearchEngine::search(const Board& board, int color,
 
     if (alphabeta_enabled_ && !stop_flag.load()) {
         AlphaBetaSearch ab(evaluator_, tt_alphabeta_);
-        // Same absolute deadline the VCF/VCT phases were given: remaining_time
-        // below is only this phase's slice, so on its own it lets the move
-        // overshoot by that whole slice once the tactics phases spent it.
+        // The absolute end-of-move deadline, not a slice: remaining_time below
+        // is only this phase's share of the budget, so on its own it lets the
+        // move overshoot by that whole share once the tactics phases spent it.
         if (has_deadline) ab.set_deadline(search_deadline);
+        // Iteration-level frames for the client: the frame at the end of this
+        // function only lands once the whole search is over, which is too late
+        // for its 终止 button. The member is copied out first so the hook carries
+        // its own value.
+        const ProgressCallback progress_cb = progress_callback_;
+        if (progress_cb) {
+            ab.set_progress_callback([progress_cb](int depth, int nodes, int elapsed_ms) {
+                progress_cb(depth, nodes, elapsed_ms);
+            });
+        }
         int remaining_time = time_limit_ms;
         auto elapsed = std::chrono::high_resolution_clock::now() - start;
         int used_ms = static_cast<int>(
@@ -200,6 +227,10 @@ SearchResult SearchEngine::search(const Board& board, int color,
         result.depth = info.depth;
         result.nodes_searched = info.nodes_searched;
         result.method = "alphabeta";
+        // Depth 0 means not one iteration finished and AlphaBeta fell back to
+        // root_moves[0]; calling that alphabeta showed depth 0 / score 0 in the
+        // replay panel (README:513 lists greedy as a method).
+        if (info.depth == 0) result.method = "greedy";
         result.elapsed_ms = info.elapsed_ms;
 
         // AlphaBeta proved the loss itself (mate threshold, side-to-move

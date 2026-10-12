@@ -2224,6 +2224,186 @@ void test_params_rejects_out_of_range_tunables() {
     std::cout << "test_params_rejects_out_of_range_tunables passed" << std::endl;
 }
 
+// R85 F1: a file's stated values must survive the load. from_json_string used to
+// check each key against its own bound and then call sanitize(), whose two
+// cross-key repairs (the strength ladder and the double_*/four_three floor)
+// silently rewrote file values inside their bounds: live_two=1000 loaded as 30,
+// double_four=10000 under live_four=40000 loaded as 40000. The reader must refuse
+// such a file with the offending keys named instead.
+void test_params_rejects_cross_key_rewrites() {
+    std::string error;
+    ThreatCoefficients parsed;
+
+    // A. Every adjacent pair of the strength ladder, inverted one at a time, all
+    // values inside their own bounds so only the cross-key rule can catch them.
+    // The refusal names the first adjacent pair the ladder finds broken, so the
+    // only key pinned here is the one this file asks too much of - the sentence
+    // around it, and the counterpart it is compared against, are free to change.
+    const struct {
+        const char* text;
+        const char* weaker;
+        int asked;
+        int neighbour;
+    } ladder[] = {
+        {R"({"live_four":1500,"rush_four":2000})", "rush_four", 2000, 1500},
+        {R"({"rush_four":300,"live_three":8000})", "live_three", 8000, 300},
+        {R"({"live_three":150,"sleepy_three":2000})", "sleepy_three", 2000, 150},
+        {R"({"sleepy_three":30,"live_two":1000})", "live_two", 1000, 30},
+        {R"({"live_two":10,"sleepy_two":500})", "sleepy_two", 500, 10},
+    };
+    for (const auto& c : ladder) {
+        error.clear();
+        const bool ok = CoefficientVector::from_json_string(c.text, parsed, error);
+        assert(!ok);
+        assert(!error.empty());
+        assert(error.find(c.weaker) != std::string::npos);
+        const std::string asked = std::to_string(c.asked);
+        const std::string neighbour = std::to_string(c.neighbour);
+        assert(error.find(asked) != std::string::npos ||
+               error.find(neighbour) != std::string::npos);
+        std::cout << "  refused " << c.text << " -> " << error << std::endl;
+    }
+
+    // B. A combination floor below live_four: the file asks for a pair worth less
+    // than the single threat it contains, which sanitize() would raise for it.
+    const struct {
+        const char* text;
+        const char* key;
+    } floors[] = {
+        {R"({"live_four":40000,"double_four":10000})", "double_four"},
+        {R"({"live_four":40000,"double_three":5000})", "double_three"},
+        {R"({"live_four":40000,"double_four":50000,"double_three":40000,)"
+         R"("four_three":5000})", "four_three"},
+    };
+    for (const auto& c : floors) {
+        error.clear();
+        const bool ok = CoefficientVector::from_json_string(c.text, parsed, error);
+        assert(!ok);
+        assert(!error.empty());
+        assert(error.find(c.key) != std::string::npos);
+        assert(error.find("live_four") != std::string::npos);
+        std::cout << "  refused " << c.text << " -> " << error << std::endl;
+    }
+
+    // F1b: the refusal is narrowed to the end sanitize would actually rewrite. A
+    // written key the defaults would clamp is refused; a default a written key
+    // would raise is repaired in place instead - the file stated nothing about it.
+    error.clear();
+    assert(CoefficientVector::from_json_string(R"({"live_four":40000})", parsed, error));
+    assert(parsed.live_four == 40000);
+    assert(parsed.double_three == 40000);  // default 30000, raised to live_four
+    assert(parsed.four_three == 40000);    // default 20000, raised to live_four
+    assert(parsed.double_four == 50000);   // already above, untouched
+
+    const struct {
+        const char* text;
+        const char* written;
+    } written_violations[] = {
+        {R"({"live_two":1000})", "live_two"},        // default sleepy_three=100 pins it to 100
+        {R"({"rush_four":15000})", "rush_four"},     // default live_four=10000 pins it to 10000
+        {R"({"sleepy_two":500})", "sleepy_two"},     // default live_two=50 pins it to 50
+        {R"({"double_four":1500})", "double_four"},  // default live_four=10000 raises it
+    };
+    for (const auto& c : written_violations) {
+        error.clear();
+        const bool ok = CoefficientVector::from_json_string(c.text, parsed, error);
+        assert(!ok);
+        assert(error.find(c.written) != std::string::npos);
+        std::cout << "  refused " << c.text << " -> " << error << std::endl;
+    }
+
+    // Written values the defaults leave alone still load: the line is "would
+    // sanitize change what the file wrote", not "does a neighbour differ".
+    error.clear();
+    assert(CoefficientVector::from_json_string(R"({"live_two":50})", parsed, error));
+    assert(parsed.live_two == 50);
+    error.clear();
+    assert(CoefficientVector::from_json_string(R"({"sleepy_two":10})", parsed, error));
+    assert(parsed.sleepy_two == 10);
+    error.clear();
+    assert(CoefficientVector::from_json_string(R"({"rush_four":1500})", parsed, error));
+    assert(parsed.rush_four == 1500);
+
+    // C. Not an over-reach: a file whose ladder holds (several adjacent pairs
+    // exactly equal) and whose combinations clear live_four loads with every
+    // value byte for byte as written.
+    error.clear();
+    assert(CoefficientVector::from_json_string(
+        R"({"live_four":20000,"rush_four":5000,"live_three":5000,)"
+        R"("sleepy_three":500,"live_two":500,"sleepy_two":500,)"
+        R"("double_four":60000,"double_three":60000,"four_three":60000})",
+        parsed, error));
+    assert(parsed.live_four == 20000);
+    assert(parsed.rush_four == 5000);
+    assert(parsed.live_three == 5000);
+    assert(parsed.sleepy_three == 500);
+    assert(parsed.live_two == 500);
+    assert(parsed.sleepy_two == 500);
+    assert(parsed.double_four == 60000);
+    assert(parsed.double_three == 60000);
+    assert(parsed.four_three == 60000);
+
+    // D. A partial file is still a file: the defaults behind the written keys
+    // already satisfy both invariants.
+    const ThreatCoefficients defaults;
+    error.clear();
+    assert(CoefficientVector::from_json_string(R"({"live_four":20000})", parsed, error));
+    assert(parsed.live_four == 20000);
+    assert(parsed.rush_four == defaults.rush_four);
+    assert(parsed.double_four == defaults.double_four);
+    assert(parsed.sleepy_two == defaults.sleepy_two);
+
+    error.clear();
+    const std::string default_text = CoefficientVector::to_json_string(defaults);
+    assert(CoefficientVector::from_json_string(default_text, parsed, error));
+    assert(CoefficientVector::to_vector(parsed) == CoefficientVector::to_vector(defaults));
+
+    // E. Anti-regression: the optimizers' silent repairs stay in place - they feed
+    // candidate vectors, not files, and have to be clamped rather than refused.
+    ThreatCoefficients inverted;
+    inverted.live_two = 1000;
+    inverted.sleepy_three = 30;
+    CoefficientVector::sanitize(inverted);
+    assert(inverted.live_two == 30);
+    assert(inverted.sleepy_three == 30);
+
+    std::vector<int> values = CoefficientVector::to_vector(ThreatCoefficients());
+    values[static_cast<int>(TunableParam::LIVE_TWO)] = 1000;
+    values[static_cast<int>(TunableParam::SLEEPY_THREE)] = 30;
+    CoefficientVector::sanitize_vector(values);
+    assert(values[static_cast<int>(TunableParam::LIVE_TWO)] == 30);
+
+    std::vector<int> raised = CoefficientVector::to_vector(ThreatCoefficients());
+    raised[static_cast<int>(TunableParam::LIVE_FOUR)] = 40000;
+    raised[static_cast<int>(TunableParam::DOUBLE_FOUR)] = 10000;
+    const ThreatCoefficients clamped = CoefficientVector::from_vector(raised);
+    assert(clamped.double_four == 40000);
+    assert(clamped.double_three >= 40000);
+    assert(clamped.four_three >= 40000);
+
+    // F. Round trip: what to_json_string writes is exactly what from_json_string
+    // reads back, for the legal file above and for the built-in defaults.
+    ThreatCoefficients legal;
+    legal.live_four = 20000;
+    legal.rush_four = 5000;
+    legal.live_three = 5000;
+    legal.sleepy_three = 500;
+    legal.live_two = 500;
+    legal.sleepy_two = 500;
+    legal.double_four = 60000;
+    legal.double_three = 60000;
+    legal.four_three = 60000;
+    const std::string legal_text = CoefficientVector::to_json_string(legal);
+    error.clear();
+    assert(CoefficientVector::from_json_string(legal_text, parsed, error));
+    assert(CoefficientVector::to_vector(parsed) == CoefficientVector::to_vector(legal));
+    assert(CoefficientVector::to_json_string(parsed) == legal_text);
+    assert(CoefficientVector::to_json_string(
+               CoefficientVector::from_vector(CoefficientVector::to_vector(legal))) == legal_text);
+
+    std::cout << "test_params_rejects_cross_key_rewrites passed" << std::endl;
+}
+
 // R77 L2: stod() parses "nan"/"inf" with used == text.size(), and a NaN then
 // sails through every range guard below it (all comparisons are false), so
 // --accept-score nan used to start a training run whose promotion threshold no
@@ -2318,6 +2498,7 @@ int main() {
     test_params_rejects_broken_rule_constants();
     test_params_rejects_unrecognised_keys();
     test_params_rejects_out_of_range_tunables();
+    test_params_rejects_cross_key_rewrites();
     test_trainer_cli_rejects_non_finite_accept_score();
 
     std::cout << "All training tests passed" << std::endl;

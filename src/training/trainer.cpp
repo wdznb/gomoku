@@ -205,12 +205,15 @@ int Trainer::generate_data_games(int games, int threads) {
             explorer.set_start_line(random_opening_line(config_.data_opening_plies, seed));
 
             const int count = per_worker + (t < remainder ? 1 : 0);
-            // Base the ids on the games_played_ high-water mark (persisted with
-            // the checkpoint) rather than rounds_completed_: a kill between the
-            // data append and the checkpoint would otherwise make the resumed
-            // run reissue this round's ids and duplicate (game_id, move_index)
-            // rows in samples.jsonl. Workers only read it; it advances after
-            // join. Still 1000 apart per worker.
+            // Data-game ids use the games_played_ high-water mark (persisted with
+            // the checkpoint) rather than rounds_completed_: they then number the
+            // played games densely, and INVALID games - skipped below - never
+            // consume one. It is not crash protection: the count advances here,
+            // but the checkpoint is only written at the end of the round, so a
+            // kill between the data append and the checkpoint still reissues this
+            // round's ids on --resume. Real protection needs an export marker and
+            // is not built yet. Workers only read it; it advances after join.
+            // Still 1000 apart per worker.
             const int game_id_base = games_played_ + 1 + t * 1000;
             for (int i = 0; i < count; ++i) {
                 GameRecord record;

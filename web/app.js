@@ -109,6 +109,9 @@ class GomokuGame {
         this.wsReconnect = null;
         this.wsPing = null;
         this.everConnected = false;
+        // Set when the server says another tab resumed this token: no auto
+        // reconnect from here on, or the two tabs would evict each other forever.
+        this.takenOver = false;
         // The token is the game: it is what the server keys its session table by,
         // so keeping it across a reload is what makes 继续上次那局 possible at all.
         this.sessionToken = localStorage.getItem('gomoku.session.token') || null;
@@ -172,6 +175,9 @@ class GomokuGame {
     }
 
     scheduleReconnect() {
+        // A taken-over tab stays out of the fight: reconnecting would resume the
+        // same token and evict the tab that just won it.
+        if (this.takenOver) return;
         if (this.wsReconnect) return;
         const wait = Math.min(15000, 1000 * 2 ** this.wsAttempts);
         this.wsAttempts += 1;
@@ -182,6 +188,29 @@ class GomokuGame {
             this.wsReconnect = null;
             this.openSocket();
         }, wait);
+    }
+
+    // Another tab resumed this token and took the game over (README:545: later
+    // wins). This tab is parked, not broken: the reconnect timer goes, the flags
+    // settle, and the controls take the same grey-out a settled board leaves
+    // behind. The token stays in localStorage - reloading this page is how the
+    // player takes the game back.
+    handleTakenOver() {
+        this.takenOver = true;
+        if (this.wsReconnect) {
+            clearTimeout(this.wsReconnect);
+            this.wsReconnect = null;
+        }
+        this.stopPing();
+        this.aiThinking = false;
+        this.hintInFlight = false;
+        document.getElementById('btn-undo').disabled = true;
+        document.getElementById('btn-hint').disabled = true;
+        document.getElementById('btn-resign').disabled = true;
+        document.getElementById('btn-stop').disabled = true;
+        this.setSideButtons(true, true);
+        this.refreshReplayControls();
+        this.updateStatus('本局面已在其他标签页打开，刷新页面可取回', 'warn');
     }
 
     // The server's answer to `resume`, and its announcement whenever it opened a
@@ -1518,8 +1547,12 @@ class GomokuGame {
         }
         if (msg.type !== 'ping') {
             // Say it out loud: a click that quietly vanished reads as the AI
-            // ignoring the player.
-            this.updateStatus('连接已断开，正在重连：消息未发出', 'error');
+            // ignoring the player. A taken-over tab is not reconnecting, so it
+            // gets its own line instead of a promise of a retry that will not come.
+            this.updateStatus(this.takenOver
+                                  ? '本局面已在其他标签页打开，刷新页面可取回'
+                                  : '连接已断开，正在重连：消息未发出',
+                              this.takenOver ? 'warn' : 'error');
         }
         return false;
     }
@@ -1528,6 +1561,9 @@ class GomokuGame {
         switch (msg.type) {
             case 'session':
                 this.handleSession(msg);
+                break;
+            case 'session_taken_over':
+                this.handleTakenOver();
                 break;
             case 'state_sync':
                 this.handleStateSync(msg);
@@ -1620,6 +1656,27 @@ class GomokuGame {
         // paint the board from the past while the game moved on, and every click
         // would then be dropped by the replay guard.
         if (this.replayIndex !== null) this.exitReplay();
+        // A hand-set position starts with a stone just as much as with 执黑/执白
+        // (README:283), and this frame's colour is the side the server claimed for
+        // it. Without this the colour stayed null and the game stayed waiting:
+        // 悔棋/求招 stayed disabled, the 终止 button never armed, and a black win
+        // was read as a loss.
+        if (this.gameStatus === 'waiting' && this.playerColor === null &&
+            this.baseStones.length > 0) {
+            this.playerColor = msg.color === 'black' ? BLACK : WHITE;
+            document.getElementById('btn-black').disabled = true;
+            document.getElementById('btn-white').disabled = true;
+            if (this.gameStatus !== 'game_over') {
+                document.getElementById('btn-undo').disabled = false;
+                document.getElementById('btn-hint').disabled = false;
+                this.hintInFlight = false;
+                document.getElementById('btn-resign').disabled = false;
+            }
+            // The 落子记录 held back for the side choice goes the way handleStateSync
+            // drops it on 执黑/执白: this stone is what commits the position.
+            this.moveHistory = [];
+            this.gameStatus = 'playing';
+        }
         this.placeStone(msg.row, msg.col, msg.color === 'black' ? BLACK : WHITE);
         this.currentTurn = this.currentTurn === BLACK ? WHITE : BLACK;
         this.updateTurnInfo();
