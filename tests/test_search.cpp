@@ -2231,6 +2231,72 @@ void test_sort_moves_full_order_without_tt_move() {
     std::cout << "test_sort_moves_full_order_without_tt_move passed" << std::endl;
 }
 
+// Round 89, T1: the colour gate reaches the search layer through the two
+// single-colour reads greedy_.search_ranked reports. On the four-four board
+// WHITE paid 70014 to "block" a shape BLACK can never play; that defence price
+// is now nothing, while BLACK's own list is untouched because the generator
+// already dropped the point before scoring it.
+void test_greedy_drops_the_defense_price_of_a_black_forbidden_point() {
+    Board board;
+    board.place_stone(7, 4, BLACK);
+    board.place_stone(7, 5, BLACK);
+    board.place_stone(7, 6, BLACK);
+    board.place_stone(4, 7, BLACK);
+    board.place_stone(5, 7, BLACK);
+    board.place_stone(6, 7, BLACK);
+    assert(PatternRecognizer::is_forbidden(board, 7, 7, BLACK));
+
+    GreedySearch greedy;
+    const int all = BOARD_SIZE * BOARD_SIZE;
+
+    const std::vector<ScoredMove> as_white = greedy.search_ranked(board, WHITE, all);
+    const ScoredMove* spot = nullptr;
+    const ScoredMove* neighbour = nullptr;
+    for (const ScoredMove& candidate : as_white) {
+        if (candidate.move.pos.row == 7 && candidate.move.pos.col == 7) spot = &candidate;
+        if (candidate.move.pos.row == 7 && candidate.move.pos.col == 8) neighbour = &candidate;
+    }
+    assert(spot != nullptr);
+    assert(spot->defense_score == 0);
+    assert(spot->attack_score == 14);
+    assert(spot->total_score == spot->attack_score + spot->defense_score);
+    assert(spot->total_score == 14);
+    // The square beside it is an ordinary candidate on the same board: BLACK's
+    // live four there is still a threat worth blocking.
+    assert(neighbour != nullptr);
+    assert(neighbour->defense_score == 1063);
+    assert(neighbour->attack_score == 13);
+    assert(neighbour->total_score == 1076);
+
+    // BLACK's ranked list never carried the forbidden point even before the gate.
+    const std::vector<ScoredMove> as_black = greedy.search_ranked(board, BLACK, all);
+    bool black_carries_spot = false;
+    for (const ScoredMove& candidate : as_black) {
+        if (candidate.move.pos.row == 7 && candidate.move.pos.col == 7) black_carries_spot = true;
+    }
+    assert(!black_carries_spot);
+
+    // Control: a single live four is legal for BLACK, so WHITE still pays the
+    // full blocking price for it.
+    Board legal;
+    legal.place_stone(7, 4, BLACK);
+    legal.place_stone(7, 5, BLACK);
+    legal.place_stone(7, 6, BLACK);
+    assert(!PatternRecognizer::is_forbidden(legal, 7, 7, BLACK));
+    const std::vector<ScoredMove> legal_white = greedy.search_ranked(legal, WHITE, all);
+    const ScoredMove* legal_spot = nullptr;
+    for (const ScoredMove& candidate : legal_white) {
+        if (candidate.move.pos.row == 7 && candidate.move.pos.col == 7) legal_spot = &candidate;
+    }
+    assert(legal_spot != nullptr);
+    assert(legal_spot->defense_score == 10014);
+    assert(legal_spot->total_score == 10028);
+
+    std::cout << "test_greedy_drops_the_defense_price_of_a_black_forbidden_point passed ("
+              << spot->defense_score << " defense at 7,7, control "
+              << legal_spot->defense_score << ")" << std::endl;
+}
+
 int main() {
     std::cout << "Running search tests..." << std::endl;
 
@@ -2297,6 +2363,7 @@ int main() {
     test_alphabeta_absolute_deadline_stops_search();
     test_alphabeta_expired_deadline_returns_root_fallback();
     test_alphabeta_aborted_search_stores_no_bound();
+    test_greedy_drops_the_defense_price_of_a_black_forbidden_point();
     test_alphabeta_large_depth_bounded_by_slice_without_deadline();
     test_sort_moves_pins_tt_move_already_at_front();
     test_sort_moves_promotes_tt_move_from_tail();

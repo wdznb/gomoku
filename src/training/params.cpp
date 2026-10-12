@@ -218,9 +218,9 @@ bool CoefficientVector::from_json_string(const std::string& text, ThreatCoeffici
         error = "five must stay above zero or the evaluation scale collapses";
         return false;
     }
-    // forbidden_penalty is a cost: at or below zero a forbidden move becomes an
-    // incentive, and at the mate threshold alphabeta reads our own penalty as a
-    // proven loss and resigns.
+    // forbidden_penalty is read only by evaluate_position_both, and no production
+    // path calls that entry. The range guard stays because a params file can write
+    // zero or a negative here, which turns a forbidden move into a free one.
     if (coeffs.forbidden_penalty <= 0 || coeffs.forbidden_penalty >= 100000) {
         error = "forbidden_penalty must stay between zero and the 100000 mate threshold";
         return false;

@@ -59,7 +59,7 @@ void AlphaBetaSearch::sort_moves(std::vector<Move>& moves, const Board& board, i
     //
     // Callers pass a move list that generate_moves has already filtered
     // against is_forbidden for BLACK, so calling evaluate_position_both here
-    // would rerun is_forbidden (which does a second recognize_combined) on
+    // would rerun is_forbidden (which does a second recognize_position) on
     // every node of every ply. Score both sides directly and skip that
     // redundant work.
     int start = tt_swapped ? 1 : 0;
@@ -107,6 +107,7 @@ int AlphaBetaSearch::quiescence(Board& board, int alpha, int beta, int color,
 
     const auto& candidates = board.active_empty();
     std::vector<std::pair<int, Move>> scored;
+    scored.reserve(candidates.size());
 
     for (const auto& pos : candidates) {
         if (!board.is_empty(pos.row, pos.col)) continue;
@@ -128,7 +129,8 @@ int AlphaBetaSearch::quiescence(Board& board, int alpha, int beta, int color,
             }
             // Score from the pattern we just recognized; calling
             // evaluate_position here would re-run the same four scans.
-            int s = evaluator_.evaluate_position_with_pattern(board, pos.row, pos.col, pattern);
+            int s = evaluator_.evaluate_position_with_pattern(board, pos.row, pos.col, pattern,
+                                                              color);
             scored.emplace_back(s, Move(pos.row, pos.col, color));
         }
     }

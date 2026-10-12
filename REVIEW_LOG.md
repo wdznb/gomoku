@@ -1857,3 +1857,65 @@ with the code shapes grepped instead of invented negatives, and `build/r88s_cli.
 byte for byte on every CLI-level line (`e1`/`e2`/`e3`/`s9a`/`s9b` stderr md5 and exit codes equal, no residue,
 the repo's `data/` untouched).
 
+## 轮次89 黑棋落不了的那一格值多少分 — bugfix round 89 batch T
+
+**Found.** Batch S closed the search/engine layer, so this round re-audited the evaluator and the pattern
+side against README:27-29, plus a second pass over the training CLI surface the same window touched. Four
+rows survived my own line-by-line re-read and became batch T. **T1** is the only behaviour change: the
+evaluator states its own rule at `evaluator.cpp:150-153` — a shape BLACK can never legally play must not bank
+points — and applies it in `evaluate_board` only. `candidate_value` had no colour at all, so every single-cell
+read (`evaluate_position`, `evaluate_position_pair`, and downstream `alphabeta.cpp:73` move ordering,
+`greedy.cpp:41-42` defense prices, `vcf.cpp:31` / `vct.cpp:32,:71` static scores) paid forbidden shapes freely.
+Measured on the four-four board (BLACK (7,4)(7,5)(7,6) + (4,7)(5,7)(6,7), probe (7,7)): WHITE's defense price
+for that square was **70014** and a 三三 point **31014** — a tempo BLACK is not allowed to spend, so the AI
+was ranking "blocks" of illegal shapes above real ones. **T2** `params.cpp:221-223` justified the
+`forbidden_penalty` range guard with "AlphaBeta treats the penalty as a loss", but the only reader of that
+field is `evaluate_position_both`, which no production path calls (verified: `evaluator.cpp:134-141` is
+self-contained and `src/` has no caller) — comment-side fix. **T3** the innermost quiescence loop rebuilt
+`scored` without a `reserve`. **T4** `alphabeta.cpp:62` claimed `is_forbidden` re-runs `recognize_combined`;
+it re-runs `recognize_position`.
+
+**Fixed.** `candidate_value(row, col, pattern, color)` takes the colour and returns 0 for a BLACK forbidden
+pattern — placed **after** the exact-FIVE early return, so a square that makes five is still worth
+`coeffs_.five` and never zeroed (README:27/29: a five is a win, not a 禁手).
+`evaluate_position_with_pattern` gained the same colour parameter at all four call sites (`alphabeta.cpp:132`
+→ `color`, `vcf.cpp:31` → `color`, `vct.cpp:32` → `color`, `vct.cpp:72` → `opp`), and
+`evaluate_position_pair` now judges each half with its own colour (`mine` as `color`, `theirs` as
+`opponent(color)`), which is what makes the pair equal to the sum of the two single reads. `params.cpp`'s
+comment states the test-only reader instead of the mate argument; `alphabeta.cpp:110` reserves `scored`;
+`alphabeta.cpp:62` names `recognize_position`. README:29 gained the scoring rule as stated behaviour.
+
+**Not defects / deliberately left.** The `--no-sessions` row from the server audit ("a detached game is still
+resumable in-process for 30 minutes, so 对局不是只活在 socket 里") is a README wording problem, not a code
+problem: README:62 and README:558 both state that games hang on the token session table rather than the
+socket, and `flush_entry` (`server.cpp:1403`) does refuse every write when `sessions_dir_` is empty — the
+one-line CLI comment at README:161 is the inaccurate text and gets reworded instead of the behaviour changed.
+The bare-`[` asymmetry between `position_from_text` (`position_json.cpp:271-285`, refuses a top-level array)
+and `read_position_payload` (`server.cpp:59-64`, wraps one into `board`) is two documented intents, and
+README:225 describes the 完整棋盘 form as a `board` **field**; widening the file format is a design change, so
+it is not dispatched. Round-88's carries stayed refuted: no `five`-memoisation of `recognize_position`, no
+pattern-cache merge, no incremental full-board evaluation. Three verified rows are carried forward as round-90
+batch U instead: `trainer.cpp:37-40` measures every intra-round fitness match with the candidate's rule
+constants defaulted (round 74's carry at `:322-323` only covers the verification match), and `server.cpp:834`
+/`:1066` count `position_pending()` as content, so 摆棋→清空→确认 twice rotates a token and shelves an
+empty engine for the whole reattach window — against README:540-542's 落过子/摆过子/选过边 list and the
+predicate's own comment at `:1063-1065`.
+
+**Verified.** Gate over the identical tree: `ctest` **8/8** (bare `cmake ..`) and
+`node tests/web_frontend_check.js` **30/30**. HEAD negatives in `build/neg89t` (`git archive 5073953` plus the
+current `tests/`) fail on exactly two cases: `tests/test_evaluator.cpp:366`
+`evaluate_position(four_four, 7, 7, BLACK) == 0` (HEAD 70014) and `tests/test_search.cpp:2260`
+`spot->defense_score == 0` (HEAD 70014); HEAD's full `ctest` prints 2 failed out of 8 and every earlier case
+in both binaries still passes. The anti-overreach pins are green on both trees, including the ordering proof
+(`test_exact_five_outranks_the_forbidden_gate`: a square whose pattern carries `has_four_four` **and** an exact
+five still scores `five`, 100000 on both trees), the ordinary neighbour (1063/13/1076 unchanged), a legal
+single 活四 (WHITE still pays the full 10014 defense), and BLACK's own ranked list, which never contained the
+forbidden point even before the gate. T2 is **无可观察差异** with the CLI as evidence: `build/r89t_cli.sh` and
+`build/r89t_cli_neg.sh` agree item by item (0 / −1 / 100000 rejected with byte-identical stderr, 40000 and
+99999 accepted), and the one differing figure (`out_bytes` 327 vs 325 on the `--timeout-ms 20` cases) was
+proved to be wall-clock noise rather than a signal — the same tree twice is not reproducible at that budget
+(`r89t_det.log`: 327 / 326), while `r89t_det2.sh` at `--timeout-ms 5000` gives one identical 330-byte file
+across four runs on both trees with `forbidden_penalty: 40000` written back unchanged. T3 and T4 are
+**无可观察差异** with the two-tree diff and the `candidate_value` / `evaluate_position_with_pattern` greps
+(4-parameter declaration, definition, three internal uses, four coloured call sites, no leftover 3-argument
+shape).

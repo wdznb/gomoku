@@ -41,7 +41,7 @@ public:
     // used to filter, so re-recognizing inside evaluate_position doubles the
     // direction scans in the engine's hottest loop).
     int evaluate_position_with_pattern(const Board& board, int row, int col,
-                                       const PositionPattern& pattern) const;
+                                       const PositionPattern& pattern, int color) const;
     int evaluate_position_both(const Board& board, int row, int col, int my_color) const;
 
     // Both sides' candidate scores at one empty square: exactly
@@ -61,8 +61,9 @@ private:
     void init_position_weights();
     int pattern_score(const PositionPattern& pattern) const;
     // A recognised candidate pattern's value for its colour: the mate bonus for
-    // a five, otherwise the pattern score plus the square's centre bias.
-    int candidate_value(int row, int col, const PositionPattern& pattern) const;
+    // a five, otherwise the pattern score plus the square's centre bias - except
+    // a shape BLACK may not legally play, which is worth nothing.
+    int candidate_value(int row, int col, const PositionPattern& pattern, int color) const;
 };
 
 }

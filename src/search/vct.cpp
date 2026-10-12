@@ -29,7 +29,8 @@ std::vector<Move> VCTSearch::generate_attacks(const Board& board, int color) {
         }
 
         if (is_attack) {
-            int score = evaluator_.evaluate_position_with_pattern(board, pos.row, pos.col, pattern);
+            int score = evaluator_.evaluate_position_with_pattern(board, pos.row, pos.col, pattern,
+                                                                  color);
             scored_moves.emplace_back(score, Move(pos.row, pos.col, color));
         }
     }
@@ -68,7 +69,8 @@ std::vector<Move> VCTSearch::generate_defenses(const Board& board, int color,
         }
 
         if (is_threat) {
-            int score = evaluator_.evaluate_position_with_pattern(board, pos.row, pos.col, pattern);
+            int score = evaluator_.evaluate_position_with_pattern(board, pos.row, pos.col, pattern,
+                                                                  opp);
             scored_defenses.emplace_back(score, Move(pos.row, pos.col, opp));
         }
     }

@@ -91,22 +91,29 @@ int Evaluator::evaluate_position(const Board& board, int row, int col, int color
 
     PositionPattern pattern = PatternRecognizer::recognize_position(board, row, col, color);
 
-    return evaluate_position_with_pattern(board, row, col, pattern);
+    return evaluate_position_with_pattern(board, row, col, pattern, color);
 }
 
 int Evaluator::evaluate_position_with_pattern(const Board& board, int row, int col,
-                                              const PositionPattern& pattern) const {
+                                              const PositionPattern& pattern, int color) const {
     if (!board.is_empty(row, col)) return 0;
 
-    return candidate_value(row, col, pattern);
+    return candidate_value(row, col, pattern, color);
 }
 
-int Evaluator::candidate_value(int row, int col, const PositionPattern& pattern) const {
+int Evaluator::candidate_value(int row, int col, const PositionPattern& pattern,
+                               int color) const {
     for (int d = 0; d < 4; ++d) {
         if (pattern.directions[d].type == PatternType::FIVE) {
             return coeffs_.five;
         }
     }
+
+    // An exact five is not a forbidden shape (README:27/29), which is why the
+    // check above runs first. A double-three / double-four / overline, though, is
+    // a stone BLACK can never place, so the threat it describes is worth nothing -
+    // the same rule evaluate_board applies to each side of a candidate square.
+    if (color == BLACK && PatternRecognizer::is_forbidden_from_pattern(pattern)) return 0;
 
     int score = pattern_score(pattern);
     score += get_position_weight(row, col);
@@ -120,7 +127,8 @@ int Evaluator::evaluate_position_pair(const Board& board, int row, int col, int 
     PositionPattern mine, theirs;
     PatternRecognizer::recognize_position_both(board, row, col, color, mine, theirs);
 
-    return candidate_value(row, col, mine) + candidate_value(row, col, theirs);
+    return candidate_value(row, col, mine, color) +
+           candidate_value(row, col, theirs, opponent(color));
 }
 
 int Evaluator::evaluate_position_both(const Board& board, int row, int col, int my_color) const {
