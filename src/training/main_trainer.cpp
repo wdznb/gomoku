@@ -43,6 +43,7 @@ void print_usage(const char* program) {
         "  --no-resign                 Never resign during training games\n"
         "  --seed N                    RNG seed (20261011)\n"
         "  --params PATH               Starting coefficients (built-in defaults)\n"
+        "                              (not together with --resume)\n"
         "  --out PATH                  Where the champion is written\n"
         "                              (data/training/best_params.json)\n"
         "  --records PATH              Append played games as JSONL\n"
@@ -52,6 +53,7 @@ void print_usage(const char* program) {
         "  --resume PATH               Continue from this checkpoint, and write the\n"
         "                              rest of the run back to it; when --checkpoint\n"
         "                              is given too, the two must name one file\n"
+        "                              (not together with --params)\n"
         "  --quiet                     Only print the final result\n"
         "  --help                      Show this text\n";
 }
@@ -251,6 +253,14 @@ int main(int argc, char** argv) {
                       << std::endl;
             return 1;
         }
+    }
+    // Both name the starting point for this round, and a resume replaces what was
+    // loaded: keeping both would read and announce a file the run never uses.
+    if (!base_params.empty() && !resume_path.empty()) {
+        std::cerr << "Error: --params " << base_params << " and --resume " << resume_path
+                  << " cannot both be given (each names the starting point for this round)"
+                  << std::endl;
+        return 1;
     }
 
     config.params_path = out_path;

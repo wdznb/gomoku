@@ -194,11 +194,11 @@ cd build
 | `--data-games` / `--threads` | 4 / 2 | 每轮采集数据的自我对弈盘数与并发线程 |
 | `--no-data` | — | 只调参，不采集数据 |
 | `--no-resign` | — | 训练对局中禁止认输（认输会截断数据） |
-| `--params` | 内置默认 | 起始参数文件 |
+| `--params` | 内置默认 | 起始参数文件；**不能与 `--resume` 同时给出**，两者都声称是本轮的起点，同给时启动即报错退出（退出码 1），因为续训会把断点里的系数整套换掉，这里载入的文件根本用不上 |
 | `--out` | `data/training/best_params.json` | 冠军参数输出位置 |
 | `--records` / `--samples` | 空 | 对局记录 / 训练样本 JSONL |
 | `--checkpoint` | `data/training/checkpoint.json` | 断点文件；与 `--resume` 同时给出时必须指向同一个文件 |
-| `--resume` | — | 从断点继续训练，需要一个断点文件路径；进度写回该文件，与 `--checkpoint` 路径不同则启动即报错退出（退出码 1） |
+| `--resume` | — | 从断点继续训练，需要一个断点文件路径；进度写回该文件，与 `--checkpoint` 路径不同、或与 `--params` 同时给出，都是启动即报错退出（退出码 1） |
 
 产物目录 `data/training/` 已被 `.gitignore` 忽略，训练不会污染仓库。
 

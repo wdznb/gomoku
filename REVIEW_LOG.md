@@ -1642,3 +1642,65 @@ branch needs a real mid-write failure (`file.good()` after the flush), which no 
 `save_session(dir, snap, error)` - inventing one would mean opening a failure back door in `src`, and the
 degraded case (a normal save leaves no `.tmp`, an illegal token writes nothing) passes on HEAD exactly as it
 should.
+
+## 轮次86（批 Q）被 `--quiet` 漏掉的那一行、被宣布又被丢弃的 `--params`、算了八遍的那半边特征 — bugfix round 86 batch Q
+
+**Found.** Three training-domain rows from a read-only audit of `game_record.cpp` / `data_collector.cpp` /
+`trainer.cpp` / `main_trainer.cpp` / `game_manager.cpp` and the server's replay-restart-append paths; I
+re-read every cited line before dispatching.
+
+`trainer.cpp:166` printed `skipping data games this round: no --records or --samples output path was given`
+through `std::cout` - the only bare `std::cout` in the file, where every other progress line goes through
+`if (log_) log_(...)` (`:295 :311 :353 :358 :368`) and `main_trainer.cpp:281` installs that callback only
+when `!quiet`. README:199 makes both output paths default-empty, so a bare `gomoku_train --quiet` printed one
+line per round against `--help`'s own "Only print the final result" (`main_trainer.cpp:55`).
+
+`main_trainer.cpp:259-267` loaded `--params` fatally (a bad file exits 1), announced `Starting from <path>`,
+passed the result as the Trainer's `base` (which `trainer.cpp:29` pushes as `versions_[0]`) - and then
+`load_checkpoint` replaced `versions_`, `elo_` and `best_version_` wholesale (`trainer.cpp:537-540`), so under
+`--resume` the announced start point is not the one used, and a file the run will never read can still stop it
+from starting. `base` has no other use in `trainer.cpp`.
+
+`data_collector.cpp:127-135` called the whole `extract_features` once per symmetry variant, so the
+`active_empty()` loop with its two `recognize_position` calls per candidate cell (`:42-68`) ran eight times
+per sampled ply. Slots **0-24** are identical for all eight orientations - the shape counts are summed over
+the four directions and scaled by `actives.size()`, which a dihedral map preserves bijectively; the stone
+counts, active count, ply and side are counts; `centre_control` uses Chebyshev distance to `(7,7)`, and
+`transform_board` (`transforms.cpp:15-22`) replays `move_history` through `place_stone`, so it is an exact
+board isometry that also preserves `move_count`/`last_move`. Only **25-51** (last-move row/col and the 5x5
+window) follow the transform, which is what `data_collector.h:30-32` already says the augmentation multiplies.
+
+**Fixed.** The skip notice went to `if (log_) log_(...)` with its text unchanged; the four `std::cerr`
+write-failure lines were left alone (settled: those print regardless of `--quiet`). `--params` and `--resume`
+now refuse each other at startup, in the same shape as the existing `--checkpoint`/`--resume` rule, so neither
+a wasted fatal check nor a false announcement is possible, and `--help` says so on both rows.
+`extract_features` keeps its public signature and its return byte-for-byte: its body is now
+`fill_invariants` (0-24) + `fill_orientation` (25-51) over a zero-initialised vector, and `collect()` computes
+the invariants once per ply inside the emit branch, then copies them and refills only 25-51 per accepted
+variant. Sample counts, the `seen` dedup, the `FEATURE_*` constants and the writers are untouched.
+
+**Refuted this round.** `game_record.cpp:158-173`'s plain `ofstream(trunc)` single-record save is not a
+production writer (only `test_training.cpp:242`/`:1921` call it; the server appends through
+`append_to_jsonl`, `server.cpp:1453`) and README:561's "不会留下半个文件" describes the 10-second session
+flush, which is atomic. A 摆棋 `base`-backed record reaching `DataCollector::collect()` from an empty board
+needs someone to hand-copy a session file's `record` into a trainer path, and README:565 says exactly that
+those games live only in the session file and stay out of the training stream (`server.cpp:828` implements
+it) - the ignored `place_stone` result at `:149` cannot diverge for a record that path can actually produce.
+From the frontend audit three candidates were dropped the same way, for 0 dispatchable items.
+
+**Verified.** `ctest` **8/8** (bare `cmake ..`, new case `test_augmented_samples_match_manual_transforms`
+inside `test_training`) and `node tests/web_frontend_check.js` **30/30**, the web harness re-run by the
+orchestrator. Q1 and Q2 are CLI-observable, so they were proven by a script rather than a unit case:
+against the worktree, `gomoku_train --quiet --rounds 1 --data-games 1` prints the skip notice **0** times
+while the same run without `--quiet` prints it **1**, and `--resume A --params B` exits **1** naming both
+flags while each alone still exits 0 (`Starting from` for `--params`, `Resumed` and **0** `Starting from`
+for `--resume`). In `build/neg86q` (`git archive 980983b` + the current `tests/`), the same script shows
+both defects verbatim: `--quiet` prints the notice, and the combination runs to completion announcing
+`Starting from /tmp/r86qn_b_params.json` followed by `Resumed /tmp/r86qn_ck.json`. Q3 has **no negative
+proof by design** - it is a behaviour-preserving reordering, so the gold-standard case (every kept sample
+equals `extract_features(transform_board(board_i, v), side)` bit for bit, identity orientation present, all
+eight distinct orientations surviving, one sample per ply when augmentation is off) passes on `980983b`
+too; the evidence for the change is the call shape instead: `980983b` still had
+`sample.features = extract_features(oriented, side)` inside the variant loop, while the worktree calls
+`fill_invariants` once per ply (`:136`) and only `fill_orientation` per variant (`:149`).
+No run wrote into `data/training/` (the default checkpoint is still absent).

@@ -788,6 +788,83 @@ void test_data_collector_samples() {
     std::cout << "test_data_collector_samples passed" << std::endl;
 }
 
+// R86 Q3: collect() with augmentation evaluates all eight board orientations,
+// but slots 0..24 are read off the whole board and are identical under every
+// symmetry - the fix hoists that part out of the variant loop and recomputes
+// only 25..51 per orientation. The reorder must be behaviour-preserving: every
+// kept sample has to equal extract_features(transform_board(board_i, v), side)
+// for one of the eight v, and the identity orientation must still be kept.
+void test_augmented_samples_match_manual_transforms() {
+    // Six plies on purpose: the board is asymmetric from ply 1 on ((7,8) and
+    // (7,6) are mirror images, but (8,8) and (5,5) are not), so the late plies
+    // really carry all eight orientations, not a deduplicated subset.
+    GameRecord record;
+    record.winner = BLACK;
+    record.reason = GameEndReason::FIVE;
+    const Position line[6] = {{7, 7}, {7, 8}, {8, 8}, {6, 6}, {5, 5}, {7, 6}};
+    for (int i = 0; i < 6; ++i) {
+        MoveRecord entry;
+        entry.move = Move(line[i].row, line[i].col, i % 2 == 0 ? BLACK : WHITE);
+        entry.score = 0;
+        entry.depth = 4;
+        entry.nodes = 100;
+        entry.elapsed_ms = 5;
+        entry.method = "alphabeta";
+        record.moves.push_back(entry);
+    }
+    record.total_nodes = 600;
+    record.max_depth = 4;
+
+    // boards[i] is the position before record.moves[i] is played.
+    std::vector<Board> boards(record.moves.size() + 1);
+    for (size_t i = 0; i < record.moves.size(); ++i) {
+        boards[i + 1] = boards[i];
+        boards[i + 1].place_stone(record.moves[i].move.pos.row, record.moves[i].move.pos.col,
+                                  record.moves[i].move.color);
+    }
+
+    DataCollector collector;
+    const std::vector<TrainingSample> augmented = collector.collect(record, 9090, true);
+    assert(!augmented.empty());
+
+    std::map<int, std::vector<std::vector<float>>> kept;
+    for (const auto& sample : augmented) {
+        assert(sample.move_index >= 0 && sample.move_index < static_cast<int>(record.moves.size()));
+        assert(static_cast<int>(sample.features.size()) == DataCollector::FEATURE_COUNT);
+        kept[sample.move_index].push_back(sample.features);
+    }
+    assert(static_cast<int>(kept.size()) == static_cast<int>(record.moves.size()));
+
+    for (const auto& entry : kept) {
+        const int side = record.moves[entry.first].move.color;
+        std::vector<std::vector<float>> want;
+        for (int v = 0; v < SYMMETRY_COUNT; ++v) {
+            want.push_back(collector.extract_features(transform_board(boards[entry.first], v), side));
+        }
+        assert(entry.second.size() >= 1 && entry.second.size() <= static_cast<size_t>(SYMMETRY_COUNT));
+        // Every kept sample is one of the eight orientations, bit for bit.
+        for (const auto& features : entry.second) {
+            assert(std::find(want.begin(), want.end(), features) != want.end());
+        }
+        // The identity orientation is the board itself: it must be kept, and
+        // every distinct orientation must survive as a sample of its own.
+        assert(std::find(entry.second.begin(), entry.second.end(), want[0]) != entry.second.end());
+        for (const auto& features : want) {
+            assert(std::find(entry.second.begin(), entry.second.end(), features) != entry.second.end());
+        }
+    }
+
+    // Anti-overreach: without augmentation there is exactly one sample per ply,
+    // equal to the untransformed board's full 52-slot vector.
+    const std::vector<TrainingSample> plain = collector.collect(record, 9091, false);
+    assert(plain.size() == record.moves.size());
+    for (const auto& sample : plain) {
+        assert(sample.features == collector.extract_features(boards[sample.move_index], record.moves[sample.move_index].move.color));
+    }
+
+    std::cout << "test_augmented_samples_match_manual_transforms passed" << std::endl;
+}
+
 void test_hill_climbing() {
     ThreatCoefficients base;
     const double initial = deviation_score(base);
@@ -2525,6 +2602,7 @@ int main() {
     test_retry_explorer_forced_line();
     test_feature_extraction();
     test_data_collector_samples();
+    test_augmented_samples_match_manual_transforms();
     test_hill_climbing();
     test_genetic();
     test_hill_climbing_empty_steps();

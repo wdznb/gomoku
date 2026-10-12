@@ -163,8 +163,8 @@ int Trainer::generate_data_games(int games, int threads) {
     // Nothing to write means nothing to play for: without either output path
     // the games would only burn the round's budget and be dropped at merge.
     if (config_.records_path.empty() && config_.samples_path.empty()) {
-        std::cout << "skipping data games this round: no --records or --samples "
-                     "output path was given" << std::endl;
+        if (log_) log_("skipping data games this round: no --records or --samples "
+                       "output path was given");
         return 0;
     }
 

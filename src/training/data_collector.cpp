@@ -34,6 +34,13 @@ float centre_control(const Board& board, int color) {
 
 std::vector<float> DataCollector::extract_features(const Board& board, int side_to_move) const {
     std::vector<float> features(FEATURE_COUNT, 0.0f);
+    fill_invariants(board, side_to_move, features);
+    fill_orientation(board, side_to_move, features);
+    return features;
+}
+
+void DataCollector::fill_invariants(const Board& board, int side_to_move,
+                                    std::vector<float>& out) const {
     const int opp_color = opponent(side_to_move);
 
     int my_shapes[PATTERN_SLOTS] = {0};
@@ -56,15 +63,15 @@ std::vector<float> DataCollector::extract_features(const Board& board, int side_
         }
 
         for (int d = 0; d < 4; ++d) {
-            if (mine.directions[d].type == PatternType::FIVE) features[FEATURE_MY_FIVE] = 1.0f;
-            if (theirs.directions[d].type == PatternType::FIVE) features[FEATURE_OPP_FIVE] = 1.0f;
+            if (mine.directions[d].type == PatternType::FIVE) out[FEATURE_MY_FIVE] = 1.0f;
+            if (theirs.directions[d].type == PatternType::FIVE) out[FEATURE_OPP_FIVE] = 1.0f;
         }
     }
 
     const float scale = 1.0f / static_cast<float>(std::max<size_t>(1, actives.size()));
     for (int i = 0; i < PATTERN_SLOTS; ++i) {
-        features[i] = static_cast<float>(my_shapes[i]) * scale;
-        features[PATTERN_SLOTS + i] = static_cast<float>(opp_shapes[i]) * scale;
+        out[i] = static_cast<float>(my_shapes[i]) * scale;
+        out[PATTERN_SLOTS + i] = static_cast<float>(opp_shapes[i]) * scale;
     }
 
     int my_stones = 0;
@@ -76,18 +83,21 @@ std::vector<float> DataCollector::extract_features(const Board& board, int side_
             else if (cell == opp_color) opp_stones++;
         }
     }
-    features[FEATURE_MY_STONES] = static_cast<float>(my_stones) / 20.0f;
-    features[FEATURE_OPP_STONES] = static_cast<float>(opp_stones) / 20.0f;
-    features[FEATURE_MY_CENTRE] = centre_control(board, side_to_move);
-    features[FEATURE_OPP_CENTRE] = centre_control(board, opp_color);
-    features[FEATURE_ACTIVE] = static_cast<float>(actives.size()) / 40.0f;
-    features[FEATURE_PLY] = static_cast<float>(board.move_count()) / 40.0f;
-    features[FEATURE_SIDE] = side_to_move == BLACK ? 1.0f : 0.0f;
+    out[FEATURE_MY_STONES] = static_cast<float>(my_stones) / 20.0f;
+    out[FEATURE_OPP_STONES] = static_cast<float>(opp_stones) / 20.0f;
+    out[FEATURE_MY_CENTRE] = centre_control(board, side_to_move);
+    out[FEATURE_OPP_CENTRE] = centre_control(board, opp_color);
+    out[FEATURE_ACTIVE] = static_cast<float>(actives.size()) / 40.0f;
+    out[FEATURE_PLY] = static_cast<float>(board.move_count()) / 40.0f;
+    out[FEATURE_SIDE] = side_to_move == BLACK ? 1.0f : 0.0f;
+}
 
+void DataCollector::fill_orientation(const Board& board, int side_to_move,
+                                     std::vector<float>& out) const {
     if (board.move_count() > 0) {
         const Move last = board.last_move();
-        features[FEATURE_LAST_ROW] = static_cast<float>(last.pos.row - BOARD_SIZE / 2) / 7.0f;
-        features[FEATURE_LAST_COL] = static_cast<float>(last.pos.col - BOARD_SIZE / 2) / 7.0f;
+        out[FEATURE_LAST_ROW] = static_cast<float>(last.pos.row - BOARD_SIZE / 2) / 7.0f;
+        out[FEATURE_LAST_COL] = static_cast<float>(last.pos.col - BOARD_SIZE / 2) / 7.0f;
 
         for (int dr = -2; dr <= 2; ++dr) {
             for (int dc = -2; dc <= 2; ++dc) {
@@ -99,12 +109,10 @@ std::vector<float> DataCollector::extract_features(const Board& board, int side_
                     if (cell == BLACK) value = 1.0f;
                     else if (cell == WHITE) value = -1.0f;
                 }
-                features[FEATURE_WINDOW + (dr + 2) * 5 + (dc + 2)] = value;
+                out[FEATURE_WINDOW + (dr + 2) * 5 + (dc + 2)] = value;
             }
         }
     }
-
-    return features;
 }
 
 std::vector<TrainingSample> DataCollector::collect(const GameRecord& record, int game_id,
@@ -122,6 +130,11 @@ std::vector<TrainingSample> DataCollector::collect(const GameRecord& record, int
         if (engine_chose && entry.depth >= min_search_depth_) {
             const float value = record.outcome_for(side);
             if (value != 0.0f || keep_undecided_) {
+                // 0-24 are the same under every square symmetry: compute them once
+                // for the ply, and let only 25-51 follow each transform.
+                std::vector<float> invariants(FEATURE_COUNT, 0.0f);
+                fill_invariants(board, side, invariants);
+
                 std::set<std::pair<uint64_t, int>> seen;
                 const int variants = with_augmentation ? SYMMETRY_COUNT : 1;
                 for (int variant = 0; variant < variants; ++variant) {
@@ -132,7 +145,8 @@ std::vector<TrainingSample> DataCollector::collect(const GameRecord& record, int
                     }
 
                     TrainingSample sample;
-                    sample.features = extract_features(oriented, side);
+                    sample.features = invariants;
+                    fill_orientation(oriented, side, sample.features);
                     sample.value = value;
                     sample.move = oriented_move;
                     sample.search_score = entry.score;
