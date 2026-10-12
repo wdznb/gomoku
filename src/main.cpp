@@ -30,20 +30,40 @@ int main(int argc, char* argv[]) {
                 port = parsed;
             } else if (arg == "--web-dir" && i + 1 < argc) {
                 web_dir = argv[++i];
+                if (web_dir.empty()) {
+                    std::cerr << "Invalid --web-dir (must not be empty)" << std::endl;
+                    return 1;
+                }
             } else if (arg == "--book" && i + 1 < argc) {
                 book_path = argv[++i];
+                if (book_path.empty()) {
+                    std::cerr << "Invalid --book (must not be empty)" << std::endl;
+                    return 1;
+                }
             } else if (arg == "--no-book") {
                 book_path.clear();
             } else if (arg == "--sessions" && i + 1 < argc) {
                 sessions_dir = argv[++i];
+                if (sessions_dir.empty()) {
+                    std::cerr << "Invalid --sessions (must not be empty)" << std::endl;
+                    return 1;
+                }
             } else if (arg == "--no-sessions") {
                 // Only the flag is recorded here: clearing the paths in the loop
                 // would let a later --records re-open one half of persistence.
                 no_sessions = true;
             } else if (arg == "--records" && i + 1 < argc) {
                 records_path = argv[++i];
+                if (records_path.empty()) {
+                    std::cerr << "Invalid --records (must not be empty)" << std::endl;
+                    return 1;
+                }
             } else if (arg == "--params" && i + 1 < argc) {
                 params_path = argv[++i];
+                if (params_path.empty()) {
+                    std::cerr << "Invalid --params (must not be empty)" << std::endl;
+                    return 1;
+                }
             } else {
                 std::cerr << "Unknown or valueless option: " << arg << std::endl;
                 return 1;

@@ -992,6 +992,82 @@ void test_genetic() {
     std::cout << "test_genetic passed" << std::endl;
 }
 
+// R87: one half of the seeded population is redrawn across each bound's whole
+// box. The old draw was min + noise * span with noise in (-0.5, 0.5), so every
+// reseeded gene landed in the lower half of its range - for double_four the old
+// maximum is 50000 - 1, and the top half of every box was unreachable at
+// seeding time, which is exactly the region a wider search of these bounds
+// needs to start from.
+void test_genetic_seed_covers_the_whole_box() {
+    ThreatCoefficients base;
+    const std::vector<int> base_genes = CoefficientVector::to_vector(base);
+
+    GeneticConfig settings;
+    settings.population_size = 12;
+    // Zero generations leaves run() with nothing to evolve, so population() is
+    // exactly what seed_population() wrote.
+    settings.max_generations = 0;
+
+    // Seeds chosen after a sweep of candidates: the draw is deterministic per
+    // seed, and gene 9 (span 20) truncates to its min about 5% of the time, so
+    // these two are picked where that coincidence does not occur.
+    const std::vector<uint64_t> seeds = {202, 505};
+    bool upper_half_seen = false;
+
+    // The most one inner step can add to a gene is span / 8 (noise is bounded
+    // by 0.5 and then the 0.25 factor halves it again), and a nudge member
+    // spends one step per gene. Ladder repairs only move a value towards
+    // another gene that is itself within this budget of its own base.
+    long nudge_budget = 0;
+    for (int g = 0; g < TUNABLE_COUNT; ++g) {
+        const ParamBound bound = CoefficientVector::bound_for(static_cast<TunableParam>(g));
+        nudge_budget += (bound.max_value - bound.min_value) / 8;
+    }
+    std::cout << "[r87r] nudge_budget=" << nudge_budget << std::endl;
+
+    for (uint64_t seed : seeds) {
+        GeneticOptimizer optimizer([](const ThreatCoefficients&) { return 0.0; },
+                                   settings, seed);
+        int generations = -1;
+        double best = -1.0;
+        optimizer.run(base, generations, best);
+        assert(generations == 0);
+        assert(optimizer.population().size() ==
+               static_cast<size_t>(settings.population_size));
+
+        // Seat 0 is the founder: the hand-tuned base itself, gene for gene.
+        assert(optimizer.population()[0].genes == base_genes);
+
+        for (int i = 1; i < settings.population_size; ++i) {
+            const std::vector<int>& genes = optimizer.population()[i].genes;
+            const bool reseeded = i % 2 == 1;
+            std::cout << "[r87r] seed=" << seed << " member[" << i << "]"
+                      << (reseeded ? " reseed:" : " nudge: ");
+            for (int v : genes) std::cout << ' ' << v;
+            std::cout << std::endl;
+            if (reseeded) {
+                for (int g = 0; g < TUNABLE_COUNT; ++g) {
+                    const ParamBound bound =
+                        CoefficientVector::bound_for(static_cast<TunableParam>(g));
+                    assert(genes[g] != bound.min_value);
+                }
+                if (genes[static_cast<size_t>(TunableParam::DOUBLE_FOUR)] > 50000) {
+                    upper_half_seen = true;
+                }
+            } else {
+                for (int g = 0; g < TUNABLE_COUNT; ++g) {
+                    assert(std::abs(genes[g] - base_genes[g]) <= nudge_budget);
+                }
+            }
+        }
+    }
+    // 50000 - 1 is the old draw's ceiling for double_four, so a member above
+    // the midpoint of that box proves the whole box is reachable now.
+    assert(upper_half_seen);
+
+    std::cout << "test_genetic_seed_covers_the_whole_box passed" << std::endl;
+}
+
 // B6: empty steps (candidate == current) must neither count as evaluations nor
 // trigger stagnation. A multiplier of 1.0 with sanitize makes every neighbor a
 // no-op for the base genes.
@@ -1047,8 +1123,15 @@ void test_hill_climbing_effective_steps() {
     std::cout << "test_hill_climbing_effective_steps passed" << std::endl;
 }
 
-// B7: elitism means the incumbent is never re-evaluated; it is appended after
-// evaluate(). A counting fitness proves calls per vector.
+// B7: elitism means the incumbent is appended after evaluate(), so the elite
+// slot itself never gets scored a second time. Scoring by gene-vector was
+// dropped: a produced child can coincide with a vector that is already in the
+// population, and that child is scored again - that is what the current
+// implementation does (measured on c14854a: seed=3 a non-winner vector was
+// scored 4 times, seed=11 the founder vector 3 times, seed=4242 the winning
+// vector 2 times), so calls-per-vector measured vector uniqueness rather than
+// elite re-scoring, and it was not independent of the seeding distribution.
+// What stays observable here is the elite slot and the evaluation count.
 void test_genetic_elite_single_evaluation() {
     ThreatCoefficients base;
     GeneticConfig settings;
@@ -1058,17 +1141,13 @@ void test_genetic_elite_single_evaluation() {
     settings.crossover_ratio = 0.85;
     settings.mutation_rate = 0.0;
 
-    std::map<std::string, int> calls;
-    auto count_fitness = [&](const ThreatCoefficients& c) -> double {
-        std::string k;
-        for (int v : CoefficientVector::to_vector(c)) k += std::to_string(v) + ",";
-        calls[k]++;
+    auto sum_fitness = [](const ThreatCoefficients& c) -> double {
         long sum = 0;
         for (int v : CoefficientVector::to_vector(c)) sum += v;
         return static_cast<double>(sum);
     };
 
-    GeneticOptimizer optimizer(count_fitness, settings, 3);
+    GeneticOptimizer optimizer(sum_fitness, settings, 3);
     int generations = 0;
     double best = 0.0;
     ThreatCoefficients winner = optimizer.run(base, generations, best);
@@ -1076,11 +1155,12 @@ void test_genetic_elite_single_evaluation() {
     // Population is full (elite appended, not pre-filled before evaluate).
     assert(optimizer.population().size() == static_cast<size_t>(settings.population_size));
 
-    // The elite (winner) is scored exactly 1 time (once in the initial population,
-    // appended without re-evaluation). On HEAD it was scored twice (initial + elite slot).
-    std::string winner_key;
-    for (int v : CoefficientVector::to_vector(winner)) winner_key += std::to_string(v) + ",";
-    assert(calls[winner_key] == 1);
+    // The last slot is the incumbent carried across the generation: it holds the
+    // fitness run() reports as best, and its coefficients are the returned
+    // champion, without having been scored again by the append.
+    assert(optimizer.population().back().fitness == best);
+    assert(CoefficientVector::to_vector(optimizer.population().back().coefficients) ==
+           CoefficientVector::to_vector(winner));
 
     // Total evaluations = population_size + generations * (population_size - 1).
     assert(optimizer.evaluations() ==
@@ -2605,6 +2685,7 @@ int main() {
     test_augmented_samples_match_manual_transforms();
     test_hill_climbing();
     test_genetic();
+    test_genetic_seed_covers_the_whole_box();
     test_hill_climbing_empty_steps();
     test_hill_climbing_effective_steps();
     test_genetic_elite_single_evaluation();

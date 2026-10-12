@@ -165,6 +165,11 @@ cd build
 原因并关闭落盘继续运行——端口能服务、棋能下，比一个写不进去的目录重要；写盘失败同样只报在
 stdout，不会打断对局。`data/sessions/` 与 `data/training/` 都在 `.gitignore` 里。
 
+路径类选项（`--web-dir`、`--book`、`--sessions`、`--records`、`--params`）**给空串就是启动即报错退出**
+（退出码 1，错误信息点名是哪个 flag）：空路径多半是 shell 变量没展开，而不是「不要这个功能」，
+关闭有专门的 `--no-book` / `--no-sessions`。把 `--book ""` 当成禁用会让人以为开局库还在，
+把 `--sessions ""` 当成关闭则会让完局静默地不落盘。
+
 ## 自我训练（阶段3）
 
 训练器 `gomoku_train` 用自我对弈评估威胁系数，每轮的流程是：

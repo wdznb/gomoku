@@ -1704,3 +1704,70 @@ too; the evidence for the change is the call shape instead: `980983b` still had
 `sample.features = extract_features(oriented, side)` inside the variant loop, while the worktree calls
 `fill_invariants` once per ply (`:136`) and only `fill_orientation` per variant (`:149`).
 No run wrote into `data/training/` (the default checkpoint is still absent).
+
+## 轮次87 只撒到下半格的播种、被当成禁用的空路径 — bugfix round 87 batch R
+
+**Found.** **R1** `src/training/genetic.cpp:51` built the "redrawn across the whole box" half of the seeded
+population with `bound.min_value + noise(rng_) * span`, reusing the `std::uniform_real_distribution<double>
+noise(-0.5, 0.5)` from `:38`. Half of those draws are negative, so they land *below* `min_value` and are
+clamped back by `sanitize_vector` (`params.cpp:71-90`, the clamp at `:76`); the reachable band was
+`min .. min + span/2`, not the box the comment at `:45-46` claims, and roughly half of every reseeded member's
+genes sat pinned at the floor of their `ParamBound` (`params.cpp:18-31`). Measured on `c14854a`: 23-33 of the
+60 reseeded genes per 12-member population hit a `min_value`, and no member ever exceeded the midpoint of the
+`double_four` box (10 seeds). The founder half is untouched, so this was purely about where the *search*
+starts - the upper half of each box, which is exactly where a wider coefficient search has to be able to
+begin, was never sampled. **R3** `src/main.cpp` took `--web-dir ""` / `--book ""` / `--sessions ""` /
+`--records ""` / `--params ""` as "feature off": an empty shell variable therefore silenced the opening book,
+dropped the 10-second session flush and the finished-game record stream, or replaced the trained params with
+the built-in defaults, all without a word - while README:159-161 documents `--no-book` / `--no-sessions` as
+the only off switches and the file's own fail-loud principle (`:70-72`, `:83-85`) refuses a path the caller
+did not really give.
+
+**Fixed.** `:39` adds a separate `uniform(0.0, 1.0)` and `:51` uses it for the redraw branch only, so
+`min + U(0,1) * span` covers the box without a clamp; the `noise` distribution stays for the nudge branch at
+`:49`, and nothing else in the optimizer (tournament, crossover, mutation, elitism) was touched. The five
+path flags each refuse an empty value with `Invalid <flag> (must not be empty)` and exit 1, next to the
+existing `--port`/unknown-option refusals; README now states the rule where the flags are documented.
+
+**Test-side.** `tests/test_training.cpp` gains `test_genetic_seed_covers_the_whole_box` (two fixed seeds,
+`max_generations = 0` so `population()` is exactly what `seed_population` wrote: seat 0 equals the base gene
+for gene, odd seats are the redrawn members and no gene may sit on its `min_value`, even seats stay within
+`nudge_budget`, and at least one redrawn `double_four` is above the box midpoint - the old draw's ceiling was
+50000-1). `test_genetic_elite_single_evaluation` was **rewritten as 用例假设错, not as an implementation
+regression**: its `assert(calls[winner_key] == 1)` counted fitness calls per *gene-vector string*, so it
+measured "this vector happens to be unique" rather than "the elite is not re-scored", and any change to the
+seeding distribution could flip it. The probe settles it - on both trees and all eight seeds
+`evaluations() == 15 == pop + gens * (pop - 1)`, i.e. the elite is genuinely never re-scored, while duplicate
+vectors are re-scored on `c14854a` too (seed 3 a non-winner vector 4 times, seed 11 the founder 3 times,
+seed 4242 the winner 2 times). The case now pins the observable form (`population().back().fitness == best`,
+the appended elite's coefficients equal to the returned champion, the population size and the evaluation
+count formula unchanged) and the vector-keyed map is gone.
+
+**Refuted this round.** "must_block throws away a proven VCF win" - in the cited position black's live-four
+creation at (5,6) hands the move to white, who completes five at (10,7), so the block is the only move; a
+five-completion point is always adjacent to a friendly stone and therefore always inside `active_empty()`, so
+no five point can be missing from that scan. Multiplicative mutation (`genetic.cpp:107-117`) cannot move a
+gene already at 0 (`POSITION_WEIGHT_SCALE` has `min_value = 0`): a real limitation, but the seeding fix
+removes the mass of floor-pinned genes that made it common, and README promises no additive fallback. The
+static-serving/CLI audit cleared `server.cpp:403-442` (`/` → `index.html`, `%`/backslash/`//` rejected,
+every `..`/`.` segment rejected, `weakly_canonical` + root-prefix check, `is_regular_file` so no directory
+listing), `server.cpp:444-458` (all three shipped assets have explicit content types), `main.cpp` `--port`
+(`used != text.size()` rejects trailing junk, `stoi` failures exit 1, the 1-65535 check runs before the
+`uint16_t` endpoint), duplicate/unknown flags, and `elo.cpp:60-94` / `game_record.*` / `self_play.cpp`
+counters and labels. One item from that audit is **carried to the next batch**: `params.cpp:344-347` returns
+on a mid-write failure without removing `<path>.tmp`, while its own comment at `:329-331` claims it mirrors
+`save_session`, which removes the temp on that branch (`session_store.cpp:244-248`) and `params.cpp:352`
+removes it when only the rename failed.
+
+**Verified.** Gate over the identical tree: `ctest` **8/8** (bare `cmake ..`; `test_genetic_seed_covers_the_whole_box`
+and `test_genetic_elite_single_evaluation` both pass in `test_training`) and `node tests/web_frontend_check.js`
+**30/30**. Negative proofs in `build/neg87r` (`git archive c14854a` + the current `tests/`): the seeding case
+aborts at `tests/test_training.cpp:1052` `Assertion 'genes[g] != bound.min_value' failed` (exit 134) with
+`min_hits=23` / `31` and `double_four_above_mid=0`, while the elite case **passes** at HEAD - the rewrite is
+behaviour-neutral, only R1 is proven by it. R3 is CLI-proven both ways: on the worktree all five empty values
+exit **1** naming the flag (`Invalid --params (must not be empty)` is the log tail), legal paths and
+`--no-book` / `--no-sessions` alone still reach `Server started` (exit 124 from the harness' own timeout) with
+**0** empty-path refusals, and no run wrote into the repo's `data/`; on `c14854a` the same four flags
+`--book`/`--sessions`/`--records`/`--params` given `""` print `Server started` and never name the flag (only
+`--web-dir ""` exited 1, and for the pre-existing "not a directory" reason).
+

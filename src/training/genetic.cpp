@@ -36,6 +36,7 @@ void GeneticOptimizer::seed_population(const ThreatCoefficients& base) {
     population_.push_back(founder);
 
     std::uniform_real_distribution<double> noise(-0.5, 0.5);
+    std::uniform_real_distribution<double> uniform(0.0, 1.0);
     for (int i = 1; i < config_.population_size; ++i) {
         std::vector<int> genes = base_genes;
         for (int g = 0; g < static_cast<int>(genes.size()); ++g) {
@@ -47,7 +48,7 @@ void GeneticOptimizer::seed_population(const ThreatCoefficients& base) {
                 const size_t target = rng_() % genes.size();
                 genes[target] += static_cast<int>(noise(rng_) * span * 0.25);
             } else {
-                genes[g] = static_cast<int>(bound.min_value + noise(rng_) * span);
+                genes[g] = static_cast<int>(bound.min_value + uniform(rng_) * span);
             }
         }
         CoefficientVector::sanitize_vector(genes);
