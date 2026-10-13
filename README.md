@@ -526,9 +526,9 @@ ctest --output-on-failure
 不再自动重连（`reconnect` / `resume`），但 `localStorage` 里的 token 保留——刷新页面仍可把这局拿
 回来。
 
-`replay` 是本会话对局的逐手分析：`method` 为 `human` 表示玩家落子（无搜索数据），
-其余为引擎返回路径（`book` / `vcf` / `vct` / `alphabeta` / `greedy`）；
-`score` 是**刚落子一方**视角的分值，非 AlphaBeta 路径不填 `depth` / `nodes`。`base` 是摆棋摆上去、
+`replay` 是本会话对局的逐手分析：`method` 为 `human` 表示玩家落子（无搜索数据），其余为引擎返回路径
+（`book` / `vcf` / `vct` / `alphabeta` / `greedy` / `forced` / `greedy_five` / `must_block`），后三条是搜索前的
+快速路径（只剩一个候选点、自己一手成五、对方一手成五不得不挡），它们照样落子、照样进分析；`score` 是**刚落子一方**视角的分值，非 AlphaBeta 路径不填 `depth` / `nodes`，这三条也一样。`must_block` 的 99000 只是防守标记分：它低于前端判定已证胜负的阈值（`|score| >= 99999`），既不会显示成「胜/负」，也不会在评估曲线上画红点，只是被 ±2000 截断后贴在曲线边缘的一个大分。`base` 是摆棋摆上去、
 `moves` 里没有的那些子：只有 `moves` 读不出摆棋对局的棋盘，前端重画时先铺 `base` 再按顺序落 `moves`，
 轮次也按两者之和取。
 

@@ -1589,6 +1589,111 @@ check('V3 rotating the view outside setup still writes the 视角 line', () => {
     assert(el('btn-view-rotate').textContent === '旋转 90°', 'the button matches the view');
 });
 
+// W1: README:529-531 says the three pre-search fast paths forced / greedy_five /
+// must_block answer without a depth or a node count, exactly like book / vcf /
+// vct / greedy. formatAnalysis omits both suffixes whenever the field is falsy,
+// so all seven labels must render as "<method> <score>" and keep only the
+// timing suffix in the replay line.
+check('W1 fast-path methods render without depth or node suffixes', () => {
+    const game = newGame();
+    const quick = ['book', 'vcf', 'vct', 'greedy', 'forced', 'greedy_five', 'must_block'];
+    for (const method of quick) {
+        const text = game.formatAnalysis(
+            { method, score: 120, depth: 0, nodes: 0, elapsed_ms: 0 }, true);
+        assert(text === `${method} 120`,
+               `${method} must print as "<method> <score>", got: ${text}`);
+        assert(!/\d+d(\s|$)/.test(text), `${method} carries no depth suffix, got: ${text}`);
+        assert(!/\dk/.test(text), `${method} carries no node suffix, got: ${text}`);
+    }
+
+    // The searched path is the control: fill depth and nodes and both suffixes
+    // appear, so the seven absences above come from the fast paths themselves.
+    const searched = game.formatAnalysis(
+        { method: 'alphabeta', score: 120, depth: 4, nodes: 1500, elapsed_ms: 0 }, true);
+    assert(searched === 'alphabeta 120 4d 1.5k',
+           'the searched path prints both suffixes, got: ' + searched);
+
+    // Same through the replay line, where the timing suffix is shown: the method
+    // name and its time arrive while the two fast-path suffixes stay missing.
+    game.moveHistory = [{ row: 7, col: 7, color: BLACK }];
+    game.analysis = [{ method: 'must_block', score: 120, depth: 0, nodes: 0, elapsed_ms: 7 }];
+    game.replayIndex = 0;
+    game.updateReplayInfo();
+    const line = el('replay-info').textContent;
+    assert(line.indexOf('must_block 120 7ms') > 0,
+           'the replay line names the method and the time, got: ' + line);
+    assert(!/\d+d(\s|$)/.test(line) && !/\dk/.test(line),
+           'no depth or node suffix in the replay line, got: ' + line);
+});
+
+// W2: README:531 calls 99000 a defensive mark score, below the |score| >= 99999
+// threshold that turns a number into a verdict. The must_block label itself is
+// unaffected either way.
+check('W2 the 99000 defensive mark stays a number, 100000 reads as a win', () => {
+    const game = newGame();
+    const defend = game.formatAnalysis(
+        { method: 'must_block', score: 99000, depth: 0, nodes: 0, elapsed_ms: 0 }, true);
+    assert(defend.indexOf('must_block') === 0, 'the label is printed, got: ' + defend);
+    assert(defend.indexOf('99000') >= 0, 'and the score stays a number, got: ' + defend);
+    assert(defend.indexOf('胜') < 0 && defend.indexOf('负') < 0,
+           '99000 is not a proven win or loss, got: ' + defend);
+    assert(defend === 'must_block 99000', 'exact line, got: ' + defend);
+
+    const win = game.formatAnalysis(
+        { method: 'must_block', score: 100000, depth: 0, nodes: 0, elapsed_ms: 0 }, true);
+    assert(win === 'must_block 胜', '100000 clears the mate threshold, got: ' + win);
+    const loss = game.formatAnalysis(
+        { method: 'must_block', score: -100000, depth: 0, nodes: 0, elapsed_ms: 0 }, true);
+    assert(loss === 'must_block 负', 'the mirrored score reads as a loss, got: ' + loss);
+});
+
+// W3: the curve is clipped at +/-2000 and only a saturated score earns the red
+// dot (README:531), so the 99000 defensive mark sits pinned to the edge with no
+// dot, while a mate score past the threshold draws one.
+check('W3 the curve dots 100000 but not the 99000 defensive mark', () => {
+    const game = newGame();
+    const ctx = el('eval-graph').getContext();
+    let dots = [];
+    let line = [];
+    ctx.arc = (x, y, r) => { dots.push({ x, y, r }); };
+    ctx.moveTo = (x, y) => { line.push({ x, y }); };
+    ctx.lineTo = (x, y) => { line.push({ x, y }); };
+
+    // The stub canvas is 200x64, so y = 32 - (clamped / 2000) * 26: a score past
+    // the clip sits on y = 6. Each ply's point is found by its own x.
+    const plot = (scores, colors) => {
+        dots = [];
+        line = [];
+        game.moveHistory = colors.map(color => ({ row: 7, col: 7, color }));
+        game.analysis = scores.map(score => ({
+            method: 'must_block', score, depth: 0, nodes: 0, elapsed_ms: 1,
+        }));
+        game.drawEvalGraph();
+        const ys = scores.map((unused, i) => {
+            const want = 200 * (i + 0.5) / scores.length;
+            const hit = line.filter(p => Math.abs(p.x - want) < 1e-9);
+            assert(hit.length === 1, 'no curve point at x=' + want);
+            return hit[0].y;
+        });
+        return { dots: dots.slice(), ys };
+    };
+
+    const defend = plot([99000], [BLACK]);
+    assert(defend.dots.length === 0, 'the defensive mark score earns no red dot');
+    assert(Math.abs(defend.ys[0] - 6) < 1e-9,
+           'and it sits clipped on the top edge, y=' + defend.ys[0]);
+
+    const win = plot([100000], [BLACK]);
+    assert(win.dots.length === 1, 'a score past the mate threshold earns the dot');
+    assert(Math.abs(win.ys[0] - 6) < 1e-9, 'at the same clipped edge, y=' + win.ys[0]);
+
+    const mixed = plot([99000, 100000], [BLACK, BLACK]);
+    assert(mixed.dots.length === 1, 'only the mated ply of the pair is dotted');
+    assert(Math.abs(mixed.dots[0].x - 150) < 1e-9, 'the dot belongs to the mated ply');
+    assert(Math.abs(mixed.ys[0] - 6) < 1e-9 && Math.abs(mixed.ys[1] - 6) < 1e-9,
+           'both clipped plies share the top edge, ys=' + mixed.ys.join(','));
+});
+
 let failed = 0;
 for (const result of results) {
     console.log(`${result.ok ? 'PASS' : 'FAIL'} ${result.label}` +

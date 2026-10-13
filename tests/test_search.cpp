@@ -777,6 +777,74 @@ void test_forced_move() {
     std::cout << "test_forced_move passed" << std::endl;
 }
 
+// Round 92 W2: the three pre-search fast paths README:530 lists - forced,
+// greedy_five, must_block - are reached from the engine side. Each method string
+// is written on exactly one return, so the label plus the score and depth that
+// branch leaves behind is the whole observable: none of the three fills a depth,
+// and only the two five-handling paths set a score.
+void test_fast_path_labels_fill_no_depth() {
+    std::atomic<bool> stop(false);
+
+    {
+        // forced: every cell but (7,7) is filled, so the candidate list holds one
+        // point. The 2-row stripe colouring keeps every line at B,B,W,W or
+        // B,W,B,W under a two-stone run, so no side has a five to resign over.
+        Board board;
+        for (int r = 0; r < BOARD_SIZE; ++r) {
+            for (int c = 0; c < BOARD_SIZE; ++c) {
+                if (r == 7 && c == 7) continue;
+                board.place_stone(r, c, (2 * r + c) % 4 < 2 ? BLACK : WHITE);
+            }
+        }
+        assert(board.active_empty().size() == 1);
+
+        SearchEngine engine;
+        SearchResult result = engine.search(board, WHITE, 4, 1000, stop);
+        assert(result.method == "forced");
+        assert(result.score == 0);
+        assert(result.depth == 0);
+    }
+
+    {
+        // greedy_five: WHITE's open-ended four in row 8 completes next move, so
+        // the own-win scan answers before any depth is searched.
+        Board board;
+        board.place_stone(8, 3, WHITE);
+        board.place_stone(8, 4, WHITE);
+        board.place_stone(8, 5, WHITE);
+        board.place_stone(8, 6, WHITE);
+        board.place_stone(2, 2, BLACK);
+        board.place_stone(12, 12, BLACK);
+
+        SearchEngine engine;
+        SearchResult result = engine.search(board, WHITE, 4, 1000, stop);
+        assert(result.method == "greedy_five");
+        assert(result.score == 100000);
+        assert(result.depth == 0);
+    }
+
+    {
+        // must_block: WHITE's four in row 0 is capped at (0,6) by a black stone,
+        // so (0,1) is the single completion point, the turn is savable, and the
+        // defensive mark score 99000 is what gets reported.
+        Board board;
+        board.place_stone(0, 2, WHITE);
+        board.place_stone(0, 3, WHITE);
+        board.place_stone(0, 4, WHITE);
+        board.place_stone(0, 5, WHITE);
+        board.place_stone(0, 6, BLACK);
+        board.place_stone(10, 10, BLACK);
+
+        SearchEngine engine;
+        SearchResult result = engine.search(board, BLACK, 4, 1000, stop);
+        assert(result.method == "must_block");
+        assert(result.score == 99000);
+        assert(result.depth == 0);
+    }
+
+    std::cout << "test_fast_path_labels_fill_no_depth passed" << std::endl;
+}
+
 // Round 33 F1: winning your own five must take priority over blocking the
 // opponent's. Greedy ranks by attack + defense, so a defensive square can
 // outrank an outright winning five; before the fix the must_block branch
@@ -2335,6 +2403,7 @@ int main() {
     test_controller_stop();
     test_controller_restart_after_completion();
     test_forced_move();
+    test_fast_path_labels_fill_no_depth();
     test_search_result_fields_initialized_on_fast_paths();
     test_vcf_defense_proven_loss();
     test_vcf_defense_survives();

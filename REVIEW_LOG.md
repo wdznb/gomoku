@@ -1979,6 +1979,70 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次92 回放契约里没写出来的那三条路径 — bugfix round 92 batch W
+
+**Found.** Four read-only audits over `7e458b6` (search layer, server/session/protocol, core geometry + view mapping,
+self-play/retry/opening-book, plus my own sweeps of the DOM-id set, `src/main.cpp`'s flag handling and
+README-vs-code defaults). **W1** README:529-531 tells a client what a `replay` frame's `method` can be:
+「其余为引擎返回路径（`book` / `vcf` / `vct` / `alphabeta` / `greedy`）」 — presented as the set. The engine actually
+writes eight: `search_engine.cpp:92` returns `forced` when exactly one candidate point survives, `:109` returns
+`greedy_five` (score 100000) when a root candidate completes its own five, and `:150` returns `must_block`
+(score 99000) for the single point that has to be blocked. All three **commit a stone**, so they land in `analyses_`
+(`game_manager.cpp:418-420`), travel in the `replay` frame, and are printed verbatim by `web/app.js:804`; a reader
+following the documented enum treats them as unknown values.
+
+**Fixed.** README only: the enum now lists all eight engine paths and states that the last three are pre-AlphaBeta
+fast paths that fill no `depth` / `nodes` either, and that `must_block`'s 99000 is a defensive marker, not a proven
+result — the frontend's proven-win/loss test is `|score| >= 99999` (`app.js:802` for the 胜/负 word, `:863` for the
+curve's red dot), so 99000 shows as a plain number and sits clipped at ±2000 without a dot. No code was touched and
+the file is still 658 lines, so every `README:NNN` citation in the tree keeps its target.
+
+**Not defects / deliberately left.** The search audit's headline row claimed `must_block`'s 99000 is plotted as a
+near-mate win — **refuted against the code** (`app.js:802` and `:863` both gate on `>= 99999`). Its second row
+(`greedy.cpp:17-19` answers `Move(7,7)` when its candidate list is empty, and `search_engine.cpp:334` would commit
+that unvalidated cell) is **unconstructible**: reaching it needs every cell in `board.active_empty()` forbidden for
+BLACK *and* a legal cell outside that window, otherwise `:40-45` or the `far_legal` rescan at `:66-86` already
+returns `no_legal_move`/`resign` and commits nothing — and a legal cell beyond the window means the bordering
+window cells are plain extensions of lone stones. The third row (loss proof gated on `alphabeta_enabled_`) is
+**unreachable**: `set_alphabeta_enabled(false)` has exactly one caller, `tests/test_search.cpp:1511`. Core geometry
+came back clean after full-path verification (8 bijections forming the D4 group, `transforms.cpp:9-11` agreeing with
+the book's convention, `logicalOf(displayOf(·))` the identity for all eight rot×flip views, edge labels reproducing
+`coordName`, the ±4 bitboard window wall-masked rather than wrapped, incremental `active_empty` surviving undo, 摆棋
+stored in logical coordinates) — and there is **no** hover-preview handler in `app.js`, so that target does not
+exist. Self-play/retry/book is likewise clean: `query` enforces side parity and BLACK-first alternation, all 40
+shipped lines open at the D4-invariant centre `[7,7]`, the runtime overload rejects `is_forbidden` before handing
+back a black book move, `max_depth_` matches the `move_count() <= max_depth()` gate, and
+`rewind_to_next_branch` marks every branch tried exactly once. The training CLI's stale promises
+(`main_trainer.cpp:166-168` calls `--rounds 0` 「the documented … case handled below」 while `:225` refuses it;
+`:180-184` says `--timeout-ms`/`--max-moves` 「keep accepting whatever the caller writes」 while `:236` refuses them;
+`require_seed` at `:100-108` lets `stoull("-1")` wrap to `18446744073709551615` and pass its own `used == size`
+guard) are queued as **round 93's batch X**, not folded into this one. `trainer.cpp:424-436` leaves a
+`<path>.tmp` behind when the checkpoint flush fails while `params.cpp:338-348` removes it — real asymmetry, but
+IO-failure-only and not reachable through the gate, so it stays deliberately unfixed rather than dispatched with a
+test that cannot go red.
+
+**Verified.** Over the identical tree the tester ran the gate: `ctest` **8/8** (`100% tests passed, 0 tests failed
+out of 8`, bare `cmake ..`) and `node tests/web_frontend_check.js` **35/35** (32 before W1/W2/W3). Because W1 touched
+only `README.md` and `git diff --stat -- src web CMakeLists.txt data` is empty, every new assertion is a
+*descriptive pin* (green on HEAD too) and the doc change has **无可观察差异**; no HEAD-negative was invented. What the
+pins establish: **W1** (`tests/web_frontend_check.js:1597`) all seven non-AlphaBeta methods print as
+`<method> <score>` with no `d`/`k` suffix while `alphabeta` prints `120 4d 1.5k`, and `updateReplayInfo()` renders
+`must_block 120 7ms`; **W2** (`:1632`) `must_block 99000` stays `must_block 99000` with no 胜/负, whereas ±100000
+becomes `must_block 胜` / `must_block 负`, pinning the `|score| >= 99999` threshold the sentence relies on; **W3**
+(`:1653`) the curve draws 0 arcs at 99000 (the point pins to the edge at y=6) and 1 arc at 100000, so the 99000
+number really is not a proven result; **X2** (`tests/test_search.cpp:785`, registered `:2406`) builds the three
+fast paths from real boards and asserts only `method`/`score`/`depth` — `forced 0 0`, `greedy_five 100000 0`,
+`must_block 99000 0` — which is what makes the enum in the doc exhaustive rather than guessed.
+**X3** (`tests/readme_anchor_check.js`, a standalone script, not in `ctest`) printed `README.md lines: 658` and
+`citations found: 27`, cross-checked the doc enum against the ten labels `search_engine.cpp` actually assigns (the
+two extras, `resign` and `no_legal_move`, cannot reach a replay frame - `game_manager.cpp:395` returns on
+`result.resigned` and `:407` pushes only for a valid `best_move`), and in doing so surfaced a *separate* defect for
+the next round: eight pre-existing `README:NNN` citations in `src/`, `web/` and `tests/` drifted onto blank or
+unrelated lines (`params.cpp:231`→154, `test_training.cpp:2199`→154, `app.js:193`→545, `search_engine.cpp:11`→336,
+`search_engine.cpp:277`→513, `app.js:919`/`:1663` + `web_frontend_check.js:1171`→283, `web_frontend_check.js:1056`/
+`:1064` + `app.js:184`→530, `server.cpp:1182` + `test_server.cpp:907`/`:1181`→476). They drifted at `7e458b6`
+already - this round replaced 3 lines with 3 lines - so the anchor-fix is batch X work, not a W regression.
+
 ## 轮次91 被当成重复的那一半样本、被自己回显拒掉的文档、被冲掉的那条指引 — bugfix round 91 batch V
 
 **Found.** Three read-only audits over `8b15beb` (frontend / position-document / training-data) and nine candidate
@@ -2024,7 +2088,7 @@ newer truth and the setup panel is stale the moment a stone lands — and was no
 
 **Verified.** Gate over the identical tree: `ctest` **8/8** (bare `cmake ..`) and
 `node tests/web_frontend_check.js` **32/32** (30 before E's two cases). HEAD negatives in `build/neg91`
-current `tests/`): **2 of 8 binaries red** and nothing else — `5 - test_position` aborts at
+(`git archive 8b15beb` plus the current `tests/`): **2 of 8 binaries red** and nothing else — `5 - test_position` aborts at
 `tests/test_position.cpp:1010` `forced.ok()`, `8 - test_training` at `tests/test_training.cpp:2822`
 `augmented.size() == SYMMETRY_COUNT` (both had already printed 16 / 49 existing ` passed` lines), and the neg-tree
 web harness is `31/32` with only `tests/web_frontend_check.js:1564` failing. Anti-overreach pins green on **both**
