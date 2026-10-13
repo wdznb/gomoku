@@ -1507,6 +1507,60 @@ void test_zero_stone_position_keeps_the_token() {
     std::cout << "test_zero_stone_position_keeps_the_token passed" << std::endl;
 }
 
+// Round 94, Y1: a transient accept failure used to be the last thing the listener
+// ever did - the completion handler returned without re-arming, so the port went
+// unserved for the rest of the process while the sessions already open kept
+// playing. The retry timer paces the re-armed loop, and operation_aborted, which
+// is the shape a shutdown takes, stays the only error that ends it.
+void test_transient_accept_failure_rearms_and_abort_ends() {
+    using clock = std::chrono::steady_clock;
+    beast::error_code ec;
+    {
+        // A closed acceptor completes async_accept with a descriptor error. That
+        // is transient, not a shutdown, so every round has to leave another
+        // attempt scheduled behind it.
+        GameServer server(0, std::string(), std::string(), nullptr, std::string(),
+                          std::string());
+        server.acceptor_.close(ec);
+        server.do_accept();
+
+        auto previous = server.accept_retry_timer_.expiry();
+        auto shortest_gap = clock::duration::max();
+        int rearms = 0;
+        for (int i = 0; i < 4; ++i) {
+            server.ioc_.restart();
+            server.ioc_.run_for(std::chrono::milliseconds(150));
+            const auto deadline = server.accept_retry_timer_.expiry();
+            if (deadline > previous) {
+                ++rearms;
+                shortest_gap = std::min(shortest_gap, deadline - previous);
+            }
+            previous = deadline;
+        }
+        assert(rearms >= 2);
+        // The wait is what paces the retry: an inline re-accept in the same
+        // handler stack would move the deadline by ~0 instead of ~100 ms.
+        assert(shortest_gap >= std::chrono::milliseconds(50));
+
+        server.accept_retry_timer_.cancel();
+        server.ioc_.restart();
+        server.ioc_.poll();
+    }
+    {
+        // The shutdown shape: an accept that is still pending when the acceptor
+        // closes completes aborted, and that on its own must end the loop.
+        GameServer server(0, std::string(), std::string(), nullptr, std::string(),
+                          std::string());
+        const auto baseline = server.accept_retry_timer_.expiry();
+        server.do_accept();
+        server.acceptor_.close(ec);
+        server.ioc_.restart();
+        server.ioc_.run_for(std::chrono::milliseconds(300));
+        assert(server.accept_retry_timer_.expiry() == baseline);
+    }
+    std::cout << "test_transient_accept_failure_rearms_and_abort_ends passed" << std::endl;
+}
+
 }  // namespace
 
 int main() {
@@ -1533,6 +1587,7 @@ int main() {
     test_hint_answer_for_a_superseded_position();
     test_resume_restores_each_config_half();
     test_zero_stone_position_keeps_the_token();
+    test_transient_accept_failure_rearms_and_abort_ends();
 
     std::cout << "All server tests passed!" << std::endl;
     return 0;

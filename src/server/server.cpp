@@ -265,6 +265,14 @@ void WebSocketSession::run_websocket() {
         [](websocket::response_type& res) {
             res.set(boost::beast::http::field::server, "GomokuAI");
         }));
+    // The cap on a buffered inbound message is stated here rather than left to
+    // whatever the Boost build happens to default it to, because do_read()
+    // accumulates a fragmented message whole before any handler runs - the 225-stone
+    // and timeout checks downstream come too late. The number is the frame size the
+    // position loader already assumes on this wire (position_json.cpp's "The wire
+    // allows a 16 MiB frame"); past it Beast fails the read with message_too_big and
+    // the existing error path drops the socket.
+    ws_.read_message_max(16u * 1024u * 1024u);
 
     ws_.async_accept(
         req_,
@@ -499,7 +507,8 @@ GameServer::GameServer(int port, const std::string& web_dir,
                        const std::string& records_path)
     : ioc_(), acceptor_(net::make_strand(ioc_)),
       signals_(ioc_, SIGINT, SIGTERM), web_dir_(web_dir),
-      sessions_dir_(sessions_dir), records_path_(records_path), flush_timer_(ioc_) {
+      sessions_dir_(sessions_dir), records_path_(records_path), flush_timer_(ioc_),
+      accept_retry_timer_(ioc_) {
     if (coefficients) {
         coefficients_ = *coefficients;
         use_loaded_coefficients_ = true;
@@ -567,6 +576,7 @@ void GameServer::stop() {
     beast::error_code ec;
     acceptor_.close(ec);
     flush_timer_.cancel();
+    accept_retry_timer_.cancel();
     signals_.cancel();
     ioc_.stop();
 }
@@ -576,12 +586,21 @@ void GameServer::do_accept() {
         net::make_strand(ioc_),
         [this](beast::error_code ec, tcp::socket socket) {
             if (ec) {
-                if (ec != net::error::operation_aborted) {
-                    std::cerr << "Accept error: " << ec.message() << std::endl;
-                }
+                // Only a shutdown ends the accept loop. Everything else is
+                // transient - no_descriptors and network_down come and go, and a
+                // client that resets mid-accept is one connection, not a dead
+                // server - so the loop re-arms itself rather than leaving the
+                // listening socket with nothing waiting on it. The timer paces the
+                // retry so a failure that does NOT go away cannot spin the loop.
+                if (ec == net::error::operation_aborted) return;
+                std::cerr << "Accept error: " << ec.message() << std::endl;
+                accept_retry_timer_.expires_after(std::chrono::milliseconds(100));
+                accept_retry_timer_.async_wait([this](beast::error_code wait_ec) {
+                    if (!wait_ec) do_accept();
+                });
                 return;
             }
-            
+
             auto session = std::make_shared<WebSocketSession>(std::move(socket), web_dir_);
             on_connect(session);
             session->start();

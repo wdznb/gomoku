@@ -142,6 +142,10 @@ private:
     std::string sessions_dir_;
     std::string records_path_;
     net::steady_timer flush_timer_;
+    // Retries do_accept() after a transient accept failure. Without it one bad
+    // accept (descriptor exhaustion, a client resetting mid-accept) would leave no
+    // pending operation and the port would stop being served for the rest of the run.
+    net::steady_timer accept_retry_timer_;
     // Guards every map above. The io thread is the only thread that touches them
     // today, so the lock is the record of that rule rather than a requirement.
     std::mutex games_mutex_;

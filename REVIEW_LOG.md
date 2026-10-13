@@ -1979,6 +1979,70 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次94 一次瞬时 accept 失败就把端口永久关掉 — bugfix round 94 batch Y
+
+**Found.** **Y1** `src/server/server.cpp:574-589` `GameServer::do_accept()`: the completion handler returned on *any*
+`ec` except `net::error::operation_aborted` without calling `do_accept()` again. A transient accept failure
+(`no_descriptors` when the descriptor limit is hit, `network_down`, a peer that resets mid-accept) therefore left the
+acceptor **open with no pending operation** - the process kept every already-connected game playing while the port
+stopped being served for the rest of its life, which contradicts README:128「服务器默认在端口 **8080** 启动」and
+README:294「启动服务器后，在浏览器中打开 `http://localhost:8080`」.
+
+**My Y2 premise was wrong and the fixer refuted it with the header, which I then read myself.** I dispatched it
+claiming `run_websocket` set no inbound cap so Beast's `max_message_size` default was `size_t::max`, letting
+`do_read` (`:296-324`) buffer a fragmented message of arbitrary size before any of the project's own caps run. The
+installed Boost says otherwise: `/usr/include/boost/beast/websocket/impl/stream_impl.hpp:77` declares
+`std::size_t rd_msg_max /* max message size */ = 16 * 1024 * 1024;`, and the setter is `read_message_max`
+(`stream.hpp:575`) - there is no `max_message_size` member at all in Boost 1.90 (the fixer's first
+`-fsyntax-only` run failed on it, verbatim in its report). So `position_json.cpp:214`'s「The wire allows a 16 MiB
+frame」was true all along and nothing was unbounded. The line stays as `ws_.read_message_max(16u * 1024u * 1024u)` -
+a pin, so a Boost upgrade that changes the default cannot silently widen the only inbound bound - but it is
+**无可观察差异**, and it gets no negative proof.
+
+**Fixed.** `server.h` adds one member (`accept_retry_timer_`, constructed on `ioc_`); `do_accept` now treats only
+`operation_aborted` as terminal, logs the transient error, and re-arms through a 100 ms `expires_after` wait so a
+failure that does *not* go away cannot spin the loop; `stop()` cancels the new timer next to `flush_timer_`. The
+success path's order (`on_connect` → `start()` → `do_accept()`) is untouched, `do_read` gained no special case, and
+`position_json.cpp:214` was not edited. Scope is exactly `src/server/server.cpp` + `src/server/server.h` (the only
+extra character-level change is one trailing-whitespace cleanup on a blank line inside the hunk).
+
+**Not defects (verified by reading, after three auditors produced them):** the claim that `request_hint`
+(`game_manager.cpp:310`) snapshots `board_` off-lock while the AI worker writes it under `thinking_mutex_` is wrong -
+`:302` refuses while `ai_thinking_` is set and `ai_thinking_worker` clears it only *after* its commit block
+(`:423`), and `halt_search` joins the worker before returning, so the hand-shake keeps the two off the board at the
+same time; the sample loader does check feature arity (`data_collector.cpp:258`, error string at `:260`, with
+`FEATURE_SIZE = 52` at `:31`) - the `push_back` loop at `:208-216` I first read is only the number filter;
+`hill_climbing.cpp:105-108`'s `INT_MIN → INT_MIN` re-derivation is its comment's stated intent, `candidate != current`
+at `:58` already refuses a no-op step so it cannot waste an iteration; `--gens -1` / `--pop 0` / `--seed -1` are all
+refused at the CLI by `require_int`'s `minimum = 1` default (`main_trainer.cpp:71-84`) and batch X's `require_seed`;
+there is no `isfinite`-skip in the optimizers; `send_error` on a session whose `token` is still empty is harmless
+because the resume branch that could see it is reached only after `open_session` succeeds. The concurrency auditor's
+headline row again failed the whole-function test: `do_read`'s `if (ec)` branch **does** return (`:303`).
+
+**Queued for round 95 (verified in code, not yet dispatched).** **Z1** `result.elapsed_ms` is assigned on exactly one
+path - `search_engine.cpp:279`, from AlphaBeta's own `start_time_` set at `alphabeta.cpp:270`, i.e. after the VCF and
+VCT slices that the engine already measured as `used_ms` (`:231-233`) - so every 定式/vcf/vct/forced/greedy_five/
+must_block/greedy return leaves the 0 the struct documents (`search_engine.h:20-27`) and the replay panel's 耗时
+(README:57) reports a book move as instant. Z2 (VCF/VCT keep scanning roots after a proven win, `-INT_MAX, INT_MAX`
+so the cutoffs at `vcf.cpp:231` / `vct.cpp:224,322` cannot fire) is held because an early break changes *which*
+winning move is chosen and README does not settle that; Z4 (the evaluator's static cap is `five - 1 = 99999`, which
+the frontend's `|score| >= 99999` 已证胜负 band renders as proven while a real VCT win reports 90000) is held because
+correcting it touches README:338, `app.js` and the harness in one step.
+
+**Verified.** Gate over the exact worktree (bare `cmake ..`, `make -j4`, WSL): `100% tests passed, 0 tests failed out
+of 8` (`r94_gate2_ctest.log:19`, 27.39 s real, `7/8 Test #7: test_server ...... Passed 7.25 sec`, the binary stamped
+22:27 against a 22:25 source - i.e. the run includes the new case), `web_frontend_check: 35/35 passed`, and
+`readme_anchor_check: 27 citations, 0 problems`. **Y1 is a real double-tree difference**, measured with
+`bash build/r94_y1_run.sh wt|neg` (`ulimit -n 64` on the server process, `build/r94_y1_probe.py` flooding TCP
+connections until stderr shows `Accept error: Too many open files`, releasing them, then one full handshake): HEAD
+prints the error **once** and then answers nothing for 12 s, the worktree re-arms and returns
+`101 Switching Protocols` with its first frame. **Y2: 无可观察差异** by measurement, not by assertion - the default
+was already 16 MiB (`stream_impl.hpp:77`), so no negative was manufactured. New case
+`test_transient_accept_failure_rearms_and_abort_ends` (`tests/test_server.cpp:1515-1562`, registered `:1590`) drives
+the transient branch by closing the acceptor and asserts `accept_retry_timer_.expiry()` advances ≥50 ms per window,
+then drives the aborted shape and asserts it no longer re-arms; it reaches the privates through the file's existing
+`#define private public` convention (`:80`/`:87`), which is why it compiles.
+
 ## 轮次93 注释指向空行的那八个锚点 — bugfix round 93 batch X
 
 **Found.** Batch W's own anchor script (`tests/readme_anchor_check.js`, which prints `citations found: 27`) surfaced a
