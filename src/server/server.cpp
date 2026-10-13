@@ -1179,7 +1179,7 @@ std::shared_ptr<GameServer::TrackedGame> GameServer::open_session(const SessionS
     // diverge when the rebuild FAILED: then the token's file is the unreadable
     // record itself, which stays on disk for a human to look at and must not be
     // written over by this fresh game's flushes - so that one gets a new token,
-    // and resumed:false with a new token is what README:476 promises for a
+    // and resumed:false with a new token is what README:487 promises for a
     // record nobody could read.
     if (from && !unreadable_record) {
         entry->token = from->token;

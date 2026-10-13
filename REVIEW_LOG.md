@@ -1979,6 +1979,93 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次93 注释指向空行的那八个锚点 — bugfix round 93 batch X
+
+**Found.** Batch W's own anchor script (`tests/readme_anchor_check.js`, which prints `citations found: 27`) surfaced a
+class of defect none of the audits had looked for: comments that cite `README:NNN` for a rule the doc states on a
+*different* line. I read every cited line myself before dispatching, and eight of them are wrong at `3ae8588` -
+two land on a blank line, six on unrelated prose:
+
+| citing comment | claims | actually says | belongs at |
+| --- | --- | --- | --- |
+| `src/training/params.cpp:231` | the loader must refuse, not clamp | blank line | `155` |
+| `src/search/search_engine.cpp:11` | deeper searches get more time | 回放角标「第 N 手」 | `343` |
+| `src/search/search_engine.cpp:277` | `greedy` is a listed method | `position_preview` 失败示例 | `530` |
+| `web/app.js:184` | reconnect countdown in amber | the replay `method` enum | `553` |
+| `web/app.js:193` | later tab wins | blank line | `567` |
+| `web/app.js:919`, `:1663` | a hand-set position starts with a stone | `detect_grid_encodings` 等函数列表 | `289` |
+| `src/server/server.cpp:1182` | `resumed:false` + new token | `check_position` 帧示例 | `487` |
+
+**X2** `README:338` describes the evaluation curve's red dot as 「该手分值超出曲线量程（已证胜负）」, conflating two
+different conditions that batch W's W3 pin happens to separate: `web/app.js:858` clips the curve at `limit = 2000`
+while `:863` draws a dot only for `|score| >= 99999`. A searched 99000 is far outside the range and gets **no** dot -
+it just pins to the edge - so the sentence promises a dot the code deliberately withholds.
+
+**X3** `src/training/main_trainer.cpp` carries two comments that describe the *old* CLI and one real bug. `:166-168`
+calls `--rounds 0` 「the documented case handled below」 while `:225-228` exits with an error (README:194 documents a
+default of 3 and no zero-round mode); `:180-184` says `--timeout-ms` / `--max-moves` 「keep accepting whatever the
+caller writes」 while `:236-240` refuses `timeout_ms < 1` and `max_moves < 2`. `require_seed` at `:100-108` validates
+only `used != text.size()` after `std::stoull`, and `stoull("-1")` does not throw - it wraps to
+`18446744073709551615` - so `gomoku_train --seed -1` currently accepts a negative seed and exits 0. The two comments
+are docs-only; the seed guard is the batch's only behavior change.
+
+**Fixed.** `git diff --stat` over the batch is 6 files, +17/−17 - every line either a comment or the one README
+sentence. I re-read all six diffs before believing the report. X1 replaced only the digits in the eight citations
+listed above (`params.cpp:231`, `search_engine.cpp:11` and `:277`, `app.js:184`, `:193`, `:919`, `:1663`,
+`server.cpp:1182`), and the fixer additionally re-checked the five citations that were already right
+(`evaluator.cpp` README:27/29, `position_setup.cpp` 261-262, the two `server.cpp` 541-543, `trainer.cpp` 607-608) and
+left them alone. X2 rewrote README:338 as 「红点表示该手已证胜负（`|score| >= 99999`），而曲线本身只按 ±2000 截断——
+超量程的分值贴在边缘但并不画红点」, hunk header `@@ -338 +338 @@`, `wc -l README.md` still 658. X3's `require_seed`
+(`main_trainer.cpp:99-107`) now rejects anything `text.find_first_not_of("0123456789")` sees before `stoull` runs, so
+the `-1` wrap cannot reach a caller as a seed, and the two comments say what the code does (0 parses then is refused
+below; the bounds are the guard's business). One accepted side effect the fixer flagged rather than hid: `--seed 0x10`,
+which `stoull` used to read as 16, is now refused too - that converges on README's integer-seed口径, it is not a
+regression, and the file's line count is unchanged at 322 so no other citation drifted.
+
+**Not defects.** The server audit's other two rows were re-verified and dropped: the hot/cold `resumed` asymmetry is
+honest (a `sessions_` entry exists only because a game was played; the content guard at `server.cpp:1321-1326` is the
+cold-file path README:487 describes), and the restored-`max_depth` re-pin at `app.js:254-260` only fires for a
+hand-written session file below the documented ranges, which the web harness cannot feed (it has no raw-frame
+injection), so a test for it would be a hand-invoked handler call proving nothing.
+
+**Queued, real but not dispatchable this round.** The audit's other two rows I confirmed by reading the code: the
+`session` frame carries `position_pending` (`server.cpp:1260`) that `web/app.js` never reads, and `handleSession`
+resets `baseStones` at `:271` without re-seeding it from `msg.board` the way `handlePositionSet` (`:1262`) and
+`handleStateSync` (`:1637`) do - so the `pendingPosition` guard at `:922-925` is false right after a 摆棋 resume and
+the first click is dropped until the `request_replay` reply re-seeds at `:649`. Likewise `game_manager.cpp:261` sets
+`move_count` to 盘上子数 (base + played), so `resumedStatusText` (`app.js:308-325`) prints 「已恢复对局：N 手」 with N
+inflated by the base stones and never reaches its 「已恢复摆好的局面」 branch, correcting itself one RTT later. Both are
+one-RTT self-healing, both need a real socket pair to observe, and the harness has no frame injection - so they wait
+for a raw-client round rather than getting a stub-shaped test.
+
+**Verified.** Gate over the exact worktree (bare `cmake ..`, no `-D`; `make -j4`; WSL): `100% tests passed, 0 tests
+failed out of 8` (26.15 s real) and `web_frontend_check: 35/35 passed`.
+
+- **Y1, the batch's only behaviour change, proven red-on-HEAD both ways.** Same command shape
+  `./gomoku_train --seed -1 --rounds 1` (all artifacts under `build/`): HEAD `3ae8588` (a `git archive` tree in
+  `build/neg93`) exits **0** and writes a 16-line `params.json` from the wrapped seed, the worktree exits **1** with
+  `Error: invalid seed for --seed: -1`. Anti-overcorrection: `--seed 0` / `42` / `007` / `18446744073709551615` fall
+  through to the later `--rounds must be at least 1` guard on **both** trees, so the parser was not tightened for
+  legal shapes.
+- **My brief was wrong about `--seed 0x10`, and the tester corrected it with measurements rather than accepting it**:
+  `std::stoull`'s default base is 10, so HEAD already failed on `used != size` and both trees emit the byte-identical
+  refusal. The shapes batch X newly refuses are exactly `+7` and a leading space. Verdict: 收敛到文档口径, non-regression.
+  Left open on **both** trees (not introduced here, untouched): a digits-only string ≥ 2^64 passes the digits guard and
+  dies in the bare `Error: stoull` message.
+- **X1/X2/X3 comments and prose: 无可观察差异, measured not asserted.** The three re-cited object files are
+  byte-identical to the `build/neg93` tree's (`search_engine.cpp.o` `21d23be3…`, `params.cpp.o` `9c87ca9c…`,
+  `server.cpp.o` `64e57422…`); `web/app.js` with whole-line `//` comments stripped is identical at 1697 lines, and
+  HEAD's own `app.js` passes the 35 checks with the same `|score| >= 99999` dot threshold and ±2000 clip that the
+  rewritten README:338 now describes. Identical training command on both trees yields byte-identical
+  `params.json` (`6d60f8d9…`), `checkpoint.json` and `samples.jsonl`; the only `records.jsonl` delta is
+  `elapsed_ms` 3 vs 4 at `nodes=484`, `score=-2038`.
+- **Y3 (tests/, the tester's own file):** 4 stale citations corrected by digits only - `test_training.cpp:2199`
+  `154→155`, `web_frontend_check.js:1056` and `:1064` `530→553`, `:1171` `283-284→289`; no assertion logic changed.
+- **Y4:** `node tests/readme_anchor_check.js` after Y3 reports `27 citations, 0 problems` (it had been the one that
+  surfaced batch X). Its single remaining line is a `HINT` (`web_frontend_check.js:1549 → README:360`, a CJK-phrase
+  heuristic false positive in a comment block) that does not affect the exit code. The script is standalone - not in
+  `ctest`, and `CMakeLists.txt` untouched. README still measures 658 lines with the one `@@ -338 +338 @@` hunk.
+
 ## 轮次92 回放契约里没写出来的那三条路径 — bugfix round 92 batch W
 
 **Found.** Four read-only audits over `7e458b6` (search layer, server/session/protocol, core geometry + view mapping,

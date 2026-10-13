@@ -228,7 +228,7 @@ bool CoefficientVector::from_json_string(const std::string& text, ThreatCoeffici
 
     // The file is an instruction, not a suggestion: sanitize() would clamp an
     // out-of-range tunable into its bound and the loader would still report
-    // success (README:154 wants a refusal). The clamping stays for the
+    // success (README:155 wants a refusal). The clamping stays for the
     // optimizers, whose own moves are always generated inside the bounds.
     static const char* tunable_names[] = {"live_four", "rush_four", "live_three",
                                           "sleepy_three", "live_two", "sleepy_two",

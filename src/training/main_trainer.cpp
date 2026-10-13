@@ -99,12 +99,12 @@ double require_double(const char* flag, int& index, int argc, char** argv) {
 
 uint64_t require_seed(const char* flag, int& index, int argc, char** argv) {
     const std::string text = require_value(flag, index, argc, argv);
-    size_t used = 0;
-    const unsigned long long value = std::stoull(text, &used);
-    if (used != text.size()) {
+    // stoull does not reject a sign: "-1" wraps to 18446744073709551615 and the
+    // caller believes that is the seed. A seed is digits or nothing.
+    if (text.empty() || text.find_first_not_of("0123456789") != std::string::npos) {
         throw std::invalid_argument(std::string("invalid seed for ") + flag + ": " + text);
     }
-    return static_cast<uint64_t>(value);
+    return static_cast<uint64_t>(std::stoull(text));
 }
 
 // A training run writes several artefacts, and the default paths live in a
@@ -163,8 +163,8 @@ int main(int argc, char** argv) {
                                                 " (use genetic or hill)");
                 }
             } else if (flag == "--rounds") {
-                // Zero is the documented "load the parameters, train nothing"
-                // case handled below, so only negatives are rejected here.
+                // Only negatives fail here; a zero round count parses and is
+                // refused below, where the run would train nothing.
                 config.rounds = require_int("--rounds", i, argc, argv, 0);
             } else if (flag == "--population") {
                 config.population_size = require_int("--population", i, argc, argv);
@@ -177,8 +177,8 @@ int main(int argc, char** argv) {
             } else if (flag == "--depth") {
                 config.search_depth = require_int("--depth", i, argc, argv);
             } else if (flag == "--timeout-ms") {
-                // Untimed / unbounded search are meanings of their own, so these
-                // two keep accepting whatever the caller writes.
+                // The bounds are the guard below's business (--timeout-ms at least
+                // 1, --max-moves at least 2), so this parses any integer written.
                 config.timeout_ms = require_int("--timeout-ms", i, argc, argv, INT_MIN);
             } else if (flag == "--max-moves") {
                 config.max_moves = require_int("--max-moves", i, argc, argv, INT_MIN);

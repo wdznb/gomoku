@@ -8,7 +8,7 @@ namespace {
 
 // AlphaBeta keeps the tail of the move budget: while VCF/VCT shared the whole
 // deadline, an expensive tactical phase left AlphaBeta only the 100 ms floor
-// and a depth-0 fallback (README:336 wants deeper searches to get more time).
+// and a depth-0 fallback (README:343 wants deeper searches to get more time).
 constexpr int kVcfBudgetPercent = 35;
 constexpr int kVctBudgetPercent = 55;
 
@@ -274,7 +274,7 @@ SearchResult SearchEngine::search(const Board& board, int color,
         result.method = "alphabeta";
         // Depth 0 means not one iteration finished and AlphaBeta fell back to
         // root_moves[0]; calling that alphabeta showed depth 0 / score 0 in the
-        // replay panel (README:513 lists greedy as a method).
+        // replay panel (README:530 lists greedy as a method).
         if (info.depth == 0) result.method = "greedy";
         result.elapsed_ms = info.elapsed_ms;
 

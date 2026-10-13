@@ -1053,7 +1053,7 @@ check('B2 btn-replay still follows only the stale judgment', () => {
     assert(el('btn-replay-first').disabled === true, 'no moves means no replay nav');
 });
 
-// B3: README:530 wants the reconnect countdown in amber (warn); only refused or
+// B3: README:553 wants the reconnect countdown in amber (warn); only refused or
 // lost-connection events are errors (red). 上一局找不回来了 stays a warning.
 check('B3 disconnect statuses follow README colour rules', () => {
     const game = newGame();
@@ -1061,7 +1061,7 @@ check('B3 disconnect statuses follow README colour rules', () => {
     game.ws.readyState = bundle.sandbox.WebSocket.CLOSED;
     game.wsReconnect = null;
     game.scheduleReconnect();
-    // README:530 explicitly prescribes amber for the reconnect countdown.
+    // README:553 explicitly prescribes amber for the reconnect countdown.
     assert(el('status').className === 'status warn',
            '重连倒计时 must be warn (amber), got ' + el('status').className);
 
@@ -1168,7 +1168,7 @@ check('B5 eval graph dots only for mate scores', () => {
            'both clipped plies share the top edge, ys=' + mixed.ys.join(','));
 });
 
-// D4: README:283-284 allows 直接落子 after 摆棋 confirmation without claiming a
+// D4: README:289 allows 直接落子 after 摆棋 confirmation without claiming a
 // side first. An empty waiting board still requires choose_side.
 check('D4 click sends make_move on a pending position', () => {
     const game = newGame();

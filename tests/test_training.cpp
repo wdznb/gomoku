@@ -2196,7 +2196,7 @@ void test_params_rejects_non_object_coefficients() {
 
 #ifndef _WIN32
     // The CLI doors: a malformed --params file makes both binaries exit 1 with
-    // their own refusal, and neither may print the success line (README:154:
+    // their own refusal, and neither may print the success line (README:155:
     // the server exits rather than falling back to defaults).
     if (std::filesystem::exists("gomoku_server") &&
         std::filesystem::exists("gomoku_train")) {

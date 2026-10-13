@@ -181,7 +181,7 @@ class GomokuGame {
         if (this.wsReconnect) return;
         const wait = Math.min(15000, 1000 * 2 ** this.wsAttempts);
         this.wsAttempts += 1;
-        // README:530 wants the reconnect countdown in 琥珀色; only the refused or
+        // README:553 wants the reconnect countdown in 琥珀色; only the refused or
         // lost-connection events are errors.
         this.updateStatus(`连接断开，${Math.round(wait / 1000)} 秒后重连（第 ${this.wsAttempts} 次）`, 'warn');
         this.wsReconnect = setTimeout(() => {
@@ -190,7 +190,7 @@ class GomokuGame {
         }, wait);
     }
 
-    // Another tab resumed this token and took the game over (README:545: later
+    // Another tab resumed this token and took the game over (README:567: later
     // wins). This tab is parked, not broken: the reconnect timer goes, the flags
     // settle, and the controls take the same grey-out a settled board leaves
     // behind. The token stays in localStorage - reloading this page is how the
@@ -916,7 +916,7 @@ class GomokuGame {
         }
 
         // A hand-set position that nobody has claimed a side for starts with a stone
-        // just as much as with 执黑/执白 (README:283): the server claims the colour
+        // just as much as with 执黑/执白 (README:289): the server claims the colour
         // from the move and move_made brings it back, so this board is clickable.
         // An empty waiting board is not - it has no position to start.
         const pendingPosition = this.gameStatus === 'waiting' && this.playerColor === null &&
@@ -1660,7 +1660,7 @@ class GomokuGame {
         // would then be dropped by the replay guard.
         if (this.replayIndex !== null) this.exitReplay();
         // A hand-set position starts with a stone just as much as with 执黑/执白
-        // (README:283), and this frame's colour is the side the server claimed for
+        // (README:289), and this frame's colour is the side the server claimed for
         // it. Without this the colour stayed null and the game stayed waiting:
         // 悔棋/求招 stayed disabled, the 终止 button never armed, and a black win
         // was read as a loss.
