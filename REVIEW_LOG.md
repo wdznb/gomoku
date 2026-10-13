@@ -1978,3 +1978,62 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 `five: 90000` back, stderr empty on both. No `data/training/checkpoint.json` residue. The tester's diff is
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
+
+## 轮次91 被当成重复的那一半样本、被自己回显拒掉的文档、被冲掉的那条指引 — bugfix round 91 batch V
+
+**Found.** Three read-only audits over `8b15beb` (frontend / position-document / training-data) and nine candidate
+rows survived into my own re-read as *non*-defects; three did not. **V1** `data_collector.cpp:141-143` keyed the
+8-direction augmentation dedupe on `(zobrist_hash, played cell)`, but the hash is placement-only
+(`transforms.cpp`'s `transform_board` replays history) while features 25-51 come from the *oriented* board's
+`last_move()` (`fill_orientation`). When a self-symmetry fixes the played cell and still relocates the last stone,
+the two reads are different samples and one was silently dropped. Fixture measured by the tester: 黑(7,7) 黑(6,8)
+黑(8,6) 白(7,6) 白(6,7), sampled 黑(5,5) — main-diagonal mirroring keeps the placement and the played cell, moves
+白(6,7)→(7,6): HEAD emits **4** augmented rows per ply where 8 are distinct, i.e. half of the samples that carry a
+last-move anchor are lost, and they are exactly the self-symmetric positions the augmentation exists to reach.
+**V2** `alphabets()` lists `""` as an empty-point alias for the three symbol families, so a `board` array written
+with `""` cells is recognised, and `check_position` echoes the *canonical* mark (`.` / `空`) — README:539 tells the
+client to carry that echo back as the forced `encoding`. The forced-branch coverage loop at
+`position_setup.cpp:380-388` compared every normalised token against the three marks, and `normalize("")` stays
+empty, so the round trip the protocol prescribes was refused with 「指定的标志不含 ""」. **V3** `app.js:446` ran the
+`视角：…` status write on the same path as 旋转/镜像, and 摆棋's amber guidance (README:360) lives in that same
+`#status` node with nothing else writing it back — rotating the view mid-setup erased the guidance until the next
+server frame.
+
+**Fixed.** The dedupe key now packs the oriented last-move cell under the played cell
+(`index * 256 + last_cell + 1`, empty board = `-1` → 0; indices ≤ 224 keep the packing injective), so a symmetry
+that moves the anchor is a distinct sample and a genuine duplicate still collapses. The forced-coverage loop skips an
+empty token only when the stated `encoding.empty` is one of the five blank spellings (`.`, `_`, `-`, `·`, `空`), so
+`""` stays a stray token under a numeric mapping and the «never read a stray symbol as empty» guard is intact.
+`applyView()` returns before the status write while `setup.active`; the button labels, the toggled classes and the
+board redraw are untouched, and the outside-setup path still writes 视角. README side: `:181` documents the
+augmentation key's three parts, `:379` that 摆棋's guidance owns the top bar, `:539` the `""` ↔ canonical-mark round
+trip, and `:454` (queued from round 90) is corrected to 「悔棋不会吃掉 `base` 子」.
+
+**Not defects / deliberately left.** Elo's `games` counter counting *matches* (`elo.cpp:55-57`) — README:49 never
+states the bracket's unit and the counter is informational. `updateMoveList`'s force-scroll (`app.js:2062`) and the
+摆棋 O(n²) repaint / triple `drawBoard` — no README sentence, and the harness stubs `scrollTop`/`scrollHeight` as
+plain `0`, so a pin would assert on a stub artifact; the repaint is ≤225 rows per click. A malformed `encoding` on a
+`bitboard`/`moves` document still hard-rejects (`position_json.cpp:249-252`) — README:536 says the field only
+appears for the board form, and refusing what a file actually stated is the loader contract. `handle_set_position`'s
+token rotation before the install, `game_id` density, and the mid-round `append_to_jsonl` failure window are the
+auditor's own unreachable / IO-only / already-closed cross-file trades. `--resume` letting the checkpoint's seed win
+was re-surfaced and re-refuted from rounds 73-74. `GeneticOptimizer::run` not resetting
+`generations_since_improvement_` is latent-only: `trainer.cpp:298` constructs a fresh optimizer per round. V3's twin
+observation (`handleAiMove` overwriting 摆棋中 during a live AI frame) is by design — the server frame carries the
+newer truth and the setup panel is stale the moment a stone lands — and was not dispatched.
+
+**Verified.** Gate over the identical tree: `ctest` **8/8** (bare `cmake ..`) and
+`node tests/web_frontend_check.js` **32/32** (30 before E's two cases). HEAD negatives in `build/neg91`
+current `tests/`): **2 of 8 binaries red** and nothing else — `5 - test_position` aborts at
+`tests/test_position.cpp:1010` `forced.ok()`, `8 - test_training` at `tests/test_training.cpp:2822`
+`augmented.size() == SYMMETRY_COUNT` (both had already printed 16 / 49 existing ` passed` lines), and the neg-tree
+web harness is `31/32` with only `tests/web_frontend_check.js:1564` failing. Anti-overreach pins green on **both**
+trees via the isolation driver: `test_collector_still_drops_genuine_symmetry_duplicates` (last stone also on the
+diagonal → still 4; fully asymmetric → 8) and `test_blank_cell_is_stray_outside_the_letter_families` (numeric
+`1/2/0` mapping still refuses `""`, a `?` under `B/W/.` still refuses, exit 0 on both trees), plus E's counter-check
+that a rotation *outside* setup still writes 视角 with `status idle`. `build/r91v_probe.cpp` linked against both
+trees' objects: augmented rows per sampled ply **4 → 8**, `at_played_cell` 1 → 2 with anchors `(6,7)` and `(7,6)`,
+`plain` 1 on both; `forced_ok` for the `B/W/""` and `黑/白/""` families **0 → 1** with the same cells read back,
+while the numeric family is `0` on both trees (identical message). The tester's diff is additive only
+(`test_training.cpp` +147, `test_position.cpp` +113, `tests/web_frontend_check.js` +43, zero deleted lines) and no
+`src/`, `web/`, `README.md`, `CMakeLists.txt` or `data/` file was touched by it.

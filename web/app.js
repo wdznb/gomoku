@@ -443,6 +443,9 @@ class GomokuGame {
         rotate.classList.toggle('toggled', this.view.rot !== 0);
         document.getElementById('btn-view-mirror').classList.toggle('toggled', this.view.flipH);
         this.drawBoard();
+        // 摆棋's guidance owns the top bar while the panel is open, and nothing
+        // writes it back, so a rotation here would leave the player without it.
+        if (this.setup.active) return;
         this.updateStatus(`视角：${this.viewLabel()}`, 'idle');
     }
 

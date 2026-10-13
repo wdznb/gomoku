@@ -964,6 +964,117 @@ void test_ragged_row_in_a_fifteen_row_grid_names_the_row() {
               << error << ")" << std::endl;
 }
 
+// R91 V2: the array form writes an empty point as "". Detection reads that as
+// empty and echoes back its family's canonical symbol, so the confirmed mapping
+// a client sends back (README:539) has to cover the blanks it was handed -
+// otherwise re-reading the same cells under the echo it produced is refused.
+void test_blank_cells_reread_under_the_echoed_encoding() {
+    // 15 rows of 15 tokens with one black stone, one white stone and the rest
+    // spelled `blank`, which is how a UI round-trip actually looks.
+    auto rows = [](const char* black, const char* white, const char* blank) {
+        json grid = json::array();
+        for (int r = 0; r < BOARD_SIZE; ++r) {
+            json row = json::array();
+            for (int c = 0; c < BOARD_SIZE; ++c) {
+                if (r == 7 && c == 7) row.push_back(black);
+                else if (r == 6 && c == 6) row.push_back(white);
+                else row.push_back(blank);
+            }
+            grid.push_back(std::move(row));
+        }
+        return grid;
+    };
+
+    struct Family { const char* black; const char* white; const char* blank; const char* echoed; };
+    // The two canonical empty symbols the echo can carry for a blank-filled
+    // array: "." for the letter families, "空" for the Chinese one.
+    const Family families[] = {{"B", "W", "", "."}, {"黑", "白", "", "空"}};
+
+    for (const Family& family : families) {
+        json doc;
+        doc["version"] = 1;
+        doc["board"] = rows(family.black, family.white, family.blank);
+
+        const SetupResult detected = position_from_json(doc);
+        assert(detected.ok());
+        assert(detected.encoding.black == family.black);
+        assert(detected.encoding.white == family.white);
+        assert(detected.encoding.empty == family.echoed);
+        assert(detected.black_count == 1 && detected.white_count == 1);
+
+        // Hand that very echo back as the confirmed mapping over the same cells.
+        doc["encoding"] = {{"black", detected.encoding.black},
+                           {"white", detected.encoding.white},
+                           {"empty", detected.encoding.empty}};
+        const SetupResult forced = position_from_json(doc);
+        assert(forced.ok());
+        assert(same_cells(detected, forced));
+        assert(forced.black_count == 1 && forced.white_count == 1);
+    }
+
+    std::cout << "test_blank_cells_reread_under_the_echoed_encoding passed" << std::endl;
+}
+
+// Anti-overreach for V2: the blank only counts as covered when the stated empty
+// symbol is one of the spellings the detector treats as empty. Under a numeric
+// mapping, and for a symbol no alphabet defines at all, the coverage guard still
+// has to refuse the grid instead of quietly dropping a stone.
+void test_blank_cell_is_stray_outside_the_letter_families() {
+    auto rows = [](const char* black, const char* white, const char* blank, const char* stray) {
+        json grid = json::array();
+        for (int r = 0; r < BOARD_SIZE; ++r) {
+            json row = json::array();
+            for (int c = 0; c < BOARD_SIZE; ++c) {
+                if (r == 7 && c == 7) row.push_back(black);
+                else if (r == 6 && c == 6) row.push_back(white);
+                else if (r == 3 && c == 3 && stray) row.push_back(stray);
+                else row.push_back(blank);
+            }
+            grid.push_back(std::move(row));
+        }
+        return grid;
+    };
+
+    // 0/1/2 is a legal mapping, and "" is not one of its spellings for anything.
+    json numeric;
+    numeric["version"] = 1;
+    numeric["board"] = rows("1", "2", "", nullptr);
+    numeric["encoding"] = {{"black", "1"}, {"white", "2"}, {"empty", "0"}};
+    const SetupResult refused = position_from_json(numeric);
+    assert(!refused.ok());
+    assert(!refused.error.empty());
+
+    // The same blank grid under the mapping that does cover it is accepted, so
+    // the refusal above is about the numeric flags, not about the document.
+    json numeric_blank;
+    numeric_blank["version"] = 1;
+    numeric_blank["board"] = rows("1", "2", "0", nullptr);
+    numeric_blank["encoding"] = {{"black", "1"}, {"white", "2"}, {"empty", "0"}};
+    const SetupResult accepted = position_from_json(numeric_blank);
+    assert(accepted.ok());
+
+    // A symbol no alphabet defines stays a stray token even under a mapping that
+    // does cover blanks.
+    json stray;
+    stray["version"] = 1;
+    stray["board"] = rows("B", "W", "", "?");
+    stray["encoding"] = {{"black", "B"}, {"white", "W"}, {"empty", "."}};
+    const SetupResult rejected = position_from_json(stray);
+    assert(!rejected.ok());
+    assert(!rejected.error.empty());
+
+    // Same cells, stated symbol instead of the blank: the letter mapping reads it.
+    json clean;
+    clean["version"] = 1;
+    clean["board"] = rows("B", "W", ".", nullptr);
+    clean["encoding"] = {{"black", "B"}, {"white", "W"}, {"empty", "."}};
+    const SetupResult read = position_from_json(clean);
+    assert(read.ok());
+    assert(same_cells(read, accepted));
+
+    std::cout << "test_blank_cell_is_stray_outside_the_letter_families passed" << std::endl;
+}
+
 int main() {
     std::cout << "Running position setup tests..." << std::endl;
     test_grid_parsing();
@@ -982,6 +1093,8 @@ int main() {
     test_snapshot_round_trip();
     test_undo_rejected_in_position_pending();
     test_ragged_row_in_a_fifteen_row_grid_names_the_row();
+    test_blank_cells_reread_under_the_echoed_encoding();
+    test_blank_cell_is_stray_outside_the_letter_families();
     std::cout << "All position setup tests passed!" << std::endl;
     return 0;
 }

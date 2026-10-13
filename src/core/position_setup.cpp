@@ -373,9 +373,16 @@ SetupResult position_from_grid(const GridCells& cells, const GridEncoding* force
         // An explicitly supplied mapping is trusted as stated, but every token
         // still has to be covered by it - otherwise a stray symbol would be read
         // as empty and quietly delete a stone.
+        // A "" cell is the documented way the array form spells an empty point, and
+        // the detector reads it as empty for the symbol families; it is covered here
+        // exactly when those are, and stays a stray token under a numeric mapping.
+        const bool blank_is_empty = encoding.empty == "." || encoding.empty == "_" ||
+                                    encoding.empty == "-" || encoding.empty == "·" ||
+                                    encoding.empty == "空";
         for (const GridRow& row : cells) {
             for (const std::string& cell : row) {
                 const std::string token = normalize(cell);
+                if (token.empty() && blank_is_empty) continue;
                 if (!same_sign(token, encoding.black) && !same_sign(token, encoding.white) &&
                     !same_sign(token, encoding.empty)) {
                     result.error = "指定的标志不含 \"" + token + "\"，请确认黑/白/空分别对应哪个符号";

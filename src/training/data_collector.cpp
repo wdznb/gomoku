@@ -140,7 +140,15 @@ std::vector<TrainingSample> DataCollector::collect(const GameRecord& record, int
                 for (int variant = 0; variant < variants; ++variant) {
                     const Board oriented = variant == 0 ? board : transform_board(board, variant);
                     const Move oriented_move(transform_position(entry.move.pos, variant), side);
-                    if (!seen.insert({oriented.zobrist_hash(), oriented_move.pos.to_index()}).second) {
+                    // The hash only describes the placement, while features 25-51 come
+                    // from the oriented board's last move. A symmetry can fix the played
+                    // cell and still move that last stone, so the two variants are
+                    // different samples: the last cell (-1 on an empty board) joins the
+                    // key, packed below the played cell since both stay under 256.
+                    const int last_cell =
+                        oriented.move_count() > 0 ? oriented.last_move().pos.to_index() : -1;
+                    const int key = oriented_move.pos.to_index() * 256 + last_cell + 1;
+                    if (!seen.insert({oriented.zobrist_hash(), key}).second) {
                         continue;
                     }
 

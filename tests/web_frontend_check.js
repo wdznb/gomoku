@@ -1546,6 +1546,49 @@ check('C3 a hint result outside setup still marks the board', () => {
     assert(el('status').textContent === '建议已失效', 'and reports the hint as void');
 });
 
+// V3: while 摆棋 is open its guidance owns the top bar (README:360). Rotating
+// the view redraws the board and the view buttons, but must leave the amber
+// 摆棋中 line exactly as 摆棋 wrote it.
+check('V3 rotating the view during setup keeps the 摆棋中 guidance', () => {
+    const game = newGame();
+    game.enterSetup();
+    assert(game.setup.active === true, 'setup must be open');
+    const text = el('status').textContent;
+    const kind = el('status').className;
+    assert(kind === 'status warn', '摆棋 opens with the amber guidance, got: ' + kind);
+    assert(text.indexOf('摆棋中') === 0, 'and the line is the 摆棋 guidance, got: ' + text);
+
+    game.view.rot = 90;
+    game.applyView();
+
+    assert(el('status').textContent === text, 'a rotation must not rewrite the top bar');
+    assert(el('status').className === kind, 'nor change its colour');
+    assert(el('btn-view-rotate').textContent === '旋转 90°',
+           'the rotate button still wears the angle it turned to, got: ' +
+           el('btn-view-rotate').textContent);
+});
+
+// Anti-overreach for V3: outside setup the view line still writes the top bar,
+// so the early return did not take the only feedback the rotation has.
+check('V3 rotating the view outside setup still writes the 视角 line', () => {
+    const game = newGame();
+    game.setup.active = false;
+    game.view.rot = 0;
+    game.view.flipH = false;
+    game.applyView();
+    assert(el('status').textContent.indexOf('视角：') === 0,
+           'a plain rotation narrates the view, got: ' + el('status').textContent);
+    assert(el('status').className === 'status idle', 'in the narration colour');
+
+    game.view.rot = 90;
+    game.applyView();
+    assert(el('status').textContent.indexOf('视角：') === 0 &&
+           el('status').textContent.indexOf('旋转 90°') >= 0,
+           'and it follows the new angle, got: ' + el('status').textContent);
+    assert(el('status').className === 'status idle', 'still narration, not a warning');
+    assert(el('btn-view-rotate').textContent === '旋转 90°', 'the button matches the view');
+});
+
 let failed = 0;
 for (const result of results) {
     console.log(`${result.ok ? 'PASS' : 'FAIL'} ${result.label}` +

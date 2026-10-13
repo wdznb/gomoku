@@ -2738,6 +2738,151 @@ void test_measure_fitness_leaves_default_rule_constants_alone() {
               << defaults.forbidden_penalty << ")" << std::endl;
 }
 
+// R91 V1: the per-ply dedup key has to carry the last stone's cell as well as
+// the played one. Slots 0-24 are invariant, but 25-51 are read off the oriented
+// board's last move - so a symmetry that fixes the played cell while moving that
+// stone yields a genuinely different sample, and dropping it loses data.
+//
+// A record whose leading plies are replays (collect() ignores those) plus one
+// searched ply that is the only sampled one.
+static GameRecord sampled_record(const std::vector<Move>& placement, Move sampled) {
+    GameRecord record;
+    record.winner = BLACK;
+    record.reason = GameEndReason::FIVE;
+    for (const Move& m : placement) {
+        MoveRecord entry;
+        entry.move = m;
+        entry.method = "replay";
+        record.moves.push_back(entry);
+    }
+    MoveRecord entry;
+    entry.move = sampled;
+    entry.score = 120;
+    entry.depth = 4;
+    entry.nodes = 500;
+    entry.elapsed_ms = 9;
+    entry.method = "alphabeta";
+    record.moves.push_back(entry);
+    record.total_nodes = 500;
+    record.max_depth = 4;
+    return record;
+}
+
+// The board the sampled ply is played on: every ply but the last.
+static Board sampled_prefix(const GameRecord& record) {
+    Board board;
+    for (size_t i = 0; i + 1 < record.moves.size(); ++i) {
+        board.place_stone(record.moves[i].move.pos, record.moves[i].move.color);
+    }
+    return board;
+}
+
+// The part augmentation is supposed to multiply: slots 25-51 plus the move.
+static std::vector<float> orientation_key(const TrainingSample& sample) {
+    std::vector<float> key(sample.features.begin() + DataCollector::FEATURE_LAST_ROW,
+                           sample.features.end());
+    key.push_back(static_cast<float>(sample.move.pos.to_index()));
+    key.push_back(static_cast<float>(sample.move.color));
+    return key;
+}
+
+// The number of samples whose (25-51, move) key is unique in the batch.
+static int distinct_orientation_keys(const std::vector<TrainingSample>& samples) {
+    std::set<std::vector<float>> seen;
+    for (const TrainingSample& sample : samples) seen.insert(orientation_key(sample));
+    return static_cast<int>(seen.size());
+}
+
+void test_collector_keeps_the_variant_that_moved_the_last_stone() {
+    // The main-diagonal mirror (variant 4) maps this placement back onto itself:
+    // (7,7) holds, the black pair (6,8)/(8,6) swaps, the white pair (7,6)/(6,7)
+    // swaps. It also fixes the played cell (5,5) - but it moves the last stone.
+    const std::vector<Move> placement{Move(7, 7, BLACK), Move(6, 8, BLACK), Move(8, 6, BLACK),
+                                      Move(7, 6, WHITE), Move(6, 7, WHITE)};
+    const GameRecord record = sampled_record(placement, Move(5, 5, BLACK));
+    const Board before = sampled_prefix(record);
+
+    // The fixture really is self-symmetric, really fixes the played cell, and
+    // really relocates the last move - otherwise the count below proves nothing.
+    const std::vector<int> symmetries = self_symmetries(before);
+    assert(symmetries.size() == 2);
+    assert(std::find(symmetries.begin(), symmetries.end(), 4) != symmetries.end());
+    assert(transform_position(Position(5, 5), 4) == Position(5, 5));
+    const Position last = before.last_move().pos;
+    assert(last == Position(6, 7));
+    assert(transform_position(last, 4) != last);
+    assert(transform_board(before, 4).zobrist_hash() == before.zobrist_hash());
+    assert(transform_board(before, 4).last_move().pos == Position(7, 6));
+
+    DataCollector collector;
+    const std::vector<TrainingSample> augmented = collector.collect(record, 7101, true);
+
+    // Eight orientations, four distinct placements, two last-stone cells each:
+    // none of them is a duplicate of another.
+    assert(augmented.size() == static_cast<size_t>(SYMMETRY_COUNT));
+    assert(distinct_orientation_keys(augmented) == SYMMETRY_COUNT);
+
+    // The identity reading and the main-diagonal reading share the played cell
+    // (5,5) and the placement hash - they are the pair the old key threw away.
+    // Both must be present, anchored at the two different last-move cells.
+    int at_played_cell = 0;
+    bool anchored_before = false;
+    bool anchored_after = false;
+    for (const TrainingSample& sample : augmented) {
+        if (sample.move.pos != Position(5, 5)) continue;
+        ++at_played_cell;
+        const std::vector<float>& f = sample.features;
+        const int row = static_cast<int>(f[DataCollector::FEATURE_LAST_ROW] * 7.0f + 7.0f + 0.5f);
+        const int col = static_cast<int>(f[DataCollector::FEATURE_LAST_COL] * 7.0f + 7.0f + 0.5f);
+        if (row == 6 && col == 7) anchored_before = true;
+        if (row == 7 && col == 6) anchored_after = true;
+    }
+    assert(at_played_cell == 2);
+    assert(anchored_before && anchored_after);
+
+    // One orientation only ever means one sample for this ply.
+    const std::vector<TrainingSample> plain = collector.collect(record, 7102, false);
+    assert(plain.size() == 1);
+    assert(plain[0].move.pos == Position(5, 5));
+
+    std::cout << "test_collector_keeps_the_variant_that_moved_the_last_stone passed ("
+              << augmented.size() << " augmented, " << plain.size() << " plain)" << std::endl;
+}
+
+// Anti-overreach for V1: when the symmetry fixes the last stone too the two
+// variants ARE one and the same sample, and a fully asymmetric placement has
+// eight distinct readings to begin with. Both answers must stay as they were.
+void test_collector_still_drops_genuine_symmetry_duplicates() {
+    DataCollector collector;
+
+    // (i) Both the last stone (9,9) and the played cell (5,5) sit on the main
+    // diagonal, so variant 4 reproduces the identity sample exactly.
+    const std::vector<Move> diagonal{Move(7, 7, BLACK), Move(6, 8, BLACK), Move(8, 6, BLACK),
+                                     Move(6, 6, WHITE), Move(9, 9, WHITE)};
+    const GameRecord fixed_record = sampled_record(diagonal, Move(5, 5, BLACK));
+    const Board fixed_before = sampled_prefix(fixed_record);
+    assert(self_symmetries(fixed_before).size() == 2);
+    assert(transform_position(fixed_before.last_move().pos, 4) == fixed_before.last_move().pos);
+    const std::vector<TrainingSample> fixed = collector.collect(fixed_record, 7103, true);
+    assert(fixed.size() == 4);
+    assert(distinct_orientation_keys(fixed) == 4);
+
+    // (ii) No self-symmetry at all: all eight readings are different boards, so
+    // all eight are kept.
+    const std::vector<Move> asymmetric{Move(7, 7, BLACK), Move(6, 8, BLACK), Move(8, 6, BLACK),
+                                       Move(7, 6, WHITE), Move(4, 9, WHITE)};
+    const GameRecord loose_record = sampled_record(asymmetric, Move(5, 5, BLACK));
+    const Board loose_before = sampled_prefix(loose_record);
+    assert(self_symmetries(loose_before).size() == 1);
+    const std::vector<TrainingSample> loose = collector.collect(loose_record, 7104, true);
+    assert(loose.size() == SYMMETRY_COUNT);
+    assert(distinct_orientation_keys(loose) == SYMMETRY_COUNT);
+
+    std::cout << "test_collector_still_drops_genuine_symmetry_duplicates passed ("
+              << fixed.size() << " duplicate-keeping, " << loose.size() << " asymmetric)"
+              << std::endl;
+}
+
 int main() {
     std::cout << "Running training tests..." << std::endl;
 
@@ -2791,6 +2936,8 @@ int main() {
     test_trainer_cli_rejects_non_finite_accept_score();
     test_measure_fitness_flattens_rule_constants_for_candidates();
     test_measure_fitness_leaves_default_rule_constants_alone();
+    test_collector_keeps_the_variant_that_moved_the_last_stone();
+    test_collector_still_drops_genuine_symmetry_duplicates();
 
     std::cout << "All training tests passed" << std::endl;
     return 0;
