@@ -1979,6 +1979,59 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次110 两条路径守卫比的是写法而不是文件，于是同文件漏拦、合法命令反被拒 — bugfix round 110 batch NN
+
+**Found.** 三个只读审计（训练循环记账 / 摆棋导入回环 / 核心几何 / 搜索层候选处理）里三条整域 CLEAN，
+只有训练 CLI 报回一条，我读回整个 `main` 后确认并扩成双向：
+
+- **NN1** `src/training/main_trainer.cpp` 的两条路径守卫比较的是**原始字符串**——`:291`（旧行号）
+  `if (out_path == checkpoint_path)` 与 `:262` `else if (checkpoint_path != resume_path)`。README:204 说
+  `--out`「与 `--checkpoint` 指向同一个文件时启动即报错退出（退出码 1）——收尾的冠军写入会把断点换成参数
+  文件，之后的 `--resume` 再也读不回来」，README:206 说 `--checkpoint`「与 `--resume` 同时给出时必须指向
+  同一个文件」。两句说的都是**同一个文件**，不是同一段写法。于是同一份代码在两个方向上都错：
+  ① `--out 目录/ck.json --checkpoint 目录/./ck.json` 绕开拒绝，跑完一轮把 1284 字节的断点换成 325 字节的
+  冠军参数——正是文档明令禁止的那个后果；② `--resume 目录/ck.json --checkpoint 目录/./ck.json` 指的是同一
+  个文件，HEAD 却用退出码 1 把这条合法命令拒了，训练根本不开始。
+
+**Fixed.** `src/training/main_trainer.cpp` +17/−2：新增自由函数 `file_named()`（`ensure_parent_directory`
+下方），用 `std::filesystem::weakly_canonical` 的 `error_code` 版本把路径解析成它所指的文件——`weakly_`
+是这里唯一可用的形式，因为这些文件在拒绝判定那一刻还不存在（是这一趟 run 才创建的）；解析不了或空路径就
+原样返回，因为「两个我放不到一起的路径」并没有被证明是同一个文件，这里猜错会放行冠军写入覆盖断点。两条
+守卫改为比较解析结果。错误文案里的路径保持原样（回显用户打的那一段）。README 不动：204/206 两条本来就
+写明「同一个文件」。
+
+**裁决（不是缺陷）.** 摆棋导入回环与核心几何两域整域 CLEAN（台账见轮次109 块）。搜索层候选处理本轮也
+整域 CLEAN，被审计逐函数读后否掉的：`vcf.cpp:126` 缺口冲四 `count + beyond == 4` 对白棋看似该 `>= 4`，
+实则 beyond≥4 意味着填洞本身已成五，`:152/:266` 的成五分枝先赢，该候选永不可达；`search_engine.cpp:127`
+must_block 抢在 VCF/VCT 前是**可证安全**（对方只剩一个成五点时，非即时取胜都会被先成五，即时五已由 `:111`
+覆盖）；`alphabeta.cpp:226` 首轮中止返回 `-INT_MAX` 被 `:352` 的 `!aborted_` 提交门与 `:255` 的存储门拦住，
+无观察面；`vcf.cpp:420` 每步防守复制整盘是 README:624-625 记下的实测取舍；`vct.cpp:99` 去重内层被 9×9 窗
+界定。训练记账里核过不是缺陷的：resume 后的轮次/种子推导、`play_match` 两局执色换算、checkpoint 写序与
+tmp+rename、`--resume`×`--seed`/`--params`/`--checkpoint` 三条拒绝的先后次序。我自己纠正了派单里的一处
+行号：`--checkpoint` 行是 README:**206**，207 是 `--resume` 行。
+
+**Verified.** 测试会话只动 `tests/`：`tests/test_training.cpp` +199/−0，两条用例
+`test_trainer_refuses_one_file_written_two_ways_for_out_and_checkpoint`（判别：异写法同文件 → 修复树 exit 1
+且断点字节不变；HEAD exit 0 且 1284→325，红在 `tests/test_training.cpp:3567`）与
+`test_trainer_accepts_a_resume_and_checkpoint_that_differ_only_by_a_dot_segment`（判别：合法 resume → 修复树
+exit 0 且 `--out` 写出；HEAD exit 1 且 `--out` 不存在）。三条对照两棵树都绿：同一写法仍被拒、两个真正
+不同的文件仍跑通并都写出、**两个不同文件的 `--resume`×`--checkpoint` 仍双双退出 1**（证明修复没把真拒绝
+改松）。跑法延用 JJ2 一家的 `base` 标志串 + `run()` + `temp_path()`，`.` 段由
+`parent_path()/"."/filename()` 注入，所有路径绝对，不依赖 cwd、不写 `data/`；`--rounds 0` 依旧不能判别
+（轮次守卫排在两条拒绝之前）。HEAD 反证只读 `git archive 0d258ac` → `/tmp/neg110`，按 `link.txt` 把
+`main_trainer.cpp.o` **换成** HEAD 产物重链。合约过期：无。
+门禁由我自己在 WSL 跑完：`100% tests passed, 0 tests failed out of 8` / 「Total Test time (real) =  53.49 sec」；
+`web_frontend_check: 72/72 passed`；`readme_anchor_check: 82 citations, 0 problems`（71→82 是用例注释新增的
+README:204/206/207 引用）；`658 README.md`。
+**但要如实记账**：`tests/test_server.cpp:1985` 的 `test_a_rejected_stone_delivers_the_end_a_worker_parked()`
+在我这三轮全量里红了两次（`Assertion 'parked' failed`），单跑 `ctest -R test_server` 与最后整跑都绿——
+这就是轮次109 已经用交错 A/B 证明「与本批无关、HEAD 就存在」的那条 flake，本批未触碰 `server.cpp`，
+也没改那一例。它已经威胁到「全绿才提交」这条门禁本身，**下一轮（轮次111）的第一优先事项就是把它读透并
+消掉**：先定位是产品侧 worker 停车的时序不保证，还是用例侧等待条件本身有竞态，再按归属分给对应会话。
+
+**下一轮（轮次111）预告.** 先做上面那条 flake 的归属判定与消除；然后按同一套只读审计继续扫需求文档，
+重点转向本轮未覆盖的边角（HTTP 静态资源与 `--web-dir` 守卫、会话 token 续局与接管、参数文件读写回环）。
+
 ## 轮次109 一个不被任何符号表认得的数被截成 −1，于是凭空多出一粒白子 — bugfix round 109 batch MM
 
 **Found.** 四个只读审计（摆棋导入回环 / 前端视角与分析面板 / 搜索编排与配置管线 / 训练循环记账）这一轮只留下
@@ -2027,7 +2080,7 @@ stated encoding（姿势 F）两棵树都拒、都 0/0，只差被点名的符�
 
 **下一轮（轮次110）预告.** 批次 NN 只有一行 NN1：`src/training/main_trainer.cpp` 里两处路径比较都是**原始
 字符串**——`:291` 的 `out_path == checkpoint_path` 与 `:262` 的 `checkpoint_path != resume_path`。README:204
-说的是「指向同一个文件」、README:207 说的是「必须指向同一个文件」，说的是文件不是写法：`--out ck.json
+说的是「指向同一个文件」、README:206（`--checkpoint` 那一行）说的是「必须指向同一个文件」，说的是文件不是写法：`--out ck.json
 --checkpoint ./ck.json` 在 HEAD 上不触发拒绝，跑完后冠军写入把断点换成参数文件（正是文档禁止的后果）；反过来
 `--resume ck.json --checkpoint ./ck.json` 指向的明明是同文件，HEAD 却报错退出——一条合法命令被拒。修法是比较
 两个路径所指的文件而非其写法（`std::filesystem::weakly_canonical` 的 `error_code` 版本，两条路径都规范化后再

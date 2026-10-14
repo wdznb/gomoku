@@ -3501,6 +3501,203 @@ void test_genetic_stagnation_count_is_per_run() {
     std::cout << "test_genetic_stagnation_count_is_per_run passed" << std::endl;
 }
 
+// Round 110 NN1: README:204 refuses --out when it names the same file as --checkpoint, and
+// README:206 requires --checkpoint to name the same file as --resume. HEAD compared the two
+// command-line *strings*, so 同一个文件 written two ways went the wrong way in both
+// directions: `目录/ck.json` beside `目录/./ck.json` slipped past README:204 and the closing
+// champion write replaced a real checkpoint, while the same pair beside --resume was refused
+// as a mismatch even though README:206 was satisfied. The guards now compare
+// std::filesystem::weakly_canonical results - the file, not its spelling.
+//
+// Both arms therefore judge exit codes and what the named files end up holding, never the
+// wording of a message beyond the flag names the refusal must print. Every path is absolute,
+// temp_path-built, with the "." segment injected through parent_path()/"."/filename() so no
+// arm depends on anything but ./gomoku_train, and data/ is never opened. --rounds 0 still
+// cannot discriminate (the round-count guard sits ahead of both refusals), so each arm runs
+// the cheapest legal round round 106 JJ2 and round 101 FF2 established.
+void test_trainer_refuses_one_file_written_two_ways_for_out_and_checkpoint() {
+#ifndef _WIN32
+    if (!std::filesystem::exists("gomoku_train")) {
+        std::cout << "  --out/--checkpoint spelling probes skipped: gomoku_train is not in the "
+                     "working directory" << std::endl;
+        std::cout << "test_trainer_refuses_one_file_written_two_ways_for_out_and_checkpoint passed"
+                  << std::endl;
+        return;
+    }
+    const std::string base =
+        "--rounds 1 --population 2 --generations 1 --depth 1 --timeout-ms 1 --max-moves 2 "
+        "--fitness-games 1 --verification-games 2 --no-data --quiet";
+    const std::filesystem::path err = temp_path("r110_nn1a_stderr.txt");
+    auto read_all = [](const std::filesystem::path& p) {
+        std::ifstream in(p);
+        std::ostringstream text;
+        text << in.rdbuf();
+        return text.str();
+    };
+    std::string last_err;
+    auto run = [&](const std::string& arguments) {
+        const std::string command = "./gomoku_train " + base + " " + arguments +
+                                    " > /dev/null 2> '" + err.string() + "'";
+        const int status = std::system(command.c_str());
+        assert(status != -1);
+        last_err = read_all(err);
+        return WEXITSTATUS(status);
+    };
+
+    // A real checkpoint to protect: a run that owns two differently named files leaves a
+    // resume state on disk, and its bytes are what README:204's refusal exists to keep.
+    const std::filesystem::path out = temp_path("r110_nn1a_out.json");
+    const std::filesystem::path ck = temp_path("r110_nn1a_ck.json");
+    const int setup = run("--out '" + out.string() + "' --checkpoint '" + ck.string() + "'");
+    const std::string before = read_all(ck);
+    std::cout << "  [r110nn1a] two distinct names => exit " << setup << ", checkpoint "
+              << before.size() << " bytes" << std::endl;
+    assert(setup == 0);
+    assert(!before.empty());
+    assert(std::filesystem::exists(out));
+
+    // Discriminator: 目录/ck.json and 目录/./ck.json are one file. HEAD compares the
+    // spellings, sees two, runs the round and overwrites the checkpoint with the champion -
+    // exit 0 and a different file.
+    const std::filesystem::path dotted = ck.parent_path() / "." / ck.filename();
+    const int refused = run("--out '" + ck.string() + "' --checkpoint '" + dotted.string() + "'");
+    const std::string after = read_all(ck);
+    std::cout << "  [r110nn1a] --out 目录/ck.json vs --checkpoint 目录/./ck.json => exit "
+              << refused << ", bytes " << before.size() << " -> " << after.size() << std::endl;
+    assert(refused == 1);
+    assert(after == before);
+    assert(last_err.find("--out") != std::string::npos);
+    assert(last_err.find("--checkpoint") != std::string::npos);
+
+    // Control, green before and after: the identical spelling was already refused, so
+    // resolving the paths did not loosen README:204's real case.
+    const std::filesystem::path kept = temp_path("r110_nn1a_kept.json");
+    const std::string kept_before = [&kept, &before] {
+        std::ofstream writer(kept);
+        writer << before;
+        return before;
+    }();
+    const int same_spelling =
+        run("--out '" + kept.string() + "' --checkpoint '" + kept.string() + "'");
+    std::cout << "  [r110nn1a] --out == --checkpoint, one spelling => exit " << same_spelling
+              << ", bytes " << kept_before.size() << " -> " << read_all(kept).size() << std::endl;
+    assert(same_spelling == 1);
+    assert(read_all(kept) == kept_before);
+
+    // Control: two genuinely different files still train and still write both - the
+    // canonicalizing guard must not turn the ordinary run into a refusal.
+    const std::filesystem::path apart_out = temp_path("r110_nn1a_apart_out.json");
+    const std::filesystem::path apart_ck = temp_path("r110_nn1a_apart_ck.json");
+    const int apart =
+        run("--out '" + apart_out.string() + "' --checkpoint '" + apart_ck.string() + "'");
+    std::cout << "  [r110nn1a] two genuinely different files => exit " << apart << ", stderr "
+              << last_err.size() << " bytes" << std::endl;
+    assert(apart == 0);
+    assert(last_err.empty());
+    assert(std::filesystem::exists(apart_out));
+    assert(std::filesystem::exists(apart_ck));
+
+    std::cout
+        << "test_trainer_refuses_one_file_written_two_ways_for_out_and_checkpoint passed"
+        << std::endl;
+#endif
+}
+
+// Round 110 NN1, the other direction: --resume and --checkpoint may name one file in two
+// spellings (README:206). HEAD's string comparison called `目录/ck.json` and `目录/./ck.json`
+// different, so a legal resume aborted with exit 1 and the run never started.
+//
+// The same-cheapest-round driver as the case above, and the guard ordering is what makes the
+// arms readable: the --resume/--checkpoint comparison sits ahead of the --params, --seed and
+// --out refusals and ahead of every file operation, so --out here deliberately names a third
+// file - pointing it at the checkpoint would answer 1 for the README:204 reason and mask this
+// guard. The control that matters most is the two-genuinely-different-files arm: it must stay
+// red for the caller on both trees, i.e. the fix did not soften README:207's real refusal.
+void test_trainer_accepts_a_resume_and_checkpoint_that_differ_only_by_a_dot_segment() {
+#ifndef _WIN32
+    if (!std::filesystem::exists("gomoku_train")) {
+        std::cout << "  --resume/--checkpoint spelling probes skipped: gomoku_train is not in "
+                     "the working directory" << std::endl;
+        std::cout << "test_trainer_accepts_a_resume_and_checkpoint_that_differ_only_by_a_dot"
+                     "_segment passed" << std::endl;
+        return;
+    }
+    const std::string base =
+        "--rounds 1 --population 2 --generations 1 --depth 1 --timeout-ms 1 --max-moves 2 "
+        "--fitness-games 1 --verification-games 2 --no-data --quiet";
+    const std::filesystem::path err = temp_path("r110_nn1b_stderr.txt");
+    auto read_all = [](const std::filesystem::path& p) {
+        std::ifstream in(p);
+        std::ostringstream text;
+        text << in.rdbuf();
+        return text.str();
+    };
+    std::string last_err;
+    auto run = [&](const std::string& arguments) {
+        const std::string command = "./gomoku_train " + base + " " + arguments +
+                                    " > /dev/null 2> '" + err.string() + "'";
+        const int status = std::system(command.c_str());
+        assert(status != -1);
+        last_err = read_all(err);
+        return WEXITSTATUS(status);
+    };
+
+    // A checkpoint a resume can legitimately read: written here by a real run, so
+    // load_checkpoint() accepts it and an exit 1 can only come from the guards.
+    const std::filesystem::path ck = temp_path("r110_nn1b_ck.json");
+    const std::filesystem::path setup_out = temp_path("r110_nn1b_setup_out.json");
+    const int setup =
+        run("--out '" + setup_out.string() + "' --checkpoint '" + ck.string() + "'");
+    std::cout << "  [r110nn1b] setup => exit " << setup << ", checkpoint "
+              << read_all(ck).size() << " bytes" << std::endl;
+    assert(setup == 0);
+    assert(std::filesystem::exists(ck));
+
+    // Discriminator: one file, two spellings. README:206 is satisfied, so the run should
+    // proceed; HEAD refuses it and writes nothing.
+    const std::filesystem::path dotted = ck.parent_path() / "." / ck.filename();
+    const std::filesystem::path resume_out = temp_path("r110_nn1b_resume_out.json");
+    const int accepted = run("--resume '" + ck.string() + "' --checkpoint '" + dotted.string() +
+                             "' --out '" + resume_out.string() + "'");
+    std::cout << "  [r110nn1b] --resume 目录/ck.json --checkpoint 目录/./ck.json => exit "
+              << accepted << ", stderr " << last_err.size() << " bytes, --out "
+              << (std::filesystem::exists(resume_out) ? "written" : "absent") << std::endl;
+    assert(accepted == 0);
+    assert(last_err.empty());
+    assert(std::filesystem::exists(resume_out));
+
+    // Control, green on both trees: the identical spelling was never refused, so the fix
+    // keeps the run it already allowed.
+    const std::filesystem::path same_out = temp_path("r110_nn1b_same_out.json");
+    const int same_spelling = run("--resume '" + ck.string() + "' --checkpoint '" + ck.string() +
+                                  "' --out '" + same_out.string() + "'");
+    std::cout << "  [r110nn1b] --resume == --checkpoint, one spelling => exit " << same_spelling
+              << ", stderr " << last_err.size() << " bytes" << std::endl;
+    assert(same_spelling == 0);
+    assert(last_err.empty());
+    assert(std::filesystem::exists(same_out));
+
+    // Control, the one that must stay red for a loosened guard: two genuinely different
+    // files are still refused before anything is opened (README:207).
+    const std::filesystem::path other_ck = temp_path("r110_nn1b_other_ck.json");
+    const std::filesystem::path refusal_out = temp_path("r110_nn1b_refusal_out.json");
+    const int refused = run("--resume '" + ck.string() + "' --checkpoint '" + other_ck.string() +
+                            "' --out '" + refusal_out.string() + "'");
+    std::cout << "  [r110nn1b] --resume and --checkpoint two files => exit " << refused
+              << ", checkpoint " << other_ck << " exists "
+              << (std::filesystem::exists(other_ck) ? "yes" : "no") << std::endl;
+    assert(refused == 1);
+    assert(last_err.find("--resume") != std::string::npos);
+    assert(last_err.find("--checkpoint") != std::string::npos);
+    assert(!std::filesystem::exists(other_ck));
+    assert(!std::filesystem::exists(refusal_out));
+
+    std::cout
+        << "test_trainer_accepts_a_resume_and_checkpoint_that_differ_only_by_a_dot_segment passed"
+        << std::endl;
+#endif
+}
+
 int main() {
     std::cout << "Running training tests..." << std::endl;
 
@@ -3565,6 +3762,8 @@ int main() {
     test_trainer_refuses_a_seed_that_a_resume_would_drop();
     test_trainer_refuses_one_file_for_both_out_and_checkpoint();
     test_genetic_stagnation_count_is_per_run();
+    test_trainer_refuses_one_file_written_two_ways_for_out_and_checkpoint();
+    test_trainer_accepts_a_resume_and_checkpoint_that_differ_only_by_a_dot_segment();
 
     std::cout << "All training tests passed" << std::endl;
     return 0;

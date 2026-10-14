@@ -128,6 +128,21 @@ void ensure_parent_directory(const std::string& path) {
     std::filesystem::create_directories(parent, ec);
 }
 
+// The path guards below compare the files the arguments name, not the text that
+// names them: "ck.json" and "./ck.json" are one file. weakly_canonical is the
+// form that resolves a path which does not exist yet - the normal state here,
+// since the run itself creates these files. When a path cannot be resolved its
+// stated text is kept: two paths we cannot place are not shown to be the same
+// file, and guessing there would allow the very overwrite the guard exists to
+// prevent.
+std::string file_named(const std::string& path) {
+    if (path.empty()) return path;
+    std::error_code ec;
+    const std::filesystem::path resolved = std::filesystem::weakly_canonical(path, ec);
+    if (ec) return path;
+    return resolved.string();
+}
+
 void print_coefficients(const ThreatCoefficients& coeffs) {
     std::cout << "champion coefficients:\n"
               << "  live_four        = " << coeffs.live_four << "\n"
@@ -259,7 +274,7 @@ int main(int argc, char** argv) {
     if (!resume_path.empty()) {
         if (!checkpoint_given) {
             checkpoint_path = resume_path;
-        } else if (checkpoint_path != resume_path) {
+        } else if (file_named(checkpoint_path) != file_named(resume_path)) {
             std::cerr << "Error: --checkpoint " << checkpoint_path << " and --resume "
                       << resume_path << " must name the same file when both are given"
                       << std::endl;
@@ -288,7 +303,7 @@ int main(int argc, char** argv) {
     // The run writes the champion to --out and the resume state to --checkpoint, so
     // one file for both means the final champion overwrites the checkpoint and the
     // next resume replays a run that already finished.
-    if (out_path == checkpoint_path) {
+    if (file_named(out_path) == file_named(checkpoint_path)) {
         std::cerr << "Error: --out " << out_path << " and --checkpoint " << checkpoint_path
                   << " cannot name the same file (the champion parameters would replace the resume state)"
                   << std::endl;
