@@ -722,6 +722,76 @@ void test_engine_elapsed_covers_the_tactical_phases() {
               << ", slack " << slack << ", depth " << result.depth << ")" << std::endl;
 }
 
+// R96 AA2: the iteration frames AlphaBeta emits (search_engine.cpp's progress
+// hook, feeding the client's thinking_progress) timed only their own phase, so
+// the first frame of a 2 s move that had already spent ~1.1 s in VCF/VCT reported
+// a handful of milliseconds while the terminal frame reported the whole move -
+// two clocks in one progress stream. The wrapper now adds the pre-search segment
+// to every layer frame. Measure that segment separately by running the same
+// position with AlphaBeta switched off: that call ends at the greedy fallback
+// (README:530's method list) with elapsed_ms stamped from the move start, so it
+// is the tactics segment alone.
+void test_engine_progress_frames_share_the_search_clock() {
+    Board board;
+    for (int i = 0; i < 4; ++i) {
+        const int r = 1 + i * 3;
+        const int c = 2 + (i % 3);
+        board.place_stone(r, c, BLACK);
+        board.place_stone(r, c + 1, WHITE);
+        board.place_stone(r, c + 2, WHITE);
+        board.place_stone(r, c + 3, WHITE);
+    }
+    assert(board.move_count() == 16);
+
+    std::atomic<bool> stop(false);
+
+    SearchEngine pre;
+    pre.set_alphabeta_enabled(false);
+    const auto t_pre = std::chrono::steady_clock::now();
+    const SearchResult pre_search = pre.search(board, WHITE, 8, 2000, stop);
+    const long long pre_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t_pre).count();
+    assert(pre_search.method == "greedy");
+    assert(pre_search.elapsed_ms <= pre_ms + 1);
+    const int pre_search_ms = pre_search.elapsed_ms;
+
+    SearchEngine engine;
+    std::vector<int> depths;
+    std::vector<int> elapsed;
+    bool returned = false;
+    bool after_return = false;
+    engine.set_progress_callback([&](int depth, int, int elapsed_ms) {
+        if (returned) after_return = true;
+        depths.push_back(depth);
+        elapsed.push_back(elapsed_ms);
+    });
+
+    const auto t0 = std::chrono::steady_clock::now();
+    SearchResult result = engine.search(board, WHITE, 8, 2000, stop);
+    const long long total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+    returned = true;
+
+    assert(result.method == "alphabeta");
+    assert(!after_return);
+    assert(elapsed.size() >= 2);
+    // On a machine fast enough that the tactics phase finishes under half a
+    // second there is nothing to show, so the lower bound is conditional; the
+    // agreement with the measured pre-search segment is what HEAD fails.
+    assert(elapsed.front() + 50 >= pre_search_ms || pre_search_ms < 500);
+    for (size_t i = 1; i < elapsed.size(); ++i) {
+        assert(elapsed[i] >= elapsed[i - 1]);
+        assert(depths[i] >= depths[i - 1]);
+    }
+    assert(static_cast<long long>(elapsed.back()) <= total_ms + 1);
+    assert(elapsed.back() == result.elapsed_ms);
+
+    std::cout << "test_engine_progress_frames_share_the_search_clock passed (pre-search "
+              << pre_search_ms << " ms, first frame " << elapsed.front()
+              << " ms, " << elapsed.size() << " frames, terminal " << elapsed.back()
+              << " ms of " << total_ms << " ms)" << std::endl;
+}
+
 void test_search_engine_finds_five() {
     Board board;
     SearchEngine engine;
@@ -844,10 +914,12 @@ void test_search_result_fields_initialized_on_fast_paths() {
     std::atomic<bool> stop(false);
     SearchResult result = engine.search(board, WHITE, 4, 1000, stop);
 
-    // Own-win path: score is set, the timing fields default to 0 (not garbage).
+    // Own-win path: score is set, and the depth/nodes fields stay 0.
     assert(result.method == "greedy_five");
     assert(result.score == 100000);
-    assert(result.elapsed_ms == 0);
+    // elapsed_ms is a real measurement here, so a sub-millisecond fast path
+    // legitimately reports 0; pinning that a costly path stamps it is
+    // test_engine_stamps_elapsed_on_tactical_wins' job, not this one's.
     assert(result.depth == 0);
     assert(result.nodes_searched == 0);
 
@@ -2511,6 +2583,7 @@ int main() {
     test_engine_keeps_alphabeta_time_after_tactics();
     test_engine_stamps_elapsed_on_tactical_wins();
     test_engine_elapsed_covers_the_tactical_phases();
+    test_engine_progress_frames_share_the_search_clock();
     test_search_engine_finds_five();
     test_controller_async();
     test_controller_stop();

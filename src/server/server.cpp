@@ -1209,7 +1209,6 @@ std::shared_ptr<GameServer::TrackedGame> GameServer::open_session(const SessionS
     }
     sessions_[entry->token] = entry;
     if (unreadable_record) {
-        entry->unreadable_record = true;
         // Stamp the fresh empty game with exactly what a flush would write for
         // it, so flush_entry's dedup returns early instead of taking its
         // empty-board branch - that branch deletes the file named by the token,
@@ -1421,8 +1420,8 @@ SessionSnapshot GameServer::snapshot_of(const TrackedGame& entry) const {
     return snap;
 }
 
-void GameServer::flush_entry(const std::shared_ptr<TrackedGame>& entry) {
-    if (sessions_dir_.empty()) return;
+bool GameServer::flush_entry(const std::shared_ptr<TrackedGame>& entry) {
+    if (sessions_dir_.empty()) return true;
     const SessionSnapshot snap = snapshot_of(*entry);
     // The timestamps say when the write happened, not what changed, so the
     // comparison is made against a copy with them cleared: a session nobody has
@@ -1431,30 +1430,27 @@ void GameServer::flush_entry(const std::shared_ptr<TrackedGame>& entry) {
     probe.created_ms = 0;
     probe.updated_ms = 0;
     const std::string payload = session_to_json(probe);
-    if (payload == entry->saved_payload) return;
+    if (payload == entry->saved_payload) return true;
     // Content decides: a game with no stone anywhere - base or played - is not
     // kept, even if a side was chosen and the game resigned at move zero. A
     // settled previous game on restart always has stones, so it still lands.
     if (snap.base.empty() && snap.record.moves.empty()) {
-        // A token that opened on an unreadable record keeps that file until this
-        // game has content: choosing a side is not content, and the stamp stops
-        // the next tick from re-entering here.
-        if (entry->unreadable_record) {
-            entry->saved_payload = payload;
-            return;
-        }
         // And a file from an earlier game on this token must not outlive the
         // wipe: undo back to an empty board deletes the residue, or a restart
         // would resurrect the undone game. Only commit the dedup stamp once the
         // delete actually succeeded, so a failure retries on the next tick.
+        // A game that opened on an unreadable record takes this branch too and
+        // is safe: it holds a NEW token (see open_session), so the file named
+        // here is its own, while the record nobody could read stays under the old
+        // token - and deleting a file that is simply not there reports success.
         std::string remove_error;
         if (!delete_session(sessions_dir_, entry->token, remove_error)) {
             std::cerr << "会话 " << entry->token << " 残留文件删除失败: "
                       << remove_error << std::endl;
-            return;
+            return false;
         }
         entry->saved_payload = payload;
-        return;
+        return true;
     }
 
     SessionSnapshot to_write = snap;
@@ -1467,7 +1463,7 @@ void GameServer::flush_entry(const std::shared_ptr<TrackedGame>& entry) {
         // saved_payload keeps its old value: the next tick sees the difference
         // and retries, instead of treating a failed write as saved forever.
         std::cerr << "会话 " << entry->token << " 落盘失败: " << error << std::endl;
-        return;
+        return false;
     }
     // Only a game that started from an empty board is a training record on its
     // own: one that began from a hand-set position needs its `base` stones too,
@@ -1477,7 +1473,7 @@ void GameServer::flush_entry(const std::shared_ptr<TrackedGame>& entry) {
         if (!records_path_.empty()) {
             if (!to_write.record.append_to_jsonl(records_path_, error)) {
                 std::cerr << "对局记录追加失败: " << error << std::endl;
-                return;
+                return false;
             }
         }
         entry->exported = true;
@@ -1486,6 +1482,7 @@ void GameServer::flush_entry(const std::shared_ptr<TrackedGame>& entry) {
     // done: committing it before the append meant a failed records.jsonl write
     // was never retried, and the game vanished from the training stream.
     entry->saved_payload = payload;
+    return true;
 }
 
 void GameServer::flush_all() {
@@ -1507,17 +1504,19 @@ void GameServer::schedule_flush() {
 void GameServer::on_flush_tick() {
     std::lock_guard<std::mutex> lock(games_mutex_);
     for (auto it = sessions_.begin(); it != sessions_.end();) {
-        flush_entry(it->second);
+        const bool settled = flush_entry(it->second);
         TrackedGame& entry = *it->second;
         const bool overdue = !entry.attached && entry.detached_ms > 0 &&
                              now_ms() - entry.detached_ms >= kReattachWindowSeconds * 1000LL;
-        if (overdue) {
-            // Back onto the shelf. The file is current (flush_entry just ran), so
-            // what is dropped is the engine, not the game: the token still
+        if (overdue && settled) {
+            // Back onto the shelf. The file is current (flush_entry just settled
+            // it), so what is dropped is the engine, not the game: the token still
             // resumes, by rebuilding from that file.
             cold_sessions_[entry.token] = snapshot_of(entry);
             it = sessions_.erase(it);
         } else {
+            // A failed write leaves the entry in the table, so the next tick
+            // retries it instead of shelving a game whose file is stale.
             ++it;
         }
     }

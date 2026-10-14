@@ -1979,6 +1979,87 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次96 一次思考两套时钟，以及落盘重试被驱逐掐断 — bugfix round 96 batch AA
+
+**Found.** Four rows, all re-read by me at `518ae66` before dispatching (a timing-pipeline audit and a
+session-persistence audit ran read-only in parallel while round 95's gate was still building).
+
+- **AA2 (低, created by round 95).** `search_engine.cpp:240-245` handed AlphaBeta a pass-through progress
+  wrapper, so the per-layer frames kept `alphabeta.cpp:356-359`'s private clock (from its own `start_time_`)
+  while round 95 had moved the terminal frame to the entry clock. One 思考, two timelines: on the four-row
+  drifting-triplet board the tactics phases burn VCF 700 + VCT 400 ms before AlphaBeta starts, so layer frames
+  read ~4/110/571 ms for a call that `ai_move` then reported as 2000 ms. README:521 describes
+  `thinking_progress` and `ai_move` as one search's progress and its 终点.
+- **AA3 (低).** `web/app.js:807` gated the 耗时 token on `a.elapsed_ms` truthiness. After round 95, 0 is a real
+  measurement (book/forced/greedy_five paths measured 34–440 µs), so the replay line dropped it while `:1702`
+  printed 「0ms」 for the same stone, and `:642`'s `|| 0` made 0 indistinguishable from absent.
+- **AA4 (中).** `flush_entry:1442-1444` refused the empty-board delete whenever `entry->unreadable_record` was
+  set, but `open_session:1203-1209` gives exactly such an entry a **new** token — the flag was meant to protect
+  the unreadable record, which lives under the *old* token's filename and this entry never names it. So a
+  session that opened on a corrupt file, played a stone (writing its own file), then undid to an empty board
+  kept that residue, and a restart resurrected the undone game. The protection was never needed:
+  `delete_session` (`session_store.cpp:295-315`) succeeds for an absent file, because `filesystem::remove`
+  clears `ec` — which is the very split the `:301-303` comment describes.
+- **AA5 (低).** `on_flush_tick:1509-1519` evicted an overdue detached game into `cold_sessions_` on its own
+  comment's assurance that "the file is current (flush_entry just ran)", but `flush_entry` returns early without
+  committing `saved_payload` when `save_session` (`:1466-1471`) or the residue delete (`:1450-1455`) or the
+  records append (`:1473-1476`) fails. Once erased, nothing visits that token again, and a later `resume` stamps
+  the cold snapshot as saved (`:1186-1189`) — which silently cancelled the retry-on-failure that rounds 72/73
+  built (README:570-571).
+
+**Fixed.** `search_engine.cpp` computes the pre-AlphaBeta `used_ms` before installing the wrapper and captures it
+in the lambda (`elapsed_ms + used_ms`), so layer frames and the terminal frame share the entry clock; a constant
+offset cannot break round-85 F3's non-decreasing property, and `alphabeta.*` is untouched. `app.js` now tests
+`a.elapsed_ms != null` while `depth`/`nodes` keep their documented truthiness gates (`:797-799`). `flush_entry`
+returns `bool` ("settled"), its three failure arms return false, the `unreadable_record` member and its
+protective branch are gone (`server.h`), and eviction now requires `overdue && settled` so a failed write stays
+in `sessions_` for the next tick. The empty-board branch's comment states why the unreadable-record case is safe
+there. Net: `search_engine.cpp` +11/−9, `app.js` +1/−1, `server.h` +3/−5, `server.cpp` +18/−19.
+
+**Not defects / refuted.** T1 — "an invalid `best_move` without resignation strands the client in 「AI 思考中」
+forever (README:521-522)" — is refuted by the arming rule: `web/app.js:1799-1809` is the *only* `aiThinking =
+true` and it lives in `handleThinkingProgress`, so a search that emits no frame never enters the frozen state;
+the residual needs a completed layer whose move is then invalid *and* every `search_engine.cpp:271-279`
+candidate occupied or 禁手, and 终止 stays enabled (`:1804`) and clears the flag locally (`:1013-1016`). Also
+refuted: "the `is_decisive()` export gate (`server.cpp:1476`) drops 满盘和棋 from `records.jsonl`" — unreachable,
+already closed twice in rounds 81 and 82. The persistence audit's own sweep came back by-design on `.tmp` residue
+(`session_store.cpp:235-256` removes on both failure paths; `list_sessions` skips non-`.json`), `--no-sessions`
+closing `--records` together (`main.cpp:52-54`, README:162), uncapped `cold_sessions_` (`server.h:137-141`),
+last-writer takeover (`server.cpp:1310-1334` = README:567-569), `exported` inferred rather than stored
+(`server.h:114-116`), and the 120 s idle timer.
+
+**Queued for round 97.** Nothing dispatched yet — and one consequence of this batch is deliberately left to the
+test session rather than the fixer: `tests/test_server.cpp:932` read the deleted `unreadable_record` member, so
+`test_server` cannot compile until that case is re-pointed at observable disk state; `tests/test_search.cpp:850`'s
+round-92 pin `assert(result.elapsed_ms == 0)` also contradicts round 95's contract and is green only through
+sub-millisecond rounding.
+
+**Verified.** Gate on the identical tree: `cmake` rc 0, `make -j4` rc 0, `ctest` **8/8**
+(`build/r96_ctest.log`, with the three new cases named in `build/Testing/Temporary/LastTest.log:149/:286/:311`),
+`node tests/web_frontend_check.js` **36/36** (one case added), `node tests/readme_anchor_check.js`
+**31 citations, 0 problems**, README.md still **658** lines (untouched).
+
+- AA2 — `tests/test_search.cpp:725-794` (`test_engine_progress_frames_share_the_search_clock`, registered `:2586`)
+  measures the tactics pre-phase with AlphaBeta disabled first, then asserts the first layer frame covers it
+  (`:781` `elapsed.front() + 50 >= pre_search_ms || pre_search_ms < 500`), that frames stay non-decreasing, and
+  that the closing frame equals `result.elapsed_ms` exactly. Worktree: first frame 1104 ms against a 1100 ms
+  pre-phase; **HEAD `518ae66` fails `test_search.cpp:781`** (rc 134, first frame in single-digit ms).
+- AA3 — `tests/web_frontend_check.js:1697-1731` pins `'greedy_five 胜 0ms'`, `'alphabeta 120 4d 1.5k 0ms'`, an
+  analysis with no `elapsed_ms` field still rendering without it, and the compact line still omitting time.
+  **HEAD fails**: `got: greedy_five 胜`, `35/36 passed`.
+- AA4 — `tests/test_server.cpp:902-970` rewrites `test_unreadable_record_file_survives` onto disk facts only (the
+  deleted member is gone): the unreadable file survives, and after 摆子 → undo to empty → flush the session's own
+  file is deleted (`:961`). **HEAD fails `:961`**.
+- AA5 — `tests/test_server.cpp:973-1033` (`test_failed_flush_keeps_the_overdue_entry_hot`, registered `:1656`)
+  blocks the directory, pushes `detached_ms` past the reattach window and ticks: `:1006` asserts the entry is
+  still in `sessions_` and `:1007` that it did not reach `cold_sessions_`; after unblocking, the next tick evicts
+  it normally. **HEAD fails `:1006`**.
+
+All four rows are observably fixed; none reported 无可观察差异. The stale round-92 pin was retired as decided:
+`tests/test_search.cpp:917-922` drops `assert(result.elapsed_ms == 0)` for a comment (a sub-millisecond path's 0
+is a real measurement; the stamping contract is pinned by round-95 case A), with that case's other assertions
+untouched.
+
 ## 轮次95 逐手耗时只量了 AlphaBeta 那一段 — bugfix round 95 batch Z
 
 **Found.** Z1 (`src/search/search_engine.cpp`, verified by me at `87b91f0` before dispatching). README:57

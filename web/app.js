@@ -804,7 +804,7 @@ class GomokuGame {
         const parts = [a.method, verdict];
         if (a.depth) parts.push(`${a.depth}d`);
         if (a.nodes) parts.push(`${(a.nodes / 1000).toFixed(1)}k`);
-        if (!compact && a.elapsed_ms) parts.push(`${a.elapsed_ms}ms`);
+        if (!compact && a.elapsed_ms != null) parts.push(`${a.elapsed_ms}ms`);
         return parts.join(' ');
     }
 

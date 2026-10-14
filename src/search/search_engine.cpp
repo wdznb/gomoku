@@ -233,22 +233,24 @@ SearchResult SearchEngine::search(const Board& board, int color,
         // is only this phase's share of the budget, so on its own it lets the
         // move overshoot by that whole share once the tactics phases spent it.
         if (has_deadline) ab.set_deadline(search_deadline);
-        // Iteration-level frames for the client: the frame at the end of this
-        // function only lands once the whole search is over, which is too late
-        // for its 终止 button. The member is copied out first so the hook carries
-        // its own value.
-        const ProgressCallback progress_cb = progress_callback_;
-        if (progress_cb) {
-            ab.set_progress_callback([progress_cb](int depth, int nodes, int elapsed_ms) {
-                progress_cb(depth, nodes, elapsed_ms);
-            });
-        }
         int remaining_time = time_limit_ms;
         auto elapsed = std::chrono::high_resolution_clock::now() - start;
         int used_ms = static_cast<int>(
             std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count());
         remaining_time -= used_ms;
         if (remaining_time < 100) remaining_time = 100;
+        // Iteration-level frames for the client: the frame at the end of this
+        // function only lands once the whole search is over, which is too late
+        // for its 终止 button. The member is copied out first so the hook carries
+        // its own value. AlphaBeta times only its own phase, so the tactics phases
+        // it came after are added on: one clock for the per-depth frames and the
+        // terminal frame below, and a constant offset keeps the sequence non-decreasing.
+        const ProgressCallback progress_cb = progress_callback_;
+        if (progress_cb) {
+            ab.set_progress_callback([progress_cb, used_ms](int depth, int nodes, int elapsed_ms) {
+                progress_cb(depth, nodes, elapsed_ms + used_ms);
+            });
+        }
 
         // Tie the node budget to the wall-clock deadline so that a large
         // timeout actually buys more search. Empirical throughput on this

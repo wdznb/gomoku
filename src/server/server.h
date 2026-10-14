@@ -114,9 +114,6 @@ private:
         // Already appended to records_path, so a resumed game does not export a
         // second copy of the same ending.
         bool exported = false;
-        // The file behind this token could not be read, so it stays on disk for a
-        // human to look at even while the fresh game here is still stone-less.
-        bool unreadable_record = false;
         // The last flushed payload with its timestamps zeroed: unchanged means
         // nothing to write, which is what keeps a quiet session off the disk.
         std::string saved_payload;
@@ -195,8 +192,9 @@ private:
 
     SessionSnapshot snapshot_of(const TrackedGame& entry) const;
     // Writes the session file when the game changed, and appends the record once
-    // the game is over and replayable on its own.
-    void flush_entry(const std::shared_ptr<TrackedGame>& entry);
+    // the game is over and replayable on its own. False means the write did not
+    // settle, so the entry still owes a retry and must not be shelved as cold.
+    bool flush_entry(const std::shared_ptr<TrackedGame>& entry);
     void flush_all();
     // Releases a game its socket no longer holds, keeping it in memory until the
     // reattach window runs out. games_mutex_ must already be held; on_disconnect

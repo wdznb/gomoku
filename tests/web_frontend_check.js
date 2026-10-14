@@ -1694,6 +1694,41 @@ check('W3 the curve dots 100000 but not the 99000 defensive mark', () => {
            'both clipped plies share the top edge, ys=' + mixed.ys.join(','));
 });
 
+// AA3: README:57 lists 耗时 as one of the five per-ply analysis fields, so a
+// measure of 0 ms is information, not an absence. formatAnalysis gated the suffix
+// on truthiness, which dropped every honest sub-millisecond 0 while the two
+// round-92 pins above show that depth / nodes stay hidden when they are 0 - those
+// two gates are deliberately unchanged, only the elapsed one reads != null.
+check('AA3 a measured 0ms shows in the full line, depth and nodes still hide', () => {
+    const game = newGame();
+
+    const fast = game.formatAnalysis(
+        { method: 'greedy_five', score: 100000, depth: 0, nodes: 0, elapsed_ms: 0 });
+    assert(fast === 'greedy_five 胜 0ms', 'a 0 ms measurement is printed, got: ' + fast);
+
+    const searched = game.formatAnalysis(
+        { method: 'alphabeta', score: 120, depth: 4, nodes: 1500, elapsed_ms: 0 });
+    assert(searched === 'alphabeta 120 4d 1.5k 0ms',
+           'the searched line keeps both suffixes and gains 0ms, got: ' + searched);
+
+    // An analysis that never measured anything at all keeps no suffix: the field
+    // is absent, not zero.
+    const unmeasured = game.formatAnalysis(
+        { method: 'alphabeta', score: 120, depth: 4, nodes: 1500 });
+    assert(unmeasured === 'alphabeta 120 4d 1.5k',
+           'a missing elapsed_ms stays unprinted, got: ' + unmeasured);
+
+    // The compact replay line has never shown the time, and does not start to.
+    const compact = game.formatAnalysis(
+        { method: 'greedy_five', score: 100000, depth: 0, nodes: 0, elapsed_ms: 0 }, true);
+    assert(compact === 'greedy_five 胜', 'the compact line stays without a time, got: ' + compact);
+
+    // A real measurement still reads the same as before the fix.
+    const timed = game.formatAnalysis(
+        { method: 'must_block', score: 120, depth: 0, nodes: 0, elapsed_ms: 7 });
+    assert(timed === 'must_block 120 7ms', 'a nonzero time is unchanged, got: ' + timed);
+});
+
 let failed = 0;
 for (const result of results) {
     console.log(`${result.ok ? 'PASS' : 'FAIL'} ${result.label}` +

@@ -899,13 +899,12 @@ void test_resign_survives_interruption() {
     std::cout << "test_resign_survives_interruption passed" << std::endl;
 }
 
-// Round 79, A6 (contract updated in R85): a session file whose record cannot be
-// rebuilt (open_session falls back to a fresh empty game) must stay on disk byte
-// for byte while the game is still stone-less: choosing a side alone changes the
-// flushed payload, which used to send flush_entry's empty-board branch into
-// delete_session - the very file the token names. The game the player gets is not
-// the damaged token's any more (README:476-477 hands out a fresh one), so the
-// entry is found through the socket and the old file is what must survive.
+// Round 79, A6 (contract updated in R85; disk facts only since R96 AA4): a session
+// file whose record cannot be rebuilt is handed a NEW token (README:476-477), so
+// what has to survive is the old file on disk - the entry no longer owns it. The
+// unreadable_record flag flush_entry used to consult is gone: the fresh game takes
+// the ordinary empty-board branch, and deleting a file its own token has never
+// written is a success, not a case to guard.
 void test_unreadable_record_file_survives() {
     const auto dir = scratch("unreadable_sessions");
     const auto records = scratch("unreadable_records.jsonl");
@@ -929,25 +928,107 @@ void test_unreadable_record_file_survives() {
             h.server.entry_locked(h.socket.get());
         assert(resumed);
         assert(resumed->token != "deadbeef");
-        assert(resumed->unreadable_record);
         assert(!resumed->rebuilt);
         // The caller gets an empty game, not a half-replayed one.
         assert(resumed->game->replay_snapshot().move_count == 0);
 
-        // Only a side is chosen - no stone is placed, so the board stays empty
-        // while the payload the next flush would write has changed.
+        const std::filesystem::path own_file =
+            std::filesystem::path(h.server.sessions_dir_) / (resumed->token + ".json");
+        // The new token has written nothing, and the unreadable record still sits
+        // under the old token, byte for byte.
+        assert(!std::filesystem::exists(own_file));
+        assert(read_text(dir / "deadbeef.json") == damaged);
+
+        // Only a side is chosen - no stone is placed, so the board stays empty and
+        // the flush takes the empty-board branch on THIS token's own (absent) file.
         h.server.handle_choose_side(h.socket, json{{"color", "black"}});
         assert(resumed->side_chosen);
+        h.server.flush_entry(resumed);
+        assert(!std::filesystem::exists(own_file));
+        assert(read_text(dir / "deadbeef.json") == damaged);
+
+        // AA4's new consequence: content is what puts the file on disk, and undoing
+        // back to an empty board has to take it away again - a restart must not
+        // resurrect a wiped game. Both writes stay off the damaged record.
+        assert(resumed->game->restore_game(playing_restore(1)));
+        h.server.flush_entry(resumed);
+        assert(std::filesystem::exists(own_file));
+        assert(read_text(dir / "deadbeef.json") == damaged);
+
+        h.server.handle_undo(h.socket);
+        assert(resumed->game->status() == GameStatus::WAITING);
+        h.server.flush_entry(resumed);
+        assert(!std::filesystem::exists(own_file));
+        assert(read_text(dir / "deadbeef.json") == damaged);
 
         h.server.detach_socket(h.socket.get());  // flushes the session on the way out
-
-        assert(std::filesystem::exists(dir / "deadbeef.json"));
         assert(read_text(dir / "deadbeef.json") == damaged);
     }
     std::error_code ec;
     std::filesystem::remove_all(dir, ec);
     std::filesystem::remove(records, ec);
     std::cout << "test_unreadable_record_file_survives passed" << std::endl;
+}
+
+// R96 AA5: on_flush_tick may not shelve a game whose file it could not write.
+// flush_entry now answers whether it settled, and only 过期且已落盘 leaves the table
+// for cold_sessions_: shelving a stale file means the token resumes from it and the
+// plies that failed to land are gone for good. A path component that is a regular
+// file makes save_session fail for real, and the same entry is settled once the
+// directory is usable again.
+void test_failed_flush_keeps_the_overdue_entry_hot() {
+    const auto dir = scratch("aa5_sessions");
+    const auto records = scratch("aa5_records.jsonl");
+    const auto wall_ms = [] {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::system_clock::now().time_since_epoch()).count();
+    };
+    {
+        Harness h(dir, records);
+        assert(h.entry->game->restore_game(playing_restore(1)));
+        h.server.detach_socket(h.socket.get());  // flushes: the one-stone game lands
+        const std::string token = h.entry->token;
+        assert(std::filesystem::exists(dir / (token + ".json")));
+
+        // Past the 30 minute reattach window, with a second ply still owed a write.
+        assert(h.entry->game->restore_game(playing_restore(2)));
+        h.entry->detached_ms = wall_ms() - 30LL * 60LL * 1000LL - 10;
+
+        const auto blocker = scratch("aa5_blocker");
+        { std::ofstream file(blocker); file << "not a directory"; }
+        const std::string good_dir = h.server.sessions_dir_;
+        h.server.sessions_dir_ = (blocker / "sub").string();
+
+        h.server.on_flush_tick();
+
+        // The write failed, so the entry still owes a retry: it stays hot, and the
+        // cold shelf - which a resume would read - stays empty for it.
+        assert(h.server.sessions_.count(token) == 1);
+        assert(h.server.cold_sessions_.count(token) == 0);
+        assert(h.server.sessions_.at(token)->game != nullptr);
+
+        // The readable copy is still the one-stone game: nothing half-written.
+        std::string error;
+        SessionSnapshot on_disk;
+        h.server.sessions_dir_ = good_dir;
+        assert(load_session(good_dir, token, on_disk, error));
+        assert(on_disk.record.moves.size() == 1);
+
+        // Writable again: the next tick settles the file and evicts as usual.
+        h.entry->detached_ms = wall_ms() - 30LL * 60LL * 1000LL - 10;
+        h.server.on_flush_tick();
+        assert(h.server.sessions_.count(token) == 0);
+        assert(h.server.cold_sessions_.count(token) == 1);
+        assert(load_session(good_dir, token, on_disk, error));
+        assert(on_disk.record.moves.size() == 2);
+
+        std::error_code cleanup;
+        std::filesystem::remove(blocker, cleanup);
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    std::filesystem::remove(records, ec);
+    std::cout << "test_failed_flush_keeps_the_overdue_entry_hot passed" << std::endl;
 }
 
 // Round 81, C1: handle_resign's "started" guard must count played plies, not
@@ -1572,6 +1653,7 @@ int main() {
     test_set_position_reopens_export();
     test_emptied_board_deletes_residue();
     test_failed_flush_retries_and_keeps_dedup();
+    test_failed_flush_keeps_the_overdue_entry_hot();
     test_check_position_skips_session_creation();
     test_failed_export_retries_records_append();
     test_request_hint_clears_stale_discard();
