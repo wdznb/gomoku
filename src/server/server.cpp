@@ -432,12 +432,17 @@ std::filesystem::path WebSocketSession::resolve_file(const std::string& target) 
     }
 
     std::string rel = p.substr(1);
+    // `..` is refused by name because it asks for a file outside web_dir_. A
+    // single `.` is the opposite: it names this directory, so `/./index.html`
+    // is index.html and must be served. It is left in place - weakly_canonical
+    // below collapses it - and the canonical path is then required to start
+    // with web_dir_, which is what actually decides the matter.
     size_t start = 0;
     while (start <= rel.size()) {
         size_t slash = rel.find('/', start);
         std::string part = rel.substr(start,
             slash == std::string::npos ? std::string::npos : slash - start);
-        if (part == ".." || part == ".") return {};
+        if (part == "..") return {};
         if (slash == std::string::npos) break;
         start = slash + 1;
     }
@@ -476,18 +481,34 @@ std::string WebSocketSession::get_content_type(const std::string& path) {
 void WebSocketSession::handle_http_request() {
     res_ = std::make_shared<http::response<http::string_body>>();
 
-    std::filesystem::path file = resolve_file(std::string(req_.target()));
-    std::ifstream in(file, std::ios::binary);
-    if (!file.empty() && in) {
-        std::ostringstream ss;
-        ss << in.rdbuf();
-        res_->body() = ss.str();
-        res_->result(http::status::ok);
-        res_->set(http::field::content_type, get_content_type(file.string()));
+    // One port, two protocols: a browser GETs index.html/app.js/style.css from
+    // web_dir_ and then upgrades the WebSocket, so a plain request is only ever
+    // a request for a static file. A HEAD asks for the headers of that same
+    // file and is answered with no body; any other method is not a read this
+    // handler knows how to serve, and handing back the file would tell the
+    // client its write had been accepted.
+    const bool is_get = req_.method() == http::verb::get;
+    const bool is_head = req_.method() == http::verb::head;
+
+    if (is_get || is_head) {
+        std::filesystem::path file = resolve_file(std::string(req_.target()));
+        std::ifstream in(file, std::ios::binary);
+        if (!file.empty() && in) {
+            std::ostringstream ss;
+            ss << in.rdbuf();
+            if (is_get) res_->body() = ss.str();
+            res_->result(http::status::ok);
+            res_->set(http::field::content_type, get_content_type(file.string()));
+        } else {
+            res_->result(http::status::not_found);
+            res_->set(http::field::content_type, "text/plain; charset=utf-8");
+            if (is_get) res_->body() = "Not found";
+        }
     } else {
-        res_->result(http::status::not_found);
+        res_->result(http::status::method_not_allowed);
         res_->set(http::field::content_type, "text/plain; charset=utf-8");
-        res_->body() = "Not found";
+        res_->set(http::field::allow, "GET, HEAD");
+        res_->body() = "Method Not Allowed";
     }
 
     res_->version(req_.version());

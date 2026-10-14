@@ -1979,6 +1979,69 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次111 「非读取」被当成读取回答的那一半端口，与一条把 `.` 跟 `..` 一起拒掉的守卫 — bugfix round 111 batch OO
+
+**先办上一轮的欠账：`'parked'` flake 的归属判定.** 结论是**用例侧的墙钟前提，不是产品时序**。12 核机器上开
+24 个 `yes` 饱和，连跑 3 次全量 ctest 每次红的都是**同样两条**，且 `test_server` 在饱和下 10.57 s 通过、
+`:1985` 的 `parked` 自旋在 12 次单跑 + 3 次饱和全量里一次也没红。两条红点是：
+① `tests/test_search.cpp:193`——`test_transposition_depth_gate_still_applies()` 直调 `alphabeta()`，
+`AlphaBetaSearch` 的默认 `move_time_limit_ms_` 是 5000（`alphabeta.cpp:10-11`），饱和下这次 depth-4 调用
+走到 `alphabeta.cpp:94` 的中止分枝，返回静态评估量级的分值，于是「TT 深度门」这条用例变成了一台负载计；
+② `tests/test_position.cpp:1111`——`assert(elapsed_ms < 10000)`，16 MB 单遍扫描实测空闲 6.6 s、饱和
+29000 ms，而同一条用例的 `ru_maxrss` 那条仍然绿（135 MB）。产品侧没有任何改动。
+
+**Found（批次 OO，来自本轮只读审计的 `--web-dir` 静态资源域）.**
+
+- **OO1** `src/server/server.cpp` 的 `handle_http_request()` 从未读 `req_.method()`，每个动词都被当 GET
+  回答：对存在的路径发 POST 会拿到 200 **加该文件自身的字节**，等于告诉发送方「你的写入已被接受」而实际上
+  什么都没写；HEAD 按其定义只要首部，HEAD 版却照样塞了 body。README:294 写的是浏览器打开
+  `http://localhost:8080`，那是取 index.html/app.js/style.css 的一次读，需求从未承诺把一个写当读服务。
+- **OO2** 同类：`resolve_file()` 逐段走 target，凡不是文件名的段一律拒绝，于是单个 `.` 跟 `..` 一起被拒。
+  两者语义相反——`..` 要的是 `web_dir_` 之外的文件，`.` 要的是**本目录**，`/./index.html` 就是 index.html；
+  HEAD 版对它还回 404。
+
+**Fixed.** `src/server/server.cpp` +32/−11（契约文本 `build/r111_oo_spec.txt`，我用 Read 下发，彻底避开上一轮
+那种代码块传输截断）：GET 与 HEAD 共用 `resolve_file` 与状态码，只有 GET 填 body，其余动词 405 +
+`Allow: GET, HEAD`；`resolve_file` 只按名字拒 `..`，把 `.` 留给下面的 `weakly_canonical` + 根前缀校验，
+后者才是真正守住目录的那一道。README 不动（658 行不变）：静态资源与路径守卫两节本来就没写「拒绝 `.`」。
+
+**裁决（不是缺陷）.** `src/training/hill_climbing.cpp:26` 的 `rounded <= 0 ? 1 : …`：审计报「步长被抬成 1 会
+掩盖 0」。逐函数读后判**无可观察差异**——乘数只可能来自 `{1.6, 0.625}` 两个步长（`hill_climbing.h:17`，
+`trainer.cpp:311-314` 从不覆盖），任何一条路径都算不出 `rounded <= 0`，两棵树上这段代码的观察面完全相同。
+
+**Verified.** 测试会话只动 `tests/`：`tests/test_server.cpp` +188/−2（两条用例
+`test_http_answers_a_read_with_the_file_and_a_write_with_a_refusal`、
+`test_resolve_file_reads_a_single_dot_segment_and_still_refuses_every_escape`）、
+`tests/test_search.cpp` +10/0、`tests/test_position.cpp` +20/−8（OO3 三处逐条授权的门禁健壮性改动）。
+HEAD 反证只读 `git archive e052445` → /tmp、按 `link.txt` 把 `server.cpp.o` **换成** HEAD 产物重链，红点
+`:2274`（POST）、`:2286`（HEAD 的 body）、`:2313`（PUT/DELETE——派单把这条记成对照，它其实也是判别，HEAD
+根本不读 `req_.method()`）、`:2357`/`:2359`/`:2370`（点点段）；九条逃逸姿势两棵树都拒绝。OO3 三处：
+`:193` 所在的两个块加 `move_time_limit_ms_ = 600000`（只在这两个块，任何量超时或节点预算的块都不许加）；
+`test_position.cpp` 的墙钟断言按授权分支删除——实测 CPU 时间**同样**是负载计（空闲 6947 ms / 饱和 13324 ms），
+而它要跨的间隙是 6.9 s 对旧容器版 13 s，没有既 ≥3 倍又低于 13 s 的阈值，成本级改由 `ru_maxrss < 250 MB`
+承载（现 135 MB 对旧 1155 MB，量级差且不含时钟）；`parked` 自旋上限 10 s→60 s 并加超时诊断行，
+`assert(parked)` 原样保留。合约过期：无。
+门禁由我自己跑完：**空闲臂** `100% tests passed, 0 tests failed out of 8` / 「Total Test time (real) =  47.86 sec」、
+`web_frontend_check: 72/72 passed`、`readme_anchor_check: 84 citations, 0 problems`（82→84 是新用例注释里的
+README:294/139 引用）、`658 README.md`。
+
+**但要如实记账：负载臂是 7/8。** `:193` 那处修好之后，`main()` 里排在它后面的两条**从来没机会执行**的用例
+第一次跑到了终点，于是暴露出同样性质的机器相对预算前提：`tests/test_search.cpp:2742`
+（`completed.method == "alphabeta"`，2000 ms 的控制臂）与 `:2149`（`result.resigned`，300 ms 预算）。
+两条都在我派单禁止测试会话触碰的用例内，所以它没写「成功」。我的裁决：两者都是**用例侧**前提，产品行为
+符合设计——控制臂那边预算用尽就按 README:530-531 的 `greedy`  relabel 报告，判别臂（10 ms 那一手）不受影响；
+resign 这边只在 AlphaBeta **证出**杀棋时才认，预算内没证出来就继续下。轮次112 处理 `:2742`：那是纯粹的
+余量问题（一层约 433 ms，把控制臂预算抬到 20000 ms 不削任何判别力），已授权给测试会话；`:2149` **不动**，
+因为那 300 ms 本身就是判别器（`probe_budget_ms > 500` 那道门只有在小预算下才关得住 VCF 反证路径，
+抬预算会让 HEAD 变绿），它是一条已记录的机器相对前提，不算门禁失败。**门禁仍取空闲四段。**
+
+**下一轮（轮次112）预告.** 三个只读审计已回：训练盘 id（U1 INVALID 漏计——审计逐路径证明
+`GameEndReason::INVALID` 在数据路径不可达，故并入**无可观察差异**；U2 `--data-games 2001 --threads 2`
+起 `per_worker` 越过 1000 步长、两个 worker 的 id 带重叠）、会话生命周期三条（接管分支漏 flush、
+`deferred_end_for_` 未随接管复位、空档 entry 被 shelved 后旧 token 复活）、前端回放/视角四条
+（「已恢复对局：N 手」用盘上子数、`session_taken_over` 不释放回放时钟、副本全空时 确认 不发 `set_position`、
+`replay` 回复删掉刚收到的那一手）。以上**都要我先逐函数读代码核验**才下发，另加 `:2742` 的预算余量。
+
 ## 轮次110 两条路径守卫比的是写法而不是文件，于是同文件漏拦、合法命令反被拒 — bugfix round 110 batch NN
 
 **Found.** 三个只读审计（训练循环记账 / 摆棋导入回环 / 核心几何 / 搜索层候选处理）里三条整域 CLEAN，

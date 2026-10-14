@@ -1975,12 +1975,25 @@ void test_a_rejected_stone_delivers_the_end_a_worker_parked() {
         }
         h.entry->game->start_ai_thinking();
         // Wait on the event itself rather than on a clock: the frame the worker's
-        // callback parks under the armed slot.
+        // callback parks under the armed slot. Round 111 OO3 widened the ceiling from
+        // 2000 x 5 ms (10 s) to 60 s: the wait is a bound on a worker that is doing real
+        // search on a shared box, so under a saturated gate it simply loses the race - the
+        // assertion below is unchanged, a frame that never arrives is still a failure.
         bool parked = false;
-        for (int spin = 0; spin < 2000 && !parked; ++spin) {
+        for (int spin = 0; spin < 12000 && !parked; ++spin) {
             std::lock_guard<std::mutex> lock(h.server.end_frame_mutex_);
             parked = !h.server.deferred_end_frame_.is_null();
             if (!parked) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        if (!parked) {
+            std::lock_guard<std::mutex> lock(h.server.end_frame_mutex_);
+            std::cout << "  [r99dd3] TIMEOUT after 60 s: ai_thinking="
+                      << h.entry->game->ai_thinking_.load()
+                      << " status=" << static_cast<int>(h.entry->game->status_)
+                      << " deferred_end_for=" << static_cast<const void*>(h.server.deferred_end_for_)
+                      << " session=" << static_cast<const void*>(h.socket.get())
+                      << " same=" << (h.server.deferred_end_for_ == h.socket.get() ? "yes" : "no")
+                      << std::endl;
         }
         assert(parked);
 
@@ -2211,6 +2224,177 @@ void test_transient_accept_failure_rearms_and_abort_ends() {
 
 }  // namespace
 
+// Round 111 OO1: one port, two protocols - README:294 is the browser opening
+// http://localhost:8080, which is a plain GET for index.html/app.js/style.css before the
+// WebSocket upgrade. handle_http_request() never read req_.method(), so it answered every
+// verb as a GET: a POST to an existing path got 200 plus the file's own bytes, telling the
+// sender its write had been accepted when nothing was written anywhere, and a HEAD - a
+// request that by definition asks for headers only - got a body anyway. The handler now
+// branches the verb: GET and HEAD share resolve_file and the status code, only GET fills
+// the body, and any other method gets 405 with an Allow naming the two reads it knows.
+//
+// What is asserted: the status code, whether the body is the file's bytes, and the
+// presence of the Content-Type / Allow fields. No message wording. One deliberate
+// non-assertion: prepare_payload() writes Content-Length from the body it is handed, so a
+// HEAD's is 0 - that is this round's semantics, so no arm pins it as the file size.
+void test_http_answers_a_read_with_the_file_and_a_write_with_a_refusal() {
+    const auto dir = scratch("r111_oo1_web");
+    std::filesystem::create_directories(dir);
+    // A sentinel no page in web/ contains, so "the body is the file" is a statement about
+    // this response rather than about index.html.
+    const std::string sentinel = "<!doctype html>r111-oo1-sentinel-index-bytes</html>\n";
+    {
+        std::ofstream file(dir / "index.html", std::ios::binary);
+        file << sentinel;
+    }
+
+    net::io_context ioc;   // never run: a write on an unconnected socket just stays queued
+    auto ask = [&dir, &ioc](http::verb method, const std::string& target) {
+        auto session = std::make_shared<WebSocketSession>(tcp::socket(ioc), dir.string());
+        session->req_.method(method);
+        session->req_.target(target);
+        session->handle_http_request();
+        return session->res_;
+    };
+    auto has = [](const std::shared_ptr<http::response<http::string_body>>& res,
+                  http::field name) {
+        return res->find(name) != res->end();
+    };
+
+    // Discriminator 1: POST is not a read this handler can serve, so the file stays
+    // unoffered and the answer says which methods are. HEAD's tree has no verb branch at
+    // all and hands back 200 with the file.
+    const auto posted = ask(http::verb::post, "/index.html");
+    std::cout << "  [r111oo1] POST /index.html => " << static_cast<int>(posted->result())
+              << ", body " << posted->body().size() << " bytes, allow "
+              << (has(posted, http::field::allow)
+                      ? std::string(posted->find(http::field::allow)->value())
+                      : std::string("<absent>"))
+              << std::endl;
+    assert(posted->result() == http::status::method_not_allowed);
+    assert(has(posted, http::field::allow));
+    assert(posted->find(http::field::allow)->value().find("GET") != std::string::npos);
+    assert(posted->body().find(sentinel) == std::string::npos);
+
+    // Discriminator 2: HEAD asks for the headers of that same file. The status and the
+    // Content-Type are the GET's, the body is not.
+    const auto head = ask(http::verb::head, "/index.html");
+    std::cout << "  [r111oo1] HEAD /index.html => " << static_cast<int>(head->result())
+              << ", body " << head->body().size() << " bytes, content-type present "
+              << (has(head, http::field::content_type) ? "yes" : "no") << std::endl;
+    assert(head->result() == http::status::ok);
+    assert(head->body().empty());
+    assert(has(head, http::field::content_type));
+
+    // Control, green before and after: the GET the browser actually sends is unchanged,
+    // byte for byte, and a miss is still a 404.
+    const auto got = ask(http::verb::get, "/index.html");
+    std::cout << "  [r111oo1] GET /index.html => " << static_cast<int>(got->result())
+              << ", body " << got->body().size() << " bytes, HEAD agrees on content-type "
+              << (got->find(http::field::content_type)->value() ==
+                          head->find(http::field::content_type)->value()
+                      ? "yes"
+                      : "no") << std::endl;
+    assert(got->result() == http::status::ok);
+    assert(got->body() == sentinel);
+    assert(has(got, http::field::content_type));
+    const auto missed = ask(http::verb::get, "/nope.html");
+    assert(missed->result() == http::status::not_found);
+
+    // The same branch, two more verbs: 405 is what a non-read gets, not what POST in
+    // particular gets. HEAD's handler has no verb branch at all, so these arms are red
+    // there too - they widen the discriminator, they are not both-trees-green controls.
+    const http::verb methods[] = {http::verb::put, http::verb::delete_};
+    for (const http::verb other : methods) {
+        const auto refused = ask(other, "/index.html");
+        std::cout << "  [r111oo1] " << (other == http::verb::put ? "PUT" : "DELETE")
+                  << " /index.html => " << static_cast<int>(refused->result()) << ", allow "
+                  << (has(refused, http::field::allow) ? "set" : "absent") << std::endl;
+        assert(refused->result() == http::status::method_not_allowed);
+        assert(has(refused, http::field::allow));
+        assert(refused->body().find(sentinel) == std::string::npos);
+    }
+
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    std::cout
+        << "test_http_answers_a_read_with_the_file_and_a_write_with_a_refusal passed"
+        << std::endl;
+}
+
+// Round 111 OO2: resolve_file() walked the target segment by segment and refused any
+// segment that was not a name, so a single `.` was rejected with `..`. They are not the
+// same request: `..` asks for a file outside web_dir_ (README:139 is the directory being
+// rooted in), and `.` asks for this one - `/./index.html` *is* index.html. HEAD's tree
+// answers that with a 404. The guard now refuses only `..` by name and lets
+// weakly_canonical plus the root-prefix check at server.cpp:450-459 decide, which is what
+// actually holds the line: every control below was red-proof before and stays green now.
+void test_resolve_file_reads_a_single_dot_segment_and_still_refuses_every_escape() {
+    const auto dir = scratch("r111_oo2_web");
+    std::filesystem::create_directories(dir / "a");
+    const std::string index = "<!doctype html>r111-oo2-index</html>\n";
+    {
+        std::ofstream file(dir / "index.html", std::ios::binary);
+        file << index;
+    }
+    {
+        std::ofstream file(dir / "a" / "b.css", std::ios::binary);
+        file << "body{margin:0}\n";
+    }
+
+    net::io_context ioc;
+    auto session = std::make_shared<WebSocketSession>(tcp::socket(ioc), dir.string());
+    auto resolved = [&session](const std::string& target) {
+        return session->resolve_file(target).string();
+    };
+
+    // Discriminator: one file, two spellings.
+    const std::string plain = resolved("/index.html");
+    const std::string dotted = resolved("/./index.html");
+    std::cout << "  [r111oo2] /index.html hit=" << (plain.empty() ? "no" : "yes")
+              << ", /./index.html hit=" << (dotted.empty() ? "no" : "yes") << std::endl;
+    assert(!plain.empty());
+    assert(dotted == plain);
+    // An intermediate `.` segment is the same no-op.
+    assert(resolved("/a/./b.css") == resolved("/a/b.css"));
+    assert(!resolved("/a/b.css").empty());
+
+    // The same answer through the handler, not just the resolver: a browser that spells
+    // its own root with a dot still gets the page instead of a 404.
+    session->req_.method(http::verb::get);
+    session->req_.target("/./index.html");
+    session->handle_http_request();
+    std::cout << "  [r111oo2] GET /./index.html => "
+              << static_cast<int>(session->res_->result()) << ", body "
+              << session->res_->body().size() << " bytes" << std::endl;
+    assert(session->res_->result() == http::status::ok);
+    assert(session->res_->body() == index);
+
+    // Controls: the escapes are still refused, and each is refused for the reason the
+    // comment above names - `..` by name, the rest by the entry check or the root prefix.
+    const char* const escapes[] = {"/../index.html", "/x/../../etc/passwd",
+                                   "/./../index.html", "/a/../index.html",
+                                   "/%2e%2e/index.html", "/a//b", "/..", "index.html",
+                                   "/\\..\\index.html"};
+    for (const char* target : escapes) {
+        const std::string hit = resolved(target);
+        std::cout << "  [r111oo2] " << target << " => " << (hit.empty() ? "refused"
+                                                                        : "served")
+                  << std::endl;
+        assert(hit.empty());
+    }
+
+    // Control: `.` alone names the directory, and a directory is not a regular file, so
+    // reading the root itself is still a miss - the dot is allowed, not the listing.
+    assert(resolved("/.").empty());
+    assert(resolved("/./").empty());
+
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    std::cout << "test_resolve_file_reads_a_single_dot_segment_and_still_refuses_every_escape"
+                 " passed" << std::endl;
+}
+
 int main() {
     std::cout << "Running server tests..." << std::endl;
 
@@ -2245,6 +2429,8 @@ int main() {
     test_resume_restores_each_config_half();
     test_zero_stone_position_keeps_the_token();
     test_transient_accept_failure_rearms_and_abort_ends();
+    test_http_answers_a_read_with_the_file_and_a_write_with_a_refusal();
+    test_resolve_file_reads_a_single_dot_segment_and_still_refuses_every_escape();
 
     std::cout << "All server tests passed!" << std::endl;
     return 0;

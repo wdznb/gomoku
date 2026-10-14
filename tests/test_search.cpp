@@ -167,10 +167,19 @@ void test_transposition_depth_gate_still_applies() {
     // search() is what normally stamps the clock a fresh search starts on; calling
     // alphabeta() directly has to do the same, or is_timeout() reads an epoch-old
     // start_time_ and every node takes the abort branch before the table is read.
+    //
+    // Round 111 OO3, same reason one notch further down: AlphaBetaSearch's default
+    // move_time_limit_ms_ is 5000 (alphabeta.cpp:10-11), so a saturated gate box can make
+    // this depth-4 call run out of wall time and leave through the abort branch at
+    // alphabeta.cpp:94 - which returns a static-evaluation-magnitude score and turns the
+    // two value asserts below into a load meter. What this case claims is the TT depth
+    // gate, so the clock is taken out of the room it tests: the limit is lifted for these
+    // two blocks only, never in a block that measures a timeout or a node budget.
     {
         TranspositionTable tt(1 << 12);
         AlphaBetaSearch search(evaluator, tt);
         search.start_time_ = std::chrono::high_resolution_clock::now();
+        search.move_time_limit_ms_ = 600000;
         tt.store(hash, 4, 123456, Move(7, 6, BLACK), TTFlag::EXACT);
         tt.new_search();
         Board work = board;
@@ -182,6 +191,7 @@ void test_transposition_depth_gate_still_applies() {
         TranspositionTable tt(1 << 12);
         AlphaBetaSearch search(evaluator, tt);
         search.start_time_ = std::chrono::high_resolution_clock::now();
+        search.move_time_limit_ms_ = 600000;
         tt.store(hash, 3, 123456, Move(7, 6, BLACK), TTFlag::EXACT);
         tt.new_search();
         const TTEntry* hint = tt.lookup(hash);

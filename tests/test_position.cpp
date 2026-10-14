@@ -1087,14 +1087,21 @@ void test_oversized_flat_run_is_scanned_in_one_pass() {
     const size_t bytes = 16 * 1024 * 1024;  // one 16 MB line of dots, no separators
     const std::string huge(bytes, '.');
 
-    rusage after{};
+    rusage before{};
+    getrusage(RUSAGE_SELF, &before);
     const auto start = std::chrono::steady_clock::now();
     GridCells cells;
     std::string error;
     const bool ok = parse_grid_text(huge, cells, error);
     const long long elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - start).count();
+    rusage after{};
     getrusage(RUSAGE_SELF, &after);
+    // ru_utime is charged by the kernel in quanta of CPU, so unlike the wall clock above it
+    // is not a meter of how many other processes wanted this core.
+    const long long cpu_ms =
+        (after.ru_utime.tv_sec - before.ru_utime.tv_sec) * 1000LL +
+        (after.ru_utime.tv_usec - before.ru_utime.tv_usec) / 1000LL;
 
     assert(!ok);
     assert(!error.empty());
@@ -1102,13 +1109,18 @@ void test_oversized_flat_run_is_scanned_in_one_pass() {
     assert(error.find("225") != std::string::npos);
     assert(cells.empty());
     std::cout << "  [r98cc1] 16 MB run refused in " << elapsed_ms
-              << " ms, peak RSS " << (after.ru_maxrss / 1024) << " MB" << std::endl;
-    // The suite is what carries the bound, not the clock: the eight test targets
-    // compile without the -O2 the shipped server gets (CMakeLists.txt:87 versus the
-    // test rules), so this run measures the unoptimised per-symbol work. Measured
-    // here: 115 MB and ~6.6 s, against 1155 MB and ~13 s before the one-pass scan;
-    // the same two binaries built with -O2 come down to 429 ms and 1585 ms.
-    assert(elapsed_ms < 10000);
+              << " ms wall / " << cpu_ms << " ms cpu, peak RSS "
+              << (after.ru_maxrss / 1024) << " MB" << std::endl;
+    // Round 111 OO3: the wall clock above used to be a *pass* condition, and a wall clock
+    // is a load meter - on a saturated 12-core box this same one-pass scan read 27602 ms.
+    // CPU time is not the same meter (measured here: 6947 ms idle, 13324 ms under the same
+    // 24-way saturation) but it cannot carry the claim either: the gap it would have to
+    // straddle is 6.9 s now against ~13 s for the per-symbol container it replaced, so no
+    // threshold is both >= 3x this scan and below 13 s - and a saturated box reaches that
+    // number on its own. The cost class is therefore carried by the one bound that does
+    // separate the two versions: 1155 MB peak for the container against the 135 MB here, an
+    // order of magnitude with no clock in it. Both timings above stay printed as evidence,
+    // asserted on nothing.
     // ru_maxrss is the process high-water mark in KB. The text itself is 16 MB and
     // the readers copy it a few times; a vector of one string per codepoint lands
     // an order of magnitude above that.
