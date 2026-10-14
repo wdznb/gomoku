@@ -3300,6 +3300,127 @@ check('SS1b an un-taken page still gets its answer, and a finished one still hol
     }
 });
 
+// TT1 (round 116): README:379 gives the top line to 摆棋's amber guidance for as long
+// as the editor is open, which is why applyView, handleAIMove, handleUndoSuccess,
+// handleHintResult and handleGameOver each write theirs only outside it. state_sync was
+// the one handler that did not: its tail line replaced the guidance with 「对局开始」
+// while the player was still setting a position, and nothing repaints it -
+// renderSetupPanel only ever writes #position-status.
+check('TT1a 摆棋中的 state_sync 只让位顶栏一行，其余效果照常落地', () => {
+    const game = newGame();
+    game.sendMessage = () => true;
+    game.playerColor = BLACK;
+    game.gameStatus = 'playing';
+    game.baseStones = [];
+    game.board = emptyBoard();
+    game.board[7][7] = BLACK;
+    game.moveHistory = [{ row: 7, col: 7, color: BLACK }];
+    game.currentTurn = BLACK;
+    game.enterSetup();
+    const guidance = el('status').textContent;
+    assert(guidance.indexOf('摆棋中') === 0, 'the guidance owns the top line, got: ' + guidance);
+    game.replayIndex = 3;
+
+    const server = emptyBoard();
+    server[2][3] = WHITE;
+    game.handleServerMessage({ type: 'state_sync', board: server, current_turn: 'white' });
+
+    assert(el('status').textContent === guidance,
+           'the opening line does not replace it, got: ' + el('status').textContent);
+    assert(el('status').textContent.indexOf('对局开始') === -1,
+           'and is not there at all, got: ' + el('status').textContent);
+    assert(el('status').className.indexOf('warn') >= 0,
+           'still the amber level 摆棋 wrote, got: ' + el('status').className);
+
+    // The guard gives up one line, not the handler: the authoritative state lands.
+    assert(game.gameStatus === 'playing', 'the frame still starts the game');
+    assert(game.board[7][7] === 0 && game.board[2][3] === WHITE,
+           'the server board still overwrites the live one');
+    assert(game.moveHistory.length === 0, 'the old 落子记录 is still dropped');
+    assert(game.baseStones.length === 1 && game.baseStones[0].row === 2 && game.baseStones[0].col === 3,
+           'and the new stone is still the base, got: ' + JSON.stringify(game.baseStones));
+    assert(game.replayIndex === null, 'the historical view is still abandoned');
+    assert(el('turn-info').textContent.indexOf('轮到') === 0,
+           'the sub-line still names the turn, got: ' + el('turn-info').textContent);
+});
+
+// TT1-b: the control that the guard is about 摆棋 alone - outside the editor the
+// opening line is still written (the same effect JJ3's 「a state_sync with no replay
+// running needs no release」 pins at its :2611 assertion).
+check('TT1b 不在摆棋时 state_sync 照旧写开场行', () => {
+    const game = newGame();
+    game.sendMessage = () => true;
+    game.board = emptyBoard();
+    game.moveHistory = [];
+    game.enterSetup();
+    game.exitSetup(false);
+    assert(game.setup.active === false, 'the editor is closed again');
+
+    game.handleServerMessage({ type: 'state_sync', board: emptyBoard(), current_turn: 'black' });
+    assert(el('status').textContent.indexOf('对局开始') === 0,
+           'the opening line still reaches the top bar, got: ' + el('status').textContent);
+    assert(el('status').className.indexOf('ok') >= 0,
+           'at its own level, got: ' + el('status').className);
+});
+
+// The prelude both TT2 halves share: a live game whose sub-line claims a thinking AI,
+// then 摆棋 opened over it (handleMoveMade is how HH2 gets that sentence).
+const thinkingSetup = () => {
+    const game = newGame();
+    game.sendMessage = () => true;
+    game.playerColor = BLACK;
+    game.gameStatus = 'playing';
+    game.baseStones = [];
+    game.board = emptyBoard();
+    game.moveHistory = [];
+    game.currentTurn = BLACK;
+    game.handleMoveMade({ row: 7, col: 7, color: 'black' });
+    const thinking = el('turn-info').textContent;
+    assert(thinking.indexOf('轮到') === 0 && thinking.indexOf('思考中') >= 0,
+           'the move_made line claims a turn and a thinking AI, got: ' + thinking);
+    game.enterSetup();
+    game.handleGameOver({ winner: 'white', reason: 'five' });
+    return { game, thinking };
+};
+
+// TT2 (round 116): handleGameOver skips updateTurnInfo('') together with the status
+// line while 摆棋 owns it. exitSetup repaints the status half from gameOverText on the
+// 取消 way out, but the turn half had no second owner, so a game settled behind the
+// editor came back showing an AI that is no longer thinking.
+check('TT2a 摆棋中等来的终局，取消后子行不再谎报思考中', () => {
+    const { game, thinking } = thinkingSetup();
+    assert(game.setup.active === true, 'the ending arrived while 摆棋 was open');
+    assert(game.gameStatus === 'game_over', 'and settled the game');
+    assert(el('turn-info').textContent === thinking,
+           'while the editor owns the top line the sub-line is left alone, got: '
+           + el('turn-info').textContent);
+    assert(el('status').textContent.indexOf('摆棋中') === 0,
+           'and the guidance is still what the player reads, got: ' + el('status').textContent);
+
+    fireClick('btn-setup-cancel');
+    assert(game.setup.active === false, 'the cancel closed the editor');
+    assert(el('status').textContent === game.gameOverText,
+           'the result is painted back, got: ' + el('status').textContent);
+    assert(el('status').textContent.indexOf('摆棋中') !== 0,
+           'and it is no longer the guidance, got: ' + el('status').textContent);
+    assert(el('turn-info').textContent === '',
+           'the settled game keeps no thinking AI, got: ' + el('turn-info').textContent);
+});
+
+// TT2-c: 确认 is untouched by the new branch - it is inside the !confirmed half, so on
+// both trees exitSetup(true) leaves the sub-line to its caller, and its only caller
+// handlePositionSet writes updateTurnInfo('') itself.
+check('TT2c 确认路径不经过这句新分支', () => {
+    const { game, thinking } = thinkingSetup();
+    game.exitSetup(true);
+    assert(game.setup.active === false, 'the confirmed way out also closes the editor');
+    assert(el('turn-info').textContent === thinking,
+           'the branch leaves the sub-line exactly as the editor found it, got: '
+           + el('turn-info').textContent);
+    assert(el('status').textContent.indexOf('摆棋中') === 0,
+           'and the top line to its own writer, got: ' + el('status').textContent);
+});
+
 let failed = 0;
 for (const result of results) {
     console.log(`${result.ok ? 'PASS' : 'FAIL'} ${result.label}` +

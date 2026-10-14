@@ -1979,6 +1979,49 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次116 摆棋中的权威帧换掉了指引，终局回来后子行还在替死局思考 — bugfix round 116 batch TT
+
+**Found.** 两域只读审计（摆棋 × 权威帧次序、终局 × 编辑器生命周期）逐条读回整函数之后，站得住的两条都在
+`web/app.js`：
+
+- **TT1** `handleStateSync` 结尾的 `this.updateStatus('对局开始', 'ok');`（`:1729`）没有摆棋守卫。
+  README:360 与 README:379 规定摆棋期间顶栏归那条琥珀色指引，而项目里每一个会动顶栏的权威帧处理器都
+  遵守：`applyView`、`handleAIMove`、`handleUndoSuccess`、`handleHintResult`、`handleGameOver` 全写在
+  `if (!this.setup.active)` 里，唯独这一句没有。路径：点执黑/执白 → 回包未到的空档点「摆棋」
+  （`enterSetup` 刚写入指引）→ `state_sync` 落地，把指引整行换成绿色「对局开始」，此后无人恢复
+  ——`renderSetupPanel` 只写 `#position-status`。服务端一侧只有 `handle_choose_side`
+  （`src/server/server.cpp:789-794`）发这一帧，所以这正是「顶栏归谁」判错的那一类。
+- **TT2** `handleGameOver` 在摆棋中把 `updateStatus(statusText, kind)` 与 `this.updateTurnInfo('')` 一起
+  跳过（`:1930-1933`）。玩家随后点「取消」，`exitSetup` 的 `!confirmed` 分支（`:1190-1195`）只把 `#status`
+  回绘成 `gameOverText`，`#turn-info` 没有第二个负责者：它仍停在终局前那一刻的「轮到白棋 · AI 思考中」，
+  替一局已经结束的对局宣称 AI 还在思考。README:307 把顶栏定义为「系统提示 + 轮到谁」两行，两半要分别落地。
+
+**Fixed.** `web/app.js` +11/−1：TT1 那句改为 `if (!this.setup.active) this.updateStatus('对局开始', 'ok');`
+（+6/−1，含注释）；TT2 在 `!confirmed` 分支回绘状态行之后补 `if (this.gameStatus === 'game_over') this.
+updateTurnInfo('');`（+5/0）。`handleStateSync` 其余行、`handleGameOver` 的守卫、`exitSetup` 的确认路径
+一行未动。守卫只让位顶栏那**一行**：摆棋中的棋盘、回合、`gameStatus`、回放退出照常跟随 `state_sync`。
+两条注释初始稿写的是 `web/app.js` 自查行号，与落地后的行号已经漂移，故本轮另发 TT-A 修正案把行号引用换成
+处理器名（`applyView`/`handleAIMove`/`handleUndoSuccess`/`handleHintResult`/`handleGameOver`），代码行冻结。
+
+**裁决（其余条目，全部不外派）。** `error` 帧把「游戏结束 - …」冲掉：README:307 把顶栏定成共用报告行、
+红=拒绝/错误，给终局加哑等于吞掉 README:326-327 明文欠玩家的那条错误。`handleReplay:726/:739` 摆棋中复位
+`replayIndex`：已 HOLD 的 D5。`handleUndoSuccess:1832` 的 `game_status === 'game_over'` 分支：服务端 `undo`
+把 GAME_OVER 一律映射回 PLAYING（`game_manager.cpp:231-235`），无法构造。`reasonText`、手/子单位链、
+落子记录行序：逐函数读过，干净。TT2 的确认半边（`exitSetup(true)`）在两棵树上都逐字不动 `#turn-info` ⇒
+**无可观察差异**，且确认唯一的调用者 `handlePositionSet`（`:1359`）自己就写 `updateTurnInfo('')`，没有残留泄漏。
+
+**Verified.** 测试会话只在 `tests/web_frontend_check.js` 加 4 条（+121/−0，零删除 ⇒ 合约过期 **无**）：
+`TT1a`（摆棋中的 `state_sync`：顶栏逐字仍是那条指引、不含「对局开始」、`className` 仍带 `warn`，同时
+`gameStatus==='playing'`、盘面被覆盖、`moveHistory` 清空、`baseStones` 换成服务端那一子、`replayIndex`
+归 null、子行照常报回合）、`TT1b`（不在摆棋时仍写开场行，与既有 `JJ3`（`:2611`）同族对照）、`TT2a`（终局
+落在摆棋中→点「取消」：`#status === game.gameOverText` 且 `#turn-info === ''`）、`TT2c`（确认路径对照）。
+我重跑同一棵树：`ctest` **8/8**（裸 `cmake ..`，92.28 s real）、`node tests/web_frontend_check.js`
+**88/88**、`node tests/readme_anchor_check.js` **102 citations, 0 problems**、`wc -l README.md` **658**。
+HEAD 负例 `/d/tmp/r116_head_mine` = `git show f2d73f8:web/app.js` + 当前 tests（无 checkout/stash）：
+**86/88**，只在 `tests/web_frontend_check.js:3329`（`the opening line does not replace it, got: 对局开始`）
+与 `:3407`（`the settled game keeps no thinking AI, got: 轮到白棋 · AI 思考中`）红；轮次115 的 `SS1a` 在那棵
+树上仍绿（这是检查点，证明负例树只剥掉本轮两句），`TT1b`/`TT2c`/`TT2a` 前置三处同样绿。
+
 ## 轮次115 被接管那一页收回来的，是一手无人能落的建议 — bugfix round 115 batch SS
 
 **Found.** 四只只读审计（逐手引擎数字呈现链、会话文件 schema 新旧兼容、落子记录与状态分级渲染、求招链路）

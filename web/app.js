@@ -1192,6 +1192,11 @@ class GomokuGame {
             // one place the player stops looking at the working board (README:379).
             this.updateStatus(this.gameStatus === 'game_over' && this.gameOverText
                 ? this.gameOverText : '已退出摆棋：棋盘已还原，落子记录未清空', 'idle');
+            // handleGameOver skips updateTurnInfo('') together with the status line
+            // while 摆棋 owns it (its !this.setup.active guard); the status half is
+            // repainted above, so the turn half has to be cleared here too, or
+            // #turn-info keeps claiming a thinking AI for a game already settled.
+            if (this.gameStatus === 'game_over') this.updateTurnInfo('');
         }
     }
 
@@ -1726,7 +1731,12 @@ class GomokuGame {
         this.drawEvalGraph();
         this.refreshReplayControls();
         this.updateTurnInfo();
-        this.updateStatus('对局开始', 'ok');
+        // README:379 gives the top line to 摆棋's amber guidance, which is why applyView,
+        // handleAIMove, handleUndoSuccess, handleHintResult and handleGameOver each
+        // write theirs only outside the editor. state_sync arriving after the player
+        // opened 摆棋 would replace that guidance with 「对局开始」 for good -
+        // renderSetupPanel only ever writes #position-status.
+        if (!this.setup.active) this.updateStatus('对局开始', 'ok');
     }
     
     handleMoveMade(msg) {
