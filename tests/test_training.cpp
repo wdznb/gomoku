@@ -12,6 +12,7 @@
 #include "training/hill_climbing.h"
 #include <algorithm>
 #include <cassert>
+#include <cctype>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
@@ -429,6 +430,64 @@ void test_elo_system() {
     assert(threw);
 
     std::cout << "test_elo_system passed" << std::endl;
+}
+
+// Round 101 FF1: the bracket behind the rating table disagreed with the promotion
+// rule it sits next to. README:198 makes a verification match 8 games, so a 5-3
+// candidate scores 0.625, which trainer.cpp:336 promotes (>= the 0.56 accept score)
+// while the old `>= 0.75 / <= 0.25` test booked *both* sides a draw - the table
+// printed a match somebody had clearly taken as nobody winning. The bracket now
+// follows what a match score means: above half is a win, below half a loss, exactly
+// half the only draw. The two scores the stricter test already called correctly
+// (0.75 from round 99's D6, 0.25) stay correct, and the rating itself is computed
+// from score_a before any bracketing, so every arm pins the Elo delta too - the
+// bookkeeping is the only thing that changed.
+void test_elo_scores_a_majority_match_as_a_win() {
+    struct Arm {
+        double score;
+        int wins_a;
+        int losses_a;
+        int draws_a;
+    };
+    const Arm arms[] = {
+        {1.000, 1, 0, 0},
+        {0.750, 1, 0, 0},   // 3-1 of 4: win before and after (round 99, D6)
+        {0.625, 1, 0, 0},   // 5-3 of 8: the score that used to print as a draw
+        {0.500, 0, 0, 1},   // exactly half is still the only draw
+        {0.375, 0, 1, 0},   // 3-5 of 8: the mirror of the arm above
+        {0.250, 0, 1, 0},
+        {0.000, 0, 1, 0},
+    };
+
+    for (const Arm& arm : arms) {
+        EloSystem elo(1500.0, 32.0);
+        const int a = elo.add_player("candidate");
+        const int b = elo.add_player("champion");
+        elo.record_result(a, b, arm.score);
+
+        std::cout << "  [r101ff1] score " << arm.score << " -> candidate w/l/d "
+                  << elo.player(a).wins << "/" << elo.player(a).losses << "/"
+                  << elo.player(a).draws << ", champion w/l/d " << elo.player(b).wins << "/"
+                  << elo.player(b).losses << "/" << elo.player(b).draws << ", elo "
+                  << elo.player(a).elo << std::endl;
+
+        assert(elo.player(a).wins == arm.wins_a);
+        assert(elo.player(a).losses == arm.losses_a);
+        assert(elo.player(a).draws == arm.draws_a);
+        // The opponent is scored on the same match, so its counters mirror a's.
+        assert(elo.player(b).wins == arm.losses_a);
+        assert(elo.player(b).losses == arm.wins_a);
+        assert(elo.player(b).draws == arm.draws_a);
+        assert(elo.player(a).games == 1 && elo.player(b).games == 1);
+
+        // Equal starting ratings make the expected score exactly half, so the
+        // rating move is k * (score - 0.5) whichever bracket the score lands in.
+        const double delta = 32.0 * (arm.score - 0.5);
+        assert(std::abs(elo.player(a).elo - (1500.0 + delta)) < 1e-9);
+        assert(std::abs(elo.player(b).elo - (1500.0 - delta)) < 1e-9);
+    }
+
+    std::cout << "test_elo_scores_a_majority_match_as_a_win passed" << std::endl;
 }
 
 void test_coefficient_vector() {
@@ -3174,6 +3233,117 @@ void test_server_refuses_no_sessions_with_a_stated_path() {
 #endif
 }
 
+// Round 101 FF2: `--resume CK --seed N` used to start, parse N, and then let the
+// resume overwrite it (trainer.cpp:551 assigns the seed the checkpoint recorded, and
+// trainer.cpp:409 always writes one), so the reproducibility the caller asked for was
+// not the run that actually happened. The parser now refuses the pair, the same class
+// as the --params/--resume contradiction it sits next to.
+//
+// Arms that must merely *run* use the cheapest knobs the guards allow (one round, one
+// generation, depth 1, a 1 ms slice, two moves per game, two verification games,
+// --no-data), which takes tens of milliseconds, and every artefact is a temp path so
+// data/ is never written. Judgement is the exit code, which flag names appear in
+// stderr, and the seed number the checkpoint ends up carrying - no wording is
+// asserted. NOTE for the next CLI probe here: run a full `make -j4` first, or an
+// unchanged gomoku_train from before the fix is exec'd and the arms read as failures.
+void test_trainer_refuses_a_seed_that_a_resume_would_drop() {
+#ifndef _WIN32
+    if (!std::filesystem::exists("gomoku_train")) {
+        std::cout << "  --seed/--resume probes skipped: gomoku_train is not in the working "
+                     "directory" << std::endl;
+        std::cout << "test_trainer_refuses_a_seed_that_a_resume_would_drop passed" << std::endl;
+        return;
+    }
+    const std::string base =
+        "--rounds 1 --population 2 --generations 1 --depth 1 --timeout-ms 1 --max-moves 2 "
+        "--fitness-games 1 --verification-games 2 --no-data --quiet";
+    const std::filesystem::path err = temp_path("r101_ff2_stderr.txt");
+    auto read_all = [](const std::filesystem::path& p) {
+        std::ifstream in(p);
+        std::ostringstream text;
+        text << in.rdbuf();
+        return text.str();
+    };
+    // The number the writer put behind the "seed" key, read without assuming any
+    // particular spacing or field order.
+    auto seed_in = [&read_all](const std::filesystem::path& p) -> long long {
+        const std::string text = read_all(p);
+        const size_t key = text.find("\"seed\"");
+        if (key == std::string::npos) return -1;
+        size_t i = text.find_first_of("0123456789", key + 6);
+        if (i == std::string::npos) return -1;
+        long long value = 0;
+        for (; i < text.size() && std::isdigit(static_cast<unsigned char>(text[i])); ++i) {
+            value = value * 10 + (text[i] - '0');
+        }
+        return value;
+    };
+    std::string last_err;
+    auto run = [&](const std::string& arguments) {
+        const std::string command = "./gomoku_train " + base + " " + arguments +
+                                    " > /dev/null 2> '" + err.string() + "'";
+        const int status = std::system(command.c_str());
+        assert(status != -1);
+        last_err = read_all(err);
+        return WEXITSTATUS(status);
+    };
+
+    // Setup, and the both-absent control: a run that never mentions --seed writes a
+    // checkpoint carrying a seed of its own.
+    const std::filesystem::path params = temp_path("r101_ff2_params.json");
+    const std::filesystem::path ck = temp_path("r101_ff2_ck.json");
+    std::error_code ec;
+    std::filesystem::remove(ck, ec);
+    const int setup = run("--out '" + params.string() + "' --checkpoint '" + ck.string() + "'");
+    const long long stored_seed = seed_in(ck);
+    std::cout << "  [r101ff2] neither flag => exit " << setup << ", checkpoint seed "
+              << stored_seed << std::endl;
+    assert(setup == 0);
+    assert(std::filesystem::exists(ck));
+    assert(stored_seed != 7);
+
+    // Both given, in either order: refused, naming both flags.
+    const std::string quoted_ck = "'" + ck.string() + "'";
+    for (const std::string arguments : {"--resume " + quoted_ck + " --seed 7",
+                                        "--seed 7 --resume " + quoted_ck}) {
+        const int status = run(arguments);
+        std::cout << "  [r101ff2] " << arguments << " => exit " << status << ": "
+                  << last_err.substr(0, last_err.find('\n')) << std::endl;
+        assert(status == 1);
+        assert(last_err.find("--seed") != std::string::npos);
+        assert(last_err.find("--resume") != std::string::npos);
+    }
+    // The refusal happens before the run, so the checkpoint it named is untouched.
+    assert(seed_in(ck) == stored_seed);
+
+    // Control: --resume on its own still resumes (a fresh copy, because the run
+    // advances the file it read).
+    const std::filesystem::path resume_copy = temp_path("r101_ff2_resume_copy.json");
+    std::filesystem::copy_file(ck, resume_copy, std::filesystem::copy_options::overwrite_existing);
+    const int resume_only = run("--resume '" + resume_copy.string() + "'");
+    std::cout << "  [r101ff2] --resume alone => exit " << resume_only << ", stderr "
+              << last_err.size() << " bytes, checkpoint seed " << seed_in(resume_copy)
+              << std::endl;
+    assert(resume_only == 0);
+    assert(last_err.empty());
+    assert(seed_in(resume_copy) == stored_seed);
+
+    // Control: --seed on its own takes effect, which is the whole point of the
+    // refusal above - the value is only dropped when a resume is in play.
+    const std::filesystem::path seed_params = temp_path("r101_ff2_seed_params.json");
+    const std::filesystem::path seed_ck = temp_path("r101_ff2_seed_ck.json");
+    std::filesystem::remove(seed_ck, ec);
+    const int seed_only = run("--seed 7 --out '" + seed_params.string() + "' --checkpoint '" +
+                              seed_ck.string() + "'");
+    std::cout << "  [r101ff2] --seed 7 alone => exit " << seed_only << ", checkpoint seed "
+              << seed_in(seed_ck) << std::endl;
+    assert(seed_only == 0);
+    assert(seed_in(seed_ck) == 7);
+
+    std::cout << "test_trainer_refuses_a_seed_that_a_resume_would_drop passed" << std::endl;
+#endif
+}
+
 int main() {
     std::cout << "Running training tests..." << std::endl;
 
@@ -3185,6 +3355,7 @@ int main() {
     test_game_record_roundtrip();
     test_game_record_requires_outcome();
     test_elo_system();
+    test_elo_scores_a_majority_match_as_a_win();
     test_coefficient_vector();
     test_self_play_records_legal_game();
     test_self_play_replays_prefix();
@@ -3234,6 +3405,7 @@ int main() {
     test_trainer_refuses_an_empty_flag_value();
     test_trainer_help_states_the_probe_budget();
     test_server_refuses_no_sessions_with_a_stated_path();
+    test_trainer_refuses_a_seed_that_a_resume_would_drop();
 
     std::cout << "All training tests passed" << std::endl;
     return 0;

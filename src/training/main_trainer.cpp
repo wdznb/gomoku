@@ -154,6 +154,7 @@ int main(int argc, char** argv) {
     std::string out_path = "data/training/best_params.json";
     std::string checkpoint_path = "data/training/checkpoint.json";
     bool checkpoint_given = false;
+    bool seed_given = false;
     bool quiet = false;
 
     try {
@@ -208,6 +209,7 @@ int main(int argc, char** argv) {
                 config.resign_enabled = false;
             } else if (flag == "--seed") {
                 config.seed = require_seed("--seed", i, argc, argv);
+                seed_given = true;
             } else if (flag == "--params") {
                 base_params = require_value("--params", i, argc, argv);
             } else if (flag == "--out") {
@@ -269,6 +271,16 @@ int main(int argc, char** argv) {
     if (!base_params.empty() && !resume_path.empty()) {
         std::cerr << "Error: --params " << base_params << " and --resume " << resume_path
                   << " cannot both be given (each names the starting point for this round)"
+                  << std::endl;
+        return 1;
+    }
+
+    // A resume overwrites the seed with the one the checkpoint recorded, so a
+    // stated --seed would be read and then dropped without a word - the same
+    // two-entrypoints-for-one-starting-point contradiction as --params above.
+    if (seed_given && !resume_path.empty()) {
+        std::cerr << "Error: --seed " << config.seed << " and --resume " << resume_path
+                  << " cannot both be given (a resume restores the checkpoint's seed)"
                   << std::endl;
         return 1;
     }

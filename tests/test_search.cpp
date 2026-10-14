@@ -2581,6 +2581,81 @@ void test_greedy_drops_the_defense_price_of_a_black_forbidden_point() {
               << legal_spot->defense_score << ")" << std::endl;
 }
 
+// Round 101 FF4, labelled as what it is: a source-shape pin, not a behaviour probe.
+// The commit gate of the iterative-deepening loop used to re-read the clock and the
+// node budget at the instant of committing, so a layer whose every root move had
+// been searched could still be thrown away because the deadline crossed in the few
+// instructions after the last one. The replacement trusts the layer's own record.
+// No deterministic seam for that window exists: is_timeout() reads a raw
+// high_resolution_clock (alphabeta.h:63), and every node-level short circuit that
+// could have raised it sets aborted_ in the same breath (:95/:148/:178/:231), which
+// is only cleared once per search (:266) rather than per node - so the new gate can
+// only ever accept a layer the old one also accepted, plus that race window. This
+// row is therefore reported as 无可观察差异 and pinned by shape. The deadline cases
+// already in this file (test_alphabeta_expired_deadline_returns_root_fallback,
+// test_alphabeta_absolute_deadline_stops_search,
+// test_alphabeta_aborted_search_stores_no_bound,
+// test_alphabeta_huge_timeout_does_not_overflow_node_budget) stay as the behaviour
+// guard and are not re-written here.
+void test_alphabeta_commit_gate_trusts_the_layers_own_record() {
+#ifdef GOMOKU_SOURCE_DIR
+    std::ifstream in(std::string(GOMOKU_SOURCE_DIR) + "/src/search/alphabeta.cpp");
+    assert(in.is_open());
+    std::vector<std::string> lines;
+    {
+        std::string line;
+        while (std::getline(in, line)) lines.push_back(line);
+    }
+
+    auto find_line = [&lines](const char* needle) -> long {
+        for (size_t i = 0; i < lines.size(); ++i) {
+            if (lines[i].find(needle) != std::string::npos) return static_cast<long>(i);
+        }
+        return -1;
+    };
+    auto count_lines = [&lines](const char* needle) {
+        int seen = 0;
+        for (const std::string& line : lines) {
+            if (line.find(needle) != std::string::npos) ++seen;
+        }
+        return seen;
+    };
+
+    const long gate = find_line("if (layer_complete");
+    const long declared = find_line("bool layer_complete = true;");
+    const long broken = find_line("layer_complete = false;");
+    const long reset = find_line("aborted_ = false;");
+    std::cout << "  [r101ff4] declared at " << declared << ", broken at " << broken
+              << ", committed at " << gate << ", aborted_ reset at " << reset
+              << ", node abort sites " << count_lines("aborted_ = true;") << std::endl;
+
+    assert(gate >= 0);
+    assert(declared >= 0 && broken >= 0 && reset >= 0);
+    // The record opens before the root loop, the loop's own exit closes it, and the
+    // commit that reads it comes after both.
+    assert(declared < broken);
+    assert(broken < gate);
+    // The invariant the gate leans on: aborted_ is cleared per search, not per node,
+    // so a node that short-circuited anywhere in the layer is still visible here.
+    assert(reset < declared);
+    assert(count_lines("aborted_ = true;") >= 4);
+    assert(count_lines("aborted_ = false;") == 1);
+
+    const std::string& commit = lines[static_cast<size_t>(gate)];
+    assert(commit.find("is_timeout") == std::string::npos);
+    assert(commit.find("node_limit_") == std::string::npos);
+    assert(commit.find("!stop_flag.load()") != std::string::npos);
+    assert(commit.find("!aborted_") != std::string::npos);
+    // The re-read test is gone from the file, not just from that line.
+    assert(find_line("nodes_searched_ <= node_limit_") < 0);
+
+    std::cout << "test_alphabeta_commit_gate_trusts_the_layers_own_record passed" << std::endl;
+#else
+    std::cout << "test_alphabeta_commit_gate_trusts_the_layers_own_record skipped (no "
+                 "GOMOKU_SOURCE_DIR)" << std::endl;
+#endif
+}
+
 int main() {
     std::cout << "Running search tests..." << std::endl;
 
@@ -2652,6 +2727,7 @@ int main() {
     test_alphabeta_absolute_deadline_stops_search();
     test_alphabeta_expired_deadline_returns_root_fallback();
     test_alphabeta_aborted_search_stores_no_bound();
+    test_alphabeta_commit_gate_trusts_the_layers_own_record();
     test_greedy_drops_the_defense_price_of_a_black_forbidden_point();
     test_alphabeta_large_depth_bounded_by_slice_without_deadline();
     test_sort_moves_pins_tt_move_already_at_front();

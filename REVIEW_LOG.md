@@ -1979,6 +1979,65 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次101 把 5-3 局算成和棋的那半个括号，与被时钟推翻的完整一层 — bugfix round 101 batch FF
+
+**Found.** 三个只读审计（训练数据/Elo、搜索时间预算与中止路径、前端状态机）加上我自己的两处通读
+（`game_manager.cpp` 全量、`board.cpp` 增量维护）交回十余条，逐条读码后留下 3 条。**我自己的通读
+一条缺陷都没交出来**（详见 Not defects 第 1-5 项）。前端审计在批次下发之后才回，它的 5 条我已登记为
+轮次102 队列，本轮未下发。
+
+- **FF1（中，统计口径自相矛盾）** `src/training/elo.cpp:84-93` 的 W/L/D 括号与它**自己上面的注释**相反：
+  注释写「只有正好一半才算和棋，因为 `--verification-games 4` 的 3-1 是 0.75」，代码却用
+  `>= 0.75` / `<= 0.25`。README:198 的默认值是 `--verification-games 8`，得分以 0.125 为步长，于是 5-3 局
+  （0.625）两边各记 `draws++`——而这一局正是 `trainer.cpp:336` 按 `accept_score` 0.56 把挑战者晋升的那一局，
+  `main_trainer.cpp:324` 随后把它打印成 `0-0-1`。晋升、Elo 增量、`games` 都没错，错的只有胜负场次归属。
+  两名审计独立报出同一条。
+- **FF2（中，明说的参数被静默丢弃）** `main_trainer.cpp:210` 接受 `--seed`，`trainer.cpp:551` 在 `--resume`
+  时用 checkpoint 里的 `seed` 键覆盖它，所以 `--resume … --seed 7` 读完就扔、退出码仍为 0；README 从未授权
+  `--resume` 覆盖 `--seed`。与已落地的 Q2（`--resume` × `--params` 拒绝）是同一类「同一入口的两种说法互相
+  矛盾」，README:169-172 的口径是解析期报错退出并点名 flag。
+- **FF4（高，完整的一层被丢弃）** `src/search/alphabeta.cpp:346` 的迭代加深提交门在根循环**跑完之后**重读
+  一次时钟与节点数：一个把 225 个根候选全部搜完、`aborted_` 仍为假的分量，会因为 deadline 恰好落在
+  「最后一次根搜索结束」与「这次重读」之间而被整层丢弃，`:352-354` 的意图注释与 README:521/591
+  （提交的是**完成**的那一层）都相反。`aborted_`（`:95/:148/:178/:231` 设，`:266` 每次 `search()` 清一次）
+  本就同时覆盖超时与节点上限短路，所以多余的正是那两个重读。
+
+**Fixed.** `elo.cpp` 括号改为 `score_a > 0.5` / `score_a < 0.5` / else 和棋，注释同步为它现在真的实现的那条规则，
+Elo 增量与 `games++` 两行逐字不动（+5/−5）；`main_trainer.cpp` 与既有 `checkpoint_given` 并列加 `seed_given`，
+把新拒绝块放在 `--resume` × `--params` 旁边，只在**两个都说出口**时 `return 1` 并同点名（+12/0，符合
+「只拒文件真正说过的值」口径）；`alphabeta.cpp` 每层一个 `bool layer_complete = true`，在 `:331` 的 break 前置
+false，提交门换成 `layer_complete && !stop_flag.load() && !aborted_`（+8/−2）。安全性论证：`aborted_` 只在
+`:266` 清，故新门绝不可能提交一个节点被短路过的层——它不比旧门松，唯一的行为变化就是那条被丢弃的完整层。
+
+**Not defects.** 1. AI 与人类的禁手对称成立：`game_manager.cpp:174` 拒人类禁手，AI 提交路径 `:420` 不查，但
+`result.best_move` 的每个来源都已先过滤（`search_engine.cpp:61-81`、`alphabeta.cpp:33/:127`、
+`opening_book.cpp:236`）。2. `no_legal_move` 冻不住会话：`:48-55` 只在下满 225 格时触发，而那时
+`check_game_over`（`game_manager.cpp:446`）已判和棋。3. undo/replay 奇偶一致（`undo()` 的弹出上限
+`analyses_.size()`，`replay_snapshot()` 同一条不变量的反向）。4. `Board` 落子时不清
+`neighbor_count_[placed]` 是对的，因为 `undo_last_move` 严格按栈序移除。5. `SearchController` 无生产调用方、
+搜索非并行，README:596-597/399 已明说。另否掉/挂起：`elo` 的 `games` 按场计而非按局（README:49 只要求「自适应
+K」）、`trainer.cpp:225` `game_id_base`、`data_collector.cpp:171` 忽略 `place_stone` 返回值（仓库内无人回读
+`records.jsonl`）、VCF/VCT 绑定了 `tt_` 却不查询（文档未要求的优化缺失）、`high_resolution_clock` 与
+`steady_clock` 混用（此处不可测）。前端审计的「每帧全量 `drawBoard()`」是 README:519-521 的要求，不是缺陷。
+
+**Verified.** 测试会话只写 `tests/`（`test_training.cpp` +172/0、`test_search.cpp` +76/0，`git diff -- tests/`
+零删除行，我逐行核过），HEAD 负例树用只读 `git archive a9651bd` 建到 /tmp：
+`test_elo_scores_a_majority_match_as_a_win` 直接驱动 `EloSystem::record_result` 七个得分档位，同时断两边
+w/l/d、`games == 1` 与 Elo 增量 `32*(score-0.5)`。HEAD 原文 `test_training.cpp:474: Assertion
+'elo.player(a).wins == arm.wins_a' failed`，可观察行 `score 0.625 -> candidate w/l/d 0/0/1, champion w/l/d 0/0/1,
+elo 1504`——两棵树 elo 数值相同，正好证明分数回归从未移动。
+`test_trainer_refuses_a_seed_that_a_resume_would_drop` 只判退出码 + stderr 是否点名 `--seed`/`--resume` +
+checkpoint 里 `"seed"` 的数字。HEAD 原文 `test_training.cpp:3312: Assertion 'status == 1' failed`，可观察
+`--resume '…ck.json' --seed 7 => exit 0:`，stderr 0 字节、checkpoint 仍是 `"seed": 20261011`。
+FF4 结论是**无可观察差异**：`alphabeta.h:63` 是裸 `high_resolution_clock`、没有注入缝，那条竞争窗口无法构造
+确定性负例，故只做代码形状钉（`test_search.cpp:2600`：声明 320 < 破坏 331 < 提交 351、`aborted_` 清 265、
+4 个短路点、提交行不含 `is_timeout`/`node_limit_`）；HEAD 原文 `test_search.cpp:2632: Assertion 'gate >= 0' failed`。
+合约过期：**无**——既有 W/L/D 断言只有 1.0 胜、0.5 和（`:381/:388`）与 `verification_score == 0.5 ⇒ draws == 1`
+（`:1332`），在 `>0.5/<0.5` 下全部保持。另有两处是我写简报时编造的事实，由测试会话顶回而非迁就：基线锚点
+不是 41 条/README 706 行（实为 36/658），`main_trainer.cpp` 也没有 `--seed-file` 这个选项。
+门禁（我与测试会话各跑一次，一致）：ctest **8/8**（44.47 s）、web **42/42**、锚点 **36 citations / 0 problems**
+（35→36：多出的那条是测试注释引用 `README:198`）、README **658**。
+
 ## 轮次100 让整盘评估归零的那一格参数，与被静默丢掉的落盘目录 — bugfix round 100 batch EE
 
 **Found.** 三个只读审计（G：会话持久化 + 断线续局 + 记录导出；H：`web/app.js` 帧处理；I：启动 CLI +

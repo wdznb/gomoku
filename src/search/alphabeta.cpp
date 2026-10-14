@@ -316,6 +316,9 @@ Move AlphaBetaSearch::search(const Board& board, int color, int max_depth,
         int beta = INT_MAX;
         int depth_best_score = -INT_MAX;
         Move depth_best_move;
+        // The layer's own record of whether it ran to the end. A deadline that
+        // crosses after the last root move must not discard a fully searched layer.
+        bool layer_complete = true;
 
         // Re-copied per iteration on purpose. undo_last_move() restores the
         // candidate list by swap-remove, so a board that has already played and
@@ -325,7 +328,10 @@ Move AlphaBetaSearch::search(const Board& board, int color, int max_depth,
         // change which equal-valued moves get searched first.
         Board mutable_board = board;
         for (const auto& move : root_moves) {
-            if (stop_flag.load() || is_timeout() || nodes_searched_ > node_limit_) break;
+            if (stop_flag.load() || is_timeout() || nodes_searched_ > node_limit_) {
+                layer_complete = false;
+                break;
+            }
 
             mutable_board.place_stone(move.pos.row, move.pos.col, color);
 
@@ -343,7 +349,7 @@ Move AlphaBetaSearch::search(const Board& board, int color, int max_depth,
             }
         }
 
-        if (!stop_flag.load() && !is_timeout() && nodes_searched_ <= node_limit_) {
+        if (layer_complete && !stop_flag.load() && !aborted_) {
             best_move = depth_best_move;
             best_score = depth_best_score;
             info_.depth = depth;
