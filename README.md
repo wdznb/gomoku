@@ -500,7 +500,7 @@ ctest --output-on-failure
 {"type": "game_over", "winner": "black", "reason": "five"}
 {"type": "game_restarted", "game_status": "waiting"}
 {"type": "session", "token": "9af83343549460e1", "resumed": true, "player_color": "black",
- "game_status": "playing", "current_turn": "white", "position_pending": false, "move_count": 6,
+ "game_status": "playing", "current_turn": "white", "position_pending": false, "move_count": 5,
  "winner": "", "reason": "", "timeout_ms": 5000, "max_depth": 8, "board": [[...]]}
 {"type": "session_taken_over", "token": "9af83343549460e1"}
 {"type": "replay", "game_over": true, "winner": "white", "reason": "resign",

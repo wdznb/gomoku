@@ -12,6 +12,10 @@ int main(int argc, char* argv[]) {
     std::string records_path = "data/training/records.jsonl";
     std::string params_path;
     bool no_sessions = false;
+    // Which of the two persistence paths the caller actually wrote down, as
+    // opposed to the defaults above - --no-sessions needs to tell them apart.
+    bool sessions_stated = false;
+    bool records_stated = false;
 
     try {
         for (int i = 1; i < argc; ++i) {
@@ -44,6 +48,7 @@ int main(int argc, char* argv[]) {
                 book_path.clear();
             } else if (arg == "--sessions" && i + 1 < argc) {
                 sessions_dir = argv[++i];
+                sessions_stated = true;
                 if (sessions_dir.empty()) {
                     std::cerr << "Invalid --sessions (must not be empty)" << std::endl;
                     return 1;
@@ -54,6 +59,7 @@ int main(int argc, char* argv[]) {
                 no_sessions = true;
             } else if (arg == "--records" && i + 1 < argc) {
                 records_path = argv[++i];
+                records_stated = true;
                 if (records_path.empty()) {
                     std::cerr << "Invalid --records (must not be empty)" << std::endl;
                     return 1;
@@ -79,6 +85,15 @@ int main(int argc, char* argv[]) {
     // inside the server constructor.
     if (port < 1 || port > 65535) {
         std::cerr << "Invalid --port " << port << " (must be 1-65535)" << std::endl;
+        return 1;
+    }
+
+    // An explicit path alongside --no-sessions is the same ambiguous instruction
+    // --sessions "" is refused for: clearing the stated directory silently would
+    // re-read what the caller wrote, so the contradiction has to be named here.
+    if (no_sessions && (sessions_stated || records_stated)) {
+        std::cerr << "Conflicting options: --no-sessions cannot be combined with --sessions/--records"
+                  << std::endl;
         return 1;
     }
 

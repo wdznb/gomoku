@@ -1979,6 +1979,53 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次100 让整盘评估归零的那一格参数，与被静默丢掉的落盘目录 — bugfix round 100 batch EE
+
+**Found.** 三个只读审计（G：会话持久化 + 断线续局 + 记录导出；H：`web/app.js` 帧处理；I：启动 CLI +
+参数→引擎配置 + HTTP 静态服务）交回 8 条，逐条读码后留下 2 条。**G 交回 0 条代码缺陷**，它自己的
+near-miss 账本（摆棋 base 与 played 重叠、`--no-sessions` 后的挂起、冷重建把 `exported` 置真、终局
+flush 的 `net::post` 撞上 rotate）每条都指到了把它清掉的那一行。**H 的 4 条全部被我否掉**：它们都建立在
+「服务器发出一份不合规格的帧」这个前提上，而服务器唯一的棋盘发射口
+`src/server/server.cpp:1557-1567` 逐字写死 15 行 × 15 列、格子只可能是 `EMPTY/BLACK/WHITE`，
+`state_sync` / `session` / `position_set` 全部经它出盘，前端那些不加守卫的读法在文档路径上打不到。
+
+- **EE1（高，静默变盲）** `src/training/params.cpp:215-220` 的 `five` 下限守卫是 `five <= 0`，注释却写明
+  它的存在是为了保护消费端 `src/core/evaluator.cpp:175-178` 的 `cap = coeffs_.five - 1`。于是
+  `{"coefficients": {"five": 1}}` 被接受、服务器照报参数已加载（`main.cpp:100`），而 cap 恰为 0 ⇒
+  `evaluate_board` 对**任何**局面返回 0，静态评估整体塌成平地——正是那条注释声称要防住的状态。守卫差一格。
+- **EE2（中，含糊指令被静默重新解释）** `src/main.cpp:51-54` 记下 `--no-sessions` 后在 `:85-88` 无条件
+  `sessions_dir.clear(); records_path.clear();`，所以 `./gomoku_server --no-sessions --sessions data/sessions`
+  会把用户明写的目录丢掉且不改退出码；而孪生开关 `--no-book` 在 `:43-44` 当场 clear，后面的 `--book` 反而能赢——
+  两个同类开关的优先级相反。README:169-172 的口径是同一类含糊必须报错退出点名 flag（它举的例子正是
+  「把 `--sessions ""` 当成关闭则会让完局静默地不落盘」），并未授予 `--no-sessions` 跨顺序否决权。
+
+**Fixed.** `params.cpp` 下限改为 `coeffs.five <= 1`、注释同步为「cap 必须为正」，上限与 `forbidden_penalty`
+守卫一字未动（+5/−4）；`main.cpp` 加 `sessions_stated`/`records_stated` 两个局部 bool，在 `--port` 校验之后、
+`no_sessions` 生效之前把 `--no-sessions` 与显式 `--sessions`/`--records` 共存判为冲突，stderr 同时点名两边并
+`return 1`（+15/0，两处 clear 保留，`--no-book` 路径不动）。另有一处文档自洽由我直接改：README:503 的
+`session` 样本写着 `move_count: 6` 配 `current_turn: "white"`，与 README:219-220 的奇偶规则和
+`server.cpp:1309`（`replay.move_count % 2`，且 `game_manager.cpp:261` 让这个计数含摆棋 base）都对不上，
+改为 `move_count: 5`（1/1 行，仍 658）。
+
+**Not defects.** H 的 4 条（见上，`server.cpp:1557-1567`）；I 的 `forbidden_penalty` 范围守卫无生产消费者
+（`:221-223` 的注释自己已声明这点，属挂起项而非缺陷）；I 的 `five > 100000` 上端与 99999 红点阈值撞车那一半
+就是 REVIEW_LOG 里挂起的 **Z4**，本轮不重复下发。
+
+**Verified.** 测试会话只写 `tests/test_training.cpp`（+124/0，`git diff -- tests/` 零删除行，我逐行核过）：
+`test_params_refuses_a_five_that_flattens_the_scale` 一边断加载器拒 `five:1`（且哨兵 31337/4242 不被改写）、
+`five:2` 仍接受，一边绕开加载器直接把机制钉在 `Evaluator` 上（黑四连 + 一白子：`five=1` ⇒ 评估 0，`five=2` ⇒ 非
+0）。HEAD 原文 `test_training.cpp:2417: Assertion '!CoefficientVector::from_json_string(...five":1)...' failed`。
+`test_server_refuses_no_sessions_with_a_stated_path` 每条都带一个不存在的 `--web-dir` 与 `--port 59321`，
+使两棵树都在 bind 之前退出、端口从未监听，再断退出 1 + stderr 点名 `--no-sessions` 且**不含** `--web-dir`
+（证明拒在新守卫而不是目录检查），覆盖 `--sessions` 前/后两种顺序与 `--records`，控制组（单用 `--no-sessions`
+或单用 `--sessions`）仍走 `--web-dir` 那条拒。HEAD 原文 `Assertion 'last_err.find("--no-sessions") …' failed`
+（HEAD 实得 `Invalid --web-dir …`）。负例树 /tmp/neg100（`git archive 4eca5ec`）。
+既有断言核查：`test_params_rejects_broken_rule_constants` 只测 0/−1/100001/100000，没有一条把 `five:1` 当合法 ⇒
+无既有用例变红。过程教训（已进记忆）：CLI 探针必须先 `make -j4` 全量重编，否则 `build/` 里的旧
+`gomoku_server` 会伪装成回归失败。
+门禁（我与测试会话各跑一次，一致）：ctest **8/8**（44.64 s）、web **42/42**、锚点 **35 citations / 0 problems**
+（34→35：多出的那条是 EE2 注释引用 README:169-172）、README **658**。合约过期：仅锚点计数基线。
+
 ## 轮次99 被拒的那一手替别人收走的终局帧，与只报到第四种的符号清单 — bugfix round 99 batch DD
 
 **Found.** 三个只读审计（D：server 终局帧生命周期×摆棋；E：app.js 状态机×重连；F：训练 CLI/build 脚本）交回

@@ -2400,6 +2400,56 @@ void test_params_rejects_broken_rule_constants() {
     std::cout << "test_params_rejects_broken_rule_constants passed" << std::endl;
 }
 
+// Round 100 EE1: the guard behind that boundary stopped one step short. Evaluator
+// clamps the aggregate at five - 1 (evaluator.cpp:175-177), so five == 1 is not a
+// smaller scale but a cap of zero - evaluate_board answers 0 for every board, the
+// engine plays blind, and the server still prints the file as loaded. The other
+// side of the boundary (five == 2) must stay legal, and a rejected file must leave
+// the caller's coefficients untouched.
+void test_params_refuses_a_five_that_flattens_the_scale() {
+    ThreatCoefficients sentinel;
+    sentinel.five = 31337;
+    sentinel.forbidden_penalty = 4242;
+
+    std::string error;
+    ThreatCoefficients out = sentinel;
+    error.clear();
+    assert(!CoefficientVector::from_json_string(R"({"coefficients":{"five":1}})", out, error));
+    assert(!error.empty());
+    assert(out.five == sentinel.five);
+    assert(out.forbidden_penalty == sentinel.forbidden_penalty);
+    std::cout << "  [r100ee1] rejected five:1" << std::endl;
+
+    ThreatCoefficients parsed;
+    error.clear();
+    assert(CoefficientVector::from_json_string(R"({"coefficients":{"five":2}})", parsed, error));
+    assert(parsed.five == 2);
+    assert(error.empty());
+    std::cout << "  [r100ee1] accepted the five:2 boundary" << std::endl;
+
+    // What the guard buys: the same black live four scored with a cap of 0 and a
+    // cap of 1. The flattening is reproduced by handing the Evaluator the
+    // coefficients directly - the loader no longer lets five == 1 through.
+    Board board;
+    board.place_stone(7, 4, BLACK);
+    board.place_stone(7, 5, BLACK);
+    board.place_stone(7, 6, BLACK);
+    board.place_stone(7, 7, BLACK);
+    board.place_stone(0, 0, WHITE);
+    ThreatCoefficients flat;
+    flat.five = 1;
+    ThreatCoefficients working;
+    working.five = 2;
+    const int flattened = Evaluator(flat).evaluate_board(board, BLACK);
+    const int scored = Evaluator(working).evaluate_board(board, BLACK);
+    std::cout << "  [r100ee1] evaluate_board: five=1 -> " << flattened
+              << ", five=2 -> " << scored << std::endl;
+    assert(flattened == 0);
+    assert(scored != 0);
+
+    std::cout << "test_params_refuses_a_five_that_flattens_the_scale passed" << std::endl;
+}
+
 // Round 78, M1: a parameter file that names none of the twelve coefficients is
 // the wrong file (or a wholesale rename), and the old reader loaded it as a
 // successful load of pure defaults - training ran against parameters the file
@@ -3052,6 +3102,78 @@ void test_trainer_help_states_the_probe_budget() {
 #endif
 }
 
+// Round 100 EE2: --no-sessions next to a directory the caller actually wrote down
+// used to mean "the directory you named is dropped on the floor" - the same
+// ambiguous instruction `--sessions ""` is refused for (README:169-172's rationale).
+// The parser now answers exit 1 naming both sides. Every probe also carries a
+// nonexistent --web-dir, so a tree without the conflict guard stops at the web-dir
+// refusal (main.cpp:122) instead of binding a port, and a tree with it never gets
+// that far: the --port value below is therefore never bound in either. What is
+// under test is which refusal the process produces, read off the exit code and the
+// flag names in stderr - no wording is asserted.
+void test_server_refuses_no_sessions_with_a_stated_path() {
+#ifndef _WIN32
+    if (!std::filesystem::exists("gomoku_server")) {
+        std::cout << "  --no-sessions conflict probes skipped: gomoku_server is not in the "
+                     "working directory" << std::endl;
+        std::cout << "test_server_refuses_no_sessions_with_a_stated_path passed" << std::endl;
+        return;
+    }
+    const std::filesystem::path err = temp_path("r100_ee2_stderr.txt");
+    const std::string missing_web = temp_path("r100_ee2_no_such_web").string();
+    auto read_all = [](const std::filesystem::path& p) {
+        std::ifstream in(p);
+        std::ostringstream text;
+        text << in.rdbuf();
+        return text.str();
+    };
+    std::string last_err;
+    auto run = [&](const std::string& arguments) {
+        const std::string command = "./gomoku_server " + arguments + " --web-dir '" +
+                                    missing_web + "' --port 59321 > /dev/null 2> '" +
+                                    err.string() + "'";
+        const int status = std::system(command.c_str());
+        assert(status != -1);
+        last_err = read_all(err);
+        return WEXITSTATUS(status);
+    };
+
+    const char* const conflicts[] = {
+        "--no-sessions --sessions '/tmp/r100_ee2_sessions'",
+        "--sessions '/tmp/r100_ee2_sessions' --no-sessions",
+        "--no-sessions --records '/tmp/r100_ee2_records.jsonl'",
+    };
+    for (const char* arguments : conflicts) {
+        const int status = run(arguments);
+        std::cout << "  [r100ee2] " << arguments << " => exit " << status << ": "
+                  << last_err.substr(0, last_err.find('\n')) << std::endl;
+        assert(status == 1);
+        // The contradiction is named, and it is named instead of the web-dir
+        // refusal that every one of these commands would otherwise reach.
+        assert(last_err.find("--no-sessions") != std::string::npos);
+        assert(last_err.find("--web-dir") == std::string::npos);
+    }
+
+    // Controls: each half on its own still parses, so the refusal above is about
+    // the combination rather than either flag. Both fall through to the web-dir
+    // guard, which is what keeps these runs from ever listening.
+    const int alone = run("--no-sessions");
+    std::cout << "  [r100ee2] --no-sessions alone => exit " << alone << ": "
+              << last_err.substr(0, last_err.find('\n')) << std::endl;
+    assert(alone == 1);
+    assert(last_err.find("--web-dir") != std::string::npos);
+    assert(last_err.find("--no-sessions") == std::string::npos);
+
+    const int stated = run("--sessions '/tmp/r100_ee2_sessions'");
+    std::cout << "  [r100ee2] --sessions alone => exit " << stated << ": "
+              << last_err.substr(0, last_err.find('\n')) << std::endl;
+    assert(stated == 1);
+    assert(last_err.find("--web-dir") != std::string::npos);
+
+    std::cout << "test_server_refuses_no_sessions_with_a_stated_path passed" << std::endl;
+#endif
+}
+
 int main() {
     std::cout << "Running training tests..." << std::endl;
 
@@ -3100,6 +3222,7 @@ int main() {
     test_buffered_write_failures_are_caught();
     test_params_rejects_non_object_coefficients();
     test_params_rejects_broken_rule_constants();
+    test_params_refuses_a_five_that_flattens_the_scale();
     test_params_rejects_unrecognised_keys();
     test_params_rejects_out_of_range_tunables();
     test_params_rejects_cross_key_rewrites();
@@ -3110,6 +3233,7 @@ int main() {
     test_collector_still_drops_genuine_symmetry_duplicates();
     test_trainer_refuses_an_empty_flag_value();
     test_trainer_help_states_the_probe_budget();
+    test_server_refuses_no_sessions_with_a_stated_path();
 
     std::cout << "All training tests passed" << std::endl;
     return 0;

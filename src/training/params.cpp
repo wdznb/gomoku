@@ -212,10 +212,11 @@ bool CoefficientVector::from_json_string(const std::string& text, ThreatCoeffici
         error = "five must not exceed the 100000 mate threshold";
         return false;
     }
-    // The evaluator caps ordinary scores at five - 1, so a non-positive five
-    // flattens them or turns the whole static evaluation negative.
-    if (coeffs.five <= 0) {
-        error = "five must stay above zero or the evaluation scale collapses";
+    // The evaluator caps ordinary scores at five - 1, so that cap must stay
+    // positive: at five == 1 every board flattens to zero, and a non-positive five
+    // turns the whole static evaluation negative.
+    if (coeffs.five <= 1) {
+        error = "five must stay above 1 or the evaluation scale collapses";
         return false;
     }
     // forbidden_penalty is read only by evaluate_position_both, and no production
