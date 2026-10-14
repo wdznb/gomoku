@@ -608,6 +608,77 @@ void test_rejects_wide_integer_fields() {
     std::cout << "test_rejects_wide_integer_fields passed" << std::endl;
 }
 
+// R97 BB4: a created_ms / updated_ms that is written but is not an integer is a
+// claim about the file's birth, not an absent field. read_number used to skip
+// silently and leave the 0 default, so the next open_session wrote its own
+// now_ms back as the session's birth time - a value the file never stated,
+// replacing the one it did. Absent keys keep the 0 sentinel, and a real 64-bit
+// integer (the case above) still loads whole.
+void test_rejects_non_integer_timestamp_fields() {
+    SessionSnapshot out;
+    std::string error;
+
+    const std::string good = session_to_json(sample("ab"));
+    error.clear();
+    assert(session_from_json(good, out, error) && error.empty());
+
+    const auto with = [](const char* key, const json& value) {
+        json root = json::parse(session_to_json(sample("ab")));
+        root[key] = value;
+        return root.dump();
+    };
+
+    // null, a string, and a float past int range: present, not an integer.
+    const json bad_values[] = {json(), json("1720000000000"), json(1.72e12)};
+    for (const json& value : bad_values) {
+        error.clear();
+        assert(!session_from_json(with("created_ms", value), out, error));
+        assert(!error.empty());  // it says why, without the test pinning the wording
+        error.clear();
+        assert(!session_from_json(with("updated_ms", value), out, error));
+        assert(!error.empty());
+    }
+
+    // A whole-numbered float is still a float: 2^32 + 5 written as .0 is not the
+    // integer the wide case above proved the reader can carry.
+    error.clear();
+    assert(!session_from_json(with("created_ms", json(4294967301.0)), out, error));
+
+    // Through the file door too: nothing of the refused file reaches the caller.
+    const auto dir = scratch_dir("bad_stamp");
+    std::filesystem::create_directories(dir);
+    const std::string token = "abcdef0123456789";
+    { std::ofstream(dir / (token + ".json")) << with("created_ms", json(1.72e12)); }
+    SessionSnapshot loaded;
+    error.clear();
+    assert(!load_session(dir.string(), token, loaded, error));
+    assert(!error.empty());
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+
+    // Both keys absent is the other half of the rule: legal, and a freshly read
+    // snapshot keeps the 0 sentinel for each of them. (A fresh object: the
+    // reader only writes what the file states.)
+    json stripped = json::parse(good);
+    stripped.erase("created_ms");
+    stripped.erase("updated_ms");
+    SessionSnapshot untouched;
+    error.clear();
+    assert(session_from_json(stripped.dump(), untouched, error) && error.empty());
+    assert(untouched.created_ms == 0 && untouched.updated_ms == 0);
+
+    // One key absent, the other a real integer: the present one still lands.
+    json half = json::parse(good);
+    half.erase("updated_ms");
+    half["created_ms"] = 4294967301LL;
+    SessionSnapshot only_created;
+    error.clear();
+    assert(session_from_json(half.dump(), only_created, error) && error.empty());
+    assert(only_created.created_ms == 4294967301LL && only_created.updated_ms == 0);
+
+    std::cout << "test_rejects_non_integer_timestamp_fields passed" << std::endl;
+}
+
 // Round 75, F5: a session file is addressable by its own name, and load_session
 // compares the token inside against the name it read. A file renamed under a
 // different token would resume as a game the URL never promised, and every
@@ -717,6 +788,7 @@ int main() {
     test_delete_session_reports_main_failure();
     test_session_config_validation();
     test_rejects_wide_integer_fields();
+    test_rejects_non_integer_timestamp_fields();
     test_load_refuses_token_mismatch();
     std::cout << "All session store tests passed!" << std::endl;
     return 0;

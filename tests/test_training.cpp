@@ -1654,6 +1654,88 @@ void test_sample_move_color_must_be_exact() {
     std::cout << "test_sample_move_color_must_be_exact passed" << std::endl;
 }
 
+// R97 BB3: game_id and move_index are the sample's identity, and samples.jsonl
+// leans on (game_id, move_index) being unique. The reader used to fall back to
+// the -1 default whenever the key was written but unreadable, so a batch of
+// such lines collapsed into one phantom game carrying the same index. A key that
+// is absent stays legal - the writer simply has no id to give - but a key that
+// is present is a claim and must read back.
+void test_sample_refuses_unreadable_identity_keys() {
+    const auto features = [](int count) {
+        std::string out = "[";
+        for (int i = 0; i < count; ++i) {
+            if (i) out += ",";
+            out += "0";
+        }
+        return out + "]";
+    };
+    const int n = DataCollector::FEATURE_COUNT;
+    const std::string move = "\"move\":{\"row\":7,\"col\":7,\"color\":\"black\"}";
+    const auto sample_with = [&](const std::string& tail) {
+        return "{\"features\":" + features(n) + ",\"value\":0.5,\"weight\":1.0," +
+               move + "," + tail + "}";
+    };
+
+    TrainingSample sample;
+    std::string error;
+
+    // 7.0 is a float, "7" a string, null nothing, 4294967297 an integer that
+    // does not fit an int: all four state an identity the reader cannot carry.
+    const char* bad[] = {
+        "\"game_id\":7.0",
+        "\"game_id\":\"7\"",
+        "\"game_id\":null",
+        "\"game_id\":4294967297",
+        "\"move_index\":5.0",
+        "\"move_index\":\"five\"",
+        "\"move_index\":null",
+        "\"move_index\":-2147483649",
+    };
+    for (const char* key : bad) {
+        error.clear();
+        const bool ok = TrainingSample::from_json(sample_with(key), sample, error);
+        assert(!ok);
+        assert(!error.empty());
+    }
+
+    // Both keys absent stays the ordinary case: a legal sample, and the -1
+    // default for each identity field.
+    error.clear();
+    assert(TrainingSample::from_json(
+        "{\"features\":" + features(n) + ",\"value\":0.5,\"weight\":1.0," + move + "}",
+        sample, error) && error.empty());
+    assert(sample.game_id == -1 && sample.move_index == -1);
+
+    // One readable key next to a broken one still refuses the line, and the
+    // readable id does not smuggle the row through.
+    error.clear();
+    assert(!TrainingSample::from_json(
+        sample_with("\"game_id\":7,\"move_index\":3.5"), sample, error));
+    error.clear();
+    assert(!TrainingSample::from_json(
+        sample_with("\"game_id\":7.0,\"move_index\":3"), sample, error));
+
+    // The positive side of the same door: readable integers land on their own
+    // values, including the -1 the writer emits for an unlabelled sample.
+    error.clear();
+    assert(TrainingSample::from_json(
+        sample_with("\"game_id\":7,\"move_index\":5"), sample, error) && error.empty());
+    assert(sample.game_id == 7 && sample.move_index == 5);
+    error.clear();
+    assert(TrainingSample::from_json(
+        sample_with("\"game_id\":-1,\"move_index\":-1"), sample, error) && error.empty());
+    assert(sample.game_id == -1 && sample.move_index == -1);
+
+    // The engine numbers keep the fallback behaviour they always had: a broken
+    // search_score is not an identity claim, so it stays a default.
+    error.clear();
+    assert(TrainingSample::from_json(
+        sample_with("\"search_score\":\"loud\""), sample, error) && error.empty());
+    assert(sample.search_score == 0);
+
+    std::cout << "test_sample_refuses_unreadable_identity_keys passed" << std::endl;
+}
+
 // Round 72: play_game() discards an INVALID game, and the discarded game must
 // not inflate games_played_ - every checkpoint and status line would otherwise
 // overstate the work done. The counter is private and only alive through
@@ -2919,6 +3001,7 @@ int main() {
     test_readers_reject_out_of_range_numbers();
     test_sample_from_json_rejects_damaged();
     test_sample_move_color_must_be_exact();
+    test_sample_refuses_unreadable_identity_keys();
     test_play_game_counts_only_valid_games();
     test_parameter_save_replaces_atomically();
     test_checkpoint_save_replaces_atomically();

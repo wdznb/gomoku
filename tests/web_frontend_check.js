@@ -1729,6 +1729,152 @@ check('AA3 a measured 0ms shows in the full line, depth and nodes still hide', (
     assert(timed === 'must_block 120 7ms', 'a nonzero time is unchanged, got: ' + timed);
 });
 
+// BB1: a resume the server could not honour still answers with the whole fresh
+// session - README:486-488 says a missed resume opens a new game and that a
+// session frame comes back either way, and README:502 shows that frame carrying
+// the board, the side and the config. handleSession used to treat every
+// resumed:false as "nothing to apply" and return, so the page kept painting the
+// dead game: its stones, its side, its in-flight hint and its 摆棋. Only a frame
+// the page asked for is authoritative; the echo a server sends when it opens a
+// session on its own must still be ignored, and the resumed:true branch must
+// behave exactly as before.
+check('BB1 a missed resume lands the fresh session it was answered with', () => {
+    const deadGame = (token) => {
+        const game = newGame();
+        const sent = [];
+        game.sendMessage = (msg) => { sent.push(msg); return true; };
+        const board = emptyBoard();
+        board[7][7] = BLACK;
+        board[8][8] = WHITE;
+        game.board = board;
+        game.moveHistory = [
+            { row: 7, col: 7, color: BLACK },
+            { row: 8, col: 8, color: WHITE },
+        ];
+        game.analysis = [{ method: 'alphabeta', score: 40, depth: 4, nodes: 100, elapsed_ms: 5 }];
+        game.baseStones = [{ row: 2, col: 2, color: BLACK }];
+        game.lastMove = { row: 8, col: 8 };
+        game.playerColor = BLACK;
+        game.gameStatus = 'playing';
+        game.currentTurn = BLACK;
+        game.aiThinking = true;
+        game.hintInFlight = true;
+        game.resumeAsked = true;
+        game.setup.active = true;
+        game.setup.confirmInFlight = true;
+        el('btn-undo').disabled = false;
+        el('btn-hint').disabled = false;
+        el('btn-resign').disabled = false;
+        el('btn-stop').disabled = false;
+        game.handleServerMessage({
+            type: 'session',
+            token,
+            resumed: false,
+            player_color: '',
+            game_status: 'waiting',
+            current_turn: 'black',
+            move_count: 0,
+            max_depth: 8,
+            timeout_ms: 5000,
+            winner: '',
+            reason: '',
+            board: emptyBoard(),
+        });
+        return { game, sent };
+    };
+
+    const { game, sent } = deadGame('b'.repeat(16));
+    assert(game.board.flat().every(v => v === 0), 'the dead board must be replaced');
+    assert(game.moveHistory.length === 0, 'the dead move record must be dropped');
+    assert(game.analysis.length === 0, 'the dead engine numbers must be dropped');
+    assert(game.baseStones.length === 0, 'the dead base stones must be dropped');
+    assert(game.lastMove === null, 'the last move of the dead game must go');
+    assert(game.aiThinking === false, 'the dead game has no search running');
+    assert(game.hintInFlight === false, 'a hint asked for on the dead game is off');
+    assert(game.setup.active === false, '摆棋 cannot outlive the game it was opened on');
+    assert(game.setup.confirmInFlight === false, 'the setup 确认 must be released too');
+    assert(game.playerColor === null, 'the fresh session has no side claimed');
+    assert(game.gameStatus === 'waiting', 'the fresh session is waiting');
+    assert(game.sessionToken === 'b'.repeat(16), 'the new token is the one to keep');
+    assert(game.resumeAsked === false, 'the ask is answered, so it is consumed');
+    assert(game.resumeApplied === false, 'nothing was resumed, so no replay is owed');
+    assert(el('btn-undo').disabled === true && el('btn-hint').disabled === true,
+           'an unclaimed waiting game holds 悔棋 and 求招');
+    assert(el('btn-resign').disabled === true, 'waiting is not a game to resign');
+    assert(el('btn-stop').disabled === true, 'and has no search to stop');
+    assert(el('status').textContent === '上一局找不回来了，已开新局',
+           'the line still says the old game is gone, got: ' + el('status').textContent);
+    assert(el('status').className === 'status warn',
+           'at the warn level, got: ' + el('status').className);
+    // The DOM hands an assigned number back as text, and the stub keeps whatever
+    // type was written, so both are read as numbers.
+    assert(Number(el('depth').value) === 8 && Number(el('timeout').value) === 5,
+           'the fresh session carries its own AI settings, got: ' +
+           JSON.stringify(el('depth').value) + '/' + JSON.stringify(el('timeout').value));
+    assert(!sent.some(m => m && m.type === 'request_replay'),
+           'an empty board has nothing to replay, so nothing is asked for');
+
+    // The other half of the door: a session frame the page never asked for stays
+    // an announcement about the server, not a rewrite of what the player is doing.
+    const echo = newGame();
+    const echoSent = [];
+    echo.sendMessage = (msg) => { echoSent.push(msg); return true; };
+    const live = emptyBoard();
+    live[7][7] = BLACK;
+    echo.board = live;
+    echo.moveHistory = [{ row: 7, col: 7, color: BLACK }];
+    echo.playerColor = BLACK;
+    echo.gameStatus = 'playing';
+    echo.resumeAsked = false;
+    echo.handleServerMessage({
+        type: 'session',
+        token: 'c'.repeat(16),
+        resumed: false,
+        player_color: '',
+        game_status: 'waiting',
+        current_turn: 'black',
+        move_count: 0,
+        max_depth: 8,
+        timeout_ms: 5000,
+        winner: '',
+        reason: '',
+        board: emptyBoard(),
+    });
+    assert(echo.board[7][7] === BLACK, 'the echo must not wipe the local board');
+    assert(echo.moveHistory.length === 1, 'nor the local move record');
+    assert(echo.playerColor === BLACK, 'nor the side the player is committed to');
+    assert(echo.gameStatus === 'playing', 'nor the status of the running game');
+    assert(echoSent.length === 0, 'and it sends nothing in reply');
+
+    // The resumed:true branch is untouched by the shared helper: it still asks
+    // for the replay and flags the answer as a resume report.
+    const resumed = newGame();
+    const resumedSent = [];
+    resumed.sendMessage = (msg) => { resumedSent.push(msg); return true; };
+    const stones = emptyBoard();
+    stones[7][7] = BLACK;
+    resumed.handleServerMessage({
+        type: 'session',
+        token: 'd'.repeat(16),
+        resumed: true,
+        player_color: 'black',
+        game_status: 'playing',
+        current_turn: 'white',
+        move_count: 1,
+        max_depth: 6,
+        timeout_ms: 5000,
+        winner: '',
+        reason: '',
+        board: stones,
+    });
+    assert(resumed.board[7][7] === BLACK, 'a resumed board is still painted');
+    assert(resumed.resumeApplied === true, 'the resume still flags its replay answer');
+    assert(resumedSent.some(m => m && m.type === 'request_replay'),
+           'and still asks for the replay');
+    assert(el('status').textContent.indexOf('已恢复对局：1 手') >= 0,
+           'with the resumed status line, got: ' + el('status').textContent);
+});
+
 let failed = 0;
 for (const result of results) {
     console.log(`${result.ok ? 'PASS' : 'FAIL'} ${result.label}` +

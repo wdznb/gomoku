@@ -1901,6 +1901,39 @@ void test_game_manager_hint_uses_hint_callback() {
     std::cout << "test_game_manager_hint_uses_hint_callback passed" << std::endl;
 }
 
+// R97 BB2: a finished game refuses everything else - make_move, undo, a second
+// resign - but the hint door still opened. It searched a move nobody can play,
+// burned the whole timeout on it, and answered with a recommendation the client
+// would highlight on a dead board.
+void test_game_manager_refuses_hint_after_game_over() {
+    GameManager game;
+    game.set_player_color(BLACK);
+    game.set_config(300, 1);
+
+    std::atomic<int> hints{0};
+    game.set_hint_callback([&](const Move&, int) { hints.fetch_add(1); });
+
+    // Control, one step before the end: the very same door still answers, so the
+    // refusal below cannot be the guard that was already there.
+    const int before = hints.load();
+    assert(game.request_hint(300, 1));
+    for (int i = 0; i < 100 && hints.load() == before; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    assert(hints.load() == before + 1);
+
+    game.resign(BLACK);
+    assert(game.status() == GameStatus::GAME_OVER);
+    assert(game.winner() == WHITE);
+
+    assert(!game.request_hint(300, 1));
+    // And nothing arrives late either: the dead game has no answer to give.
+    std::this_thread::sleep_for(std::chrono::milliseconds(400));
+    assert(hints.load() == before + 1);
+
+    std::cout << "test_game_manager_refuses_hint_after_game_over passed" << std::endl;
+}
+
 void test_game_manager_replay_snapshot() {
     // Phase 4.4 replays the session's own game, so the analysis list has to be
     // the board's history seen a second way: one entry per committed stone,
@@ -2608,6 +2641,7 @@ int main() {
     test_game_manager_rejects_move_on_ai_turn();
     test_game_manager_promotes_status_when_ai_opens();
     test_game_manager_hint_uses_hint_callback();
+    test_game_manager_refuses_hint_after_game_over();
     test_game_manager_replay_snapshot();
     test_root_symmetry_dedup();
     test_search_engine_prefers_own_five_over_block();

@@ -292,6 +292,9 @@ void GameManager::resign_now(int color) {
 }
 
 bool GameManager::request_hint(int timeout_ms, int max_depth) {
+    // 死局不再求招：其余入口都已在终局处拒绝，放行只会为一局不会再落的棋
+    // 烧掉整段 timeout，再回一手无人能落的推荐。
+    if (status_ == GameStatus::GAME_OVER) return false;
     if (ai_thinking_.load() || hint_active_.load()) return false;
     timeout_ms = clamp_timeout_ms(timeout_ms);
     max_depth = clamp_max_depth(max_depth);

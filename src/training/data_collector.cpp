@@ -220,8 +220,19 @@ bool TrainingSample::from_json(const std::string& text, TrainingSample& out, std
     sample.search_depth = read_int("search_depth", sample.search_depth);
     sample.nodes = read_int("nodes", sample.nodes);
     if (root.contains("weight") && root["weight"].is_number()) sample.weight = root["weight"].get<float>();
-    sample.game_id = read_int("game_id", sample.game_id);
-    sample.move_index = read_int("move_index", sample.move_index);
+    // 身份键写了就必须读得进来：静默回落 -1 会让一批这样的行塌进同一个伪局，
+    // (game_id, move_index) 的唯一性就没了。缺失照旧合法，仍是 -1 默认。
+    auto read_id = [&root](const char* key, int& dst) {
+        return !root.contains(key) || read_json_int(root[key], dst);
+    };
+    if (!read_id("game_id", sample.game_id)) {
+        error = "sample game_id must be an integer";
+        return false;
+    }
+    if (!read_id("move_index", sample.move_index)) {
+        error = "sample move_index must be an integer";
+        return false;
+    }
     // The move is the label the features describe, so a sample without one is not
     // a sample; only the engine numbers may fall back to defaults.
     if (!root.contains("move") || !root["move"].is_object()) {

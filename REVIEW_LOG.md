@@ -1979,6 +1979,73 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次97 权威帧被丢掉的那一局，与三个「写了却不认」的读盘口 — bugfix round 97 batch BB
+
+**Found.** 三个只读审计（持久化/训练、app.js↔server 线路、game_manager/server 状态机）交回 8 条，
+逐条读码后留下 4 条，其余 4 条被我否掉或挂起。裁决证据都在行号上：
+
+- **BB1** `web/app.js:230-237`：`handleSession` 对 `resumed:false` 一律早退，连自己发出的 `resume`
+  收到的那一帧权威会话也不落地。服务器那侧 `server.cpp:1348-1351` 明明把新开的一局（空棋盘、
+  `game_status:"waiting"`、新 token、夹取后的 `max_depth`/`timeout_ms`）整帧发了过来，页面上却还挂着
+  死局的 7 个子、`aiThinking`、`hintInFlight` 与摆棋的 `confirmInFlight`。README:519-521 的原话是
+  「`session`（`resume` 的回应、服务器开局新会话时的主动播报）携带**服务器权威棋盘**：前端必须照它们
+  重画棋盘并采纳其中的 `current_turn`，否则页面上可能显示服务器并没有的子」。可达路径是断线自动重连
+  撞上服务器换进程/会话目录被清；摆棋中还会把 确认 永久按死（只有 取消 能救）。
+- **BB2** `src/server/game_manager.cpp:294-295`：`request_hint` 的守卫只有 `ai_thinking_ || hint_active_`，
+  同文件的 `make_move:148`、`resign:283`、`choose_side`、`set_position` 全都在终局处拒绝。原始帧序
+  `choose_side → resign → request_hint` 仍被受理：为一局不会再落的棋烧满 `timeout_ms`，再回一手
+  `hint_result`，而同一连接随后 `make_move` 拿到的却是 `Invalid move`。前端只是顺手挡住了按钮。
+- **BB3** `src/training/data_collector.cpp:223-224`：`game_id`/`move_index` 走 :206-209 那个
+  「写坏了和没写都回落默认」的 `read_int`，于是 `"game_id":7.0` 这类行**读取成功**却把身份改成 `-1/-1`，
+  一批塌进同一个伪局，`(game_id, move_index)` 唯一性（REVIEW_LOG:1083、`test_training.cpp:1913/:1932`
+  钉着）就没了；同一个函数 :232-243 对 `move.row/col` 却是整条拒收。README:215 只允许元数据（节点数、
+  搜索深度）回落默认，函数自己在 :225-226 也写着「only the engine numbers may fall back to defaults」。
+- **BB4** `src/server/session_store.cpp:123-125`：`read_number` 把「键存在但类型不对」静默读成 0，而
+  同文件的兄弟 `read_int`(:126-128) 对 `timeout_ms` 是整份拒绝。`server.cpp:1179` 正是拿
+  `created_ms > 0` 当「文件没声明」的哨兵（轮次86 P2），于是 `open_session` 保留自己的 `now_ms()`，
+  下一次内容落盘把一个文件从来没写过的值写进出生时间字段，真实出生时间消失。README:544 说的是只有
+  新开的一局才重开 `created_ms`。
+
+**Fixed.** BB1 把 :244-293 的落地口径原样抽成 `applyAuthoritativeSession(msg)`（AI 设置同步整段一起搬进去，
+让落空那一支也显示服务器真正会用的搜索参数），`asked && !resumed` 走它并保留 warn 文案，`!asked` 的
+回声帧照旧早退，`request_replay`/`resumeApplied` 仍只属于 `resumed:true`。BB2 在 `request_hint` 开头加
+`if (status_ == GameStatus::GAME_OVER) return false;`，复用 `server.cpp:1030` 现成的错误帧。BB3 新增
+`read_id`：键存在就必须读得进整数否则整条拒绝，缺失照旧合法（-1 默认），`search_score`/`search_depth`/
+`nodes` 与 `to_json` 一字未动。BB4 让 `read_number` 返回布尔并对两个时间戳给出中文错误，不加范围校验。
+
+**Not defects.** 会话顶层 `reason` 没有词表闸门：README:458 给这四个文本字段定的就是
+「写了就必须是字符串」的类型闸门，`status`/`player_color`/`winner` 额外做值校验是严于文档，`reason` 恰好
+等于文档。摆棋只放了 `base` 子时 悔棋 仍可点：客户端的门禁在每一处都是
+`playerColor === null || gameStatus === 'game_over'`（`app.js:282/:1019/:1696`），而 README:453-454 把这一击的
+回答就写成「base 棋局无落子记录，悔棋返回 Cannot undo」，且没有任何一帧带「已落手数」（`replay.move_count`
+含 `base` 子）。任何 `error` 帧都清 `hintInFlight`：轮次77 钉过的、防止 求招 卡死的那扇门。`std::thread`
+构造抛异常会把 `ai_thinking_` 永久留在 true（`game_manager.cpp:370` 先置标志后建线程）——机理为真，但只有
+`ulimit -u` 掐光线程预算才构造得出来，**挂起而非驳回**，日后有确定性复现再开。审计自己承认打不动的：
+`genetic.cpp:112` 硬编码 0.5（没人设 `mutation_rate`）、`trainer.cpp:256` 的 `game_id_base` 撞号、
+`trainer.cpp:356` 的 int  cast、`black_profile`/`white_profile` 默认、`method` 非字符串→`""`（兄弟闸门
+`data_collector.cpp:130` 已经把这些手数挡在外面）。测试会话另报两条「无可观察差异」：
+`session_from_json` 不复位 `out`、`request_hint` 读 `status_` 不持 `thinking_mutex_`（`games_mutex_` 下不可观察）。
+
+**Contract refresh.** 轮次77 K2 的 `test_request_hint_clears_stale_discard` 有三个姿态，第三个是
+`resign` 后再 求招——BB2 之后那个前提不存在了，故换成 `restore_game(status=playing)`：它和
+`reset`/`set_position` 一样经过 `game_manager.cpp:102` 的 `halt_search()`，抬着的标记与「求招仍被接受」
+都还原样成立。测试会话做了双树复核（`build/r97_k2_neg.sh`，HEAD 源码 + 新姿态）：该姿态在 `b601b3e`
+上也 passed，说明这是合约刷新而不是绕过修复。
+
+**Queued for round 98.** 线路域已确认没有字段名/单位/词表错位（客户端 13 种发出帧、服务器 16 种发出帧
+逐一对过），下一轮把「摆棋与终局交织的客户端门禁」和 `data/` 模板文件的装载边界收进来，并把挂起的
+线程创建失败找一条可确定性构造的路子。
+
+**Verified.** ctest **8/8**（`test_search` 19.21 s、`test_server` 8.52 s，`test_request_hint_clears_stale_discard`
+打印 reset / set_position / restore 三条），`node tests/web_frontend_check.js` **37/37**，
+`node tests/readme_anchor_check.js` **33 citations / 0 problems**。HEAD 反向证明建在 `build/neg97_src`
+（`git archive b601b3e`）：BB1 `FAIL … the dead board must be replaced`（36/37）、
+BB2 `tests/test_search.cpp:1929 assert(!game.request_hint(300, 1)) failed` 与
+`tests/test_server.cpp:1510 !game.hint_active_.load() failed`、BB3 `tests/test_training.cpp:1697 assert(!ok) failed`、
+BB4 `tests/test_session.cpp:635 session_from_json(with("created_ms", value), out, error) failed`。
+README 仍 658 行（:327 补一句「已结束的对局一律拒绝求招」、:459 补 `created_ms` / `updated_ms` 的整数闸门）。
+工件：`build/r97_*`。
+
 ## 轮次96 一次思考两套时钟，以及落盘重试被驱逐掐断 — bugfix round 96 batch AA
 
 **Found.** Four rows, all re-read by me at `518ae66` before dispatching (a timing-pipeline audit and a

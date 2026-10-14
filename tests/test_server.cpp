@@ -563,11 +563,15 @@ void test_request_hint_clears_stale_discard() {
     assert(after_position.set_position(setup));
     probe("set_position", after_position);
 
-    GameManager after_resign;
-    after_resign.set_player_color(BLACK);
-    after_resign.resign(BLACK);
-    assert(after_resign.status() == GameStatus::GAME_OVER);
-    probe("resign", after_resign);
+    // Round 97 BB2 replaced this posture: it used to resign and then ask for a
+    // hint, but request_hint now refuses a finished game by design, so "the mark
+    // is raised and a hint is still accepted" cannot hold there. restore_game is
+    // the fourth path through halt_search (:102, the same one set_position uses)
+    // and leaves the game playing, which is what this probe needs.
+    GameManager after_restore;
+    assert(after_restore.restore_game(playing_restore(2)));
+    assert(after_restore.status() == GameStatus::PLAYING);
+    probe("restore", after_restore);
 
     // Control: the other clearing door, start_ai_thinking, behaves the same.
     GameManager after_arm;
@@ -1459,6 +1463,90 @@ void test_hint_answer_for_a_superseded_position() {
     std::cout << "test_hint_answer_for_a_superseded_position passed" << std::endl;
 }
 
+// R97 BB2: the server's own door. handle_request_hint forwards whatever
+// request_hint answers, and until the finished game was refused the answer was
+// true - so 求招 on a dead board bought a full search and then a hint_result
+// highlighting a point nobody will play. With the gate the request is refused
+// where it stands: the existing error frame, no worker, and none of the timeout
+// spent.
+void test_finished_game_answers_a_hint_with_the_error_frame() {
+    const auto dir = scratch("dead_hint_sessions");
+    const auto records = scratch("dead_hint_records.jsonl");
+    {
+        Harness h(dir, records);
+        GameManager& game = *h.entry->game;
+        assert(game.restore_game(playing_restore(1)));  // one black stone, WHITE to move
+        assert(game.status() == GameStatus::PLAYING);
+
+        size_t seen = 0;
+        // Control, one step before the end: the same door gives a real hint.
+        h.server.handle_request_hint(h.socket, json{{"timeout_ms", 400}, {"max_depth", 1}});
+        assert(game.hint_active_.load());
+        for (int i = 0; i < 200 && game.hint_active_.load(); ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        assert(!game.hint_active_.load());
+        int live_results = 0;
+        int live_errors = 0;
+        for (const std::string& frame : drain_frames(h.server, h.socket, seen)) {
+            const json parsed = json::parse(frame, nullptr, false);
+            if (parsed.is_discarded() || !parsed.contains("type")) continue;
+            const std::string type = parsed["type"].get<std::string>();
+            if (type == "hint_result") ++live_results;
+            if (type == "error") ++live_errors;
+        }
+        assert(live_results == 1);
+        assert(live_errors == 0);
+
+        // End the game the way the client does.
+        h.server.handle_resign(h.socket);
+        assert(game.status() == GameStatus::GAME_OVER);
+
+        const auto t0 = std::chrono::steady_clock::now();
+        h.server.handle_request_hint(h.socket, json{{"timeout_ms", 3000}, {"max_depth", 8}});
+        const long long refused_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        // No worker was armed, and the answer did not cost the 3 s it asked for.
+        assert(!game.hint_active_.load());
+        assert(refused_ms < 500);
+
+        int dead_results = 0;
+        int dead_errors = 0;
+        std::string dead_message;
+        for (const std::string& frame : drain_frames(h.server, h.socket, seen)) {
+            const json parsed = json::parse(frame, nullptr, false);
+            if (parsed.is_discarded() || !parsed.contains("type")) continue;
+            const std::string type = parsed["type"].get<std::string>();
+            if (type == "hint_result") ++dead_results;
+            if (type != "error") continue;
+            ++dead_errors;
+            if (parsed.contains("message") && parsed["message"].is_string()) {
+                dead_message = parsed["message"].get<std::string>();
+            }
+        }
+        assert(dead_errors == 1);
+        assert(dead_results == 0);
+        assert(dead_message == "No hint available");
+
+        // And nothing arrives late either: wait past the timeout the request
+        // asked for and the dead game still has no recommendation to deliver.
+        std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+        for (const std::string& frame : drain_frames(h.server, h.socket, seen)) {
+            const json parsed = json::parse(frame, nullptr, false);
+            if (parsed.is_discarded() || !parsed.contains("type")) continue;
+            if (parsed["type"].get<std::string>() != "hint_result") continue;
+            ++dead_results;
+        }
+        assert(dead_results == 0);
+
+        std::cout << "test_finished_game_answers_a_hint_with_the_error_frame passed "
+                  << "(refused in " << refused_ms << " ms of a asked 3000)" << std::endl;
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    std::filesystem::remove(records, ec);
+}
+
 // Round 88, S5: the two halves of a resumed session's search config stand on their
 // own. A file that states max_depth but never states timeout_ms - 0 is the
 // round-86 P2 sentinel for "key absent" - used to lose both at once, because one
@@ -1667,6 +1755,7 @@ int main() {
     test_unreadable_resume_gets_a_fresh_token();
     test_resume_takeover_notifies_the_loser();
     test_hint_answer_for_a_superseded_position();
+    test_finished_game_answers_a_hint_with_the_error_frame();
     test_resume_restores_each_config_half();
     test_zero_stone_position_keeps_the_token();
     test_transient_accept_failure_rearms_and_abort_ends();

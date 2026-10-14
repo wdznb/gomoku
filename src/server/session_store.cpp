@@ -121,7 +121,10 @@ bool session_from_json(const std::string& text, SessionSnapshot& out, std::strin
         return true;
     };
     auto read_number = [&root](const char* key, long long& dst) {
-        if (root.contains(key) && root[key].is_number_integer()) dst = root[key].get<long long>();
+        if (!root.contains(key)) return true;
+        if (!root[key].is_number_integer()) return false;
+        dst = root[key].get<long long>();
+        return true;
     };
     auto read_int = [&root](const char* key, int& dst) {
         return !root.contains(key) || read_json_int(root[key], dst);
@@ -130,8 +133,16 @@ bool session_from_json(const std::string& text, SessionSnapshot& out, std::strin
     if (!read_string("status", snap.status)) return false;
     if (!read_string("winner", snap.winner)) return false;
     if (!read_string("reason", snap.reason)) return false;
-    read_number("created_ms", snap.created_ms);
-    read_number("updated_ms", snap.updated_ms);
+    // 键存在就不是「没声明」：静默留 0 会让 open_session 把自己的 now_ms 当成
+    // 出生时间写回文件，一个文件里从来没写过的值被改写，真实出生时间消失。
+    if (!read_number("created_ms", snap.created_ms)) {
+        error = "会话里的创建时间不合法";
+        return false;
+    }
+    if (!read_number("updated_ms", snap.updated_ms)) {
+        error = "会话里的更新时间不合法";
+        return false;
+    }
     if (!read_int("timeout_ms", snap.timeout_ms)) {
         error = "会话里的超时时间不合法";
         return false;

@@ -228,24 +228,35 @@ class GomokuGame {
         this.resumeAsked = false;
 
         if (!msg.resumed) {
-            // Nothing to apply. A session that was not resumed is empty by
-            // definition, and the request that made the server open it answers with
-            // its own state a moment later: overwriting the board and the chosen
-            // side here would undo the click that is already on its way.
-            if (asked) this.updateStatus('上一局找不回来了，已开新局', 'warn');
+            if (!asked) {
+                // Nothing to apply. A session that was not resumed is empty by
+                // definition, and the request that made the server open it answers
+                // with its own state a moment later: overwriting the board and the
+                // chosen side here would undo the click that is already on its way.
+                return;
+            }
+            // A resume answered with resumed:false is different: the server already
+            // sent the whole fresh session as the authoritative frame, so the dead
+            // game still on screen has to be replaced by it, stones and all.
+            this.applyAuthoritativeSession(msg);
+            this.updateStatus('上一局找不回来了，已开新局', 'warn');
             return;
         }
-        // A resume that landed while 摆棋 was open (typically a server restart
-        // before the 确认 reply arrived) carries the authoritative board: leave
-        // the setup first, unconditionally - the working copy is dropped, no
-        // set_position is sent, confirmInFlight and the button bar are released
-        // - or the page would keep painting and guarding a position the server
-        // no longer has.
-        if (this.setup.active) this.exitSetup(false);
-        this.playerColor = msg.player_color === 'black' ? BLACK
-                         : msg.player_color === 'white' ? WHITE : null;
-        this.gameStatus = msg.game_status || 'waiting';
-        this.currentTurn = msg.current_turn === 'white' ? WHITE : BLACK;
+        this.applyAuthoritativeSession(msg);
+
+        this.sendMessage({ type: 'request_replay' });
+        // The reply to that request redraws the move list, the graph and the status
+        // line; flag it so it reports the resume rather than a replay the player
+        // never asked for.
+        this.resumeApplied = true;
+        this.updateStatus(this.resumedStatusText(msg.move_count),
+                          this.gameStatus === 'game_over' ? 'idle' : 'ok');
+    }
+
+    // Landing the session frame the server treats as authoritative: both the
+    // resumed game and the fresh game a missed resume opened are painted from it.
+    // A frame with no stones has nothing to replay, so nothing is asked for.
+    applyAuthoritativeSession(msg) {
         // The session carries its own AI settings, which outlived the page: show
         // them rather than the form defaults, or the numbers on screen would
         // describe a search the server is not going to run. The deadline is stored
@@ -258,6 +269,17 @@ class GomokuGame {
             document.getElementById('timeout').value = Math.round(msg.timeout_ms / 1000);
         }
         this.syncTimeoutBounds('bounds');
+        // A resume that landed while 摆棋 was open (typically a server restart
+        // before the 确认 reply arrived) carries the authoritative board: leave
+        // the setup first, unconditionally - the working copy is dropped, no
+        // set_position is sent, confirmInFlight and the button bar are released
+        // - or the page would keep painting and guarding a position the server
+        // no longer has.
+        if (this.setup.active) this.exitSetup(false);
+        this.playerColor = msg.player_color === 'black' ? BLACK
+                         : msg.player_color === 'white' ? WHITE : null;
+        this.gameStatus = msg.game_status || 'waiting';
+        this.currentTurn = msg.current_turn === 'white' ? WHITE : BLACK;
         this.applyBoardMatrix(msg.board);
         this.lastMove = null;
         this.aiThinking = false;
@@ -291,14 +313,6 @@ class GomokuGame {
         document.getElementById('btn-restart').disabled = false;
         this.drawBoard();
         this.updateTurnInfo();
-
-        this.sendMessage({ type: 'request_replay' });
-        // The reply to that request redraws the move list, the graph and the status
-        // line; flag it so it reports the resume rather than a replay the player
-        // never asked for.
-        this.resumeApplied = true;
-        this.updateStatus(this.resumedStatusText(msg.move_count),
-                          this.gameStatus === 'game_over' ? 'idle' : 'ok');
     }
 
     // What a resumed session is worth saying, from the state the server just
