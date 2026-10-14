@@ -1452,6 +1452,23 @@ SessionSnapshot GameServer::snapshot_of(const TrackedGame& entry) const {
     return snap;
 }
 
+// The export decision, in one place for both flush paths: the record stream is
+// appended before a session file is allowed to say the game is over. False means
+// the append failed, so the caller must leave the session file where it was.
+static bool export_game_record(bool& exported, const SessionSnapshot& to_write,
+                               const std::string& records_path, std::string& error) {
+    if (!exported && to_write.base.empty() && to_write.record.is_decisive()) {
+        if (!records_path.empty()) {
+            if (!to_write.record.append_to_jsonl(records_path, error)) {
+                std::cerr << "对局记录追加失败: " << error << std::endl;
+                return false;
+            }
+        }
+        exported = true;
+    }
+    return true;
+}
+
 bool GameServer::flush_entry(const std::shared_ptr<TrackedGame>& entry) {
     if (sessions_dir_.empty()) return true;
     const SessionSnapshot snap = snapshot_of(*entry);
@@ -1501,15 +1518,7 @@ bool GameServer::flush_entry(const std::shared_ptr<TrackedGame>& entry) {
     // own: one that began from a hand-set position needs its `base` stones too,
     // which the trainer's reader has no way to place. So those stay in the
     // session file, for review and for resuming, and out of the record stream.
-    if (!entry->exported && to_write.base.empty() && to_write.record.is_decisive()) {
-        if (!records_path_.empty()) {
-            if (!to_write.record.append_to_jsonl(records_path_, error)) {
-                std::cerr << "对局记录追加失败: " << error << std::endl;
-                return false;
-            }
-        }
-        entry->exported = true;
-    }
+    if (!export_game_record(entry->exported, to_write, records_path_, error)) return false;
     // Commit the dedup stamp only once both the file write and the export are
     // done: committing it before the append meant a failed records.jsonl write
     // was never retried, and the game vanished from the training stream.
@@ -1517,9 +1526,19 @@ bool GameServer::flush_entry(const std::shared_ptr<TrackedGame>& entry) {
     return true;
 }
 
+// Shutdown exports first: a failed append leaves the session file at its
+// pre-ending state, so the next start can still write that record.
 void GameServer::flush_all() {
     std::lock_guard<std::mutex> lock(games_mutex_);
     for (const auto& token_entry : sessions_) {
+        // This snapshot is only the append's; flush_entry takes its own for the
+        // file, and a game decided here is decided there - the record cannot grow
+        // after the ending, while an undo resets the exported flag.
+        const SessionSnapshot snap = snapshot_of(*token_entry.second);
+        std::string error;
+        if (!export_game_record(token_entry.second->exported, snap, records_path_, error)) {
+            continue;
+        }
         flush_entry(token_entry.second);
     }
 }

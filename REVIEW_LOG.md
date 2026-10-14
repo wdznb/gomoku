@@ -1979,6 +1979,47 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次104 停机那一步先记账再改口 — bugfix round 104 batch II
+
+**Found.** `flush_entry` 的次序是「先写会话文件，后追加 records.jsonl」，运行期靠十分钟一度的 tick
+重试这个写法，是对的。但停机路径把返回值丢了：`stop()` 调 `flush_all()`，`flush_all()` 循环里没人看
+`flush_entry` 的结果，紧接着 `ioc_.stop()` 就退进程。于是 Ctrl+C 那一瞬追加失败（磁盘满、权限、文件被占）
+时，一局已经分出胜负的对局**永久**从训练流里消失（README:572 承诺收到退出信号时同样刷一遍，README:575
+承诺终局且从空盘开始的那一局有它自己的一行），而且会话文件已经先把「已结束」的状态落盘，冷重建按
+`record.is_decisive()` 把 `exported` 当已导出（`server.cpp:1207`），下一次真分出胜负才是最后的机会。
+
+**Fixed（`src/server/server.cpp`，+28/−9，未碰任何 .h）.** 把 `flush_entry` 里那段导出判定与追加抽成
+一个文件内部函数 `export_game_record(bool& exported, const SessionSnapshot&, const std::string&
+records_path, std::string& error)` —— 条件表达式、`对局记录追加失败: ` 的输出、成功才置 `exported`
+全部逐字保留，只有一份真相。第一个参数用 `bool&` 而不是 `TrackedGame&`，因为 `TrackedGame` 是
+`server.h:94` 起的 private 嵌套类型，文件作用域点名它要改头文件。`flush_entry` 改为调它，**次序一字
+不动**（仍是会话文件在前、追加在后、`saved_payload` 只在两者都成功后才提交）。只有 `flush_all()` 换成
+**先追加、后写文件**：追加失败就 `continue`，本次不推进会话文件，磁盘上的会话停在终局之前 —— 重启后
+重建出来的是未完局，`exported` 不会被误置，那一局下次终局仍会落进 records.jsonl。
+
+**Not defects（我判掉的）.** 修复会话主动报备了一个残留：追加成功、随后的会话写入失败时，记录流里已有
+这一局而会话文件仍是旧局，日后再次终局会再多一行。我判为可接受，不改：HEAD 在同样组合下是**整局记录
+直接消失**；会话文件停在旧一手意味着重启后的棋路必然分叉，那两行不是逐位重复；而先落的那一行描述的是一局
+**真的下完过**的对局。以「一次真实多余」换「不再静默丢失」是本轮想要的方向。`--no-sessions` 下 `exported`
+只写在内存里 = 无可观察差异（见下）。
+
+**Verified.** `tests/test_server.cpp` 纯增 138 行、0 行删除，既有的 tick 路径契约
+（`:474 test_failed_export_retries_records_append`、`:282`、`:327`）未被编辑且全绿。判别用例
+`:547 test_shutdown_flush_keeps_the_file_behind_a_failed_append`：把 `records_path_` 指向一个普通文件
+当目录使追加失败，调 `flush_all()`，断言 records 行数不增、`!exported`、`saved_payload` 未提交，且
+`load_session` 出来的会话**仍停在 8 手未终局**；恢复可写路径后第二次 `flush_all()` 恰好补一行、文件才
+推进到 9 手 decisive。控制组 `:613` 断言同一终局连刷两次只多一行。HEAD 负例（只读 `git archive 1b0d236`
+到 /tmp）在 `:589` 的 `on_disk.record.moves.size() < 9` 上变红（`HEAD_RC=134`），控制组在 HEAD 为绿。
+`:652` 那条把 `--no-sessions` 边界钉成「两条路都不写、不报错」，并说明判别态（records 非空 + sessions
+为空）在 `main.cpp:94-98` 的拒斥下不可达。门禁：ctest **8/8**（46.14 s）、web **53/53**、anchor
+**49 处引用 / 0 problems**（47→49 是本轮测试注释新增的 README:572/575 引用）、README **658** 行。
+
+**Queued（下一批，已核验未下发）.** batch III = `web/app.js` 三行：D1 是我自己在 batch GG 引出的回归
+（`handleTakenOver` 不释放 `setup.confirmInFlight`，而 README:567 说旧连接随后就被关掉，`:1648` 那次释放
+永远到不了 —— 开着摆棋时页面被彻底冻住，README:377/378 都不可达）；D2 `handleCanvasClick` 的摆棋分支
+没有同一把锁，往返期间画的子会被 `exitSetup(true)` 丢掉；D3 `handleGameOver` 的两行状态写入缺
+`!this.setup.active` 守卫，会冲掉 README:379 那条琥珀色指引。
+
 ## 轮次103 认错得迟了的那一份读法，与终局之后仍在报的轮次副行 — bugfix round 103 batch HH
 
 **Found.** 两个只读审计（会话落盘/训练记录、前端摆棋与回放状态机）在批次 GG 提交期间交回结果，本轮下发

@@ -536,6 +536,141 @@ void test_failed_export_retries_records_append() {
     std::cout << "test_failed_export_retries_records_append passed" << std::endl;
 }
 
+// Round 104 II, flush_all: the shutdown sweep appends BEFORE it lets a session
+// file say the game is over. README:572 flushes the table on the exit signal and
+// README:575 owes every decisive empty-board game its line in records.jsonl, so a
+// failed append there may not leave a finished-looking file behind: a cold rebuild
+// would read the game as decided, the exported stamp would be set for a record that
+// never landed, and the next real ending would be the last chance to export it.
+// flush_entry keeps its own order (file first, append second) - that tick path is
+// pinned verbatim by test_failed_export_retries_records_append above.
+void test_shutdown_flush_keeps_the_file_behind_a_failed_append() {
+    const auto dir = scratch("shutdown_sessions");
+    const auto records = scratch("shutdown_records.jsonl");
+    const auto blocker = scratch("shutdown_blocker");
+    std::error_code ec;
+    {
+        std::ofstream file(blocker);
+        file << "not a directory";
+    }
+    {
+        Harness h(dir, records);
+        assert(h.entry->game->restore_game(five_restore(BLACK)));
+        h.server.flush_all();
+        assert(records_lines(records) == 1);
+        assert(h.entry->exported);
+
+        // Undo reopens the export; the sweep then writes the undecided game, so
+        // the file on disk is the pre-ending state this case compares against.
+        h.server.handle_undo(h.socket);
+        assert(!h.entry->exported);
+        h.server.flush_all();
+        const std::string stamped = h.entry->saved_payload;
+        assert(!stamped.empty());
+        SessionSnapshot on_disk;
+        std::string error;
+        assert(load_session(dir.string(), h.entry->token, on_disk, error));
+        assert(on_disk.record.moves.size() == 8);
+        assert(!on_disk.record.is_decisive());
+
+        // Black finishes again with a different stone (nine plies), and the records
+        // path now points through a regular file, so the append fails.
+        h.server.handle_make_move(h.socket, json{{"row", 7}, {"col", 2}});
+        assert(h.entry->game->status() == GameStatus::GAME_OVER);
+        h.server.records_path_ = (blocker / "records.jsonl").string();
+        h.server.flush_all();
+
+        // Nothing owed, nothing paid: no line, no stamp, no dedup commit - and the
+        // session file is still the undecided one, not this finished game.
+        assert(records_lines(records) == 1);
+        assert(!h.entry->exported);
+        assert(h.entry->saved_payload == stamped);
+        assert(load_session(dir.string(), h.entry->token, on_disk, error));
+        assert(on_disk.record.moves.size() < 9);
+        assert(!on_disk.record.is_decisive());
+
+        // Restored: the next sweep pays exactly the one owed line and the file
+        // finally advances to the decided game.
+        h.server.records_path_ = records.string();
+        h.server.flush_all();
+        assert(records_lines(records) == 2);
+        assert(h.entry->exported);
+        assert(h.entry->saved_payload != stamped);
+        assert(load_session(dir.string(), h.entry->token, on_disk, error));
+        assert(on_disk.record.moves.size() == 9);
+        assert(on_disk.record.is_decisive());
+    }
+    std::filesystem::remove_all(dir, ec);
+    std::filesystem::remove(records, ec);
+    std::filesystem::remove(blocker, ec);
+    std::cout << "test_shutdown_flush_keeps_the_file_behind_a_failed_append passed" << std::endl;
+}
+
+// Control for the reordered sweep: with records writable, running it twice - the
+// shape of a Ctrl+C that lands after a tick already flushed - must advance the
+// file once and append once. The exported flag and the dedup stamp both survive
+// the call, so a finished game cannot be counted into the training stream twice.
+void test_shutdown_flush_appends_once_per_ending() {
+    const auto dir = scratch("twice_sessions");
+    const auto records = scratch("twice_records.jsonl");
+    std::error_code ec;
+    {
+        Harness h(dir, records);
+        assert(h.entry->game->restore_game(five_restore(BLACK)));
+        h.server.flush_all();
+        assert(records_lines(records) == 1);
+        h.server.flush_all();
+        assert(records_lines(records) == 1);
+        assert(h.entry->exported);
+
+        // A second ending on the same token owes its own single line.
+        h.server.handle_undo(h.socket);
+        h.server.flush_all();
+        assert(records_lines(records) == 1);
+        h.server.handle_make_move(h.socket, json{{"row", 7}, {"col", 2}});
+        h.server.flush_all();
+        h.server.flush_all();
+        assert(records_lines(records) == 2);
+        assert(h.entry->exported);
+
+        SessionSnapshot on_disk;
+        std::string error;
+        assert(load_session(dir.string(), h.entry->token, on_disk, error));
+        assert(on_disk.record.moves.size() == 9);
+        assert(on_disk.record.is_decisive());
+    }
+    std::filesystem::remove_all(dir, ec);
+    std::filesystem::remove(records, ec);
+    std::cout << "test_shutdown_flush_appends_once_per_ending passed" << std::endl;
+}
+
+// Round 104 II, the `--no-sessions` shape of the reordered sweep: with both paths
+// cleared (main.cpp:100-103), flush_all now reaches export_game_record without
+// passing flush_entry's first-line short-circuit. The helper's own path test is
+// what keeps that harmless - a decided game in the table at Ctrl+C must not create
+// a record file, a session file or anything else on disk.
+void test_shutdown_flush_with_persistence_off_writes_nothing() {
+    const auto root = scratch("off_root");
+    const auto records = root / "records.jsonl";
+    std::error_code ec;
+    {
+        GameServer server(0, std::string(), std::string(), nullptr, std::string(), std::string());
+        auto socket = std::make_shared<WebSocketSession>(tcp::socket(server.ioc_), std::string());
+        const auto entry = server.open_session(nullptr);
+        server.attach_socket(socket, entry);
+        assert(entry->game->restore_game(five_restore(BLACK)));
+        assert(server.snapshot_of(*entry).record.is_decisive());
+
+        server.flush_all();
+        assert(!std::filesystem::exists(records));
+        assert(!std::filesystem::exists(root));
+        assert(entry->saved_payload.empty());
+        assert(entry->game->status() == GameStatus::GAME_OVER);
+    }
+    std::filesystem::remove_all(root, ec);
+    std::cout << "test_shutdown_flush_with_persistence_off_writes_nothing passed" << std::endl;
+}
+
 // R77 K2: halt_search (reset / set_position / restore / resign / the destructor)
 // raises discard_pending_ so an in-flight worker drops its best move, and only
 // start_ai_thinking used to lower it again. A hint asked for right after any of
@@ -2041,6 +2176,9 @@ int main() {
     test_failed_flush_keeps_the_overdue_entry_hot();
     test_check_position_skips_session_creation();
     test_failed_export_retries_records_append();
+    test_shutdown_flush_keeps_the_file_behind_a_failed_append();
+    test_shutdown_flush_appends_once_per_ending();
+    test_shutdown_flush_with_persistence_off_writes_nothing();
     test_request_hint_clears_stale_discard();
     test_position_array_string_payload_answers();
     test_pending_position_direct_move_claims_side();
