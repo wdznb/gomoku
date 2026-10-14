@@ -1890,8 +1890,10 @@ check('BB1 a missed resume lands the fresh session it was answered with', () => 
 
 // CC4 (round 98): 摆棋 owns the top bar while it is open, so a live frame that
 // arrives underneath it must paint the board without overwriting the guidance.
-// The two writers here are ai_move and undo_success; handleGameOver is the
-// deliberate exception, because an ending outranks the panel.
+// The writers here are ai_move and undo_success. README:379 states the rule with
+// no exception: 摆棋期间顶栏归那条琥珀色指引, 不会把指引冲掉 - so game_over is held
+// to it too (round 105 III3): an ending stores its text in gameOverText and
+// exitSetup paints that back on the way out of the panel.
 check('CC4 an ai_move during setup keeps 摆棋中 and still paints', () => {
     const game = newGame();
     game.sendMessage = () => true;
@@ -1977,22 +1979,6 @@ check('CC4 an undo_success outside setup still writes its own line', () => {
     game.handleUndoSuccess({ move_count: 0, game_status: 'waiting' });
     const line = el('status').textContent;
     assert(line.indexOf('已悔至空盘') === 0, 'the undo line is written, got: ' + line);
-});
-
-check('CC4 a game over during setup still owns the top bar', () => {
-    const game = newGame();
-    game.sendMessage = () => true;
-    game.playerColor = BLACK;
-    game.gameStatus = 'playing';
-    game.board = emptyBoard();
-    game.enterSetup();
-    assert(el('status').textContent.indexOf('摆棋中') === 0, 'the setup line is on screen');
-
-    game.handleGameOver({ winner: 'white', reason: 'five' });
-    const line = el('status').textContent;
-    assert(line.indexOf('游戏结束') === 0,
-           'the ending outranks the panel, got: ' + line);
-    assert(game.gameOverText === line, 'and the settled text is the one on screen');
 });
 
 // GG2 (round 102): README:355/357 makes 确认 the only step that writes to the
@@ -2265,6 +2251,164 @@ check('HH3 the lock leaves the way out of a replay open', () => {
     assert(el('replay-info').textContent === '', 'and the live view comes back');
     assert(fireClick('btn-replay-exit'), 'btn-replay-exit registers a click handler');
     assert(game.replayIndex === null, 'staying out of the replay is fine');
+});
+
+// III (round 105): the 确认 lock had three doors that could never unlock it.
+// README:567 says a takeover sends the frame to the old socket and then CLOSES it,
+// so the error frame that normally releases the lock can never reach this page
+// (III1), and the board itself stayed paintable while 确认 was in flight (III2).
+// README:379 gives the top line to the 摆棋 guidance for as long as the copy is
+// open, and README:378 keeps the player inside 摆棋 after a refusal, so an ending
+// that lands mid-setup is stored, not painted over the guidance (III3).
+// Same caveat as GG2/HH - no CSS and no real server frame here, only DOM state
+// and the consequence of a call.
+const setupDuo = ['btn-setup-confirm', 'btn-setup-cancel', 'btn-setup-clear',
+                  'btn-position-toggle'];
+
+check('III1 a takeover releases the 确认 lock its closed socket cannot clear', () => {
+    const game = newGame();
+    game.board = emptyBoard();
+    game.enterSetup();
+    game.setup.board[5][5] = BLACK;
+    game.setup.record.push({ row: 5, col: 5, color: BLACK });
+    game.setup.preview = okReading();
+    game.setup.confirmInFlight = true;
+    game.refreshSetupControls();
+    for (const id of setupDuo) {
+        assert(el(id).disabled === true, id + ' is held before the frame');
+    }
+
+    game.handleServerMessage({ type: 'session_taken_over', token: 'ffffffffffffffff' });
+
+    assert(game.setup.confirmInFlight === false, 'the round trip is over');
+    for (const id of setupDuo) {
+        assert(el(id).disabled === false, id + ' must not stay grey with no socket to answer');
+    }
+    // Parked, not discarded: the copy the player was holding is still there.
+    assert(game.setup.active === true, 'the takeover does not leave 摆棋');
+    assert(game.setup.board[5][5] === BLACK, 'the copy keeps its stone');
+    assert(game.setup.record.length === 1, 'and its record');
+    assert(game.setup.preview !== null, 'and its reading');
+});
+
+check('III1 with no round trip in flight the same frame changes no setup control', () => {
+    const game = newGame();
+    game.board = emptyBoard();
+    game.enterSetup();
+    game.setup.confirmInFlight = false;
+    game.refreshSetupControls();
+    for (const id of setupDuo) {
+        assert(el(id).disabled === false, id + ' is clickable with nothing in flight');
+    }
+
+    game.handleServerMessage({ type: 'session_taken_over', token: 'eeeeeeeeeeeeeeee' });
+
+    assert(game.setup.confirmInFlight === false, 'the flag stays cleared');
+    for (const id of setupDuo) {
+        assert(el(id).disabled === false, id + ' stays clickable');
+    }
+    assert(game.setup.active === true, 'and 摆棋 is still open');
+});
+
+check('III2 the board cannot be edited while 确认 holds the copy', () => {
+    const game = newGame();
+    game.board = emptyBoard();
+    game.enterSetup();
+    const pad = game.geom.pad;
+    const cell = game.geom.cell;
+    const spot = (row, col) => ({ clientX: pad + col * cell, clientY: pad + row * cell });
+
+    // The entry point really reaches the copy before it is locked, so the assert
+    // below is about the lock and not about a click that does nothing anyway.
+    game.handleCanvasClick(spot(2, 2));
+    assert(game.setup.board[2][2] === BLACK, 'a free click paints the copy');
+    assert(game.setup.record.length === 1, 'and records it');
+
+    game.setup.confirmInFlight = true;
+    game.refreshSetupControls();
+    const copyBefore = JSON.stringify(game.setup.board);
+    const recordBefore = JSON.stringify(game.setup.record);
+
+    game.handleCanvasClick(spot(4, 4));
+    assert(game.setup.board[4][4] === 0, 'the locked click paints nothing');
+    assert(JSON.stringify(game.setup.board) === copyBefore, 'the copy is untouched, cell by cell');
+    assert(JSON.stringify(game.setup.record) === recordBefore, 'and so is its record');
+    assert(game.setup.confirmInFlight === true, 'the click does not release the flag either');
+
+    // The cell already painted is still editable-looking data, unchanged: the guard
+    // adds a lock, it does not rewrite what the player set up.
+    assert(game.setup.board[2][2] === BLACK, 'the earlier stone is still there');
+});
+
+check('III2 with the copy free the same click still paints', () => {
+    const game = newGame();
+    game.board = emptyBoard();
+    game.enterSetup();
+    const pad = game.geom.pad;
+    const cell = game.geom.cell;
+    game.setup.confirmInFlight = false;
+
+    game.handleCanvasClick({ clientX: pad + 4 * cell, clientY: pad + 4 * cell });
+    assert(game.setup.board[4][4] === BLACK, 'an unlocked click still edits the copy');
+    assert(game.setup.record.length === 1, 'and its record');
+});
+
+check('III3 an ending during 摆棋 waits in gameOverText instead of the guidance', () => {
+    const game = newGame();
+    game.sendMessage = () => true;
+    game.playerColor = BLACK;
+    game.gameStatus = 'playing';
+    game.currentTurn = BLACK;
+    game.board = emptyBoard();
+    game.moveHistory = [];
+    game.baseStones = [];
+    game.replayIndex = null;
+    game.enterSetup();
+
+    const guidance = el('status').textContent;
+    assert(guidance !== '', '摆棋 put its own line on the top bar');
+    assert(game.gameOverText === '', 'and nothing is stored yet');
+
+    game.handleGameOver({ winner: 'white', reason: 'five' });
+    assert(game.gameStatus === 'game_over', 'the ending still lands in the state');
+    assert(game.gameOverText !== '', 'and is stored for the way out');
+    assert(el('status').textContent === guidance, 'the guidance is not overwritten, got: ' +
+           el('status').textContent);
+    assert(el('status').textContent !== game.gameOverText, 'the top bar is still not the result');
+
+    game.exitSetup(false);
+    assert(el('status').textContent === game.gameOverText,
+           'dropping the copy paints the result it owed, got: ' + el('status').textContent);
+});
+
+check('III3 an ending with no 摆棋 open still writes the top bar at once', () => {
+    const game = newGame();
+    game.sendMessage = () => true;
+    game.playerColor = BLACK;
+    game.gameStatus = 'playing';
+    game.currentTurn = BLACK;
+    game.board = emptyBoard();
+    game.moveHistory = [];
+    game.baseStones = [];
+    game.replayIndex = null;
+    game.setup.active = false;
+    el('status').textContent = '';
+
+    game.handleGameOver({ winner: 'white', reason: 'five' });
+    assert(game.setup.active === false, 'no setup was opened by the frame');
+    assert(el('status').textContent === game.gameOverText,
+           'the result is on screen immediately, got: ' + el('status').textContent);
+
+    // And a plain cancel with no ending waiting keeps its own line: the new branch
+    // only speaks when a result was stored.
+    const fresh = newGame();
+    fresh.board = emptyBoard();
+    fresh.gameStatus = 'playing';
+    fresh.enterSetup();
+    assert(fresh.gameOverText === '', 'this one never ended');
+    fresh.exitSetup(false);
+    assert(el('status').textContent !== '', 'cancel still says something');
+    assert(el('status').textContent !== fresh.gameOverText, 'and it is not an empty result line');
 });
 
 let failed = 0;

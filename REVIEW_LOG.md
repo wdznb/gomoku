@@ -1979,6 +1979,53 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次105 被关掉的连接替不了那把锁，正在编辑的副本不该被终局改口 — bugfix round 105 batch III
+
+**Found（其中 III1 是我自己在轮次102 引出的回归）.**
+- III1：批次 GG 把 确认/取消/清空/摆棋 四个键按 `setup.confirmInFlight` 一起按住，而那次释放只有三个出口
+  （`handlePositionSet`、`exitSetup`、`error` 帧 `:1648`）。README:565-567 说同一 token 被第二个标签页 resume
+  时，服务器给旧连接发完 `session_taken_over` **就把它关掉**——旧标签页从此再也收不到 `error` 帧。于是
+  `handleTakenOver` 里 `:208-209` 只清了 `aiThinking` 与 `hintInFlight`，摆棋一旦被接管打断就**永久冻死**：
+  取消按 README:355-357 应当只丢本地副本、根本不需要连接，现在连点都点不动，README:378 的「留在摆棋里重试」
+  也一并不可达。
+- III2：同一把锁只盖住了按钮，没盖住棋盘。`handleCanvasClick` 的摆棋分支不看 `confirmInFlight` 就直接
+  `paintSetupCell`，玩家在 确认 发出后继续刷格，那些格子改了 `setup.board/record/preview`，却会被
+  `exitSetup(true)` 装回的服务器回盘整片丢掉——刷了没生效，且一句提示都没有。
+- III3：`handleGameOver` 无条件写顶栏与副行，而 ai_move / undo 两条同类路径都有 `!setup.active` 守卫。
+  落子或求招之后点进摆棋（`enterSetup` 不拦任何在飞的事），AI 那一手若直接终局，README:379 承诺「摆棋期间
+  顶栏归那条琥珀色指引，不会把指引冲掉」就被终局帧冲掉了。
+
+**Fixed（`web/app.js`，+17/−3）.** III1 在 `handleTakenOver` 里清 `confirmInFlight` 并调
+`refreshSetupControls()`——四个键的 disabled 表达式只有那一处真相，不重写四行赋值，也不 `exitSetup`
+（丢掉玩家的工作副本比按住按钮更糟）。III2 在摆棋分支开头加同一句 `if (this.setup.confirmInFlight) return;`，
+守卫放在点击入口而不是 `paintSetupCell` 本体（摆棋记录行与导入弹窗还要调它）。III3 只把顶栏那两行包进
+`if (!this.setup.active)`，`gameStatus`/`gameOverText`/按钮置灰一律保持无条件——整段跳过会把 `gameStatus`
+留在 `playing`，`exitSetup` 还原 `setup.gameButtons` 时就会把 悔棋/求招/认输 错误地放回可用；并在 `exitSetup`
+的取消分支里，若 `gameStatus === 'game_over'` 就回画 `gameOverText`，玩家错过的结局在他放下副本那一刻拿到。
+
+**裁决（本轮唯一一条合约过期，我判 III3 赢）.** 轮次98 的 `CC4 a game over during setup still owns the top bar`
+断言「终局优先于面板」，并把 `handleGameOver` 写成「摆棋不动顶栏」的**故意例外**——那条例外只存在于测试自己的
+注释里。全仓库 README 提到顶栏/指引的只有 :379 一处，且那半句对摆棋状态是无条件限定（同句后半才把范围收到
+旋转/镜像），没有任何一句支撑「终局可以冲掉指引」；反面的顾虑（玩家拿不到结局）也不成立，因为结局被存进
+`gameOverText` 并在退出时回画。故该用例与其注释里的例外说法一并退休，注释按新口径重写；同组另外四例
+（ai_move / undo_success，摆棋内外）与轮次103 的 HH2 副行用例（在 `setup.active === false` 时发帧）全部未动且仍绿。
+
+**Verified.** 六个新用例（`tests/web_frontend_check.js`，纯增 162 行 / 18 行删除——删的只有被裁决退休的那一块
+与那两行错误注释）：III1 断言接管后四个摆棋键 `disabled === false` 且 `setup.active`/`board[5][5]`/
+`record.length`/`preview` 一个都没被清；III2 由 `geom.pad/cell` 造坐标驱动 `handleCanvasClick`（不直接调
+`paintSetupCell`，否则绕过本轮的守卫），断言锁定期 `board[4][4] === 0`、整盘 JSON 与快照逐字一致、`record`
+不变；III3 断言终局帧后顶栏仍等于原指引、`gameStatus` 与 `gameOverText` 已更新，`exitSetup(false)` 后顶栏
+`=== gameOverText`。三条对照组（无往返时收同一帧 / 未锁时同一次点击真的落子 / 无摆棋时终局当场写顶栏）在
+HEAD 也应为绿——HEAD 负例（只读 `git archive 3afb114` 到 /tmp，工作树未被 checkout 覆盖）三条判据全红
+（`web_frontend_check: 56/59`），对照组全绿。门禁由我本人重跑：ctest **8/8**（48.62 s）、web **58/58**、
+anchor **55 处引用 / 0 problems**（49→55 是修复方两处 + 测试方三处 `README:378/379/567` 新引用造成的漂移）、
+README **658** 行。
+
+**Held（下一批）.** D4 建议环被 `applyView` 的 `drawBoard()` 抹掉、D5 `enterSetup` 不拦在飞的回放索引、
+D6 离线 识别 吃掉 `sendMessage` 的 false；训练/CLI 侧 P1（`five` 从未与可调系数互相界定）、P2（冠军未变仍打
+完整验证赛并注册逐位相同的版本）、P3（`--out` 与 `--checkpoint` 同名未被拒，而 `--resume` 同名被拒）。C5
+（导出 revoke 时序）仍因 harness 无真定时器而挂起。
+
 ## 轮次104 停机那一步先记账再改口 — bugfix round 104 batch II
 
 **Found.** `flush_entry` 的次序是「先写会话文件，后追加 records.jsonl」，运行期靠十分钟一度的 tick

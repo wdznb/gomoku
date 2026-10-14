@@ -207,6 +207,12 @@ class GomokuGame {
         this.stopPing();
         this.aiThinking = false;
         this.hintInFlight = false;
+        // The socket is closed behind our back, so no error frame will ever reach
+        // this page to release the 确认 lock; without this the four buttons stay grey.
+        if (this.setup.confirmInFlight) {
+            this.setup.confirmInFlight = false;
+            this.refreshSetupControls();
+        }
         document.getElementById('btn-undo').disabled = true;
         document.getElementById('btn-hint').disabled = true;
         document.getElementById('btn-resign').disabled = true;
@@ -938,6 +944,7 @@ class GomokuGame {
         // Painting edits the 摆棋 working copy, so it answers before any of the
         // live-game guards: a board being set up is not a game in progress.
         if (this.setup.active) {
+            if (this.setup.confirmInFlight) return;
             if (row >= 0 && row < BOARD_SIZE && col >= 0 && col < BOARD_SIZE) {
                 this.paintSetupCell(row, col);
             }
@@ -1161,7 +1168,10 @@ class GomokuGame {
         this.refreshReplayControls();
         this.drawBoard();
         if (!confirmed) {
-            this.updateStatus('已退出摆棋：棋盘已还原，落子记录未清空', 'idle');
+            // An ending that arrived while the copy was open is painted here, the
+            // one place the player stops looking at the working board (README:379).
+            this.updateStatus(this.gameStatus === 'game_over' && this.gameOverText
+                ? this.gameOverText : '已退出摆棋：棋盘已还原，落子记录未清空', 'idle');
         }
     }
 
@@ -1881,8 +1891,12 @@ class GomokuGame {
         // result the player is owed, not only a status code.
         statusText += ` · ${this.reasonText(msg.reason)}`;
         this.gameOverText = statusText;
-        this.updateStatus(statusText, kind);
-        this.updateTurnInfo('');
+        // README:379: 摆棋 owns the top line while it is open; gameOverText keeps
+        // the result and exitSetup paints it back when the copy is dropped.
+        if (!this.setup.active) {
+            this.updateStatus(statusText, kind);
+            this.updateTurnInfo('');
+        }
         
         document.getElementById('btn-undo').disabled = true;
         document.getElementById('btn-hint').disabled = true;
