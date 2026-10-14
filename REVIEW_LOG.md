@@ -1979,6 +1979,69 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次115 被接管那一页收回来的，是一手无人能落的建议 — bugfix round 115 batch SS
+
+**Found.** 四只只读审计（逐手引擎数字呈现链、会话文件 schema 新旧兼容、落子记录与状态分级渲染、求招链路）
+逐条读回之后，站在需求文档上的只有一条：
+
+- **SS1** `web/app.js:1853` 的 `handleHintResult` 没有 `takenOver` 守卫。README:524-526 写死了次序：
+  `session_taken_over` 是服务器发给被顶掉那个连接的最后一帧，「随后立即 `close`」；README:567-568 又规定
+  旧标签页此后不再自动重连。所以 `handleTakenOver`（`:203-229`）置的那份停放态——`hintInFlight = false`、
+  求招连同其余三个按钮一起置灰、琥珀色警告「本局面已在其他标签页打开，刷新页面可取回」——按文档就再没有
+  任何帧能来纠正。可排在 taken_over 之后入队的这一条 `hint_result` 偏偏还能动作：`:1855-1856` 按
+  `playerColor === null || gameStatus === 'game_over'` 重算，接管后两者都不成立，于是求招从灰变可点；
+  接管不动棋，`:1867` 的手数比对放行；`:1876` 在已经不属于这一页的盘面上画建议环，`:1877` 用
+  「建议 D12 · 分值 55」把接管警告整行盖掉。同一族的 RR3 在轮次114 已给 `handleThinkingProgress`
+  （`:1880-1885`）补过这句守卫，这里是漏网的那一处。
+
+**Fixed.** `web/app.js` +6/−0：`handleHintResult` 第一句 `if (this.takenOver) return;` 加五行注释，
+其余一行未动。`hintInFlight` 不需要补清——`handleTakenOver:216` 已经把它归 false、`:224` 已经置灰按钮，
+早退保持的正是接管后的那份状态。
+
+**裁决（其余条目，全部不外派）。** 呈现链域：`search_engine.cpp:291-292` 在改名 `resign` 之前写的
+`depth`/`nodes` 到不了任何帧——`game_manager.cpp:398-408` 在 `result.resigned` 时于 `place_stone` 与
+`analyses_.push_back` 之前就 return，这份分析根本不进快照，`server.cpp:1036-1046` 也就发不出；
+`:355-357` 收尾那帧 `thinking_progress` 用的是 `info.depth`，而此处它恰是 0，与 replay 里 greedy 的 0
+一致，且帧不入 `analyses_`；VCT 的 90000 不点红是 README:338 自己定的阈值 `|score| >= 99999`，与
+must_block 的 99000 同律；曲线的白棋取反与 `human` 跳手逐字就是 README:337 与 :529。整调用 `elapsed_ms`
+仍出自 `search_engine.cpp:42` 那一口钟，每条返回路径都取自它。会话文件域：只 `choose_side`、一子未落的会话
+被 `on_flush_tick:1597-1600` 收进 `cold_sessions_`（保留测试含 `player_color`），而 `flush_entry:1507` 的
+「一子未落不写」让它没有磁盘对应——这正是 README:571 加 README:566「退回磁盘态」的字面结果：进程还活着时
+`resume` 认得它、凭内存态回 `resumed:true`，重启后文件本就不存在，于是新 token 新开局；把这条判为按设计，
+不是「同一 token 反复续局」的缺陷。`black_profile`/`white_profile` 被读进来却在第一次内容不等的 flush
+被写回 −1，服务器没有任何代码路径设置它们（只在 `game_record.{h,cpp}`），**无法构造**；`root["type"]`
+无人读、token 长度 1–64 的宽松读端、两套 reason 词表，README 都未立规矩，**无可观察差异**；
+`server_reason_of` 是死码。落子记录/渲染域：两条留给下一轮——`handleStateSync:1729` 是所有会动顶栏的
+权威帧处理器里唯一不带 `if (!this.setup.active)` 的那一处（对照 `:495`/`:1777`/`:1828`/`:1861`/`:1930`），
+执黑/执白的回包晚于玩家点「摆棋」时，绿色「对局开始」会永久换掉 README:360/379 许给摆棋的那行琥珀指引；
+`handleGameOver:1930-1933` 把 `updateTurnInfo('')` 和 `updateStatus` 一起跳过，而 `exitSetup:1190-1195`
+只回绘 `#status`，于是取消摆棋后 `#turn-info` 仍替一局已结束的对局宣称「轮到白棋 · AI 思考中」。第三条
+（`error` 帧把「游戏结束 - …」冲掉）不外派：README:307 把顶栏定成共用的报告行、红=拒绝/错误，
+给终局加哑就等于吞掉 README:326-327 明文欠玩家的那一条错误。求招域其余五条见下段。
+
+我自己那条服务端候选也判 **无可观察差异**：`game_manager.cpp:330-339` 的投递守卫只比
+`move_count`，把数补回来必须走两次 `make_move`，而头一次的 AI 重挂（`:190` → `:350-357`）会在
+`search_thread_` 建出来之前先 `join` 掉 `hint_thread_`，守卫永远只看到差一手的计数。（`Board` 确实
+在 `src/core/board.h:69` 暴露 `zobrist_hash()`，若哪天这条变得可构造，身份比对就有现成的键。）
+另外：`requestHint` 不查 `aiThinking` 由服务器在 `:296` 拒绝、红字即文档认可的答复；认输之后不会有迟到的
+`hint_result`，因为 `GameManager::resign:273` 先 `halt_search()` 立 `discard_pending_`，那一帧根本发不出来；
+error 分支的置灰表达式漏 `aiThinking` 与 `:1849`/`:1855`/`:1073` 是同一份文件级规则，且随后的
+`thinking_progress` 会重新置灰；会话里 100–499 ms 的 `timeout_ms` 回填成「0 秒」是 'bounds' 模式刻意不夹
+（`:649-668`），服务器夹回 100 ms 恰是会话本值；断线窗口里置灰的求招不产生点击，谈不上「静默丢弃」
+（README:554 管的是能点下去的那些）。
+
+**Verified.** 测试会话只在 `tests/web_frontend_check.js` 追加 **+77/0**（2 条用例，一条现有用例未动）：
+判别式 `SS1a` 用 `adviceGame()` + `requestHint()` 造出真实在跑的求招，派发 `session_taken_over` 后再派发
+同手数的合法 `hint_result`，同时断言按钮仍灰、`adviceRings()` 为 0、`recommendation === null`、顶栏仍以
+接管警告开头；对照 `SS1b` 把未接管页（按钮按普通规则解冻、恰好一个环、顶栏是「建议 …」）与已终局页
+（按钮保持置灰）合写一条。合约过期：**无**。我亲自重跑：HEAD 树 `/mnt/d/tmp/r115_head`
+**83/84**，只在 SS1a 红（`the parked page keeps 求招 greyed, got: false`）；修复树 web **84/84**、
+anchor **100 citations / 0 problems**（新增的两处 README 引用：`web/app.js` 的 `README:526` 与测试注释的
+`README:524-525`，检查脚本按行展开所以 94→98→100 一路加的是引用数）、README **658** 行、
+`node --check web/app.js` 通过、ctest **8/8 / 67.29 s**（`-j8`，裸 `cmake ..`）。
+
+
+
 ## 轮次114 回放条不能后退的那一手，与三个「这是给谁的帧」判错了的控件 — bugfix round 114 batch RR
 
 **Found.** 四份只读审计（完局记录→replay 链、self_play 与训练轮次记账、前端视角与控件、会话生命周期时序）

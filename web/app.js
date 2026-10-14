@@ -1851,6 +1851,12 @@ class GomokuGame {
     }
     
     handleHintResult(msg) {
+        // README:526 makes session_taken_over the last frame the replaced socket
+        // gets, but a hint answer already queued behind it still arrives. Releasing
+        // the control here would un-grey 求招, ring a square of a board this page no
+        // longer operates, and paint 「建议 …」 over handleTakenOver's warning - with
+        // no frame left to ever undo any of it.
+        if (this.takenOver) return;
         this.hintInFlight = false;
         document.getElementById('btn-hint').disabled =
             this.playerColor === null || this.gameStatus === 'game_over';

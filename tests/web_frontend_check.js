@@ -3223,6 +3223,83 @@ check('RR4 a send that left still holds the resume for its replay answer', () =>
            'with the resumed line, got: ' + el('status').textContent);
 });
 
+// SS1 (round 115): README:524-525 makes session_taken_over the last frame the replaced
+// socket gets, and handleTakenOver parks this page - the reconnect timer, the ping and
+// the replay clock are gone, and 求招 goes grey with the rest of them. A hint answer
+// that was already queued behind that notice used to be the one frame still able to act
+// on a page that no longer operates the game: it released the button, rang a square of a
+// board it does not own, and painted its own line over the takeover warning, with no
+// later frame to put any of that back.
+const hintPage = () => {
+    const game = adviceGame();
+    game.hintInFlight = false;
+    game.moveHistory = [
+        { row: 7, col: 7, color: BLACK },
+        { row: 8, col: 8, color: WHITE },
+    ];
+    game.board[7][7] = BLACK;
+    game.board[8][8] = WHITE;
+    el('timeout').value = '5';
+    el('depth').value = '6';
+    game.requestHint();
+    return game;
+};
+
+check('SS1a 接管之后迟到的 hint_result 不解冻求招、不画环、不盖接管警告', () => {
+    const game = hintPage();
+    assert(game.hintInFlight === true && game.hintMoveCount === 2,
+           '求招 is in flight against the two-ply position');
+    assert(el('btn-hint').disabled === true, 'and 求招 is greyed while it is out');
+
+    game.handleServerMessage({ type: 'session_taken_over', token: 'c'.repeat(16) });
+    assert(game.takenOver === true, 'the takeover parked this page');
+
+    const rec = ringRecorder();
+    try {
+        rec.clear();
+        game.handleServerMessage({ type: 'hint_result', row: 3, col: 3, score: 55 });
+        assert(el('btn-hint').disabled === true,
+               'the parked page keeps 求招 greyed, got: ' + el('btn-hint').disabled);
+        const rings = adviceRings(rec, game).length;
+        assert(rings === 0, 'no ring lands on a board this page no longer operates, got ' + rings);
+        assert(game.recommendation === null, 'and no answer is held as display state, got: ' +
+               JSON.stringify(game.recommendation));
+        const status = el('status').textContent;
+        assert(status.indexOf('建议') === -1, 'the advice line does not replace it, got: ' + status);
+        assert(status.indexOf('本局面已在其他标签页打开') === 0,
+               'the takeover warning still stands, got: ' + status);
+    } finally {
+        rec.restore();
+    }
+});
+
+check('SS1b an un-taken page still gets its answer, and a finished one still holds the button', () => {
+    // Control one: the guard is about takenOver alone, not about hint_result in general.
+    const live = hintPage();
+    assert(live.takenOver === false, 'this page still operates the game');
+    const rec = ringRecorder();
+    try {
+        rec.clear();
+        live.handleServerMessage({ type: 'hint_result', row: 3, col: 3, score: 55 });
+        assert(el('btn-hint').disabled === false, 'the answer releases 求招 by the plain rule');
+        assert(adviceRings(rec, live).length === 1, 'and its ring is the one the player was owed');
+        assert(live.recommendation !== null, 'kept as display state through later repaints');
+        assert(el('status').textContent.indexOf('建议') === 0,
+               'with the advice line on top, got: ' + el('status').textContent);
+
+        // Control two: 已终局 keeps the button greyed - the expression SS1 sits above is
+        // untouched, so a game_over page does not gain a clickable 求招 from a late answer.
+        const over = hintPage();
+        over.gameStatus = 'game_over';
+        rec.clear();
+        over.handleServerMessage({ type: 'hint_result', row: 4, col: 4, score: 20 });
+        assert(el('btn-hint').disabled === true,
+               'a finished game keeps 求招 held, got: ' + el('btn-hint').disabled);
+    } finally {
+        rec.restore();
+    }
+});
+
 let failed = 0;
 for (const result of results) {
     console.log(`${result.ok ? 'PASS' : 'FAIL'} ${result.label}` +
