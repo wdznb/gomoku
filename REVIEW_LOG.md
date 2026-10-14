@@ -1979,6 +1979,62 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次113 推荐的那条构建路不出测试，却喊「Build complete!」 — bugfix round 113 batch QQ
+
+**Found.** 两份只读审计（长驻资源与性能、运行期文件与路径）逐条读回之后，只有一条站在需求文档上：
+
+- **QQ1** `build.sh:44-126` 的 cmake-free 兜底分支（`command -v cmake` 失败时走的「直接编译」）编译完
+  两个二进制就打印 `Build complete!`，**一个字都不提它没产任何测试二进制**。README:99 把这条路（方法1）
+  标成「（推荐）」，而 README:431-448 的「测试」章节是无条件的：`cd build` 然后 `ctest --output-on-failure`，
+  或者手动跑八个 `./test_board` … `./test_training`。按推荐装好的人（机器上没有 cmake）照文档走，得到的
+  是一句他解释不了的报错；脚本知道差异在哪，却不说。`if [ "$USE_CMAKE" -eq 1 ]` 分支
+  （`cmake .. && make -j$(nproc)`）会把八个测试目标连同 `add_test` 一起建出来，所以那句披露只能属于
+  else 分支——写进 128-138 行两段共用的收尾提示里，就等于让有 cmake 的正常构建谎报「这里没有测试」。
+
+**Fixed.** `build.sh` +8/−0，只在 else 分支的 `cp -r ../data .` 与 `echo "Build complete!"` 之间插 4 行注释
+加 4 行 `echo`（契约 `build/r113_qq_spec.txt`）。最后一行 `echo '      mkdir build && cd build && cmake ..
+&& make -j$(nproc)'` **用单引号**：那行是回显给用户看的命令文本，双引号会让 `$(nproc)` 真的执行一次——
+在 `set -e` 之下，替换失败就会把整个构建打断。两条 g++ 命令、`../deps/json` 的 clone 分支、两个 `cp -r`、
+if 分支与共用收尾块一行未动。
+
+**裁决（两份审计的其余条目，全部不外派）。** 长驻资源域：`cold_sessions_` 没有上限也没有 TTL，唯一移除点
+是同名 token 的 `resume`——但它**就是**磁盘态的那份索引（README:563-564「退回磁盘态」，服务器启动时又
+把 `data/sessions/` 读回它），条目是去掉引擎之后的快照，数量受磁盘上那些按设计只增的文件约束。
+`resume` 认不得 token 时照样 `open_session(nullptr)` 建一个 `GameManager`（8 MiB 位棋盘置换表），被顶掉的
+entry 在 `sessions_` 里等满 1800 s——两半都是文档写的（README:487-488 认不得就另开一局 + 新 token、
+:561-563 断开只是 detach 且留 30 分钟），而且轮次里 `transposition.h:29-32` 已经记着这条权衡：表从 2^20
+缩到 2^18，正是因为「会话无上限，三局并发就破 README:635 的 <100MB」。`TranspositionTable::clear()` 零调用者
+但 `lookup` 比的是完整 Zobrist 键，残留项只可能被同一局面命中；每 10 s 一遍的
+`replay_snapshot()` + `snapshot_of()` + `json::dump(2)` 有 `payload == saved_payload` 去重（时间戳先归零），
+没动过的盘既不写也不 unlink，只有 CPU；`Board::get_candidate_moves()` 与 `has_neighbor_` 是死码，删它要动 `.h`
+且没有可观察差异。运行文件域：训练侧 `ensure_parent_directory` 吞掉 `error_code`，但冠军写入
+（`Error: cannot write champion parameters` + 退出 1）与 `trainer.cpp:389` 的断点保存失败都会说话，没有静默丢；
+开局库 README 从不描述文件 schema，所以逐行 `continue` 的部分载入不违反任何一句，且 disabled / loaded N-M /
+unavailable 三态都打印，`load_or_default()` 零调用者也没有任何文档承诺内置退路；七个局面模板没有运行期读者
+（只有测试读）；`set_position` 全程不碰磁盘，所以 `load_position_file` 没有穿越守卫是**无法构造**；
+`session_store::read_file` 在启动时整份读入 `<token>.json` 无大小上限，前提是对方已经能写可信目录，
+解析失败会被跳过而不是崩，要证它得种几百 MB 的文件——那是我被明确要求不去搭的压力具。**QQ2**
+（README 的「测试」章节从不给 `web_frontend_check.js` / `readme_anchor_check.js` 任何调用方式，跟 README:425
+自己说的「单元测试」对不上）**暂缓**：在那一带插一行要把 42 处指向 :431 之后的引用整体重贴。
+
+**Verified.** 这是**脚本行**，不是二进制行，沿用轮次99 DD6 / 轮次107 KK2 的做法：证据是一次性探针
+`build/r113_qq_probe.sh`，`tests/` 本轮一行未写。夹具在 `/mnt/d/tmp/r113_qq/`，HEAD 树用
+`git show c43b5b3:build.sh` 解出来，`deps/json/include/` 预置（否则兜底分支会去 clone GitHub，WSL 里 TLS 就断），
+stub PATH 里放记录 argv 的 `g++` 与 `nproc` marker，`cmake` stub 只在 A2 臂出现。四臂我自己在 WSL 复跑过：
+A1 判别成立（修复树第 11 行 `Note: this fallback build compiles only gomoku_server and gomoku_train.`；
+HEAD 树第 11 行就是 `Build complete!`，全跑无该句；两臂退出码都是 0）；A2 两棵树都走 `Building with CMake...`
+且都不含那句；A3 兜底臂 `g++` 恰好两次（`-o gomoku_server` ×1、`-o gomoku_train` ×1，HEAD 也是 2 ⇒ 编译行为
+无可观察差异），兜底臂 `nproc` marker **0 行**、cmake 臂 1 行，坐实那句是回显；A4 `bash -n` 两棵树都 0，
+`git diff --numstat` 8/0 且只有一个 hunk。门禁（我自己跑的空闲四段）：`ctest` **8/8 / 71.26 s**
+（src/ 一行未动，与 75 s 基线同量级）、`web_frontend_check: 74/74`、`readme_anchor_check: 94 citations, 0 problems`、
+`wc -l README.md` **658**。**合约过期：无**（本轮没有任何既有用例被改，测试文件零改动）。
+
+**下一轮（轮次114）预告.** 两条已判定的挂起项不动（QQ2 的 README 插入代价、`replay` 覆盖 `ai_move` 的
+排序问题按 无法构造 关闭）。下一轮先派三只只读审计：完局记录与 replay 索引的一致性
+（`game_record` / `record_export` / `handle_request_replay` 一条链）、前端视角变换与回放条边界
+（README:315-320、:332-340）、训练 CLI 的 `--params/--records/--samples` 与 README:174-216 默认值对照，
+回来仍由我逐函数读回核验后才下发。
+
 ## 轮次112 「冷架上那份什么都没有的快照，与三处「这是谁的数」被混用」 — bugfix round 112 batch PP
 
 **Found（批次 PP，四条都来自轮次111 预告里我逐函数读回核验过的候选）.**

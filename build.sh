@@ -121,6 +121,14 @@ else
     cp -r ../web .
     cp -r ../data .
     
+    # The two binaries above are all this fallback branch compiles: the eight
+    # test executables and the ctest entry are CMake targets, so README's 测试
+    # chapter cannot be followed from here. Say so - a bare "Build complete!"
+    # otherwise reads as if the suite were present but failing to launch.
+    echo ""
+    echo "Note: this fallback build compiles only gomoku_server and gomoku_train."
+    echo "      The eight test binaries and ctest come from the CMake build:"
+    echo '      mkdir build && cd build && cmake .. && make -j$(nproc)'
     echo ""
     echo "Build complete!"
 fi
