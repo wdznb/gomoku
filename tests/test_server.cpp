@@ -1731,6 +1731,119 @@ void test_human_move_answers_the_stone_before_the_end() {
     std::cout << "test_human_move_answers_the_stone_before_the_end passed" << std::endl;
 }
 
+// Round 99 DD3: the reject branch of handle_make_move gave the deferred_end_for_
+// slot back but left whatever a worker had parked in deferred_end_frame_ sitting
+// there. That ending reached neither this session - its own stone was refused, so
+// no success path ever drained the slot - nor anybody else, until the NEXT
+// session played a legal stone and was handed a game_over for a game it is not
+// part of. The window is real: server.cpp:939-942 arms the slot, and an AI worker
+// committing a finishing stone under it fires the callback that parks the frame
+// (game_manager.cpp:424-426, server.cpp:1626-1634). Two statements cannot be hit
+// by timing in a test, so the slot is armed exactly the way that block arms it
+// and the worker is then run to completion: the state entering the reject branch
+// is the state the race produces, and the parked frame is the server's own
+// callback output rather than one written by this test.
+void test_a_rejected_stone_delivers_the_end_a_worker_parked() {
+    GameRestore white_finishing;
+    white_finishing.player_color = BLACK;
+    white_finishing.status = GameStatus::PLAYING;
+    // Nine alternating plies, so WHITE (the AI) is to move, and its four on row 7
+    // has both ends free: the worker's stone finishes the game.
+    const Position black_cells[5] = {{0, 0}, {0, 2}, {0, 4}, {2, 0}, {4, 0}};
+    const Position white_cells[4] = {{7, 7}, {7, 8}, {7, 9}, {7, 10}};
+    for (int i = 0; i < 9; ++i) {
+        MoveAnalysis analysis;
+        analysis.move = i % 2 == 0
+            ? Move(black_cells[i / 2].row, black_cells[i / 2].col, BLACK)
+            : Move(white_cells[i / 2].row, white_cells[i / 2].col, WHITE);
+        analysis.method = "human";
+        white_finishing.moves.push_back(analysis);
+    }
+
+    auto types_of = [](const std::vector<std::string>& frames) {
+        std::string joined;
+        for (const std::string& frame : frames) {
+            const json parsed = json::parse(frame, nullptr, false);
+            if (parsed.is_discarded() || !parsed.contains("type")) continue;
+            joined += (joined.empty() ? "" : ",") + parsed["type"].get<std::string>();
+        }
+        return joined;
+    };
+    auto index_of = [](const std::vector<std::string>& frames, const char* type) {
+        for (size_t i = 0; i < frames.size(); ++i) {
+            const json parsed = json::parse(frames[i], nullptr, false);
+            if (!parsed.is_discarded() && parsed.value("type", std::string()) == type) {
+                return static_cast<long>(i);
+            }
+        }
+        return -1L;
+    };
+
+    const auto dir = scratch("r99dd3_sessions");
+    {
+        Harness h(dir, std::string());
+        size_t seen = 0;
+        assert(h.entry->game->restore_game(white_finishing));
+        assert(h.entry->game->current_turn() == WHITE);
+        h.entry->game->set_config(300, 1);
+
+        {
+            std::lock_guard<std::mutex> lock(h.server.end_frame_mutex_);
+            h.server.deferred_end_for_ = h.socket.get();
+        }
+        h.entry->game->start_ai_thinking();
+        // Wait on the event itself rather than on a clock: the frame the worker's
+        // callback parks under the armed slot.
+        bool parked = false;
+        for (int spin = 0; spin < 2000 && !parked; ++spin) {
+            std::lock_guard<std::mutex> lock(h.server.end_frame_mutex_);
+            parked = !h.server.deferred_end_frame_.is_null();
+            if (!parked) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        assert(parked);
+
+        // (13,13) is empty; the stone is refused by the game-over guard at
+        // game_manager.cpp:148, which is what the worker's five leaves behind.
+        h.server.handle_make_move(h.socket, json{{"row", 13}, {"col", 13}});
+        const std::vector<std::string> refused_stone = drain_frames(h.server, h.socket, seen);
+
+        // A second session on the same server plays a legal stone. Its success path
+        // is what drains a frame this session should have been told about.
+        auto other_socket =
+            std::make_shared<WebSocketSession>(tcp::socket(h.server.ioc_), std::string());
+        const std::shared_ptr<GameServer::TrackedGame> other = h.server.open_session(nullptr);
+        h.server.attach_socket(other_socket, other);
+        size_t seen_other = 0;
+        assert(other->game->restore_game(playing_restore(2)));
+        other->game->set_config(120000, 20);
+        h.server.handle_make_move(other_socket, json{{"row", 5}, {"col", 5}});
+        other->game->halt_search();
+        const std::vector<std::string> next_stone =
+            drain_frames(h.server, other_socket, seen_other);
+
+        std::cout << "  [r99dd3] refused stone: " << types_of(refused_stone)
+                  << " | next session's stone: " << types_of(next_stone) << std::endl;
+
+        const long refusal = index_of(refused_stone, "error");
+        const long ending = index_of(refused_stone, "game_over");
+        assert(refusal >= 0);
+        assert(ending > refusal);
+        const json end = json::parse(refused_stone[static_cast<size_t>(ending)]);
+        assert(end["winner"] == "white");
+        assert(end["reason"] == "five");
+
+        {
+            std::lock_guard<std::mutex> lock(h.server.end_frame_mutex_);
+            assert(h.server.deferred_end_for_ == nullptr);
+            assert(h.server.deferred_end_frame_.is_null());
+        }
+        assert(types_of(next_stone) == "move_made");
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    std::cout << "test_a_rejected_stone_delivers_the_end_a_worker_parked passed" << std::endl;
+}
+
 // Round 88, S5: the two halves of a resumed session's search config stand on their
 // own. A file that states max_depth but never states timeout_ms - 0 is the
 // round-86 P2 sentinel for "key absent" - used to lose both at once, because one
@@ -1942,6 +2055,7 @@ int main() {
     test_finished_game_answers_a_hint_with_the_error_frame();
     test_check_position_reads_a_bom_prefixed_document();
     test_human_move_answers_the_stone_before_the_end();
+    test_a_rejected_stone_delivers_the_end_a_worker_parked();
     test_resume_restores_each_config_half();
     test_zero_stone_position_keeps_the_token();
     test_transient_accept_failure_rearms_and_abort_ends();

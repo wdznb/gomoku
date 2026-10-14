@@ -1979,6 +1979,58 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次99 被拒的那一手替别人收走的终局帧，与只报到第四种的符号清单 — bugfix round 99 batch DD
+
+**Found.** 三个只读审计（D：server 终局帧生命周期×摆棋；E：app.js 状态机×重连；F：训练 CLI/build 脚本）交回
+8 条，逐条读码后留下 5 条，其余被我否掉。裁决证据都在行号上：
+
+- **DD3（高，帧序/所有权）**：`handle_make_move` 的失败早退只把 `deferred_end_for_` 交回槽位主人，却没有把
+  worker 在这一窗里 park 进 `deferred_end_frame_` 的终局帧发出去，也没清空它。窗口是真的：`server.cpp:939-942`
+  先装槽位，AI worker 随后可在同一局里落成制胜一手并触发 game_over 回调（`game_manager.cpp:424/426`，回调在
+  worker 线程上跑，见 `server.cpp:1626-1634`），而玩家那一手被终局门禁（`game_manager.cpp:148`）拒掉。后果不是
+  「这一局少一帧」而已：被搁置的帧会在**下一个** session 落合法子时由成功路径发出，等于把上一局的 `game_over`
+  塞给无关对局。
+- **DD4（中，我自己在轮次98写错的契约）**：CC1 的流式扫描在见到第四种符号时 `return kinds.size() <= 3;` 提前
+  退出，投诉消息因此打印的是**它停下的那个计数**——一份混了六、八种字母的长串被报成「4 种符号」，清单只点名前
+  四个符号。我当时判断「这条消息不打印总数，所以不需要扫到底」是错的。
+- **DD5（中，破坏性 CLI）**：`require_value` 接受空串。`--resume ""`（多半是未展开的 shell 变量）被解析成「不要
+  resume」，训练照跑，然后把默认 checkpoint 覆写掉。
+- **DD6（低，文档性）**：`--stagnation` / `--hill-iterations` 的帮助文本没有说明 hill climbing 用 3x 该值作探测
+  预算（`trainer.cpp:312`），也没说明相同邻居被跳过 ⇒ 每轮至多 N+1 次评估（`hill_climbing.cpp:54-89`）。
+- **DD1（中，构建）**：`build.sh` 的 cmake-free 分支只链接 `gomoku_server`，按 README 的无 cmake 路径构建的人拿不到
+  `gomoku_train`；而且「To train the threat coefficients」那句提示被 `if [ "$USE_CMAKE" -eq 1 ]` 挡住了，恰好在这条
+  最需要指路的分支上不打印。
+
+**Fixed.** 全部由修改会话（fix-code）按我点名的文件改：`src/server/server.cpp` 失败分支在 `send_error` 前取
+`end_frame_mutex_`、置 `deferred_end_for_ = nullptr` 并 swap 出 parked 帧，取其非空则在 `send_error` 后发给本
+session（+6/0）；`src/core/position_setup.cpp` 的 `for_each_codepoint` 改为 `void`、删掉提前退出，扫描跑完全部码点，
+只有 `symbols` 的**存储**仍封顶 225（+9/−11，两处消息文本与 README:259-260 / :305 的优先级不变）；
+`src/training/main_trainer.cpp` 空值抛 `std::invalid_argument` 走既有 catch（+14/−4，含 DD6 帮助文本）；`build.sh`
+cmake-free 分支补齐 22 个 TU 的 `gomoku_train` 链接并解掉提示的门（+38/−9）；README:522 补一句帧序契约
+（1/1，仍 658 行）。另有一处由我直接改的配置卫生：`.gitignore` 补 `deps/` —— `build.sh:48-51` 会把 nlohmann/json
+克隆到仓库根的 `deps/`，而此前只忽略了 CMake 的 `_deps/`，探针一跑就留下 24 MB 未跟踪树。
+
+**Not defects.** E 的 `handleTakenOver` 未清回放行（`:757-762` 自终止、不发帧，README:567-569 只承诺「不再自动重连」）；
+F 的 `game_id_base` 族（既有挂起项，`trainer.cpp:216-223` 自己写明要 export marker）；F 的 `checkpoint.json.tmp`
+不落删除（无读者）；DD1 的 `deps/` 克隆本身（build.sh 既有行为）。
+
+**Verified.** 测试会话只写 `tests/`（`test_position.cpp` +47、`test_server.cpp` +114、`test_training.cpp` +89，
+`git diff -- tests/` 无任何删除行，逐行核过）。新用例与 HEAD 负例（HEAD `6883aa6`）：
+`test_a_rejected_stone_delivers_the_end_a_worker_parked` 按 `:939-942` 的方式装槽位、真跑 worker、轮询
+`deferred_end_frame_` 非空作为可观察同步点（不是 sleep 赌时序），HEAD 原文
+`Assertion 'ending > refusal' failed`（实得 `ai_move,error | move_made,game_over`）；
+`test_every_symbol_kind_of_an_oversized_run_is_named`（5 种/8 种乱点长串，点名清单 + 真实计数 + 不含 225），HEAD 原文
+`Assertion 'error5.find("%") != std::string::npos' failed`；
+`test_trainer_refuses_an_empty_flag_value`（三个 flag 各追加 `--rounds 0` 使 HEAD 停在解析之后的守卫，断言退出 1、
+stderr 点名该 flag 且不提 `--rounds`），HEAD 原文 `Assertion 'last_err.find(flag) != std::string::npos' failed`。
+DD6 是帮助文本断言，真实调用路径**无可观察差异**；DD4 的「存储/校验仍封顶 225」半项经公共 API 也**无可观察差异**
+（只有相等那支读 `symbols`），由轮次98 的 RSS 上界与既有 225 用例承担；DD1 用 /tmp 副本 + 受限 PATH（剥掉
+cmake/ctest）探针验证，HEAD 原文 `ls: cannot access '.../head/build/gomoku_train'`。
+门禁（我与测试会话各跑一次，一致）：ctest **8/8**（46.34 s，`test_server` 11.83 s）、web **42/42**、锚点
+**34 citations / 0 problems**（较 33 多一条：DD4 注释引用 README:259-260，属基线数字过期，不是回归）、README **658**。
+合约过期：轮次98 把「第 4 种符号即截断」写成契约的那半条，由 DD4 纠正为真实计数；旧断言（4 种仍走种类投诉、
+不含 225）仍然成立，无需改动。
+
 ## 轮次98 十六兆一个分隔符都没有的那份模板，与抢先落地的终局帧 — bugfix round 98 batch CC
 
 **Found.** 三个只读审计（app.js 摆棋×终局×回放、摆棋文档/模板装载边界、game_manager↔server 状态机与

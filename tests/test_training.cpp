@@ -2965,6 +2965,93 @@ void test_collector_still_drops_genuine_symmetry_duplicates() {
               << std::endl;
 }
 
+// Round 99 DD5: an empty flag value is nearly always an unexpanded shell variable,
+// and for a path it is destructive - `--resume ""` used to parse as "no resume" and
+// the run then wrote the default checkpoint as if nothing had been asked for.
+// require_value now throws on an empty value and the existing catch answers with
+// exit 1. Each probe carries `--rounds 0` so a tree that still accepts the empty
+// value stops at the round-count guard instead of starting a training run: what is
+// under test is which of the two refusals the parser produces, and that is read off
+// the exit code and the flag name in stderr - no wording is asserted.
+void test_trainer_refuses_an_empty_flag_value() {
+#ifndef _WIN32
+    if (!std::filesystem::exists("gomoku_train")) {
+        std::cout << "  trainer empty-value probes skipped: gomoku_train is not in the "
+                     "working directory" << std::endl;
+        std::cout << "test_trainer_refuses_an_empty_flag_value passed" << std::endl;
+        return;
+    }
+    const std::filesystem::path err = temp_path("r99_dd5_stderr.txt");
+    auto read_all = [](const std::filesystem::path& p) {
+        std::ifstream in(p);
+        std::ostringstream text;
+        text << in.rdbuf();
+        return text.str();
+    };
+    std::string last_err;
+    auto run = [&](const std::string& arguments) {
+        const std::string command = "./gomoku_train " + arguments + " > /dev/null 2> '" +
+                                    err.string() + "'";
+        const int status = std::system(command.c_str());
+        assert(status != -1);
+        last_err = read_all(err);
+        return WEXITSTATUS(status);
+    };
+
+    for (const char* flag : {"--resume", "--params", "--out"}) {
+        const int status = run(std::string(flag) + " '' --rounds 0");
+        std::cout << "  [r99dd5] " << flag << " with an empty value => exit " << status << ": "
+                  << last_err.substr(0, last_err.find('\n')) << std::endl;
+        assert(status == 1);
+        // The empty value was refused, ahead of the round-count guard behind it.
+        assert(last_err.find(flag) != std::string::npos);
+        assert(last_err.find("--rounds") == std::string::npos);
+    }
+
+    // Control: the same flags with a stated value still reach the guard that
+    // follows the parser, so the refusal above is about emptiness, not the flag.
+    const int stated = run("--out '/tmp/r99_dd5_out.json' --rounds 0");
+    std::cout << "  [r99dd5] --out with a value => exit " << stated << ": "
+              << last_err.substr(0, last_err.find('\n')) << std::endl;
+    assert(stated == 1);
+    assert(last_err.find("--rounds") != std::string::npos);
+
+    std::cout << "test_trainer_refuses_an_empty_flag_value passed" << std::endl;
+#endif
+}
+
+// Round 99 DD6, labelled as what it is: a help-text assert. Only the usage
+// entries for --stagnation and --hill-iterations were rewritten, and the two
+// claims they now make are the code's existing behaviour - the 3x probe budget is
+// trainer.cpp:312 and the N+1 ceiling is hill_climbing.cpp skipping a step whose
+// neighbour is identical. No call path changes, so there is nothing else to pin.
+void test_trainer_help_states_the_probe_budget() {
+#ifndef _WIN32
+    if (!std::filesystem::exists("gomoku_train")) {
+        std::cout << "  trainer help probe skipped: gomoku_train is not in the working "
+                     "directory" << std::endl;
+        std::cout << "test_trainer_help_states_the_probe_budget passed" << std::endl;
+        return;
+    }
+    const std::filesystem::path out = temp_path("r99_dd6_usage.txt");
+    const int status = std::system(("./gomoku_train --help > '" + out.string() +
+                                    "' 2>&1").c_str());
+    assert(status != -1);
+    std::ifstream usage(out);
+    std::ostringstream text;
+    text << usage.rdbuf();
+    const std::string help = text.str();
+    std::cout << "  [r99dd6] --help => exit " << WEXITSTATUS(status) << ", " << help.size()
+              << " bytes of usage" << std::endl;
+    assert(WEXITSTATUS(status) == 0);
+    assert(help.find("--stagnation") != std::string::npos);
+    assert(help.find("3x") != std::string::npos);
+    assert(help.find("N+1") != std::string::npos);
+
+    std::cout << "test_trainer_help_states_the_probe_budget passed" << std::endl;
+#endif
+}
+
 int main() {
     std::cout << "Running training tests..." << std::endl;
 
@@ -3021,6 +3108,8 @@ int main() {
     test_measure_fitness_leaves_default_rule_constants_alone();
     test_collector_keeps_the_variant_that_moved_the_last_stone();
     test_collector_still_drops_genuine_symmetry_duplicates();
+    test_trainer_refuses_an_empty_flag_value();
+    test_trainer_help_states_the_probe_budget();
 
     std::cout << "All training tests passed" << std::endl;
     return 0;

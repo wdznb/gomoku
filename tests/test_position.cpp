@@ -1198,6 +1198,52 @@ void test_bom_prefix_does_not_change_the_shape() {
     std::cout << "test_bom_prefix_does_not_change_the_shape passed" << std::endl;
 }
 
+// Round 99 DD4: the flat scan used to leave the run as soon as it had seen a
+// fourth kind of mark, and the complaint printed the count it stopped at - so a
+// run that mixes six or eight alphabets was reported as a four-symbol board and
+// only its first four marks were named. That is the contract round 98 CC1
+// recorded wrongly. The scan now visits every codepoint and only the *storing* of
+// symbols stays capped at the 225 a board needs; the priority between the two
+// complaints is unchanged (README:259-260, :305). The chosen stray marks contain
+// no digits, so the only ASCII digits in the message are the count itself, and
+// the list's completeness is read off the marks it names - no wording is asserted.
+void test_every_symbol_kind_of_an_oversized_run_is_named() {
+    GridCells cells;
+
+    // Three marks the table defines and two it never does, cycled past 225 cells:
+    // five kinds over 400 codepoints.
+    std::string five_kinds;
+    for (int i = 0; i < 80; ++i) five_kinds += "黑白空?%";
+    std::string error5;
+    assert(!parse_grid_text(five_kinds, cells, error5));
+    assert(!error5.empty());
+    assert(cells.empty());
+    std::cout << "  [r99dd4] five-kind report: " << error5 << std::endl;
+    // The scan ran to the end, so the fifth mark is named and the count is 5.
+    assert(error5.find("?") != std::string::npos);
+    assert(error5.find("%") != std::string::npos);
+    assert(error5.find("5") != std::string::npos);
+    // The symbol-kind complaint still precedes the cell count, which it never
+    // states: 400 cells and no 225 in the message.
+    assert(error5.find("225") == std::string::npos);
+
+    // Eight kinds over 320 codepoints: the list tracks the input instead of
+    // stopping at four.
+    std::string eight_kinds;
+    for (int i = 0; i < 40; ++i) eight_kinds += "黑白空?!@&%";
+    std::string error8;
+    assert(!parse_grid_text(eight_kinds, cells, error8));
+    std::cout << "  [r99dd4] eight-kind report: " << error8 << std::endl;
+    assert(error8.find("!") != std::string::npos);
+    assert(error8.find("@") != std::string::npos);
+    assert(error8.find("&") != std::string::npos);
+    assert(error8.find("%") != std::string::npos);
+    assert(error8.find("8") != std::string::npos);
+    assert(error8.find("225") == std::string::npos);
+
+    std::cout << "test_every_symbol_kind_of_an_oversized_run_is_named passed" << std::endl;
+}
+
 int main() {
     std::cout << "Running position setup tests..." << std::endl;
     test_grid_parsing();
@@ -1220,6 +1266,7 @@ int main() {
     test_blank_cell_is_stray_outside_the_letter_families();
     test_oversized_flat_run_is_scanned_in_one_pass();
     test_bom_prefix_does_not_change_the_shape();
+    test_every_symbol_kind_of_an_oversized_run_is_named();
     std::cout << "All position setup tests passed!" << std::endl;
     return 0;
 }

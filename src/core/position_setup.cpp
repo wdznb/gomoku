@@ -173,10 +173,11 @@ GridRow split_row(const std::string& stripped) {
 
 // One codepoint at a time, without materialising the run: the flat form has to
 // count every symbol of a block that may be megabytes long, and a vector of one
-// string per codepoint is the cost this avoids. The width comes from the lead
-// byte; a malformed or truncated lead byte stands alone, matching no alphabet.
+// string per codepoint is the cost this avoids. Every codepoint is visited, so the
+// caller may stop storing them but never stop counting. The width comes from the
+// lead byte; a malformed or truncated lead byte stands alone, matching no alphabet.
 template <typename Fn>
-bool for_each_codepoint(const std::string& block, const Fn& fn) {
+void for_each_codepoint(const std::string& block, const Fn& fn) {
     size_t i = 0;
     while (i < block.size()) {
         const unsigned char lead = static_cast<unsigned char>(block[i]);
@@ -189,10 +190,9 @@ bool for_each_codepoint(const std::string& block, const Fn& fn) {
             if ((static_cast<unsigned char>(block[i + k]) & 0xC0) != 0x80) well_formed = false;
         }
         if (!well_formed) width = 1;
-        if (!fn(block.substr(i, width))) return false;
+        fn(block.substr(i, width));
         i += width;
     }
-    return true;
 }
 
 GridCells reshape(const std::vector<std::string>& cells) {
@@ -272,21 +272,19 @@ bool parse_grid_text(const std::string& text, GridCells& out, std::string& error
         out = reshape(blocks);
         return true;
     }
-    // One pass with bounded memory: the total is what the complaint reports, so the
-    // scan runs to the end, while the symbols are only kept while they can still be
-    // the 225 of a board and a fourth kind of symbol stops the whole scan at once.
+    // One pass with bounded memory: the complaint names the true number of symbol
+    // kinds and lists them all, so the scan runs to the end; only the storing of
+    // symbols stops, once they can no longer be the 225 of a board.
     size_t total = 0;
     std::vector<std::string> symbols;
     std::vector<std::string> kinds;
     for (const std::string& block : blocks) {
-        const bool scanned = for_each_codepoint(block, [&](const std::string& symbol) {
+        for_each_codepoint(block, [&](const std::string& symbol) {
             ++total;
             if (total <= static_cast<size_t>(BOARD_SIZE * BOARD_SIZE)) symbols.push_back(symbol);
             const std::string token = normalize(symbol);
             if (std::find(kinds.begin(), kinds.end(), token) == kinds.end()) kinds.push_back(token);
-            return kinds.size() <= 3;
         });
-        if (!scanned) break;
     }
     // A fourth kind of symbol means the text cannot be a board however long it is,
     // so it is reported before the cell count: a truncated dump and a file that

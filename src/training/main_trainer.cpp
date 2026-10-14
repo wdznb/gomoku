@@ -27,9 +27,13 @@ void print_usage(const char* program) {
         "                              additional rounds on top of the checkpoint.\n"
         "  --population N              Genetic population size (8)\n"
         "  --generations N             Genetic generations per round (4)\n"
-        "  --stagnation N              Generations without improvement before a\n"
-        "                              round's optimiser stops (3)\n"
-        "  --hill-iterations N         Hill-climbing evaluations per round (12)\n"
+        "  --stagnation N              Generations without improvement that end\n"
+        "                              a genetic round; hill climbing uses 3x\n"
+        "                              this as its probe budget (3)\n"
+        "  --hill-iterations N         Hill-climbing neighbour probes per round;\n"
+        "                              identical neighbours are skipped, and the\n"
+        "                              champion is scored once on top: at most\n"
+        "                              N+1 evaluations per round (12)\n"
         "  --depth N                   Search depth during training games (4)\n"
         "  --timeout-ms N              Per-move thinking budget in ms (400)\n"
         "  --max-moves N               Ply cap for a training game (60)\n"
@@ -62,7 +66,13 @@ std::string require_value(const char* flag, int& index, int argc, char** argv) {
     if (index + 1 >= argc) {
         throw std::invalid_argument(std::string("missing value for ") + flag);
     }
-    return argv[++index];
+    const std::string value = argv[++index];
+    // An empty value is usually an unexpanded shell variable, and for a path it is
+    // destructive: --resume "" skips the resume, then overwrites the default checkpoint.
+    if (value.empty()) {
+        throw std::invalid_argument(std::string("Invalid ") + flag + " (must not be empty)");
+    }
+    return value;
 }
 
 // A count of zero for anything but --rounds is not a smaller run, it is a run

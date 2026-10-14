@@ -941,11 +941,17 @@ void GameServer::handle_make_move(std::shared_ptr<WebSocketSession> session, con
         deferred_end_for_ = session.get();
     }
     if (!game->make_move(row, col)) {
+        // Nothing landed, so nothing is owed ahead of a move_made: release the slot
+        // and take back whatever a worker parked in it while the move was rejected,
+        // so that ending goes out to this session as it did before, not to nobody.
+        json held;
         {
             std::lock_guard<std::mutex> lock(end_frame_mutex_);
             deferred_end_for_ = nullptr;
+            held.swap(deferred_end_frame_);
         }
         send_error(session, "Invalid move");
+        if (!held.is_null()) send_message(session, held);
         return;
     }
     const int placed_color = game->player_color();

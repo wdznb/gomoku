@@ -41,3 +41,6 @@ data/sessions/
 
 # Logs
 *.log
+
+# Dependencies downloaded by build.sh (cmake-free path clones nlohmann/json here)
+deps/

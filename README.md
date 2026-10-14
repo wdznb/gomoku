@@ -519,7 +519,7 @@ ctest --output-on-failure
 `state_sync`（`choose_side` 的回应）与 `session`（`resume` 的回应、服务器开局新会话时的主动播报）
 携带**服务器权威棋盘**：前端必须照它们重画棋盘并采用其中的 `current_turn`，否则页面上可能显示服务器
 并没有的子。`thinking_progress` 的 `elapsed_ms` 与 `depth` 随迭代加深推进，`ai_move` 是这一次思考的
-终点。
+终点。终结全局的那一手先回落子帧再结算：玩家一子先 `move_made`、AI 一子先 `ai_move`，其后才是 `game_over`。
 
 `session_taken_over` 只在同一个 token 被另一个标签页 `resume` 接管时出现：服务器把它发给被替掉的
 那个连接，随后立即 `close`（见「会话与断线续局」里的后到者接管）。客户端收到后取消重连定时器、
