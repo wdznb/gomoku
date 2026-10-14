@@ -2715,11 +2715,16 @@ void test_engine_greedy_relabel_zeroes_the_alphabeta_count() {
 
     // Control: the same position with an ample budget completes layers, so the
     // count is reported. Zeroing is confined to the depth-0 branch.
+    //
+    // Round 112 §3(a): this layer measures about 4858 nodes / 433 ms without -O2, so
+    // 2000 ms left only ~4.6x headroom and a saturated machine ran out of it and fell to
+    // greedy, turning :2742 red. 20000 ms is ~46x. The discriminator above is the 10 ms
+    // interrupted call, which this does not touch, so no discriminating power is lost.
     SearchEngine full;
     full.set_vcf_enabled(false);
     full.set_vct_enabled(false);
     full.set_resign_detection(false);
-    const SearchResult completed = full.search(board, WHITE, 4, 2000, stop);
+    const SearchResult completed = full.search(board, WHITE, 4, 20000, stop);
 
     std::cout << "test_engine_greedy_relabel_zeroes_the_alphabeta_count measured "
               << "(interrupted: " << interrupted.method << " d" << interrupted.depth

@@ -207,6 +207,11 @@ class GomokuGame {
             this.wsReconnect = null;
         }
         this.stopPing();
+        // Taken over means this page is no longer the side operating the game, and
+        // the replay clock is the only timer here that was never released. Left
+        // running, its interval keeps stepping the replay and writing 「回放 · 第 N 手」
+        // back to the top bar over the warning below (README:567).
+        this.stopReplayAuto();
         this.aiThinking = false;
         this.hintInFlight = false;
         // The socket is closed behind our back, so no error frame will ever reach
@@ -329,10 +334,15 @@ class GomokuGame {
 
     // What a resumed session is worth saying, from the state the server just
     // described: an ending, a position nobody has taken a side of, an empty board
-    // with a side claimed, or a game in progress. The count is the server's ply
-    // count - the local list belongs to whatever game this page last drew.
+    // with a side claimed, or a game in progress. The authoritative session frame
+    // carries the stones on the board (README:580), the 摆棋 base included, so that
+    // number is only ever 「N 子」. The ply count comes with the replay instead: that
+    // path passes nothing and falls back to the local move list, and says 「N 手」.
+    // The local list belongs to whatever game this page last drew, which is why it
+    // is not the resume count.
     resumedStatusText(moveCount) {
-        const count = Number.isInteger(moveCount) ? moveCount : this.moveHistory.length;
+        const fromServer = Number.isInteger(moveCount);
+        const count = fromServer ? moveCount : this.moveHistory.length;
         const turn = `轮到${this.currentTurn === BLACK ? '黑' : '白'}方`;
         if (this.gameStatus === 'game_over' && this.gameOverText) return this.gameOverText;
         if (this.gameStatus === 'waiting') {
@@ -348,7 +358,7 @@ class GomokuGame {
             const installed = this.board.flat().filter(v => v !== 0).length;
             if (installed > 0) return `已恢复摆好的局面：${installed} 子，${turn}`;
         }
-        return `已恢复对局：${count} 手 · ${turn}`;
+        return `已恢复对局：${count} ${fromServer ? '子' : '手'} · ${turn}`;
     }
     
     initUI() {

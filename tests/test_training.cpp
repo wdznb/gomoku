@@ -2082,6 +2082,99 @@ void test_data_game_ids_unique_across_batches() {
     std::cout << "test_data_game_ids_unique_across_batches passed" << std::endl;
 }
 
+// Round 112 PP1: the id a data game got used to be games_played_ + 1 + t * 1000, i.e. a
+// fixed offset off a counter every round advances (trainer.cpp:72 and :256 add each
+// merged record, plus the fitness and verification games). A long run therefore
+// re-reaches the offset legitimately: on the round where games_played_ is 1000, worker
+// 0's base is exactly the base worker 1 used on the games_played_ = 0 round, so two
+// different games are written under one game_id, and samples.jsonl loses the
+// (game_id, move_index) identity README:181's append stream needs. The fix claims every
+// id from one atomic counter, so claims equal merged records and no id is handed out
+// twice.
+//
+// The same stride also overlaps INSIDE one call once a worker's own count passes 1000:
+// games=2001, threads=2 gives per_worker=1000 and remainder=1, so t=0 plays 1001 games
+// and its 1001st lands on games_played_ + 1001, the very id t=1's first game uses. That
+// arm is deliberately not built here - it needs 2001 games really played - so the
+// arithmetic stays in this comment and the case below covers the cross-round reissue,
+// which is what a long run actually hits.
+//
+// The claim is pinned as two disjoint id sets rather than "distinct ids == games played":
+// generate_data_games answers with the sample count, not the game count, and a recorded
+// game whose plies all fall under the collector's search-depth gate claims an id without
+// contributing a row, so the file's id count is a lower bound on the games.
+void test_data_game_ids_do_not_repeat_across_rounds() {
+    TrainingConfig config = fast_training_config();
+    config.search_depth = 2;
+    config.timeout_ms = 120;
+    config.max_moves = 8;
+    config.data_opening_plies = 2;
+    config.seed = 13579;
+    config.records_path.clear();
+    const std::filesystem::path samples = temp_path("pp1_samples.jsonl");
+    config.samples_path = samples.string();
+
+    // One ply is owed up to SYMMETRY_COUNT rows: collection augments it into oriented
+    // variants that all carry that ply's move_index (see the per-ply counts in
+    // test_collector_keeps_the_variant_that_moved_the_last_stone). So a (game_id,
+    // move_index) pair repeats by design - what it may never do is name two different
+    // games, which is exactly what one id handed out twice amounts to. Judge the pair by
+    // its row count, and the two batches by whether they share an id.
+    const auto busiest_pair = [](const std::vector<TrainingSample>& rows) {
+        std::map<std::pair<int, int>, int> counts;
+        for (const auto& row : rows) counts[{row.game_id, row.move_index}] += 1;
+        int busiest = 0;
+        for (const auto& entry : counts) if (entry.second > busiest) busiest = entry.second;
+        return busiest;
+    };
+    const auto ids_of = [](const std::vector<TrainingSample>& rows) {
+        std::set<int> ids;
+        for (const auto& row : rows) ids.insert(row.game_id);
+        return ids;
+    };
+
+    Trainer trainer(ThreatCoefficients(), config);
+    assert(trainer.generate_data_games(4, 2) > 0);
+
+    std::vector<TrainingSample> first_batch;
+    std::string error;
+    assert(DataCollector::read_jsonl(samples.string(), first_batch, error));
+    assert(!first_batch.empty());
+
+    // Control, green on both trees: inside one call the two workers still sit 1000
+    // apart, so no id is shared and no pair leaves its ply.
+    assert(busiest_pair(first_batch) <= SYMMETRY_COUNT);
+    const std::set<int> first_ids = ids_of(first_batch);
+    assert(first_ids.size() >= 2);
+    const size_t first_rows = first_batch.size();
+
+    // A real long-run state, not an invented one: games_played_ only ever climbs, and
+    // this is the value where HEAD's t=1 offset from the very first round becomes t=0's
+    // offset for this round.
+    trainer.games_played_ = 1000;
+    assert(trainer.generate_data_games(4, 2) > 0);
+
+    std::vector<TrainingSample> all;
+    assert(DataCollector::read_jsonl(samples.string(), all, error));
+    assert(all.size() > first_rows);
+
+    // The second batch's rows are exactly what the append added after the first read.
+    const std::vector<TrainingSample> second_batch(all.begin() +
+                                                       static_cast<long>(first_rows),
+                                                   all.end());
+    const std::set<int> second_ids = ids_of(second_batch);
+    assert(!second_ids.empty());
+
+    // Discriminator: HEAD numbers this batch's worker 0 from 1000 + 1, which is where
+    // the first batch's worker 1 already started, so the same game_id names two
+    // different games and their plies pile up under one pair.
+    for (int id : second_ids) assert(first_ids.count(id) == 0);
+    assert(ids_of(all).size() == first_ids.size() + second_ids.size());
+    assert(busiest_pair(all) <= SYMMETRY_COUNT);
+
+    std::cout << "test_data_game_ids_do_not_repeat_across_rounds passed" << std::endl;
+}
+
 // Round 73, play_match: an odd game request rounds UP to the next even count -
 // every pairing plays both colours - and the score is normalised by the games
 // actually played: --fitness-games 3 means four games, not two.
@@ -3764,6 +3857,7 @@ int main() {
     test_genetic_stagnation_count_is_per_run();
     test_trainer_refuses_one_file_written_two_ways_for_out_and_checkpoint();
     test_trainer_accepts_a_resume_and_checkpoint_that_differ_only_by_a_dot_segment();
+    test_data_game_ids_do_not_repeat_across_rounds();
 
     std::cout << "All training tests passed" << std::endl;
     return 0;

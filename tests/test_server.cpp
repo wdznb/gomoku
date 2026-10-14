@@ -1217,6 +1217,105 @@ void test_failed_flush_keeps_the_overdue_entry_hot() {
     std::cout << "test_failed_flush_keeps_the_overdue_entry_hot passed" << std::endl;
 }
 
+// Round 112 PP2: an overdue entry used to go onto cold_sessions_ whatever it held, and
+// a snapshot of a game with no stone anywhere was shelved too - flush_entry's
+// empty-content branch had already deleted its file, so the shelf kept the only copy of
+// a token that describes nothing. A resume then rebuilt from that snapshot under the
+// SAME token and answered resumed:false, while README:487-488 says a game the server
+// cannot come back to opens a new one: resumed:false plus a NEW token. Dropping the
+// contentless entry instead leaves the token unknown both on disk and in memory, so the
+// resume falls through to open_session(nullptr) like any unknown token does.
+void test_a_shelved_contentless_session_does_not_keep_its_token() {
+    const auto dir = scratch("pp2_sessions");
+    const auto records = scratch("pp2_records.jsonl");
+    const auto wall_ms = [] {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::system_clock::now().time_since_epoch()).count();
+    };
+    {
+        Harness h(dir, records);
+        assert(h.entry->game->restore_game(playing_restore(1)));  // one stone, WHITE to move
+        h.server.flush_entry(h.entry);
+        const std::string token = h.entry->token;
+        const auto file = dir / (token + ".json");
+        // The game really was on disk before the undo took it back.
+        assert(std::filesystem::exists(file));
+
+        h.server.handle_undo(h.socket);
+        assert(h.entry->game->replay_snapshot().move_count == 0);
+        assert(h.server.flush_entry(h.entry));  // empty branch: delete the residue
+        assert(!std::filesystem::exists(file));
+
+        // Past the reattach window without sleeping 30 minutes: detach is what stamps
+        // detached_ms, and the tick's own clock decides it is overdue.
+        h.server.detach_socket(h.socket.get());
+        h.entry->detached_ms = wall_ms() - 30LL * 60LL * 1000LL - 10;
+        h.server.on_flush_tick();
+
+        // Nothing contentless was shelved, and the table no longer holds it.
+        assert(h.server.cold_sessions_.count(token) == 0);
+        assert(h.server.sessions_.count(token) == 0);
+
+        auto second = std::make_shared<WebSocketSession>(tcp::socket(h.server.ioc_), std::string());
+        size_t seen = 0;
+        h.server.handle_resume(second, json{{"token", token}});
+        json frame;
+        for (const std::string& text : drain_frames(h.server, second, seen)) {
+            const json parsed = json::parse(text, nullptr, false);
+            if (!parsed.is_discarded() && parsed.value("type", "") == "session") frame = parsed;
+        }
+        assert(frame.is_object());
+        assert(frame["resumed"] == false);
+        // Discriminator: the dead token is not handed back - the answer names a new one.
+        assert(frame["token"] != token);
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    std::filesystem::remove(records, ec);
+    std::cout << "test_a_shelved_contentless_session_does_not_keep_its_token passed" << std::endl;
+}
+
+// Round 112 PP2 control: the same tick still shelves a game that has stones on it, and
+// its token still comes back - README:565-566, past 30 minutes the resume rebuilds from
+// disk and the token stays valid. Without this arm the guard above would be indistinguishable
+// from "cold resume is broken".
+void test_a_shelved_played_session_keeps_its_token() {
+    const auto dir = scratch("pp2c_sessions");
+    const auto records = scratch("pp2c_records.jsonl");
+    const auto wall_ms = [] {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::system_clock::now().time_since_epoch()).count();
+    };
+    {
+        Harness h(dir, records);
+        assert(h.entry->game->restore_game(playing_restore(2)));
+        h.server.detach_socket(h.socket.get());  // flushes: the two-stone game lands
+        const std::string token = h.entry->token;
+        assert(std::filesystem::exists(dir / (token + ".json")));
+
+        h.entry->detached_ms = wall_ms() - 30LL * 60LL * 1000LL - 10;
+        h.server.on_flush_tick();
+        assert(h.server.cold_sessions_.count(token) == 1);
+        assert(h.server.sessions_.count(token) == 0);
+
+        auto second = std::make_shared<WebSocketSession>(tcp::socket(h.server.ioc_), std::string());
+        size_t seen = 0;
+        h.server.handle_resume(second, json{{"token", token}});
+        json frame;
+        for (const std::string& text : drain_frames(h.server, second, seen)) {
+            const json parsed = json::parse(text, nullptr, false);
+            if (!parsed.is_discarded() && parsed.value("type", "") == "session") frame = parsed;
+        }
+        assert(frame.is_object());
+        assert(frame["token"] == token);
+        assert(frame["resumed"] == true);
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    std::filesystem::remove(records, ec);
+    std::cout << "test_a_shelved_played_session_keeps_its_token passed" << std::endl;
+}
+
 // Round 81, C1: handle_resign's "started" guard must count played plies, not
 // stones on the board. A hand-set position installs its base stones as the board
 // itself (game_manager.cpp:90), so replay_snapshot().move_count is non-zero while
@@ -2431,6 +2530,8 @@ int main() {
     test_transient_accept_failure_rearms_and_abort_ends();
     test_http_answers_a_read_with_the_file_and_a_write_with_a_refusal();
     test_resolve_file_reads_a_single_dot_segment_and_still_refuses_every_escape();
+    test_a_shelved_contentless_session_does_not_keep_its_token();
+    test_a_shelved_played_session_keeps_its_token();
 
     std::cout << "All server tests passed!" << std::endl;
     return 0;

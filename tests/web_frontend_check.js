@@ -564,7 +564,11 @@ check('J4 resumed status reports the server ply count', () => {
         reason: '',
         board: emptyBoard(),
     });
-    assert(status !== null && status.indexOf('已恢复对局：7 手') !== -1,
+    // Round 112 PP3: the unit on this line follows README:580, which defines the
+    // session frame's move_count as 盘上子数, so the server's number is counted in 子.
+    // What the assertion is doing is unchanged - it still says "the server's number,
+    // not the local list" (see the :547 comment).
+    assert(status !== null && status.indexOf('已恢复对局：7 子') !== -1,
            'the server count must be reported, got: ' + status);
 
     // missing or non-numeric -> the local record is the only count left
@@ -1884,7 +1888,9 @@ check('BB1 a missed resume lands the fresh session it was answered with', () => 
     assert(resumed.resumeApplied === true, 'the resume still flags its replay answer');
     assert(resumedSent.some(m => m && m.type === 'request_replay'),
            'and still asks for the replay');
-    assert(el('status').textContent.indexOf('已恢复对局：1 手') >= 0,
+    // BB1 (round 97) pinned 手 here; README:580 defines a session frame's move_count
+    // as the stones on the board, so PP3 corrected the unit to 子 for this frame too.
+    assert(el('status').textContent.indexOf('已恢复对局：1 子') >= 0,
            'with the resumed status line, got: ' + el('status').textContent);
 });
 
@@ -2827,6 +2833,121 @@ check('LL5 the greying 终止 undoes is the one handleThinkingProgress arms', ()
     game.moveHistory = [];
     game.refreshReplayControls();
     assert(el('btn-replay-play').disabled === true, 'while an empty record still keeps it away');
+});
+
+// PP3 (round 112): README:580 defines the session frame's move_count as 盘上子数 - the
+// stones on the board, the 摆棋 base included - while 手 counts plies. The resumed line
+// printed that server number with 手, so a game that opened from a five-stone installed
+// position and then played six plies announced 「11 手」 over eleven stones. The
+// authoritative frame reads 子; the ply count keeps 手, because it comes from the replay
+// frame, whose path passes nothing to resumedStatusText and falls back to the local list.
+check('PP3 the resume frame counts 子 and the replay frame counts 手', () => {
+    const game = newGame();
+    let status = null;
+    const original = game.updateStatus.bind(game);
+    game.updateStatus = (text, kind) => { status = text; original(text, kind); };
+    game.sendMessage = () => true;
+
+    const base = [
+        { row: 6, col: 6, color: 'black' },
+        { row: 8, col: 8, color: 'white' },
+        { row: 5, col: 7, color: 'black' },
+        { row: 9, col: 7, color: 'white' },
+        { row: 7, col: 5, color: 'black' },
+    ];
+    const moves = [
+        { row: 7, col: 7, color: 'white' },
+        { row: 7, col: 8, color: 'black' },
+        { row: 8, col: 6, color: 'white' },
+        { row: 6, col: 8, color: 'black' },
+        { row: 8, col: 9, color: 'white' },
+        { row: 9, col: 8, color: 'black' },
+    ];
+    const board = emptyBoard();
+    for (const stone of base.concat(moves)) {
+        board[stone.row][stone.col] = stone.color === 'black' ? BLACK : WHITE;
+    }
+
+    game.handleServerMessage({
+        type: 'session',
+        token: 'a'.repeat(16),
+        resumed: true,
+        player_color: 'black',
+        game_status: 'playing',
+        current_turn: 'white',
+        move_count: base.length + moves.length,
+        max_depth: 6,
+        timeout_ms: 5000,
+        winner: '',
+        reason: '',
+        board: board,
+    });
+    // Discriminator: HEAD writes 「11 手」 here.
+    assert(status.indexOf('已恢复对局：11 子') !== -1,
+           'the server number counts stones, got: ' + status);
+    assert(status.indexOf('11 手') === -1, 'and never plies, got: ' + status);
+
+    // Control, green on both trees: the replay reply is the ply path.
+    game.handleServerMessage({ type: 'replay', base: base, moves: moves, game_over: false });
+    assert(status.indexOf('已恢复对局：6 手') !== -1,
+           'the resumed replay still counts plies, got: ' + status);
+});
+
+// PP4 (round 112): handleTakenOver released the reconnect timer and the ping and left
+// the replay clock running. A page that lost the game to another tab is not the page
+// stepping through its record any more, and the interval outliving that decision is the
+// one thing here still acting on the game. Like JJ3, the harness cannot wait for a real
+// 700 ms tick, so it records what setInterval was handed and fires only intervals the
+// page has not cleared - a browser has no other choice.
+check('PP4 a takeover releases the replay clock along with the other timers', () => {
+    const sandbox = bundle.sandbox;
+    const realSetInterval = sandbox.setInterval;
+    const realClearInterval = sandbox.clearInterval;
+    const timers = [];
+    const cleared = [];
+    sandbox.setInterval = (fn) => { timers.push(fn); return timers.length; };
+    sandbox.clearInterval = (id) => {
+        if (id) { cleared.push(id); timers[id - 1] = null; }
+    };
+    try {
+        const game = newGame();
+        game.playerColor = BLACK;
+        game.gameStatus = 'playing';
+        game.aiThinking = false;
+        game.board = emptyBoard();
+        game.baseStones = [];
+        game.analysis = [];
+        game.moveHistory = [
+            { row: 7, col: 7, color: BLACK },
+            { row: 8, col: 8, color: WHITE },
+            { row: 6, col: 6, color: BLACK },
+        ];
+        game.replayIndex = 0;
+        game.toggleReplayAuto();
+        const armed = game.replayTimer;
+        // Control, green on both trees: the same arming path leaves a live clock.
+        assert(typeof armed === 'number' && armed > 0, '自动 armed one interval');
+        assert(el('btn-replay-play').textContent === '暂停', 'and the control reads as playing');
+
+        const painted = [];
+        game.ctx.fillText = (text) => { painted.push(text); };
+
+        game.handleServerMessage({ type: 'session_taken_over', token: 'a'.repeat(16) });
+
+        assert(game.replayTimer === null, 'the takeover must leave no replay clock owned');
+        assert(cleared.indexOf(armed) >= 0, 'and must clear the interval it armed');
+        assert(el('status').textContent.indexOf('本局面已在其他标签页打开') === 0,
+               'the warning stays on the top bar, got: ' + el('status').textContent);
+        // Only an uncleared clock can still paint: on HEAD this is the orphan tick
+        // writing 回放 · 第 N 手 over a page that no longer operates the game.
+        if (cleared.indexOf(armed) === -1) timers[armed - 1]();
+        assert(painted.every((text) => text.indexOf('回放') === -1),
+               'no replay overlay is painted after the takeover, got: ' + painted.join(' | '));
+        assert(el('btn-replay-play').textContent === '自动', 'and 自动 is handed back');
+    } finally {
+        sandbox.setInterval = realSetInterval;
+        sandbox.clearInterval = realClearInterval;
+    }
 });
 
 let failed = 0;

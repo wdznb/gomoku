@@ -1979,6 +1979,77 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次112 「冷架上那份什么都没有的快照，与三处「这是谁的数」被混用」 — bugfix round 112 batch PP
+
+**Found（批次 PP，四条都来自轮次111 预告里我逐函数读回核验过的候选）.**
+
+- **PP1** `src/training/trainer.cpp` 的样本盘号是**算**出来的：`const int game_id_base = games_played_ + 1 + t * 1000`。
+  两个面都会重复发号：① 单个 worker 的盘数一旦越过 1000，t=0 与 t=1 的 id 带就互相覆盖；② 那个 `+ t * 1000` 偏移是
+  相对**只增不减**的 `games_played_` 的，后续轮次会合法地把它重新达到，于是这一轮发出的 id 与更早某一轮用过的 id
+  相同。后果是 samples.jsonl 里同一个 `game_id` 命名两盘不同的棋，而 README:181 要求这条追加流每行分得开。
+- **PP2** `src/server/server.cpp` 的 `on_flush_tick()` 把到期 entry **无论里面有没有东西**都放回 `cold_sessions_`，
+  可 `flush_entry()` 的「一子未落不保留」分支早已删掉该 token 的磁盘文件——冷架于是留着那份什么都不是的快照当唯一
+  副本。拿它去 resume 答的是 `resumed:false` **加同一个旧 token**，而 README:487-488 说的是回不来的局面开新局
+  **并给新 token**。
+- **PP3** `web/app.js` 的 `resumedStatusText()` 把权威 session 帧的 `move_count` 写成「N 手」；README:580 定义这个
+  字段是**盘上子数**（含摆棋的 `base` 子）。「手」只属于 replay 那条路径。
+- **PP4** `web/app.js` 的 `handleTakenOver()` 放开了重连、心跳与思考态，唯独没放 `replayTimer`：README:567 说接管后
+  这一页不再是操作方，可那个 interval 还在步进回放并把「回放 · 第 N 手」写回顶栏，盖掉接管提示。
+
+**Fixed.** `src/server/server.cpp` +21/−9（`base`/`record.moves`/`player_color` 三处全空的快照直接 `erase`，不再上
+冷架；`!overdue || !settled` 的重试分枝提到函数头，先判「该不该动它」再取快照）、`src/training/trainer.cpp` +15/−5
+（`std::atomic<int> next_data_id{games_played_ + 1}`，每盘**真正入档**的棋在 `collect()` 处 `fetch_add(1)` 领号——
+INVALID 的 `continue` 在领取之前，所以领取次数 == 合并后的记录数 == join 后 `games_played_` 的推进量，两个 worker
+同时领也互斥）、`web/app.js` +14/−4（接管时 `stopReplayAuto()`；`resumedStatusText()` 用 `fromServer` 分辨「子」与
+「手」）。契约文本 `build/r112_pp_spec.txt` 逐字下发。README 不动（658 行不变）。
+
+**裁决（不是缺陷）.** 轮次111 预告里另外几条读回后否掉：U1「INVALID 漏计一个 id」在数据路径不可达（那种盘由
+`explore()` 的停止标志产生，根本不进 `records`），判**无可观察差异**；接管分支漏 flush——`set_game_over_callback`
+已经 `net::post` 落过一次盘，接管路径手里没有未落的结果；`deferred_end_for_` 不随接管复位——那帧的接收方就是被接管
+的那条 socket，留着只会把 held 帧发给已关闭的会话；副本全空时 确认 不发 `set_position`——README 的摆棋一节把「全空」
+就读作清空当前局面，不发帧才是对的。
+
+**Verified.** 测试会话只动 `tests/`：`tests/test_training.cpp` +94/0、`tests/test_server.cpp` +101/0、
+`tests/web_frontend_check.js` +123/−2、`tests/test_search.cpp` +6/−1（只有轮次111 授权的 §3(a)：`:2742` 控制臂预算
+2000→20000 ms，`:2149` 所在用例没碰）。HEAD 反证（`git archive 1fac892` 只读解包 + 单 TU 重链）红点
+`test_training.cpp:2171`（两批 id 集合相交）、`test_server.cpp:1256`（冷架仍留空快照、旧 token 复活）、
+`web_frontend_check.js:2884`（HEAD 打「11 手」）、`:2935`（`replayTimer` 仍在），HEAD 整跑 web **70/74**；四条控制臂
+（同一次调用内的 id 带互不重叠、有子的会话仍按同 token 复活、replay 支仍写「手」、未接管时定时器与「暂停」按钮都在）
+两棵树都绿。
+
+**契约里两处是我写错了，按实测纠正**（不是测试会话自行放宽）：① 我写「同一手内部不会重复同一对」——`collect()`
+每手增强成最多 `SYMMETRY_COUNT`（8，`src/core/transforms.h:12`）个朝向变体，全都带这一手的 `move_index`，所以一对
+`(game_id, move_index)` 合法地带 8 行；判别因此改成「两批 id 集合互斥 + 每对行数 ≤ 8」，`generate_data_games()` 的
+返回值也如实是**样本**数而非盘数。② PP4 那句「手动跑一次被捕获的回调也不得改成……」无法照字面断言（tick 闭包里
+没有存活检查，修复树上照样会步进），改用 JJ3 已有的 `if (cleared.indexOf(armed) === -1) tick();` 姿势 + `fillText`
+记录器。
+
+**合约过期 1 条，已裁决并结案**：`tests/web_frontend_check.js:1891`（BB1，轮次97）把服务器权威帧的期望钉成
+「已恢复对局：1 手」——那正是 PP3 修掉的单位错误（该用例的帧就是 `move_count: 1` 且盘上一粒黑子），与契约已授权的
+:571 同一类；只把期望字样改成「1 子」并补一行 README:580 的 why 注释，断言取法与 `got:` 尾巴不动。`:583`/`:585`
+（`resumedStatusText(undefined)` 与 `('7')`，走本地手数回退）仍写「手」，本来就不该动。
+
+**门禁由我自己跑完：空闲臂** `100% tests passed, 0 tests failed out of 8` /「Total Test time (real) =  75.05 sec」
+（比上一轮 47.86 s 长，就是 `:2742` 控制臂抬到 20000 ms 后那层控制搜索真的跑到终点、不再被 2 s 剪掉的代价）、
+`web_frontend_check: 74/74 passed`、`readme_anchor_check: 94 citations, 0 problems`（84→94 全是新用例注释新增的
+README 引用）、`658 README.md`。**负载臂**（12 核 + 24 `yes`，两跑）这回 **8/8 / 8/8**，`test_search` 39.85 /
+39.69 s，`:2149` 没有开火——它仍是机器相对前提，不算赦免。
+
+**下一轮（轮次113）预告.** 四个只读审计（构建/打包/测试登记、特征提取与样本采集、会话生命周期时序、WS 帧契约对表）。
+已判：`build.sh:44-126` 的 cmake-free 分支**既不产测试二进制也不说一句**（README:435/441-448 无条件让读者去跑 ctest
+与八个 `./test_*`）是真缺陷；`cp -r ../web .` 重复跑**不会**套出 `web/web`（GNU cp 是合并覆盖，隔离探针三跑只剩一个
+`web`），那条否掉；`-Wno-template-body -Wno-template-id-cdtor` 在两条 g++ 命令行里缺失是**无可观察差异**（本机 g++
+15.2.0 下这份代码 0 条这类告警，两条源文件清单与 CMake 的 `GOMOKU_SOURCES`/`GOMOKU_TRAINING_SOURCES` 逐一对得上，
+无缺源）。特征域整域 CLEAN：`recognize_position_both` 与两次 `recognize_position` 逐分支等价（参数元组字节相同，
+只有 4 次线位重复解码）、52 维索引无重叠（`PATTERN_SLOTS=8` ⇒ 0..15，`FEATURE_MY_FIVE=16` … `FEATURE_WINDOW`
+27..51）、`centre_control` 值域 [0,1] 且角格恰为 0、满盘和局的标签处理与正常负局一致。「禁手点不该进特征」按
+README:30 自己列举的范围（`evaluate_position` / `evaluate_position_pair` 及其下游）本来就不在管内，且这些特征没有
+任何对局期消费者（`gomoku_server --params` 只读威胁系数），否掉。时序域 CLEAN：秒↔ms 只换算一次、客户端 ping 30 s
+对服务器空闲 120 s 有 4 倍余量、`detached_ms` 每次 detach 都重打时间戳（attach 清零）所以不存在提前回收、
+`kReattachWindowSeconds = 30*60` 与 README:565-566 一致。帧契约对表 CLEAN：服务器 15 种 / 客户端 13 种，逐方向
+0 条漏接（`pong` 客户端按 README:551 就是忽略），八条字段读写差异全是**无可观察差异**，README 门控过的入站类型
+全部有门。
+
 ## 轮次111 「非读取」被当成读取回答的那一半端口，与一条把 `.` 跟 `..` 一起拒掉的守卫 — bugfix round 111 batch OO
 
 **先办上一轮的欠账：`'parked'` flake 的归属判定.** 结论是**用例侧的墙钟前提，不是产品时序**。12 核机器上开

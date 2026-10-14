@@ -11,6 +11,7 @@
 #include <thread>
 #include <algorithm>
 #include <cmath>
+#include <atomic>
 
 using json = nlohmann::json;
 
@@ -188,6 +189,15 @@ int Trainer::generate_data_games(int games, int threads) {
     std::vector<std::thread> workers;
     workers.reserve(worker_count);
 
+    // One id per game that actually yields samples, claimed from this counter
+    // instead of computed from the worker number: the claim count equals the merged
+    // record count, so the games_played_ advance after join and the ids already
+    // handed out stay exactly aligned. A fixed 1000 stride makes two workers overlap
+    // once a worker's count passes 1000, and its offset relative to games_played_ is
+    // legitimately re-reached in later rounds; both show up as a repeated
+    // (game_id, move_index) in samples.jsonl - the identity of the training data,
+    // which README:181's append stream has to keep separable.
+    std::atomic<int> next_data_id{games_played_ + 1};
     DataCollector collector;
     const ThreatCoefficients current_champion = champion();
 
@@ -220,9 +230,9 @@ int Trainer::generate_data_games(int games, int threads) {
             // but the checkpoint is only written at the end of the round, so a
             // kill between the data append and the checkpoint still reissues this
             // round's ids on --resume. Real protection needs an export marker and
-            // is not built yet. Workers only read it; it advances after join.
-            // Still 1000 apart per worker.
-            const int game_id_base = games_played_ + 1 + t * 1000;
+            // is not built yet. Workers only read games_played_; each id is claimed
+            // from next_data_id, so several threads claiming at once is atomic and
+            // not a data race.
             for (int i = 0; i < count; ++i) {
                 GameRecord record;
                 if (!explorer.explore(record, nullptr)) {
@@ -236,8 +246,8 @@ int Trainer::generate_data_games(int games, int threads) {
                 if (record.reason == GameEndReason::INVALID) continue;
                 local.records.push_back(record);
 
-                std::vector<TrainingSample> samples =
-                    collector.collect(record, game_id_base + i, true);
+                std::vector<TrainingSample> samples = collector.collect(
+                    record, next_data_id.fetch_add(1), true);
                 for (auto& sample : samples) local.samples.push_back(std::move(sample));
             }
         });

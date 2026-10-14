@@ -1587,17 +1587,29 @@ void GameServer::on_flush_tick() {
         TrackedGame& entry = *it->second;
         const bool overdue = !entry.attached && entry.detached_ms > 0 &&
                              now_ms() - entry.detached_ms >= kReattachWindowSeconds * 1000LL;
-        if (overdue && settled) {
-            // Back onto the shelf. The file is current (flush_entry just settled
-            // it), so what is dropped is the engine, not the game: the token still
-            // resumes, by rebuilding from that file.
-            cold_sessions_[entry.token] = snapshot_of(entry);
-            it = sessions_.erase(it);
-        } else {
-            // A failed write leaves the entry in the table, so the next tick
-            // retries it instead of shelving a game whose file is stale.
+        if (!overdue || !settled) {
+            // A failed write leaves the entry in the table, so the next tick retries it
+            // instead of shelving a game whose file is stale.
             ++it;
+            continue;
         }
+        const SessionSnapshot shelved = snapshot_of(entry);
+        if (shelved.base.empty() && shelved.record.moves.empty() &&
+            shelved.player_color.empty()) {
+            // Nothing was ever played here, and flush_entry's empty-content branch
+            // already deleted this token's file. Shelving the snapshot would only let
+            // the old token come back at resume as a resumed:false frame naming the
+            // SAME token, while README:487 asks for a new game with a new token;
+            // dropping the entry leaves the token unknown both on disk and in memory,
+            // so the next resume falls through to open_session(nullptr).
+            it = sessions_.erase(it);
+            continue;
+        }
+        // Back onto the shelf. The file is current (flush_entry just settled
+        // it), so what is dropped is the engine, not the game: the token still
+        // resumes, by rebuilding from that file.
+        cold_sessions_[entry.token] = shelved;
+        it = sessions_.erase(it);
     }
 }
 
