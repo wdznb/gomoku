@@ -2411,6 +2411,208 @@ check('III3 an ending with no 摆棋 open still writes the top bar at once', () 
     assert(el('status').textContent !== fresh.gameOverText, 'and it is not an empty result line');
 });
 
+// JJ1 (round 106): README:326-327 promises the 求招 answer is 标在棋盘上, and that a
+// position which gains another stone retires that answer. The ring used to be painted
+// by highlightMove alone, one frame deep in the canvas, so any later redraw - 旋转 /
+// 镜像, a stone landing, a status repaint - dropped it while the top bar still read
+// 建议 H8. The fix keeps it as display state (this.recommendation) painted inside
+// drawBoard, so the only honest probe is a repaint that never re-runs highlightMove.
+// The harness cannot see CSS, but the board ctx is observable: the ring is the one
+// stroke whose style is #c0392b at radius geom.stone + 3.
+const ringRecorder = () => {
+    const ctx = el('board').getContext();
+    const marks = [];
+    let pending = null;
+    ctx.beginPath = () => { pending = null; };
+    ctx.arc = (x, y, r) => { pending = { x, y, r }; };
+    ctx.stroke = () => {
+        if (pending) {
+            marks.push({ r: pending.r, style: String(ctx.strokeStyle), width: ctx.lineWidth });
+        }
+        pending = null;
+    };
+    return {
+        marks,
+        clear: () => { marks.length = 0; pending = null; },
+        restore: () => {
+            ctx.beginPath = () => {};
+            ctx.arc = () => {};
+            ctx.stroke = () => {};
+        },
+    };
+};
+
+const adviceRings = (rec, game) =>
+    rec.marks.filter(m => m.style === '#c0392b' &&
+                         Math.abs(m.r - (game.geom.stone + 3)) < 1e-9 &&
+                         m.width === 2);
+
+const adviceGame = () => {
+    const game = newGame();
+    game.sendMessage = () => true;
+    game.playerColor = BLACK;
+    game.gameStatus = 'playing';
+    game.currentTurn = BLACK;
+    game.aiThinking = false;
+    game.board = emptyBoard();
+    game.baseStones = [];
+    game.moveHistory = [];
+    game.analysis = [];
+    game.replayIndex = null;
+    game.setup.active = false;
+    game.hintInFlight = true;
+    game.hintMoveCount = 0;
+    return game;
+};
+
+check('JJ1 the 建议环 survives a repaint that never re-asks 求招', () => {
+    const game = adviceGame();
+    const rec = ringRecorder();
+    try {
+        game.handleServerMessage({ type: 'hint_result', row: 7, col: 7, score: 1234 });
+        assert(adviceRings(rec, game).length === 1, 'the answer paints its ring once');
+        rec.clear();
+
+        // 旋转 is display-only (README:379) and goes through applyView -> drawBoard,
+        // never through highlightMove: this is the repaint that used to lose the ring.
+        assert(fireClick('btn-view-rotate'), 'btn-view-rotate registers a click handler');
+        const after = adviceRings(rec, game);
+        assert(after.length === 1,
+               'the ring the player was promised is still on the board after a repaint, got ' +
+               after.length);
+        assert(el('status').textContent.indexOf('视角') === 0,
+               'and the repaint really was the view one, got: ' + el('status').textContent);
+    } finally {
+        rec.restore();
+    }
+});
+
+check('JJ1 a repaint with no 求招 in the game draws no ring', () => {
+    const game = adviceGame();
+    const rec = ringRecorder();
+    try {
+        rec.clear();
+        assert(fireClick('btn-view-rotate'), 'btn-view-rotate registers a click handler');
+        assert(adviceRings(rec, game).length === 0, 'a board nobody asked advice about stays plain');
+    } finally {
+        rec.restore();
+    }
+});
+
+check('JJ1 the next stone retires the 建议环', () => {
+    const game = adviceGame();
+    const rec = ringRecorder();
+    try {
+        game.handleServerMessage({ type: 'hint_result', row: 7, col: 7, score: 1234 });
+        assert(adviceRings(rec, game).length === 1, 'the answer is on the board first');
+        rec.clear();
+
+        // 局面又落一手，这一份建议作废 (README:327) - move_made is the frame that places it.
+        game.handleMoveMade({ row: 8, col: 8, color: 'white' });
+        assert(adviceRings(rec, game).length === 0, 'the stone repaints no retired ring');
+        rec.clear();
+        assert(fireClick('btn-view-rotate'), 'btn-view-rotate registers a click handler');
+        assert(adviceRings(rec, game).length === 0, 'and a later repaint does not bring it back');
+        assert(game.moveHistory.length === 1, 'the stone itself landed');
+    } finally {
+        rec.restore();
+    }
+});
+
+// JJ3 (round 106): README:520-521 makes state_sync the authoritative opening frame -
+// the client redraws the board from it and adopts its turn. It used to blank
+// replayIndex while leaving the 自动 interval armed, so the replay clock kept running
+// against a record that no longer exists; the next tick came back as "past the last
+// ply", called exitReplay and overwrote 对局开始 with 已回到当前局面. The harness cannot
+// wait for a real 700 ms tick, so it records what setInterval was handed and, exactly
+// as a browser would, fires every interval the page has not cleared.
+check('JJ3 state_sync releases the replay clock it just invalidated', () => {
+    const sandbox = bundle.sandbox;
+    const realSetInterval = sandbox.setInterval;
+    const realClearInterval = sandbox.clearInterval;
+    const timers = [];
+    const cleared = [];
+    sandbox.setInterval = (fn) => { timers.push(fn); return timers.length; };
+    sandbox.clearInterval = (id) => {
+        if (id) { cleared.push(id); timers[id - 1] = null; }
+    };
+    try {
+        const game = newGame();
+        game.playerColor = BLACK;
+        game.gameStatus = 'playing';
+        game.aiThinking = false;
+        game.board = emptyBoard();
+        game.baseStones = [];
+        game.analysis = [];
+        game.moveHistory = [
+            { row: 7, col: 7, color: BLACK },
+            { row: 8, col: 8, color: WHITE },
+            { row: 6, col: 6, color: BLACK },
+        ];
+        game.replayIndex = 0;
+        game.toggleReplayAuto();
+        const armed = game.replayTimer;
+        assert(typeof armed === 'number' && armed > 0, '自动 armed one interval');
+        const tick = timers[armed - 1];
+        assert(typeof tick === 'function', 'and its tick is on the clock');
+        assert(el('btn-replay-play').textContent === '暂停', 'the control reads as playing');
+
+        game.handleServerMessage({ type: 'state_sync', board: emptyBoard(), current_turn: 'black' });
+
+        assert(el('status').textContent.indexOf('对局开始') === 0,
+               'the authoritative frame wrote its own line, got: ' + el('status').textContent);
+
+        // A browser can only fire an interval the page has not cleared, so the orphan
+        // tick is driven exactly when it is still on the clock - which is the whole
+        // defect: the old frame left it armed against a record that no longer exists.
+        if (cleared.indexOf(armed) === -1) tick();
+        assert(el('status').textContent.indexOf('对局开始') === 0,
+               'no orphaned replay tick rewrites the opening line, got: ' +
+               el('status').textContent);
+
+        assert(cleared.indexOf(armed) >= 0, 'state_sync must clear the interval it orphaned');
+        assert(game.replayTimer === null, 'and the page must stop owning a replay clock');
+        assert(el('btn-replay-play').textContent === '自动', 'and hand 自动 back to the player');
+    } finally {
+        sandbox.setInterval = realSetInterval;
+        sandbox.clearInterval = realClearInterval;
+    }
+});
+
+check('JJ3 a state_sync with no replay running needs no release', () => {
+    const sandbox = bundle.sandbox;
+    const realSetInterval = sandbox.setInterval;
+    const realClearInterval = sandbox.clearInterval;
+    const timers = [];
+    const cleared = [];
+    sandbox.setInterval = (fn) => { timers.push(fn); return timers.length; };
+    sandbox.clearInterval = (id) => { if (id) { cleared.push(id); timers[id - 1] = null; } };
+    try {
+        const game = newGame();
+        game.playerColor = BLACK;
+        game.gameStatus = 'playing';
+        game.aiThinking = false;
+        game.board = emptyBoard();
+        game.baseStones = [];
+        game.moveHistory = [{ row: 7, col: 7, color: BLACK }];
+        game.analysis = [];
+        game.replayIndex = null;
+        game.replayTimer = null;
+        const before = cleared.length;
+
+        game.handleServerMessage({ type: 'state_sync', board: emptyBoard(), current_turn: 'black' });
+
+        assert(el('status').textContent.indexOf('对局开始') === 0,
+               'the opening line still stands with no clock to fight it, got: ' +
+               el('status').textContent);
+        assert(cleared.length === before, 'nothing was armed, so nothing was cancelled');
+        assert(game.replayTimer === null, 'and no replay clock appeared');
+    } finally {
+        sandbox.setInterval = realSetInterval;
+        sandbox.clearInterval = realClearInterval;
+    }
+});
+
 let failed = 0;
 for (const result of results) {
     console.log(`${result.ok ? 'PASS' : 'FAIL'} ${result.label}` +

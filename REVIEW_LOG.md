@@ -1979,6 +1979,73 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次106 求招留在棋盘上的那一圈，与两个入口抢同一个文件 — bugfix round 106 batch JJ
+
+**Found.** 三个入口，都是「前端把显示态当成了画一次就完的东西」与「CLI 漏了第三种同名冲突」：
+
+- **JJ1** `highlightMove()`（`web/app.js:1919`）先 `drawBoard()` 再在 canvas 上临时描一圈建议环，
+  没有任何字段承载它。于是任何后续重绘都会把它擦掉——点 旋转/镜像 走 `applyView()` 的 `drawBoard()`
+  （`:477`），落一子走 `placeStone()` 的 `drawBoard()`（`:1916`）——而顶栏还写着「建议 H8」。
+  README:326 要求 求招「结果标在棋盘上并写入状态栏」，README:326-327 又要求「局面又落一手，这一份建议作废」：
+  前半句现在只在画的那一刻成立，后半句根本没人实现。
+- **JJ2** `--out` 与 `--checkpoint` 指向同一个文件时无人拒绝：`--resume` 的三种冲突在
+  `main_trainer.cpp:259-286` 逐一退出，`:288-289` 却把这两个路径一起接住；收尾 `:323` 的
+  `save(out_path, …)` 遂把断点文件换成参数文件，本轮日志里「checkpoint saved」全是假的，
+  下一次 `--resume` 直接读不回来。
+- **JJ3** `handleStateSync`（`:1696`）把 `replayIndex` 清成 `null` 却没 `stopReplayAuto()`——
+  `:710`、`:1102`、`:1311` 三处同类重置都是先停再清，这一处是唯一的漏网。自动播放的 tick
+  （`:777-786`）在下一拍看见 `null >= length-1` 为真，走 `exitReplay()`，把刚写下的「对局开始」
+  改成了「已回到当前局面」。
+
+**Fixed.** `web/app.js` +20/−8、`src/training/main_trainer.cpp` +10/0。建议环改由 `drawBoard()` 从
+`this.recommendation` 描（放在 `view.lastMove` 块之后、回放标记之前，半径 `stone + 3`、`#c0392b`、
+lineWidth 2 与旧代码逐字一致），`highlightMove` 只写状态并重绘；落子与四个整局重建点（session 帧
+`:293`、position_set `:1315`、重开 `:1565`、state_sync `:1697`）把这份显示态清掉。CLI 侧在
+`--seed`×`--resume` 之后、任何文件操作之前加一条 `out_path == checkpoint_path` 的退出码 1 拒绝，
+口径与 `:262` 的字面串比较一致。README:204（`--out`）与 README:207（`--resume`）由我在同一行内补齐
+文档——后者是轮次101 FF2 落地时漏下的那条 `--seed` 冲突。
+
+**裁决（不是缺陷）.** 审计给出的另外几条我自己读回代码后否掉了：
+`has_decisive_tempo`（`vcf.cpp:365-385`）“少了 `four_count >= 2` 那一条”不成立——`pattern.cpp:66-96`
+里 `four_count` 只由 `LIVE_FOUR` 与 `RUSH_FOUR` 累加，`>= 2` 必然已经有那两类方向，循环先返回了；
+反过来说 `vcf.cpp:209-211`/`:332-334` 那两处内联的 `four_count >= 2` 才是永远走不到的死代码。
+`must_block`（`search_engine.cpp:127-129`）跳过对 BLACK 是禁手的对方成五点也不是缺陷：那个格子 BLACK
+本来就不能下，挡不了就交给 alphabeta 的 `-100000` 门（`:313`）与 loss probe（`:339-349`）；`:129` 的
+重复检查只是冗余。离线点 识别 “吞掉 `sendMessage` 的 false”同样不成立——`sendMessage` 自己那条 false
+分支（`:1602-1610`）已经把 README:554 的「消息未发出」写进顶栏了，弹窗挡住顶栏是观感问题不是契约。
+`set_vcf_depth`/`set_vct_depth` 无生产调用方是 REVIEW_LOG:250 记过的刻意保留。vct 的 90000 不画红点
+就是轮次95 暂缓的 Z4，改它要同时动 README:338、`app.js` 与 harness，仍不动。
+置换表与开局库整域由独立审计逐条走过，没有任何可观察缺陷：无 STM 的 Zobrist 键靠严格交替成立
+（README:219-220），将杀分被 `alphabeta.cpp:255` 的存储门挡在表外，probe 先于终局检查也安全
+（终局型从不入表），深度门/界限标志/代龄老化合规，`search_engine.cpp:169-179` 的 `max_depth` 包含性
+正确且库着法在 `Board` 重载里重查占位与禁手。
+
+**Verified.** 测试会话只写 `tests/`：`tests/web_frontend_check.js` +202/0 新增 6 例（JJ1 的「环挺过一次
+重绘」「无 求招 的整盘重绘不描环」「落一子退役这一圈」，JJ3 的「state_sync 释放它刚作废的回放钟」
+加它的控制例），`tests/test_training.cpp` +84/0 新增 JJ2 一例（控制：两个不同路径退出码 0、stderr
+干净、两个文件都写出；判别：同一路径退出码 1、stderr 点名 `--out` 与 `--checkpoint`、文件不被写出；
+强半：预先存在的断点文件字节级存活）。回归门由我本人重跑：`cmake .. && make -j4 && ctest` ⇒
+「100% tests passed, 0 tests failed out of 8」/「Total Test time (real) = 47.11 sec」，
+`node tests/web_frontend_check.js` 63/63，`node tests/readme_anchor_check.js` 60 处引用 0 问题，
+`wc -l README.md` 658。HEAD 负例我在宿主侧从 `git archive` 副本独立复现，未碰 `build/`：
+812d35d 的树 61/63，红的只有 JJ1 与 JJ3 这两行，61 条历史用例全绿。JJ2 的 `--rounds 0` 不能判别——
+轮数守卫排在这条拒绝之前，两棵树都是退出码 1，测试会话在注释里记下了这一点并改用 `--rounds 1`。
+
+**Held.** 训练数据审计给出的四条排进轮次107：K1 导出条件用 `is_decisive()`，而 README:574 说的是
+「终局」、README:63 说的是「完局」——满盘判和（`game_manager.cpp:445-452`，winner EMPTY）因此不进
+`records.jsonl`，而 trainer 自己却把 `move_limit`/`board_full` 的未分胜负局写进同一个文件
+（`trainer.cpp:236-237`），两个生产者对「完局」的理解不一致；改的时候必须同时改 `:1460` 与冷重建的
+`:1207`，否则和棋局会在一次 resume 后被追加两次。K2 `server.cpp:546-549` 会话目录建不出来时顺手清了
+`records_path_`（README:165-166 只授权关闭落盘，README:161/169-172 把 `--records` 当独立功能）。
+K3 `trainer.cpp:355` 的 `result.games_played` 快照取在本轮数据局之前，而 `:360` 的 `samples_collected`
+取在之后。K4 `self_play.cpp:197-199` 的 `ply + 3 > max_moves` 与 README:609「最靠近终局的那一步」相差
+两手。否掉的：不给路径时数据局整个跳过（README:205 的「默认空」才是那句具体规定）、
+`--no-resign` × `no_legal_move` → INVALID 弃局（要构造全盘无合法点的局面，与轮次92/101 已判过的
+不可达同源）、`game_id` 的 `t * 1000` 重叠（README 未约定，且需 2003 盘）、奇数验证局向上取整成偶数对
+（README:179 每对黑白各一局本来就是偶数）。
+
+
+
 ## 轮次105 被关掉的连接替不了那把锁，正在编辑的副本不该被终局改口 — bugfix round 105 batch III
 
 **Found（其中 III1 是我自己在轮次102 引出的回归）.**

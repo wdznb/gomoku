@@ -71,6 +71,8 @@ class GomokuGame {
         // changed must not be painted as advice.
         this.hintMoveCount = 0;
         this.lastMove = null;
+        // The ring 求招 leaves on a square: display state, so drawBoard repaints it.
+        this.recommendation = null;
         // Engine numbers for the current game, index-aligned with moveHistory.
         // Filled by the server's "replay" reply (4.4), not by the live messages.
         this.analysis = [];
@@ -291,6 +293,7 @@ class GomokuGame {
         this.currentTurn = msg.current_turn === 'white' ? WHITE : BLACK;
         this.applyBoardMatrix(msg.board);
         this.lastMove = null;
+        this.recommendation = null;
         this.aiThinking = false;
         this.gameOverText = msg.game_status === 'game_over'
             ? `已结束的对局 · ${msg.winner === 'draw' ? '和棋' : (msg.winner === 'black' ? '黑棋' : '白棋')}胜`
@@ -1313,6 +1316,7 @@ class GomokuGame {
         this.analysisEnded = false;
         this.replayIndex = null;
         this.lastMove = null;
+        this.recommendation = null;
         this.currentTurn = msg.current_turn === 'black' ? BLACK : WHITE;
         this.gameStatus = 'waiting';
         this.playerColor = null;
@@ -1563,6 +1567,7 @@ class GomokuGame {
         // button state below is what the new game starts from.
         this.hintInFlight = false;
         this.lastMove = null;
+        this.recommendation = null;
         // A new game has no history to replay, and stale analysis would attach
         // the old game's numbers to the new moves.
         this.stopReplayAuto();
@@ -1693,8 +1698,10 @@ class GomokuGame {
         this.moveHistory = [];
         this.analysis = [];
         this.analysisEnded = false;
+        this.stopReplayAuto();
         this.replayIndex = null;
         this.lastMove = null;
+        this.recommendation = null;
         this.currentTurn = msg.current_turn === 'black' ? BLACK : WHITE;
         this.gameStatus = 'playing';
         this.renderLists();
@@ -1911,21 +1918,15 @@ class GomokuGame {
     placeStone(row, col, color) {
         this.board[row][col] = color;
         this.lastMove = { row, col, color };
+        this.recommendation = null;
         this.moveHistory.push({ row, col, color });
         this.updateMoveList();
         this.drawBoard();
     }
     
     highlightMove(row, col) {
+        this.recommendation = { row, col };
         this.drawBoard();
-        const shown = this.displayOf(row, col);
-        const p = this.cellCenter(shown[0], shown[1]);
-        
-        this.ctx.beginPath();
-        this.ctx.arc(p.x, p.y, this.geom.stone + 3, 0, Math.PI * 2);
-        this.ctx.strokeStyle = '#c0392b';
-        this.ctx.lineWidth = 2;
-        this.ctx.stroke();
     }
     
     // The board as the player should see it right now: the 摆棋 working copy while
@@ -2055,6 +2056,17 @@ class GomokuGame {
             ctx.arc(p.x, p.y, Math.max(2.5, stone * 0.3), 0, Math.PI * 2);
             ctx.fillStyle = view.lastMove.color === BLACK ? '#fff' : '#111';
             ctx.fill();
+        }
+
+        if (this.recommendation) {
+            // Painted from state so no later repaint (applyView, placeStone) can lose it.
+            const shown = this.displayOf(this.recommendation.row, this.recommendation.col);
+            const p = this.cellCenter(shown[0], shown[1]);
+            ctx.beginPath();
+            ctx.arc(p.x, p.y, stone + 3, 0, Math.PI * 2);
+            ctx.strokeStyle = '#c0392b';
+            ctx.lineWidth = 2;
+            ctx.stroke();
         }
 
         if (this.replayIndex !== null) {

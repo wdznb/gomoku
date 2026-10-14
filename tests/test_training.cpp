@@ -3344,6 +3344,89 @@ void test_trainer_refuses_a_seed_that_a_resume_would_drop() {
 #endif
 }
 
+// Round 106 JJ2: --out and --checkpoint name the two files a run owns - the champion
+// parameters it writes at the end and the resume state it writes every round. Pointing both
+// at one path meant the closing champion write replaced the checkpoint, so the next
+// --resume read coefficients where it expected a round counter. README:204 records the
+// refusal, which sits with the --params/--resume and --seed/--resume ones ahead of every
+// file operation.
+//
+// The judgement is the exit code plus what the named path ends up holding. `--rounds 0`
+// cannot be used here: the round-count guard is ahead of this refusal in the same parser, so
+// both trees would answer 1 and nothing would discriminate. The arms therefore run the
+// cheapest legal round round 101 FF2 established, and every artefact is a temp path so
+// data/ is never written. No wording is asserted beyond the two flag names.
+void test_trainer_refuses_one_file_for_both_out_and_checkpoint() {
+#ifndef _WIN32
+    if (!std::filesystem::exists("gomoku_train")) {
+        std::cout << "  --out/--checkpoint probes skipped: gomoku_train is not in the working "
+                     "directory" << std::endl;
+        std::cout << "test_trainer_refuses_one_file_for_both_out_and_checkpoint passed" << std::endl;
+        return;
+    }
+    const std::string base =
+        "--rounds 1 --population 2 --generations 1 --depth 1 --timeout-ms 1 --max-moves 2 "
+        "--fitness-games 1 --verification-games 2 --no-data --quiet";
+    const std::filesystem::path err = temp_path("r106_jj2_stderr.txt");
+    auto read_all = [](const std::filesystem::path& p) {
+        std::ifstream in(p);
+        std::ostringstream text;
+        text << in.rdbuf();
+        return text.str();
+    };
+    std::string last_err;
+    auto run = [&](const std::string& arguments) {
+        const std::string command = "./gomoku_train " + base + " " + arguments +
+                                    " > /dev/null 2> '" + err.string() + "'";
+        const int status = std::system(command.c_str());
+        assert(status != -1);
+        last_err = read_all(err);
+        return WEXITSTATUS(status);
+    };
+
+    // Control: the same cheapest run with two distinct paths finishes and writes both.
+    const std::filesystem::path out = temp_path("r106_jj2_out.json");
+    const std::filesystem::path ck = temp_path("r106_jj2_ck.json");
+    const int apart = run("--out '" + out.string() + "' --checkpoint '" + ck.string() + "'");
+    std::cout << "  [r106jj2] two paths => exit " << apart << ", stderr " << last_err.size()
+              << " bytes" << std::endl;
+    assert(apart == 0);
+    assert(last_err.empty());
+    assert(std::filesystem::exists(out));
+    assert(std::filesystem::exists(ck));
+
+    // Discriminator: one path for both roles is refused, and nothing is created.
+    const std::filesystem::path one = temp_path("r106_jj2_one.json");
+    const int refused = run("--out '" + one.string() + "' --checkpoint '" + one.string() + "'");
+    std::cout << "  [r106jj2] --out == --checkpoint => exit " << refused << ": "
+              << last_err.substr(0, last_err.find('\n')) << std::endl;
+    assert(refused == 1);
+    assert(last_err.find("--out") != std::string::npos);
+    assert(last_err.find("--checkpoint") != std::string::npos);
+    // Ahead of ensure_parent_directory and both writers, so the name it refused is absent.
+    assert(!std::filesystem::exists(one));
+
+    // The stronger half: a checkpoint already sitting at that name survives the attempt
+    // byte for byte. Replacing it is exactly the loss the refusal exists to prevent.
+    const std::filesystem::path kept = temp_path("r106_jj2_kept.json");
+    {
+        std::ofstream writer(kept);
+        writer << "{\"seed\":12345,\"rounds_completed\":7}\n";
+    }
+    const std::string before = read_all(kept);
+    const int kept_status =
+        run("--out '" + kept.string() + "' --checkpoint '" + kept.string() + "'");
+    const std::string after = read_all(kept);
+    std::cout << "  [r106jj2] one existing file => exit " << kept_status << ", bytes "
+              << before.size() << " -> " << after.size() << std::endl;
+    assert(kept_status == 1);
+    assert(after == before);
+    assert(after.find("rounds_completed") != std::string::npos);
+
+    std::cout << "test_trainer_refuses_one_file_for_both_out_and_checkpoint passed" << std::endl;
+#endif
+}
+
 int main() {
     std::cout << "Running training tests..." << std::endl;
 
@@ -3406,6 +3489,7 @@ int main() {
     test_trainer_help_states_the_probe_budget();
     test_server_refuses_no_sessions_with_a_stated_path();
     test_trainer_refuses_a_seed_that_a_resume_would_drop();
+    test_trainer_refuses_one_file_for_both_out_and_checkpoint();
 
     std::cout << "All training tests passed" << std::endl;
     return 0;

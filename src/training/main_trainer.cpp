@@ -285,6 +285,16 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // The run writes the champion to --out and the resume state to --checkpoint, so
+    // one file for both means the final champion overwrites the checkpoint and the
+    // next resume replays a run that already finished.
+    if (out_path == checkpoint_path) {
+        std::cerr << "Error: --out " << out_path << " and --checkpoint " << checkpoint_path
+                  << " cannot name the same file (the champion parameters would replace the resume state)"
+                  << std::endl;
+        return 1;
+    }
+
     config.params_path = out_path;
     config.checkpoint_path = checkpoint_path;
 
