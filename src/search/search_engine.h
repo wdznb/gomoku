@@ -17,10 +17,10 @@ namespace gomoku {
 
 struct SearchResult {
     Move best_move;
-    // Default-initialised: the non-AlphaBeta return paths (default, forced,
-    // resign, book, vcf, vct, greedy) leave these untouched, and the server
-    // callback reads score/elapsed_ms to build the ai_move message. Unset,
-    // that read is of an indeterminate value and the client gets garbage.
+    // Default-initialised so no return path can hand back an indeterminate value:
+    // the server reads score/elapsed_ms to build the ai_move message. elapsed_ms is
+    // the whole call on every path (entry timestamp to hand-back), while depth and
+    // nodes_searched stay 0 outside AlphaBeta, which is the only path that fills them.
     int score = 0;
     int depth = 0;
     int nodes_searched = 0;

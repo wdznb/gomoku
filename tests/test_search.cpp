@@ -611,6 +611,117 @@ void test_engine_keeps_alphabeta_time_after_tactics() {
               << ")" << std::endl;
 }
 
+// R95 Z1, case A: the tactical win paths. README:57 promises 逐手引擎分析（方法/
+// 分值/深度/节点/耗时）for every hand, but a hand the VCF or VCT phase wins outright
+// never reached the one assignment elapsed_ms had, so it reported 耗时 0 while the
+// phase behind it had already spent most of a second. Capped WHITE triplets give
+// each phase a forcing proof of its own: three stacked on rows 2/4/6 are a VCF
+// (100000), two on rows 2/4 are only a VCT (90000). The non-zero stamp is required
+// only once the measurement says the call really cost a millisecond - a
+// sub-millisecond call reads 0 on both sides of the fix, and this must not pass by
+// rounding nor go red on a machine fast enough to finish under 1 ms.
+void test_engine_stamps_elapsed_on_tactical_wins() {
+    std::atomic<bool> stop(false);
+
+    const auto build_lattice = [](Board& board, int rows) {
+        for (int i = 0; i < rows; ++i) {
+            const int r = 2 + i * 2;
+            board.place_stone(r, 2, BLACK);
+            board.place_stone(r, 3, WHITE);
+            board.place_stone(r, 4, WHITE);
+            board.place_stone(r, 5, WHITE);
+        }
+    };
+
+    {
+        Board board;
+        build_lattice(board, 3);
+        assert(board.move_count() == 12);
+        SearchEngine engine;
+        const auto t0 = std::chrono::steady_clock::now();
+        SearchResult result = engine.search(board, WHITE, 8, 3000, stop);
+        const long long wall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+
+        assert(result.method == "vcf");
+        assert(result.score == 100000);
+        assert(result.best_move.pos.is_valid());
+        // Only AlphaBeta fills depth and nodes_searched; the stamp must not drag
+        // them along (README:530's method enum, unchanged by this fix).
+        assert(result.depth == 0);
+        assert(result.nodes_searched == 0);
+        assert(result.elapsed_ms > 0 || wall_ms < 1);
+        assert(result.elapsed_ms <= wall_ms + 1);
+        std::cout << "test_engine_stamps_elapsed_on_tactical_wins passed (vcf: stamped "
+                  << result.elapsed_ms << " ms, whole call " << wall_ms << " ms)"
+                  << std::endl;
+    }
+    {
+        Board board;
+        build_lattice(board, 2);
+        assert(board.move_count() == 8);
+        SearchEngine engine;
+        const auto t0 = std::chrono::steady_clock::now();
+        SearchResult result = engine.search(board, WHITE, 8, 3000, stop);
+        const long long wall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+
+        assert(result.method == "vct");
+        assert(result.score == 90000);
+        assert(result.best_move.pos.is_valid());
+        assert(result.depth == 0);
+        assert(result.nodes_searched == 0);
+        assert(result.elapsed_ms > 0 || wall_ms < 1);
+        assert(result.elapsed_ms <= wall_ms + 1);
+        std::cout << "  vct: stamped " << result.elapsed_ms
+                  << " ms, whole call " << wall_ms << " ms" << std::endl;
+    }
+}
+
+// R95 Z1, case B: the AlphaBeta path. VCF and VCT run first and each owns a fixed
+// share of the budget (35 % / 55 % of the same start, round 85 F4), so a
+// forcing-rich position with no proof spends those shares before AlphaBeta opens
+// its own clock - here ~1.1 s of a 2 s move. What that path handed back was the
+// AlphaBeta sub-segment, so the single 耗时 the replay panel and
+// ai_move.thinking_time_ms show was ~1.1 s of the 2 s short (899 ms of 2000).
+// Compare against the wall clock around the call, with a band wide enough to
+// ignore machine speed.
+void test_engine_elapsed_covers_the_tactical_phases() {
+    Board board;
+    // The same capped triplets, three rows apart and one column further each row,
+    // so no line completes five: both tactical phases search the whole lattice,
+    // find nothing, and AlphaBeta answers the position.
+    for (int i = 0; i < 4; ++i) {
+        const int r = 1 + i * 3;
+        const int c = 2 + (i % 3);
+        board.place_stone(r, c, BLACK);
+        board.place_stone(r, c + 1, WHITE);
+        board.place_stone(r, c + 2, WHITE);
+        board.place_stone(r, c + 3, WHITE);
+    }
+    assert(board.move_count() == 16);
+
+    SearchEngine engine;
+    std::atomic<bool> stop(false);
+    const auto t0 = std::chrono::steady_clock::now();
+    SearchResult result = engine.search(board, WHITE, 8, 2000, stop);
+    const long long total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+
+    assert(result.method == "alphabeta");
+    assert(result.depth >= 1);
+    assert(result.nodes_searched > 0);
+    const long long slack = std::max(5LL, total_ms / 20);
+    const long long diff = result.elapsed_ms > total_ms
+                               ? static_cast<long long>(result.elapsed_ms) - total_ms
+                               : total_ms - result.elapsed_ms;
+    assert(diff <= slack);
+
+    std::cout << "test_engine_elapsed_covers_the_tactical_phases passed (whole call "
+              << total_ms << " ms, elapsed_ms " << result.elapsed_ms
+              << ", slack " << slack << ", depth " << result.depth << ")" << std::endl;
+}
+
 void test_search_engine_finds_five() {
     Board board;
     SearchEngine engine;
@@ -2398,6 +2509,8 @@ int main() {
     test_search_engine_layered();
     test_engine_progress_callback_reports_each_layer();
     test_engine_keeps_alphabeta_time_after_tactics();
+    test_engine_stamps_elapsed_on_tactical_wins();
+    test_engine_elapsed_covers_the_tactical_phases();
     test_search_engine_finds_five();
     test_controller_async();
     test_controller_stop();

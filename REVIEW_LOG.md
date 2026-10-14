@@ -1979,6 +1979,71 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次95 逐手耗时只量了 AlphaBeta 那一段 — bugfix round 95 batch Z
+
+**Found.** Z1 (`src/search/search_engine.cpp`, verified by me at `87b91f0` before dispatching). README:57
+promises 逐手引擎分析（方法/分值/深度/节点/**耗时**), and `game_manager.cpp:418-421` writes
+`result.elapsed_ms` into `analyses_` and into the `ai_move` frame's `thinking_time_ms`. At HEAD the field had
+exactly one assignment in the whole file — `:279` `result.elapsed_ms = info.elapsed_ms;` — and `info.elapsed_ms`
+comes from `alphabeta.cpp:385-386`, i.e. from `start_time_` that AlphaBeta stamps at its own entry (`:270`).
+Every other hand-back (`no_legal_move` `:50`/`:94`/`:283`, `resign` `:88`/`:158`, `forced` `:103`, `greedy_five`
+`:121`, `must_block` `:164`, `book` `:178`, `vcf` `:204`, `vct` `:226`, the tail `greedy` `:359`) left the
+`search_engine.h:20-27` default, so a move answered by the opening book or by a proven VCF win reported
+**0 ms** in the replay panel, and an AlphaBeta move reported only its own slice even though `:246-249` already
+measures the wall time the VCF (≤35%) and VCT (≤55%) pre-phases burned.
+
+**Fixed.** Two files, nothing else. `search_engine.cpp` gains one `elapsed_since_start` lambda at the existing
+entry timestamp (`:40-45`) and all 13 `return result;` statements now stamp the whole call (verified by grep:
+13 returns, 13 assignments). AlphaBeta's path no longer reports `info.elapsed_ms`; the assignment moved to just
+before the branch's only return (`:345-346`) so it is taken *after* the loss-probing block, and the same
+`whole_elapsed_ms` now feeds the terminal `progress_callback_` (`:348`) — the fixer flagged that move from the
+old `:279` slot as its one deviation, and it is exactly what was required: `used_ms + info.elapsed_ms` would
+have omitted the probe's own time. `search_engine.h:20-27` was reworded because its claim that the
+non-AlphaBeta paths leave the fields untouched stopped being true for `elapsed_ms`; comment text only, and
+`depth`/`nodes_searched` are still stated to stay 0 outside AlphaBeta, which is what the code does.
+
+**Not defects.** The timing-pipeline audit's T1 ("an invalid `best_move` with no resignation strands the client
+in 「AI 思考中」 forever, against README:521-522") is refuted by the client's own arming rule:
+`web/app.js:1799-1809` is *the only place* `aiThinking` is set, and it is `handleThinkingProgress` — a session
+that never emits a `thinking_progress` frame never arms the frozen state, so the silent hand-back cannot strand
+it. The residual case (frames emitted, then an invalid move) requires a completed AlphaBeta layer whose result
+is then invalid *and* every one of `search_engine.cpp:271-279`'s candidates occupied or 禁手, and even there
+`:1804` leaves 终止 enabled, which `stopThinking()` (`:1013-1016`) clears locally. T3's other half — the
+undo/reset hint paths misattributing a stone's 耗时 to another game — was refuted earlier and holds
+(`game_manager.cpp:54-65` discards before joining, `:74`/`:94` clear `analyses_`).
+
+**Queued for round 96.** AA2 (低, real, and created by this round): the per-layer frames still come from
+`alphabeta.cpp:356-359`, which measures from AlphaBeta's `start_time_`, while the terminal frame now measures
+from the engine entry — one 思考, two clocks, so a client plotting the timeline sees the layer frames compressed
+by whatever the pre-phases cost. Fix direction: offset the wrapper at `search_engine.cpp:242-244` by the
+pre-AlphaBeta time so the whole timeline shares the entry clock; the offset is a constant, so round-85 F3's
+non-decreasing invariant still holds. AA3 (低): `web/app.js:807` gates the 耗时 token on `a.elapsed_ms`
+truthiness, so a genuine sub-millisecond book measurement (real 0 after this round) disappears from the replay
+line while `:1702` still prints 「0ms」 for the same stone; `:642`'s `|| 0` makes 0 indistinguishable from
+absent, so the gate should be `!= null` while `depth`/`nodes` keep their documented 0-hiding
+(`:797-799` comment, README:57).
+
+**Verified.** Gate on the identical tree: `ctest` **8/8** (`build/r95_ctest.log:19`, `test_search … Passed
+15.86 sec` at `:9`), `node tests/web_frontend_check.js` **35/35** (`build/r95_web.log:36`), anchor script
+**29 citations, 0 problems**. Two new cases in `tests/test_search.cpp` (+113 lines):
+`test_engine_stamps_elapsed_on_tactical_wins` (`:623-683`, registered `:2512`) plays the capped WHITE triplet
+lattice (3 rows / 12 stones → `method=vcf score=100000`, 2 rows / 8 stones → `method=vct score=90000`) with
+`timeout_ms=3000` and asserts `elapsed_ms > 0 || wall_ms < 1` plus `elapsed_ms <= wall_ms + 1`;
+`test_engine_elapsed_covers_the_tactical_phases` (`:689-723`, registered `:2513`) uses the four-row drifting
+triplet board (16 stones, forcing but winless) at `timeout_ms=2000` and asserts the stamp is within
+`max(5 ms, total/20)` of the test's own wall clock. Measured in the worktree
+(`build/r95_test_search_wt.log:31-33`): vcf 1050/1050, vct 1650/1650, alphabeta 2000/2000 (stamp/whole).
+HEAD negatives from `build/neg95` (`git archive 87b91f0`, src md5-identical to HEAD) fail on exactly those two:
+`test_search.cpp:653: Assertion 'result.elapsed_ms > 0 || wall_ms < 1' failed` and
+`test_search_onlyB.cpp:718: Assertion 'diff <= slack' failed` — HEAD's AlphaBeta case reported **899 ms of a
+2000 ms call**, the missing 1100 ms being VCF's 700 + VCT's 400 slices. Everything else is
+**无可观察差异**: the book / forced / greedy_five / must_block / resign / no_legal_move / greedy paths measured
+34-440 µs, so both trees legitimately print 0. Frame monotonicity (round-85 F3) re-checked under the new 口径
+(`build/r95_mono`): 4/110/571 ms per layer then 1500 ms closing, depth/nodes/score semantics unchanged.
+Carried to round 96: `tests/test_search.cpp:850`'s round-92 pin `assert(result.elapsed_ms == 0)` now contradicts
+the contract and is green only through sub-millisecond rounding — it is a test-side change, so the test session
+owns it.
+
 ## 轮次94 一次瞬时 accept 失败就把端口永久关掉 — bugfix round 94 batch Y
 
 **Found.** **Y1** `src/server/server.cpp:574-589` `GameServer::do_accept()`: the completion handler returned on *any*

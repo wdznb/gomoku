@@ -37,6 +37,12 @@ SearchResult SearchEngine::search(const Board& board, int color,
                                    std::atomic<bool>& stop_flag) {
     auto start = std::chrono::high_resolution_clock::now();
     SearchResult result;
+    // The one wall clock the caller is owed: each phase times itself, but the
+    // replay panel and ai_move.thinking_time_ms report a single number per move.
+    auto elapsed_since_start = [start]() {
+        return static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::high_resolution_clock::now() - start).count());
+    };
 
     auto root_moves = board.active_empty();
     if (root_moves.empty()) {
@@ -44,6 +50,7 @@ SearchResult SearchEngine::search(const Board& board, int color,
         // when move_count_ is 0 (board.cpp:281-293). The centre may well hold a
         // stone, so hand back an invalid move and the caller commits nothing.
         result.method = "no_legal_move";
+        result.elapsed_ms = elapsed_since_start();
         return result;
     }
 
@@ -77,11 +84,13 @@ SearchResult SearchEngine::search(const Board& board, int color,
             } else if (resign_detection_) {
                 result.resigned = true;
                 result.method = "resign";
+                result.elapsed_ms = elapsed_since_start();
                 return result;
             } else {
                 // Nothing to play and no resignation asked for: an invalid move is
                 // how the caller is told to commit nothing this turn.
                 result.method = "no_legal_move";
+                result.elapsed_ms = elapsed_since_start();
                 return result;
             }
         }
@@ -90,6 +99,7 @@ SearchResult SearchEngine::search(const Board& board, int color,
     if (root_moves.size() == 1) {
         result.best_move = Move(root_moves[0], color);
         result.method = "forced";
+        result.elapsed_ms = elapsed_since_start();
         return result;
     }
 
@@ -107,6 +117,7 @@ SearchResult SearchEngine::search(const Board& board, int color,
                 result.best_move = Move(pos, color);
                 result.score = 100000;
                 result.method = "greedy_five";
+                result.elapsed_ms = elapsed_since_start();
                 return result;
             }
         }
@@ -143,11 +154,13 @@ SearchResult SearchEngine::search(const Board& board, int color,
                 if (second_five_point && resign_detection_) {
                     result.resigned = true;
                     result.method = "resign";
+                    result.elapsed_ms = elapsed_since_start();
                     return result;
                 }
                 result.best_move = Move(pos, color);
                 result.score = 99000;
                 result.method = "must_block";
+                result.elapsed_ms = elapsed_since_start();
                 return result;
             }
         }
@@ -161,6 +174,7 @@ SearchResult SearchEngine::search(const Board& board, int color,
             result.score = 0;
             result.depth = 0;
             result.method = "book";
+            result.elapsed_ms = elapsed_since_start();
             return result;
         }
     }
@@ -186,6 +200,7 @@ SearchResult SearchEngine::search(const Board& board, int color,
             result.score = 100000;
             result.method = "vcf";
             result.principal_variation = vcf_result.variation;
+            result.elapsed_ms = elapsed_since_start();
             return result;
         }
 
@@ -207,6 +222,7 @@ SearchResult SearchEngine::search(const Board& board, int color,
             result.score = 90000;
             result.method = "vct";
             result.principal_variation = vct_result.variation;
+            result.elapsed_ms = elapsed_since_start();
             return result;
         }
     }
@@ -263,6 +279,7 @@ SearchResult SearchEngine::search(const Board& board, int color,
             }
             result.best_move = fallback;
             result.method = fallback.pos.is_valid() ? "greedy" : "no_legal_move";
+            result.elapsed_ms = elapsed_since_start();
             return result;
         }
 
@@ -276,7 +293,10 @@ SearchResult SearchEngine::search(const Board& board, int color,
         // root_moves[0]; calling that alphabeta showed depth 0 / score 0 in the
         // replay panel (README:530 lists greedy as a method).
         if (info.depth == 0) result.method = "greedy";
-        result.elapsed_ms = info.elapsed_ms;
+
+        // AlphaBeta's own count starts with that phase and covers only it; the
+        // caller is owed the whole move, so the measure is taken below - after the
+        // resign probe, which spends part of the same budget.
 
         // AlphaBeta proved the loss itself (mate threshold, side-to-move
         // perspective): resign without waiting for the budget-gated probe
@@ -322,8 +342,10 @@ SearchResult SearchEngine::search(const Board& board, int color,
             }
         }
 
+        const int whole_elapsed_ms = elapsed_since_start();
+        result.elapsed_ms = whole_elapsed_ms;
         if (progress_callback_) {
-            progress_callback_(info.depth, info.nodes_searched, info.elapsed_ms);
+            progress_callback_(info.depth, info.nodes_searched, whole_elapsed_ms);
         }
 
         return result;
@@ -333,6 +355,7 @@ SearchResult SearchEngine::search(const Board& board, int color,
     // every path above returned, and alphabeta never reaches here without one.
     result.best_move = greedy_.search(board, color);
     result.method = "greedy";
+    result.elapsed_ms = elapsed_since_start();
     return result;
 }
 
