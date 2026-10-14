@@ -3427,6 +3427,80 @@ void test_trainer_refuses_one_file_for_both_out_and_checkpoint() {
 #endif
 }
 
+// Round 107 KK1: run() clears everything that describes *this* run - generations_run,
+// converged_, best_history_ - and it did not clear the stagnation counter
+// `generations_since_improvement_`. genetic.h:39-41 states the contract as "evolves until
+// the best result stops improving", i.e. this run's own improvement history, so a second run
+// on the same object inherited the first one's count and, with fitness that cannot improve,
+// hit `generations_since_improvement_ >= stagnation_generations` inside generation 1 and
+// reported generations_run == 1. The trainer builds one optimizer per round loop, so every
+// round after the first of a stagnating search was billed as a single generation.
+//
+// `evaluations_` is intentionally left alone (genetic.h:50-51 - it is the caller's cumulative
+// cost counter), which is why the accumulation is pinned in the same test: a future sweep
+// that zeroed it too would silently under-report the training budget. A constant fitness
+// makes the outcome independent of the RNG draws - no generation can beat the incumbent, so
+// the only exit is stagnation - and population_size == 2 means each generation scores
+// exactly one new member (the incumbent carries over unscored), fixing a run's cost at
+// population_size + generations * (population_size - 1).
+void test_genetic_stagnation_count_is_per_run() {
+    ThreatCoefficients base;
+
+    GeneticConfig settings;
+    settings.population_size = 2;
+    settings.stagnation_generations = 2;
+    settings.max_generations = 2;
+
+    auto flat = [](const ThreatCoefficients&) { return 1.0; };
+
+    GeneticOptimizer optimizer(flat, settings, 20261015);
+    int first_generations = 0;
+    double first_best = 0.0;
+    optimizer.run(base, first_generations, first_best);
+    const int first_cost = optimizer.evaluations();
+    std::cout << "  [r107kk1] run 1 => generations " << first_generations << ", converged "
+              << optimizer.converged() << ", evaluations " << first_cost << std::endl;
+    assert(first_generations == settings.stagnation_generations);
+    assert(optimizer.converged());
+    assert(std::abs(first_best - 1.0) < 1e-12);
+    assert(first_cost ==
+           settings.population_size + first_generations * (settings.population_size - 1));
+
+    // Discriminator: a second run on the same object owes the caller its own stagnation
+    // history, so the flat fitness again takes stagnation_generations generations.
+    int second_generations = 0;
+    double second_best = 0.0;
+    optimizer.run(base, second_generations, second_best);
+    std::cout << "  [r107kk1] run 2 on the same object => generations " << second_generations
+              << ", evaluations " << optimizer.evaluations() << std::endl;
+    assert(second_generations == settings.stagnation_generations);
+    assert(optimizer.converged());
+    assert(std::abs(second_best - 1.0) < 1e-12);
+
+    // Control: a fresh object with the same config and seed needs the same number of
+    // generations, which is exactly what the second run above was owed.
+    GeneticOptimizer fresh(flat, settings, 20261015);
+    int fresh_generations = 0;
+    double fresh_best = 0.0;
+    fresh.run(base, fresh_generations, fresh_best);
+    std::cout << "  [r107kk1] a brand-new object => generations " << fresh_generations
+              << std::endl;
+    assert(fresh_generations == first_generations);
+    assert(std::abs(fresh_best - 1.0) < 1e-12);
+
+    // The opposite invariant, and it must stay green: the cost counter keeps counting across
+    // runs. Written as a delta it holds whichever way the second run ended, and it goes red
+    // the moment run() resets evaluations_.
+    const int second_cost = optimizer.evaluations();
+    std::cout << "  [r107kk1] evaluations accumulate " << first_cost << " -> " << second_cost
+              << std::endl;
+    assert(second_cost > first_cost);
+    assert(second_cost - first_cost ==
+           settings.population_size + second_generations * (settings.population_size - 1));
+
+    std::cout << "test_genetic_stagnation_count_is_per_run passed" << std::endl;
+}
+
 int main() {
     std::cout << "Running training tests..." << std::endl;
 
@@ -3490,6 +3564,7 @@ int main() {
     test_server_refuses_no_sessions_with_a_stated_path();
     test_trainer_refuses_a_seed_that_a_resume_would_drop();
     test_trainer_refuses_one_file_for_both_out_and_checkpoint();
+    test_genetic_stagnation_count_is_per_run();
 
     std::cout << "All training tests passed" << std::endl;
     return 0;

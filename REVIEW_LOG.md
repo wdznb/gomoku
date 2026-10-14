@@ -1979,6 +1979,73 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次107 同一个对象上的第二次进化 — bugfix round 107 batch KK
+
+**Found.** 优化器域两条，都是「一个函数的私有状态与它自己写在头文件里的契约不一致」：
+
+- **KK1** `GeneticOptimizer::run()`（`src/training/genetic.cpp:123-126`）每次进来都把
+  `generations_run`、`best_fitness`、`converged_`、`best_history_` 全部重置，唯独漏了
+  `generations_since_improvement_`（`genetic.h:71` 的成员）。fitness 不涨的那一轮它已经把计数推到
+  `stagnation_generations`，于是同一个对象上第二次 `run()` 刚进 generation 1 就命中
+  `:186` 的 `>= config_.stagnation_generations`，立刻 `converged_` 并 break，返回
+  `generations_run == 1`——而 `genetic.h:39-41` 的契约说的是「这一次 run 自己的改进历史」。
+- **KK2** `--help` 里 `--stagnation` 那三行（`main_trainer.cpp:30-32`）写的是
+  “hill climbing uses 3x this as its probe budget”。探针总数其实是 `--hill-iterations`
+  （`trainer.cpp:311`），`3x` 那个值是传给 `stagnation_limit` 的（`:312`），含义是「连续
+  stagnation_limit 个真的变了却没提升的探针就提前停」（`hill_climbing.cpp:79-85`；`:61`
+  那种与当前点完全相同的邻居被跳过、根本不计数）。旧文案会让人以为 `--stagnation 3` 等于
+  爬山只试 9 个邻居。
+
+**Fixed.** `src/training/genetic.cpp` +4/0（`best_history_.clear();` 后一行
+`generations_since_improvement_ = 0;` + 三行说明为什么 `evaluations_` 保持累计）、
+`src/training/main_trainer.cpp` +2/−2（那三行的后两行）。README 不涉及这两个旗标
+（README:189 明确「常用选项，完整列表见 `--help`」），所以 658 行不动。
+
+**裁决（不是缺陷）.** 优化器/对称性审计的其余三条我读回代码后否掉了：「0 局对抗也能算出 accept」
+那条我按 `trainer.cpp` 的晋升分支逐行读过，判为走不到；`hill_climbing.cpp:26` 的
+`rounded <= 0 ? 1 : …` 是「系数不得塌成 0」的既有语义，不是缺陷；`seed_population` 的措辞属纯注释，
+而 --help 的文案早已由 `tests/test_training.cpp:3137-3162` 钉住。训练数据审计的
+K2（会话目录建不出来时顺带清 `records_path_`）以 `--no-sessions` × 已写明的 `--records` 那条
+CLI 拒绝为反证——该拒绝被 `tests/test_training.cpp:3201-3203` 钉着，说明耦合是规格里的；
+K3（`trainer.cpp:355` 的 `result.games_played` 快照过早）grep 全仓后确认
+`RoundResult::games_played` 没有任何消费者，无可观察差异；K4（`self_play.cpp:197-199` 的
+`ply + 3 > max_moves`）那行本来就带解释它是保守上界的注释。
+
+**Verified.** 测试会话只写 `tests/`：`tests/test_training.cpp` +75/0 一例
+`test_genetic_stagnation_count_is_per_run`（`:3446`，注册于 `:3567`）。配置
+`{population_size 2, stagnation_generations 2, max_generations 2}` + 恒定 fitness + 固定 seed，
+判别子落在同一个对象的第二次 `run()`：`tests/test_training.cpp:3476` 断言
+`second_generations == 2`，HEAD 上是 1（`abort`，exit 134）；第一轮、全新对象、以及
+`evaluations()` 按 `population + generations*(population-1)` 计的**增量**（钉住累计开销不被顺手清零，
+两棵树都绿）三个控制臂全绿。HEAD 负例用 `git archive 5459c2f` 解到 /tmp，只编 HEAD 的两个 TU
+再从 `link.txt` 的对象表里换掉对应 `.o`（脚本留在 `build/r107_kk1_head.sh`，gitignore 内）。
+KK2 按纪律报「无可观察差异」，没有为文案编行为用例，只确认 `tests/test_training.cpp:3137-3162`
+那三条子串钉（`--stagnation`/`3x`/`N+1`）在两棵树都绿。我另外要求的那条「hill 的评估数与
+`--stagnation` 无关」被测试会话以理由驳回并被 Accepted：`hill_climbing.cpp:79-85` 确实会被
+`stagnation_limit`（= 3N）截断，独立的只有 `--hill-iterations + 1` 这个上界，不是计数。
+门禁由我本人重跑：`cmake .. && make -j4 && ctest` ⇒「100% tests passed, 0 tests failed out of 8」/
+「Total Test time (real) = 49.08 sec」，web 63/63，锚点 60 处引用/0 问题，README 658。合约过期：无。
+
+**轮次108 已备好并逐条自核.** 三个只读审计回来 8 条，我读回代码判下 4 条真缺陷、留 4 条：
+LL2 `server.cpp:1531-1543` 的 `flush_all()` 在关停时先 `export_game_record` 再看内容，缺了
+`flush_entry:1486` 那条「一子未落就不留」（README:571），于是 choose_side→resign→Ctrl+C 会往
+`records.jsonl` 追加一条 `moves: []` 的假完局；LL3 `clearSetupBoard`（`web/app.js:1211-1213`）
+先 `renderSetupPanel()` 再 `updatePositionStatus('棋盘已清空…')`，把 README:360 要求「底栏下面一行
+显示当前计数」的那行顶掉了，而同族其他写手（`:1413` 导入、`paintSetupCell`、`swapMarks`）都是把
+提示语传进 `renderSetupPanel(note)`；LL4 建议环的显示态在 `enterSetup`（`:1109`）、
+`handleUndoSuccess`（`:1795`）、`handleReplay` 三处重建/切视图时没作废，README:326-327 说建议属于
+它被搜出来的那个局面；LL5 `stopThinking`（`:1050-1064`）把 `aiThinking` 置 false 却不
+`refreshReplayControls()`，回放簇在 `:821`/`:831` 因 `aiThinking` 被禁后就没人为它解禁——其余六个
+`aiThinking = false` 点（`:210/:297/:1565/:1751/:1877`）后面都跟着刷新，这是唯一的漏网，与 JJ3
+同形。暂缓：evaluator 的 `cap = five - 1`（`evaluator.cpp:175`）确实会给出 99999，正好落在
+README:338 的「已证胜负」带上，但改它必须同时决定 P1（`five` 可调 vs 前端常量 99999）与 Z4，
+而且 `tests/test_evaluator.cpp:25-31`、`:317` 与 `tests/test_training.cpp:2489-2504` 三面都在钉
+`five - 1`，属设计判定不是单行修；`board.cpp:58-74` 的颜色守卫排在 `cells_`/Zobrist 写之后
+（`random_table_` 内层只有 3 格）是防御性缺口，但没有任何经校验的调用方能送进非法颜色；
+`trainer.cpp:225` 的 `games_played_ + 1 + t*1000` 在每 worker ≥1000 局时才会撞 id，README 未约定
+id 语义且判别要真跑两千局自对弈；`trainer.cpp:216-224` 注释与 `:236`/`:240` 的 id 不致密只是注释
+与代码不一致，无 README 依据。
+
 ## 轮次106 求招留在棋盘上的那一圈，与两个入口抢同一个文件 — bugfix round 106 batch JJ
 
 **Found.** 三个入口，都是「前端把显示态当成了画一次就完的东西」与「CLI 漏了第三种同名冲突」：

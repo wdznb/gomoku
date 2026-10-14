@@ -124,6 +124,10 @@ ThreatCoefficients GeneticOptimizer::run(const ThreatCoefficients& base,
     best_fitness = 0.0;
     converged_ = false;
     best_history_.clear();
+    // Stagnation is measured inside one run: a second run on this object would
+    // otherwise inherit the previous one's count and stop after a single
+    // generation. evaluations_ is the caller's cost counter and stays cumulative.
+    generations_since_improvement_ = 0;
 
     seed_population(base);
     evaluate(population_);
