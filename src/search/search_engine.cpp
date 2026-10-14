@@ -294,7 +294,13 @@ SearchResult SearchEngine::search(const Board& board, int color,
         // Depth 0 means not one iteration finished and AlphaBeta fell back to
         // root_moves[0]; calling that alphabeta showed depth 0 / score 0 in the
         // replay panel (README:530 lists greedy as a method).
-        if (info.depth == 0) result.method = "greedy";
+        if (info.depth == 0) {
+            result.method = "greedy";
+            // A renamed fast path is not AlphaBeta: README:531 leaves depth/nodes
+            // unset for every other method, and this hand completed no layer.
+            result.depth = 0;
+            result.nodes_searched = 0;
+        }
 
         // AlphaBeta's own count starts with that phase and covers only it; the
         // caller is owed the whole move, so the measure is taken below - after the

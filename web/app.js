@@ -374,9 +374,15 @@ class GomokuGame {
         this.syncTimeoutBounds('min');
 
         document.getElementById('btn-export-position').addEventListener('click', () => this.exportPosition());
-        document.getElementById('btn-setup-clear').addEventListener('click', () => this.clearSetupBoard());
+        document.getElementById('btn-setup-clear').addEventListener('click', () => {
+            if (this.setup.confirmInFlight) return;
+            this.clearSetupBoard();
+        });
         document.getElementById('btn-setup-confirm').addEventListener('click', () => this.confirmSetup());
-        document.getElementById('btn-setup-cancel').addEventListener('click', () => this.exitSetup(false));
+        document.getElementById('btn-setup-cancel').addEventListener('click', () => {
+            if (this.setup.confirmInFlight) return;
+            this.exitSetup(false);
+        });
 
         // 导入 is a modal: the paste box, the file picker and the drop zone all
         // land in the working copy, never on the live board.
@@ -436,7 +442,10 @@ class GomokuGame {
             }
         }
 
-        document.getElementById('btn-position-toggle').addEventListener('click', () => this.toggleSetup());
+        document.getElementById('btn-position-toggle').addEventListener('click', () => {
+            if (this.setup.confirmInFlight) return;
+            this.toggleSetup();
+        });
         document.getElementById('btn-view-rotate').addEventListener('click', () => {
             this.view.rot = (this.view.rot + 90) % 360;
             this.applyView();
@@ -1130,6 +1139,10 @@ class GomokuGame {
         setup.view = null;
         setup.preview = null;
         setup.confirmInFlight = false;
+        // The round trip is over, so the three companions of 确认 are clickable again.
+        document.getElementById('btn-setup-cancel').disabled = false;
+        document.getElementById('btn-setup-clear').disabled = false;
+        document.getElementById('btn-position-toggle').disabled = false;
         this.setSetupBar(false);
         document.getElementById('btn-position-toggle').classList.remove('toggled');
         this.closeImportModal();
@@ -1445,6 +1458,10 @@ class GomokuGame {
         // 确认 is held while the server has the position in hand, so a double click
         // cannot send two loads.
         document.getElementById('btn-setup-confirm').disabled = setup.confirmInFlight;
+        // 确认的往返期间副本不再可弃：取消 / 清空 / 摆棋开关与 确认 一起按住。
+        document.getElementById('btn-setup-cancel').disabled = setup.confirmInFlight;
+        document.getElementById('btn-setup-clear').disabled = setup.confirmInFlight;
+        document.getElementById('btn-position-toggle').disabled = setup.confirmInFlight;
     }
 
     updatePositionStatus(text, isError) {

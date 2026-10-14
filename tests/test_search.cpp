@@ -2656,6 +2656,86 @@ void test_alphabeta_commit_gate_trusts_the_layers_own_record() {
 #endif
 }
 
+// Round 102 GG1: README:530-531 leaves depth/nodes unset for every method but
+// alphabeta. The depth-0 relabel was the one path that broke that -
+// alphabeta.cpp:393 stamps info_.nodes_searched unconditionally, so a hand whose
+// first layer never completed reported {"method":"greedy","depth":0,
+// "nodes":N>0} through game_manager into the replay entry.
+//
+// The position below is a 24-stone midgame whose *whole first layer* costs 4858
+// nodes (about 433 ms in this suite's unoptimised build). The engine's smallest
+// node budget is remaining_time * 200 (search_engine.cpp:263) with
+// remaining_time floored at 100 ms, i.e. 20000 nodes, so no node cap can cut a
+// layer that cheap - the interrupt has to come from the absolute deadline. A
+// 10 ms budget is therefore ~43x inside the layer rather than past it, which is
+// what makes the dirty count constructible instead of a shape pin.
+void test_engine_greedy_relabel_zeroes_the_alphabeta_count() {
+    const int placements[][2] = {
+        {9, 11}, {0, 14}, {10, 2},  {6, 6},  {10, 4}, {9, 2},  {4, 2},  {5, 3},
+        {2, 3},  {10, 1}, {12, 12}, {2, 6},  {1, 8},  {14, 8}, {4, 1},  {13, 4},
+        {1, 14}, {8, 11}, {10, 10}, {8, 7},  {12, 1}, {11, 6}, {5, 2},  {0, 7},
+    };
+
+    Board board;
+    for (size_t i = 0; i < sizeof(placements) / sizeof(placements[0]); ++i) {
+        // Alternating colours, twelve stones each, WHITE to move.
+        board.place_stone(placements[i][0], placements[i][1], i % 2 == 0 ? BLACK : WHITE);
+    }
+    assert(board.move_count() == 24);
+
+    std::atomic<bool> stop(false);
+
+    // VCF and VCT each take a slice of the same budget before AlphaBeta starts,
+    // and the resign probe takes the remainder after it. Switching all three off
+    // leaves the deadline to the single phase being measured.
+    SearchEngine engine;
+    engine.set_vcf_enabled(false);
+    engine.set_vct_enabled(false);
+    engine.set_resign_detection(false);
+
+    int frame_depth = -1;
+    int frame_nodes = -1;
+    engine.set_progress_callback(
+        [&](int depth, int nodes, int) {
+            frame_depth = depth;
+            frame_nodes = nodes;
+        });
+
+    const SearchResult interrupted = engine.search(board, WHITE, 4, 10, stop);
+
+    // Control: the same position with an ample budget completes layers, so the
+    // count is reported. Zeroing is confined to the depth-0 branch.
+    SearchEngine full;
+    full.set_vcf_enabled(false);
+    full.set_vct_enabled(false);
+    full.set_resign_detection(false);
+    const SearchResult completed = full.search(board, WHITE, 4, 2000, stop);
+
+    std::cout << "test_engine_greedy_relabel_zeroes_the_alphabeta_count measured "
+              << "(interrupted: " << interrupted.method << " d" << interrupted.depth
+              << "/n" << interrupted.nodes_searched
+              << ", last frame d" << frame_depth << "/n" << frame_nodes
+              << ", control: " << completed.method << " d" << completed.depth
+              << "/n" << completed.nodes_searched << ")" << std::endl;
+
+    // The renamed fast path reports the fast path's own fields: nothing filled.
+    assert(interrupted.method == "greedy");
+    assert(interrupted.depth == 0);
+    assert(interrupted.nodes_searched == 0);
+    // And it is the rename, not the no-search fallback: a move came back.
+    assert(interrupted.best_move.pos.is_valid());
+    // The work really happened - AlphaBeta's own record still reaches the
+    // terminal thinking frame, which is what the client's progress bar reads.
+    assert(frame_depth == 0);
+    assert(frame_nodes > 0);
+
+    assert(completed.method == "alphabeta");
+    assert(completed.depth >= 1);
+    assert(completed.nodes_searched > 0);
+
+    std::cout << "test_engine_greedy_relabel_zeroes_the_alphabeta_count passed" << std::endl;
+}
+
 int main() {
     std::cout << "Running search tests..." << std::endl;
 
@@ -2692,6 +2772,7 @@ int main() {
     test_engine_stamps_elapsed_on_tactical_wins();
     test_engine_elapsed_covers_the_tactical_phases();
     test_engine_progress_frames_share_the_search_clock();
+    test_engine_greedy_relabel_zeroes_the_alphabeta_count();
     test_search_engine_finds_five();
     test_controller_async();
     test_controller_stop();

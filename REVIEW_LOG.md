@@ -1979,6 +1979,63 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次102 改名成快速路径的那一手仍带着 AlphaBeta 的计数，与确认往返期间仍可弃掉的副本 — bugfix round 102 batch GG
+
+**Found.** 两条都来自轮次101 排到本轮的前端状态机与 replay 契约队列，且**每一行都由我本人读过码**才下发：
+
+- **GG1（中，契约被自己的改名分支打破）** README:530-531 说 `replay` 里「非 AlphaBeta 路径不填
+  `depth` / `nodes`」。`src/search/search_engine.cpp:291-292` 却先无条件把 `info.depth` /
+  `info.nodes_searched` 填进结果，再在 `:297` 把「一层都没跑完、退回 `root_moves[0]`」这一手
+  改名为 `method = "greedy"`；而 `src/search/alphabeta.cpp:393` 的
+  `info_.nodes_searched = nodes_searched_` 是无条件收尾的。于是这一手经
+  `game_manager.cpp:422` → `server.cpp:1021-1022` 落成
+  `{"method":"greedy","depth":0,"nodes":N>0}`——名字已是快速路径，数据还是 AlphaBeta 的。
+- **GG2（高，取消被服务器回答推翻）** README:355-357（确认是唯一写服务器的一步、取消直接丢掉副本、摆棋
+  再点一次等同取消）、:366（清空只清副本）、:377（被拒时留在摆棋里重试）。`web/app.js:1436-1448`
+  `refreshSetupControls()` 在 `setup.confirmInFlight` 为真时只按住 `btn-setup-confirm`（:1447），而
+  清空（`:377`→`clearSetupBoard():1172`）、取消（`:379`→`exitSetup():1124-1147`，它在 :1132 直接把 flag
+  清零并还原底栏）、摆棋开关（`:439`→`toggleSetup():1049`）三个入口全都还能点；更关键的是
+  `handlePositionSet:1266-1305` **无条件**安装服务器回盘——`wasSetup`（:1267）只在 :1305 决定要不要多清一行
+  提示。所以玩家在确认的往返途中点了取消，那份已经被放弃的副本照样铺到 live 棋盘上，同时
+  `game_status='waiting'`、`playerColor=null`、`analysis=[]`，而服务器那边确实已经把局面换掉了。
+
+**Fixed.** `search_engine.cpp` 只在 :297 那条 relabel 分支内把 `result.depth` 与
+`result.nodes_searched` 一起归零（`method` 保持 `"greedy"`），其余分支、`score`、`elapsed_ms`、进度回调以及
+`alphabeta.cpp` 的那个计数（思考帧要用，明确禁改）逐字不动（+7/−1）。`web/app.js`：三处**点击入口**的箭头
+函数加 `if (this.setup.confirmInFlight) return;`（:377/:379/:439），`refreshSetupControls()` 让
+`btn-setup-cancel` / `btn-setup-clear` / `btn-position-toggle` 与 `btn-setup-confirm` 同进同退，并在
+`exitSetup()` 清完 flag 之后重新放开这三个按钮（+20/−3）。守卫刻意没有加进 `exitSetup()` 本身——
+成功路径正是靠 `handlePositionSet` 里的 `exitSetup(true)` 收尾，加在那里会让它自己走不完；
+失败路径无需改动，`:1618-1624` 的 `error` 分支本来就会清 `confirmInFlight` 并重画控件。
+
+**Not defects / held.** `exported` 冷重建那一行（`server.cpp:1207`）不是改一行能了事的：
+`grep -n exported src/server/session_store.{h,cpp}` **零命中**，该标志只活在内存条目里
+（`server.cpp:758/897/990/1207/1504/1511`），而 `flush_entry` 先 `save_session`（:1494）后追加 records
+（:1506），所以会话文件本身无法区分「已追加」与「写完会话就崩了」——正确的修法必须让
+`SessionSnapshot` 持久化这个标志（要动 `.h` 并由我同步改 README 的 `session` 样本），单独排一轮。
+`trainer.cpp:264-266` 的 `break`（换 `continue` 也无从判别：写坏的路径会让整轮全失败）与
+`games_played_`（:256）在落盘之前就计数、检查点在 :373 保存，是一个需要设计取舍的「失败追加欠谁」问题，
+未凑成一行下发。前端审计余下的 C1（陈旧 `position_preview` 回盘重新武装 确认）、C2（`handleGameOver`
+不调 `updateTurnInfo()`）、C3（落子记录行点击绕过回放锁）、C4（接管后 `btn-restart` 仍武装）、
+C5（导出同步 revoke object URL）仍留在队列里。
+
+**Verified.** 测试会话只写 `tests/`：`test_search.cpp` +73/0（零删除行），
+`test_engine_greedy_relabel_zeroes_the_alphabeta_count`（:2672，注册于 :2775）直接用
+`SearchEngine::search` 打一个 24 子的中盘——它先算清楚「整层 4858 节点」而引擎最小节点预算是
+`remaining_time * 200`（`search_engine.cpp:263`，`remaining_time` 下限 100 ms ⇒ 20000 节点），
+于是断点只能来自绝对 deadline，10 ms 预算正好落在**层内**而非层后，这才把「脏 nodes」做成可构造的行为差异
+而不是形状针；关掉了 VCF/VCT/认输探测三个分片，控制组同局面给 2000 ms 断
+`method=="alphabeta" && depth>=1 && nodes>0`，并断进度帧 `frame_nodes > 0` 以证明归零只发生在改名分支、
+活儿确实干过。`web_frontend_check.js` +112/−2，四条 GG2 用例（在飞时四按钮同禁、点三个入口后
+`setup.active`/副本棋盘/`setup.record`/`confirmInFlight` 逐字不动、走一次 `exitSetup` 三个同伴恢复可用、
+不在飞时行为如旧）；那 2 个删除行是 `makeElement` 的基础设施（把空 `addEventListener` 换成被动记录
+listener 并 `return element`），该会话明确说明存量用例从不触发 listener，我核对该说明为实。
+**过程说明**：该会话的最终回报停在中途状态（「HEAD 负例 + test_server 抖动归因还在跑」）就结束了回合，
+所以本轮结论以**我自己跑的同一工作树门禁**为准；我这次 ctest 8/8 全绿，未复现它提到的抖动，锚点从 36 涨到
+**43** 是新增注释引用 README:355-357/366/377/530-531 造成的基线漂移，不是回归。
+门禁：ctest **8/8**（47.16 s）、web **46/46**、锚点 **43 citations / 0 problems**、README **658**。
+合约过期：仅锚点计数基线。
+
 ## 轮次101 把 5-3 局算成和棋的那半个括号，与被时钟推翻的完整一层 — bugfix round 101 batch FF
 
 **Found.** 三个只读审计（训练数据/Elo、搜索时间预算与中止路径、前端状态机）加上我自己的两处通读

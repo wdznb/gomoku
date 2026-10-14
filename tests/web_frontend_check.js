@@ -25,7 +25,7 @@ function assert(condition, message) {
 }
 
 function makeElement(id) {
-    return {
+    const element = {
         id,
         value: '',
         disabled: false,
@@ -42,7 +42,13 @@ function makeElement(id) {
         dataset: {},
         style: {},
         classList: { add() {}, remove() {}, toggle() {}, contains() { return false; } },
-        addEventListener() {},
+        // Round 102 GG2: the 摆棋 guards live in the click handlers themselves, so
+        // a no-op addEventListener left those entries unreachable. The record is
+        // passive - no existing case fires a listener - and elements are shared
+        // across games, so fireClick() runs the handler registered last, which is
+        // the most recently constructed game's.
+        _listeners: [],
+        addEventListener(type, handler) { element._listeners.push({ type, handler }); },
         removeEventListener() {},
         setAttribute() {},
         appendChild() {},
@@ -62,6 +68,7 @@ function makeElement(id) {
             return this._ctx;
         },
     };
+    return element;
 }
 
 function buildSandbox() {
@@ -1980,6 +1987,110 @@ check('CC4 a game over during setup still owns the top bar', () => {
     assert(line.indexOf('游戏结束') === 0,
            'the ending outranks the panel, got: ' + line);
     assert(game.gameOverText === line, 'and the settled text is the one on screen');
+});
+
+// GG2 (round 102): README:355/357 makes 确认 the only step that writes to the
+// server and 取消 the way to drop the working copy, and a second 摆棋 click is
+// that cancel; README:366 limits 清空 to the copy; README:377 keeps a refusal
+// inside 摆棋 for a retry. While a 确认 round trip was in flight those three
+// companions used to stay clickable, and handlePositionSet installed whatever
+// came back - so a copy its player had already abandoned still landed on the
+// board.
+//
+// The guards live in the click handlers, so this needs the recorded listeners
+// (see makeElement). They are DOM-state and call-consequence assertions only:
+// the harness sees no CSS and receives no real server frame, so nothing here
+// speaks for the wire pipeline.
+function fireClick(id) {
+    const listeners = el(id)._listeners;
+    for (let i = listeners.length - 1; i >= 0; --i) {
+        if (listeners[i].type === 'click') {
+            listeners[i].handler({ target: el(id), preventDefault() {} });
+            return true;
+        }
+    }
+    return false;
+}
+
+check('GG2 an in-flight 确认 holds its three companions too', () => {
+    const game = newGame();
+    game.board = emptyBoard();
+    game.enterSetup();
+    game.setup.confirmInFlight = true;
+    game.refreshSetupControls();
+    for (const id of ['btn-setup-confirm', 'btn-setup-cancel', 'btn-setup-clear',
+                      'btn-position-toggle']) {
+        assert(el(id).disabled === true, id + ' must be held while 确认 is in flight');
+    }
+});
+
+check('GG2 the three click entries refuse to drop a copy 确认 is holding', () => {
+    const game = newGame();
+    game.board = emptyBoard();
+    game.board[3][3] = BLACK;
+    game.enterSetup();
+    game.setup.board[5][5] = WHITE;
+    game.setup.record.push({ row: 5, col: 5, color: WHITE });
+    game.setup.confirmInFlight = true;
+    game.refreshSetupControls();
+
+    const copyBefore = JSON.stringify(game.setup.board);
+    const recordBefore = JSON.stringify(game.setup.record);
+    const sentBefore = game.ws ? game.ws.sent.length : 0;
+
+    for (const id of ['btn-setup-cancel', 'btn-setup-clear', 'btn-position-toggle']) {
+        assert(fireClick(id), id + ' registers a click handler');
+        assert(game.setup.active === true, id + ' must leave 摆棋 open');
+        assert(game.setup.confirmInFlight === true, id + ' must not release the flag');
+        assert(JSON.stringify(game.setup.board) === copyBefore, id + ' must not touch the copy');
+        assert(JSON.stringify(game.setup.record) === recordBefore, id + ' must not touch it');
+        assert(game.board[3][3] === BLACK, id + ' must not touch the live board');
+    }
+    assert((game.ws ? game.ws.sent.length : 0) === sentBefore,
+           'and none of the three writes to the server');
+});
+
+check('GG2 leaving setup hands the three companions back', () => {
+    const game = newGame();
+    game.board = emptyBoard();
+    game.enterSetup();
+    game.setup.confirmInFlight = true;
+    game.refreshSetupControls();
+    assert(el('btn-setup-cancel').disabled === true, 'held first');
+
+    game.exitSetup(false);
+    assert(game.setup.active === false, '摆棋 left');
+    assert(game.setup.confirmInFlight === false, 'and the flag cleared');
+    for (const id of ['btn-setup-cancel', 'btn-setup-clear', 'btn-position-toggle']) {
+        assert(el(id).disabled === false, id + ' must not stay locked once it is over');
+    }
+});
+
+check('GG2 with no round trip in flight the companions do their old jobs', () => {
+    const game = newGame();
+    game.board = emptyBoard();
+    game.board[3][3] = BLACK;
+    game.enterSetup();
+    game.setup.board[5][5] = WHITE;
+    game.setup.record.push({ row: 5, col: 5, color: WHITE });
+    game.refreshSetupControls();
+    for (const id of ['btn-setup-cancel', 'btn-setup-clear', 'btn-position-toggle']) {
+        assert(el(id).disabled === false, id + ' must be clickable with nothing in flight');
+    }
+    const sentBefore = game.ws ? game.ws.sent.length : 0;
+
+    // 清空 empties the copy only (README:366).
+    assert(fireClick('btn-setup-clear'), 'btn-setup-clear registers a click handler');
+    assert(game.setup.active === true, '清空 keeps 摆棋 open');
+    assert(game.setup.board.every((row) => row.every((v) => v === 0)), 'the copy is emptied');
+    assert(game.setup.record.length === 0, 'and its record with it');
+    assert(game.board[3][3] === BLACK, 'the live board is untouched');
+
+    // A second 摆棋 click is the cancel (README:357).
+    assert(fireClick('btn-position-toggle'), 'btn-position-toggle registers a click handler');
+    assert(game.setup.active === false, 'the toggle closes the panel it opened');
+    assert(game.board[3][3] === BLACK, 'and the live board is what comes back');
+    assert((game.ws ? game.ws.sent.length : 0) === sentBefore, 'neither click wrote to the server');
 });
 
 let failed = 0;
