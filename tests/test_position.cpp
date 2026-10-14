@@ -1244,6 +1244,112 @@ void test_every_symbol_kind_of_an_oversized_run_is_named() {
     std::cout << "test_every_symbol_kind_of_an_oversized_run_is_named passed" << std::endl;
 }
 
+// Round 109 MM1: a grid cell written as a JSON number above INT64_MAX is a value no
+// document ever named as a mark. token_of() sent every is_number_integer() cell through
+// get<long long>(), and nlohmann's arithmetic conversion for a number_unsigned is a bare
+// static_cast - it does not throw - so 18446744073709551615 arrived as the token "-1",
+// which README:240 lists as a legitimate WHITE symbol. A stone the file never asked for.
+// README:215 is the house rule against reading a 64-bit integer through a truncating cast,
+// and README:245-246 says an unrecognized symbol is refused and *shown back*, never guessed.
+// The fix branches is_number_unsigned() first, exactly as word_of() already did at :69.
+void test_cell_number_beyond_int64_is_never_read_as_minus_one() {
+    // 2^64-1. Over INT64_MAX, so the signed reader used for every JSON integer truncates it.
+    const uint64_t beyond_int64 = 18446744073709551615ULL;
+    // A 15x15 array carrying the three given cell values: `white` on (7,7), `black` on
+    // (6,6) and `blank` everywhere else. Numbers stay numbers and strings stay strings,
+    // which is what separates the two paths this case is about.
+    auto board_of = [](const json& black, const json& white, const json& blank) {
+        json rows_json = json::array();
+        for (int r = 0; r < BOARD_SIZE; ++r) {
+            json row = json::array();
+            for (int c = 0; c < BOARD_SIZE; ++c) {
+                if (r == 7 && c == 7) row.push_back(white);
+                else if (r == 6 && c == 6) row.push_back(black);
+                else row.push_back(blank);
+            }
+            rows_json.push_back(std::move(row));
+        }
+        return rows_json;
+    };
+    const json blank = "0";
+    const json oversized = beyond_int64;
+
+    json doc;
+    doc["version"] = 1;
+    doc["board"] = board_of(json(0), oversized, json(0));
+    const SetupResult refused = position_from_json(doc);
+    // The refusal every reader needs: the grid holds a symbol nothing defines.
+    assert(!refused.ok());
+    // No stone at all survives it. On HEAD a WHITE sits right here, and the count guard
+    // then rejects that document for a *different* reason (黑 0 子、白 1 子), so !ok()
+    // alone proves nothing - the empty board is the observable difference.
+    assert(refused.black_count == 0 && refused.white_count == 0);
+    assert(refused.board.get(7, 7) == EMPTY);
+    // README:246: 拒绝并列出看到的符号. The number it echoes is the number the file
+    // stated, not the one the cast invented.
+    std::cout << "  [r109mm1] refusal names: " << refused.error << std::endl;
+    assert(refused.error.find("18446744073709551615") != std::string::npos);
+
+    // The same oversized cell with a legal black companion: on HEAD the truncated token
+    // is covered by README:240's second row (1 / -1 / 0), the counts balance, and the
+    // whole document *loads* - a phantom white stone placed as if it had been written.
+    json paired;
+    paired["version"] = 1;
+    paired["board"] = board_of(json(1), oversized, json(0));
+    const SetupResult paired_refused = position_from_json(paired);
+    std::cout << "  [r109mm1] paired ok=" << (paired_refused.error.empty() ? "true" : "false")
+              << " 黑" << paired_refused.black_count << " 白" << paired_refused.white_count
+              << std::endl;
+    assert(!paired_refused.ok());
+    assert(paired_refused.black_count == 0 && paired_refused.white_count == 0);
+    assert(paired_refused.board.get(6, 6) == EMPTY && paired_refused.board.get(7, 7) == EMPTY);
+
+    // Control, green before and after: the documented 1 / -1 / 0 convention written as
+    // text really does place a white stone. The guard above must not touch it. (It needs
+    // the black companion too - a lone white is not a position a game reaches, and the
+    // count rule would reject the document for the wrong reason.)
+    json signed_form;
+    signed_form["version"] = 1;
+    signed_form["board"] = board_of(json("1"), json("-1"), blank);
+    const SetupResult signed_read = position_from_json(signed_form);
+    assert(signed_read.ok());
+    assert(signed_read.black_count == 1 && signed_read.white_count == 1);
+    assert(signed_read.encoding.white == "-1");
+    assert(signed_read.board.get(7, 7) == WHITE);
+
+    // Control: the ordinary small-integer grid is unchanged by the unsigned branch, with
+    // and without a stated encoding - 0/1/2 all sit below INT64_MAX either way.
+    json numeric;
+    numeric["version"] = 1;
+    numeric["board"] = board_of(json(1), json(2), json(0));
+    const SetupResult detected = position_from_json(numeric);
+    assert(detected.ok());
+    assert(detected.black_count == 1 && detected.white_count == 1);
+
+    json stated = numeric;
+    stated["encoding"] = {{"black", 1}, {"white", 2}, {"empty", 0}};
+    const SetupResult forced = position_from_json(stated);
+    assert(forced.ok());
+    assert(same_cells(detected, forced));
+    assert(forced.black_count == 1 && forced.white_count == 1);
+
+    // A stated encoding does not need the fix to refuse the oversized cell: the coverage
+    // guard rejects an uncovered token whatever text produced it. Both trees refuse with
+    // no stone placed, so this is a control - the reports differ only in the symbol they
+    // name, which is printed above rather than asserted.
+    json stated_oversized;
+    stated_oversized["version"] = 1;
+    stated_oversized["board"] = board_of(json(1), oversized, json(0));
+    stated_oversized["encoding"] = {{"black", 1}, {"white", 2}, {"empty", 0}};
+    const SetupResult oversized_forced = position_from_json(stated_oversized);
+    std::cout << "  [r109mm1] stated-encoding refusal names: " << oversized_forced.error
+              << std::endl;
+    assert(!oversized_forced.ok());
+    assert(oversized_forced.black_count == 0 && oversized_forced.white_count == 0);
+
+    std::cout << "test_cell_number_beyond_int64_is_never_read_as_minus_one passed" << std::endl;
+}
+
 int main() {
     std::cout << "Running position setup tests..." << std::endl;
     test_grid_parsing();
@@ -1267,6 +1373,7 @@ int main() {
     test_oversized_flat_run_is_scanned_in_one_pass();
     test_bom_prefix_does_not_change_the_shape();
     test_every_symbol_kind_of_an_oversized_run_is_named();
+    test_cell_number_beyond_int64_is_never_read_as_minus_one();
     std::cout << "All position setup tests passed!" << std::endl;
     return 0;
 }

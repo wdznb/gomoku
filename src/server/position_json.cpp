@@ -21,6 +21,13 @@ SetupResult rejected(const std::string& error) {
 // One grid value as a token: numbers become their own text, so 0/1/2 arrays and
 // "0"/"1"/"2" arrays read identically and a stated encoding can mix them.
 bool token_of(const json& value, std::string& out, std::string& error) {
+    // Unsigned first, exactly as word_of does: get<long long>() only casts a
+    // number_unsigned, so 18446744073709551615 would arrive as "-1" - a
+    // documented white symbol - and place a stone no file ever named.
+    if (value.is_number_unsigned()) {
+        out = std::to_string(value.get<uint64_t>());
+        return true;
+    }
     if (value.is_number_integer()) {
         out = std::to_string(value.get<long long>());
         return true;

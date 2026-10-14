@@ -1979,6 +1979,60 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次109 一个不被任何符号表认得的数被截成 −1，于是凭空多出一粒白子 — bugfix round 109 batch MM
+
+**Found.** 四个只读审计（摆棋导入回环 / 前端视角与分析面板 / 搜索编排与配置管线 / 训练循环记账）这一轮只留下
+一条真缺陷——前三条域带回了明确的CLEAN 台账：
+
+- **MM1** `src/server/position_json.cpp:23-34` 的 `token_of()` 只分 `is_number_integer()` 一支，然后
+  `std::to_string(value.get<long long>())`。nlohmann 对 `number_unsigned` 的算术转换就是一次 `static_cast`
+  （vendored `from_json.hpp:344-346`），**不抛，只截断**，所以 `is_number_integer()` 为真而值 > INT64_MAX 的
+  格子会带着截断结果回来。于是棋盘里一个写成 `18446744073709551615` 的格，token 变成 `"-1"`，而
+  `src/core/position_setup.cpp:51` 的自动识别表第二行 `Alphabet{{"1"},{"-1"},{"0"}}` 正把 `"-1"` 当作白棋符号
+  （README:240）。README:215 是「64 位整数不许用会截断的读法」这条 house rule，README:245-246 是
+  「识别不了就直接拒绝并列出看到的符号，绝不猜」。HEAD 在这份文档上不是拒绝，而是**替文件落下一粒它从未写过的
+  白子**：单独一格时它侥幸被「黑先手、黑白差只能 0/1」的计数规则拦住（拒绝的原因完全不同），而只要在别处补一
+  粒合法黑子，整份文档就被完整接受。同文件 `word_of():59-73` 早就写成「先分无符号」，这是唯一的漏网。
+
+**Fixed.** `src/server/position_json.cpp` +7/0——`token_of()` 前面加 `is_number_unsigned()` 一支，走
+`std::to_string(value.get<uint64_t>())`，让那个值自报成 `18446744073709551615`，识别器按未知符号正常拒绝并
+回显。小正整数两支的 `to_string` 结果一致、负数仍走有符号支，所以除 >INT64_MAX 以外无可观察变化。README 不动：
+240/215/245-246 三条本来就写明，代码只是回到文档。
+
+**裁决（不是缺陷）.** 摆棋导入回环整域 CLEAN：导出↔读回（`position_to_json` 发 `encoding{1,2,0}`+数字 board，
+读回走 forced 支）、混合符号→字母表空→拒绝、同签名去重不会把 `−1` 误当白子、`parse_grid_text` 的按行/按格分流、
+`first` 与轮到谁的推导、`check_position` 只在含 `board` 时回显 encoding、`set_position` 对无 encoding 的 board
+强制二次确认——逐条读过整函数后都不是缺陷。核心几何整域 CLEAN：`line_index/line_position` 的位域余量、
+`board.cpp:232-317` 增量邻格计数的可逆性、`transforms.cpp:6-13` 的 8 个 D4 编码与 `opening_book.cpp:16-26`
+逐字一致、`self_symmetries` 是稳定子群、`BITBOARD_TOP_MASK` 与 README:227、LUT 与标量路径按构造等价。
+我自己否掉的：`recognize_position_both` 越界早退时复用 out 参残留 `directions`（evaluator 的候选恒来自
+`active_empty()` 且颜色恒合法，构造不出调用方读到残留的路径）、`transform_board` 整史重放（模块注释未承诺增量）、
+`run_length` 允许 `color==EMPTY`（生产调用方先判 occupied）。训练记账审计报的 `--resume` 后轮次/种子、对战执色
+换算、checkpoint 写序与 tmp+rename 也都核过是文档所述行为。
+
+**Verified.** 测试会话只动 `tests/`：`tests/test_position.cpp` +107/0，一条用例
+`test_cell_number_beyond_int64_is_never_read_as_minus_one`（注册在 `main()` 末位），含两条 HEAD 红点
+（`black_count==0 && white_count==0` 与 `board.get(7,7)==EMPTY`，加最硬的一条「补一粒合法黑子后 HEAD 整盘
+ok=true」）与四条两棵树都绿的对照（文本 `1/-1/0`、小数 `0/1/2`、带 `encoding{1,2,0}` 的同盘）。它如实报了两点：
+① 我原指的姿势 A 在 HEAD 上也 `!ok()`，只是被计数规则拒的，所以红点必须落在计数与盘面上；② 同一格配
+stated encoding（姿势 F）两棵树都拒、都 0/0，只差被点名的符号，判**无可观察差异**，写成打印而非断言。
+回显断言 `error.find("18446744073709551615")` 裁定为结构性回显（README:246 要求列出看到的符号，HEAD 报的是
+自己截出来的 `-1`），与 `test_moves_array_size_is_capped` / DD4 同类先例一致，保留。HEAD 反证走只读
+`git archive aab02f9` → `/tmp/neg109`，单 TU 重链，停在 `tests/test_position.cpp:1286`。
+门禁由我自己在 WSL 跑完：`100% tests passed, 0 tests failed out of 8` / 「Total Test time (real) =  49.77 sec」
+（`test_position` 7.73 s，裸 `cmake ..` 无 Release/NDEBUG）；`web_frontend_check: 72/72 passed`；
+`readme_anchor_check: 71 citations, 0 problems`（66→71 全是用例注释新增的 README:240/215/245-246 引用）；
+`658 README.md`。合约过期：无。已知干扰：`tests/test_server.cpp` 的 `'parked'` 一例是 HEAD 就存在的 flake，
+本轮未触发，未改。
+
+**下一轮（轮次110）预告.** 批次 NN 只有一行 NN1：`src/training/main_trainer.cpp` 里两处路径比较都是**原始
+字符串**——`:291` 的 `out_path == checkpoint_path` 与 `:262` 的 `checkpoint_path != resume_path`。README:204
+说的是「指向同一个文件」、README:207 说的是「必须指向同一个文件」，说的是文件不是写法：`--out ck.json
+--checkpoint ./ck.json` 在 HEAD 上不触发拒绝，跑完后冠军写入把断点换成参数文件（正是文档禁止的后果）；反过来
+`--resume ck.json --checkpoint ./ck.json` 指向的明明是同文件，HEAD 却报错退出——一条合法命令被拒。修法是比较
+两个路径所指的文件而非其写法（`std::filesystem::weakly_canonical` 的 `error_code` 版本，两条路径都规范化后再
+比；规范化失败时退回字符串比较，因为此时无法判定它们是同一个文件，拒绝比放行安全）。
+
 ## 轮次108 关停那一遍扫描少了一条内容规则，与三处越界的建议环 — bugfix round 108 batch LL
 
 **Found.** 三个只读审计（摆棋导入核 / 前端视角与分析面板 / 搜索编排与配置管线）回来 8 条，我把每一条读回
