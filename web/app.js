@@ -260,11 +260,13 @@ class GomokuGame {
         }
         this.applyAuthoritativeSession(msg);
 
-        this.sendMessage({ type: 'request_replay' });
         // The reply to that request redraws the move list, the graph and the status
         // line; flag it so it reports the resume rather than a replay the player
-        // never asked for.
-        this.resumeApplied = true;
+        // never asked for. Only when it actually left: a send the socket refused has
+        // no reply, and a stale flag would be eaten by the next 载入本局分析 the
+        // player asked for, which then reports a resume and never enters the replay
+        // view.
+        if (this.sendMessage({ type: 'request_replay' })) this.resumeApplied = true;
         this.updateStatus(this.resumedStatusText(msg.move_count),
                           this.gameStatus === 'game_over' ? 'idle' : 'ok');
     }
@@ -775,7 +777,10 @@ class GomokuGame {
     }
 
     stepReplay(delta) {
-        const from = this.replayIndex === null ? (delta > 0 ? -1 : 0) : this.replayIndex;
+        // Out of a replay the live board shows the last ply of the record, so that
+        // is where stepping starts - otherwise ◀ cannot step back at all and only
+        // ever jumps to the opening move.
+        const from = this.replayIndex === null ? this.moveHistory.length - 1 : this.replayIndex;
         this.showReplayMove(from + delta);
     }
 
@@ -1834,8 +1839,12 @@ class GomokuGame {
         this.refreshReplayControls();
         this.drawBoard();
         // An undo does not abort a hint search that is still running: the search
-        // finishes and still answers, so this only hands the control back. The
-        // answer for the pre-undo position is voided by the ply-count check.
+        // finishes and still answers, so this only hands the control back. Void the
+        // pending answer here instead of trusting the ply count alone: undo, play a
+        // different point and let the AI answer, and the count is back to what it was
+        // over a different board. -1 is a count no history can have; the next 求招
+        // rewrites it.
+        this.hintMoveCount = -1;
         this.hintInFlight = false;
         document.getElementById('btn-hint').disabled =
             this.playerColor === null || this.gameStatus === 'game_over';
@@ -1869,6 +1878,11 @@ class GomokuGame {
     }
     
     handleThinkingProgress(msg) {
+        // README:526 makes session_taken_over the last frame the replaced socket
+        // gets, but a progress frame already queued behind it can still arrive.
+        // Re-arming here would undo handleTakenOver's grey-out with no frame left
+        // to ever clear it.
+        if (this.takenOver) return;
         // thinking_progress is shared by the AI's move search and hint searches.
         // Only treat it as "the AI is thinking" when it is actually the AI's
         // turn; a hint runs on the player's turn, and setting aiThinking there

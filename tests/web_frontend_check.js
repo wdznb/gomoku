@@ -2950,6 +2950,279 @@ check('PP4 a takeover releases the replay clock along with the other timers', ()
     }
 });
 
+// RR1 (round 114): the ◀ / ▶ pair walks the loaded record one ply at a time
+// (README:335 「之后可用 ⏮ ◀ ▶ ⏭ 逐手回看」). The live board already shows the
+// last ply of that record, so stepping starts there; HEAD read a null replayIndex as
+// "before the first ply" for ◀ too, so back could never back up - it jumped to the
+// opening move instead.
+check('RR1 实时视角按 ◀ 退回上一手，按 ▶ 停在最后一手', () => {
+    const game = adviceGame();
+    game.moveHistory = [
+        { row: 7, col: 7, color: BLACK },
+        { row: 8, col: 8, color: WHITE },
+        { row: 9, col: 9, color: BLACK },
+    ];
+    game.analysis = game.moveHistory.map(() => ({
+        score: 10, depth: 4, nodes: 100, elapsed_ms: 5, method: 'alphabeta',
+    }));
+    game.replayIndex = null;
+    game.stepReplay(-1);
+    assert(game.replayIndex === 1,
+           '◀ from the live view lands on the second-to-last ply, got: ' + game.replayIndex);
+
+    game.replayIndex = null;
+    game.stepReplay(1);
+    assert(game.replayIndex === game.moveHistory.length - 1,
+           '▶ from the live view stays on the last ply the board already shows, got: ' +
+           game.replayIndex);
+});
+
+check('RR1 stepping inside a replay, over an empty record and over an unclaimed position is unchanged', () => {
+    const game = adviceGame();
+    game.moveHistory = [
+        { row: 7, col: 7, color: BLACK },
+        { row: 8, col: 8, color: WHITE },
+        { row: 9, col: 9, color: BLACK },
+    ];
+    game.replayIndex = 1;
+    game.stepReplay(-1);
+    assert(game.replayIndex === 0, 'inside a replay ◀ still walks back one ply, got: ' + game.replayIndex);
+    game.stepReplay(1);
+    assert(game.replayIndex === 1, 'and ▶ still walks forward one, got: ' + game.replayIndex);
+
+    game.moveHistory = [];
+    game.replayIndex = null;
+    game.stepReplay(-1);
+    assert(game.replayIndex === null, 'an empty record keeps ◀ out of the replay view');
+    game.stepReplay(1);
+    assert(game.replayIndex === null, 'and keeps ▶ out of it too');
+
+    // The round-101 lock at tests:1008-1011 - a hand-set position nobody has claimed
+    // a side for keeps its leftover move list out of the replay.
+    game.moveHistory = [
+        { row: 3, col: 3, color: BLACK },
+        { row: 4, col: 4, color: WHITE },
+    ];
+    game.playerColor = null;
+    game.gameStatus = 'waiting';
+    game.showReplayMove(0);
+    assert(game.replayIndex === null, 'an unclaimed position must not enter replay');
+    game.stepReplay(-1);
+    assert(game.replayIndex === null, 'the new starting point honours that lock for ◀');
+    game.stepReplay(1);
+    assert(game.replayIndex === null, 'and for ▶');
+});
+
+// RR2 (round 114): a 求招 answer is void once the position it was searched on is gone
+// (README:327 「这一份建议作废」). The ply-count test alone misses one shape: 悔棋, then
+// two stones land at different points, and the count is back to what 求招 recorded -
+// over a different board.
+
+check('RR2 悔棋后手数补回也不画旧局面的建议环', () => {
+    const game = adviceGame();
+    game.hintInFlight = false;
+    game.moveHistory = [
+        { row: 7, col: 7, color: BLACK },
+        { row: 8, col: 8, color: WHITE },
+    ];
+    game.board[7][7] = BLACK;
+    game.board[8][8] = WHITE;
+    el('timeout').value = '5';
+    el('depth').value = '6';
+    game.requestHint();
+    assert(game.hintInFlight === true && game.hintMoveCount === 2,
+           '求招 is in flight against the two-ply position');
+
+    game.handleUndoSuccess({ move_count: 0, game_status: 'playing' });
+    game.handleMoveMade({ row: 2, col: 2, color: 'black' });
+    game.handleAIMove({ row: 3, col: 3, color: 'white', score: 12, thinking_time_ms: 4 });
+    assert(game.moveHistory.length === 2,
+           'the count is back to what 求招 recorded, got ' + game.moveHistory.length);
+    assert(game.board[7][7] === 0 && game.board[2][2] === BLACK,
+           'over a board that is not the one the answer was searched on');
+
+    const rec = ringRecorder();
+    try {
+        rec.clear();
+        game.handleServerMessage({ type: 'hint_result', row: 7, col: 7, score: 99 });
+        const rings = adviceRings(rec, game).length;
+        assert(rings === 0, 'the answer for the discarded position draws no ring, got ' + rings);
+        assert(game.recommendation === null, 'and it is not kept as display state either');
+    } finally {
+        rec.restore();
+    }
+});
+
+check('RR2 the undo voids nothing it does not cover: no undo paints, a fresh 求招 paints, a longer record voids', () => {
+    // Control one: the same answer with no undo in the game at all still lands.
+    const plain = adviceGame();
+    plain.hintInFlight = false;
+    plain.moveHistory = [
+        { row: 7, col: 7, color: BLACK },
+        { row: 8, col: 8, color: WHITE },
+    ];
+    plain.board[7][7] = BLACK;
+    plain.board[8][8] = WHITE;
+    el('timeout').value = '5';
+    el('depth').value = '6';
+    plain.requestHint();
+    const rec = ringRecorder();
+    try {
+        rec.clear();
+        plain.handleServerMessage({ type: 'hint_result', row: 0, col: 0, score: 9 });
+        assert(adviceRings(rec, plain).length === 1, 'the answer the player asked for is painted');
+        assert(plain.recommendation !== null, 'and stays on the board as display state');
+
+        // Control two: after the undo-and-rebuild of the discriminator, a 求招 the
+        // player asks for over the *current* board is owed its ring.
+        const again = adviceGame();
+        again.hintInFlight = false;
+        again.moveHistory = [
+            { row: 7, col: 7, color: BLACK },
+            { row: 8, col: 8, color: WHITE },
+        ];
+        again.board[7][7] = BLACK;
+        again.board[8][8] = WHITE;
+        again.requestHint();
+        again.handleUndoSuccess({ move_count: 0, game_status: 'playing' });
+        again.handleMoveMade({ row: 2, col: 2, color: 'black' });
+        again.handleAIMove({ row: 3, col: 3, color: 'white', score: 12, thinking_time_ms: 4 });
+        again.requestHint();
+        assert(again.hintMoveCount === 2 && again.hintInFlight === true,
+               'the second 求招 re-arms against the rebuilt position');
+        rec.clear();
+        again.handleServerMessage({ type: 'hint_result', row: 4, col: 4, score: 7 });
+        assert(adviceRings(rec, again).length === 1,
+               'so its answer is drawn, got ' + adviceRings(rec, again).length);
+
+        // Control three: the pre-count guard is untouched - one extra stone with no
+        // undo at all already voids the answer by count.
+        const longer = adviceGame();
+        longer.hintInFlight = false;
+        longer.moveHistory = [
+            { row: 7, col: 7, color: BLACK },
+            { row: 8, col: 8, color: WHITE },
+        ];
+        longer.board[7][7] = BLACK;
+        longer.board[8][8] = WHITE;
+        longer.requestHint();
+        longer.handleMoveMade({ row: 2, col: 2, color: 'white' });
+        rec.clear();
+        longer.handleServerMessage({ type: 'hint_result', row: 0, col: 0, score: 5 });
+        assert(adviceRings(rec, longer).length === 0,
+               'a position that gained a ply retires the answer by count alone, got ' +
+               adviceRings(rec, longer).length);
+    } finally {
+        rec.restore();
+    }
+});
+
+// RR3 (round 114): README:524-525 makes session_taken_over the last frame the replaced
+// socket gets, so a thinking_progress already queued behind it arrives at a page that is
+// parked. Re-arming there greys nothing back and no later frame can clear it.
+check('RR3 接管之后迟到的 thinking_progress 不再重新武装思考态', () => {
+    const game = adviceGame();
+    game.takenOver = false;
+    game.handleTakenOver();
+    assert(game.takenOver === true, 'the takeover landed');
+
+    game.gameStatus = 'playing';
+    game.currentTurn = WHITE;
+    game.handleServerMessage({ type: 'thinking_progress', depth: 4, nodes: 1200 });
+    assert(game.aiThinking === false, 'a late progress frame does not arm 思考中, got: ' + game.aiThinking);
+    assert(el('btn-stop').disabled === true, '终止 stays disabled, got: ' + el('btn-stop').disabled);
+    assert(el('btn-undo').disabled === true && el('btn-hint').disabled === true,
+           'and 悔棋/求招 stay greyed with the rest of the parked page');
+    assert(el('status').textContent.indexOf('本局面已在其他标签页打开') === 0,
+           'the parked line still stands, got: ' + el('status').textContent);
+});
+
+check('RR3 an un-taken page still arms on the very same frame', () => {
+    const game = adviceGame();
+    assert(game.takenOver === false, 'this page still operates the game');
+    game.gameStatus = 'playing';
+    game.currentTurn = WHITE;
+    game.handleServerMessage({ type: 'thinking_progress', depth: 4, nodes: 1200 });
+    assert(game.aiThinking === true, 'the AI turn still arms 思考中');
+    assert(el('btn-stop').disabled === false, 'and 终止 becomes clickable');
+});
+
+// RR4 (round 114): the resume's replay request has to have left before the page calls
+// the next replay answer a resume. A send the closed socket refused gets no reply, and
+// the stale flag was then eaten by the 载入本局分析 the player did ask for.
+check('RR4 request_replay 被拒时不留恢复标记，随后的 replay 进回放视角', () => {
+    const game = adviceGame();
+    game.sendMessage = () => false;
+    const stones = emptyBoard();
+    stones[7][7] = BLACK;
+    stones[8][8] = WHITE;
+    game.handleServerMessage({
+        type: 'session',
+        token: 'a'.repeat(16),
+        resumed: true,
+        player_color: 'black',
+        game_status: 'playing',
+        current_turn: 'white',
+        move_count: 2,
+        max_depth: 6,
+        timeout_ms: 5000,
+        winner: '',
+        reason: '',
+        board: stones,
+    });
+    assert(game.resumeApplied === false,
+           'a refused send cannot promise a reply, got: ' + game.resumeApplied);
+
+    game.handleServerMessage({
+        type: 'replay',
+        base: [],
+        moves: [
+            { row: 7, col: 7, color: 'black' },
+            { row: 8, col: 8, color: 'white' },
+        ],
+        game_over: false,
+    });
+    assert(game.replayIndex === 0, 'the replay that arrives is the view the player scrubs, got: ' + game.replayIndex);
+    assert(el('status').textContent.indexOf('回放已载入') === 0,
+           'and it reports as a replay, got: ' + el('status').textContent);
+});
+
+check('RR4 a send that left still holds the resume for its replay answer', () => {
+    const game = adviceGame();
+    game.sendMessage = () => true;
+    const stones = emptyBoard();
+    stones[7][7] = BLACK;
+    stones[8][8] = WHITE;
+    game.handleServerMessage({
+        type: 'session',
+        token: 'b'.repeat(16),
+        resumed: true,
+        player_color: 'black',
+        game_status: 'playing',
+        current_turn: 'white',
+        move_count: 2,
+        max_depth: 6,
+        timeout_ms: 5000,
+        winner: '',
+        reason: '',
+        board: stones,
+    });
+    assert(game.resumeApplied === true, 'the request left, so its answer is a resume report');
+
+    game.handleServerMessage({
+        type: 'replay',
+        base: [],
+        moves: [
+            { row: 7, col: 7, color: 'black' },
+            { row: 8, col: 8, color: 'white' },
+        ],
+        game_over: false,
+    });
+    assert(game.replayIndex === null, 'and the resumed game stays on the live board, got: ' + game.replayIndex);
+    assert(el('status').textContent.indexOf('已恢复对局') === 0,
+           'with the resumed line, got: ' + el('status').textContent);
+});
+
 let failed = 0;
 for (const result of results) {
     console.log(`${result.ok ? 'PASS' : 'FAIL'} ${result.label}` +

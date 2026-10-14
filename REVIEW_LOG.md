@@ -1979,6 +1979,74 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次114 回放条不能后退的那一手，与三个「这是给谁的帧」判错了的控件 — bugfix round 114 batch RR
+
+**Found.** 四份只读审计（完局记录→replay 链、self_play 与训练轮次记账、前端视角与控件、会话生命周期时序）
+逐条读回之后，站得住的四条全在 `web/app.js`：
+
+- **RR1** `stepReplay:777-780` 把实时视角的起点写成 `delta > 0 ? -1 : 0`，于是 `◀` 走
+  `showReplayMove(-1)` 被夹回 `0`——**与 ⏮ 完全等价，永远退不了手**。README:335「之后可用 ⏮ ◀ ▶ ⏭
+  逐手回看」要求的是逐手；而退出回放时盘上显示的就是记录的最后一手，`replayIndex === null` 的起点本该是
+  `length - 1`。`grep stepReplay tests/` 只有 `tests/web_frontend_check.js:1010` 一处，且它用 `+1`，
+  所以这不是合约过期，是一条从没被钉住的新路径。
+- **RR2** `handleHintResult:1858` 判「这份建议还是不是给当前盘面的」只看
+  `moveHistory.length !== hintMoveCount`，而它上面那句注释自述的前提（「每条改盘面的路都会往 moveHistory
+  上推一手」）漏了**先悔再下**：悔棋吃掉两手，玩家换个点重下、AI 应答又补两手，手数回到原值、盘面已经不是
+  同一张。旧建议照画环、状态照报「建议 H8」，正是 README:327「这一份建议作废……不要把旧局面里的着法
+  画到新局面上」禁的事。修在 `handleUndoSuccess` 尾部一行 `hintMoveCount = -1`——而不是加一个着法序列
+  指纹字段：现有 9 处用例（`:876 :903 :1535 :1558 :2470 :2706 :2725 :2757 :2780`）是**手写**
+  `hintMoveCount` 的，改成指纹会把它们全部打成合约过期。
+- **RR3** `handleThinkingProgress` 不看 `takenOver`。README:526 说 `session_taken_over` 之后「随后立即
+  `close`」，但那一帧是**投到被替掉的 strand 上**的，worker 已经排进队列的 `thinking_progress` 仍会在它
+  后面出去；被接管的标签页从此不会再有一帧，那一发就把 `handleTakenOver` 刚摆好的停车态推翻——终止被点亮、
+  悔棋/求招被按死，且再也无人复位。
+- **RR4** `handleSession:263` 把 `sendMessage` 的返回值丢掉，无条件 `resumeApplied = true`。发送被拒
+  （`requestHint:1046` 就会提前返回，这里却没有）意味着那一发**没有回复**，标记就一直挂着；等玩家自己点
+  「载入本局分析」，`handleReplay:724` 把这条回复当成续局消费掉：状态报「已恢复对局」，且
+  `replayIndex` 留在 `null`，棋盘根本不进回放视图。README:582 的「补一次 `request_replay`」没有发生。
+
+**Fixed.** `web/app.js` +20/−6，四处（契约 `build/r114_rr_spec.txt`）：RR1 的三元式换成
+`this.moveHistory.length - 1`；RR2 在 `handleUndoSuccess` 那句「hands the control back」注释下补
+`this.hintMoveCount = -1;`；RR3 在方法体第一行补 `if (this.takenOver) return;`；RR4 改成
+`if (this.sendMessage({ type: 'request_replay' })) this.resumeApplied = true;`。
+`handleHintResult` 的判定式一字未动，`src/`、`README.md`、`build.sh` 未动。
+
+**裁决（四份审计的其余条目，全部不外派）。** 会话生命周期域：冷架上一份**什么都没有**的会话文件被
+`resume` 时保留原 token 却回 `resumed:false`（审计说的 D1）——README:486-487 承诺「一个新 token」的三种情形是
+认不得、格式不对、读得出来却重建不出棋盘，空文件是**能**重建的那一种，而 `open_session:1246-1256` 已经把
+「重建成功就留着旧 token」的理由写在注释里（旧 URL 必须落在这一局上，不是空白局）；何况 PP2/LL2 之后这种文件
+根本不再被写（README:570）。`applyAuthoritativeSession:294` 无条件 `exitSetup(false)` 丢掉摆棋工作副本，是
+代码里自带注释的既定取舍，README:355/378 只承诺 取消/确认 是丢弃路径，副本从未离开过 socket，服务器无从知道它。
+`syncTimeoutBounds('bounds')` 把会话里的 `max_depth:1` 抹成 2——README:346-347 自己写着「2–20」是
+**输入框的网页规则**，1–20 才是服务器夹取，且这位审计也承认网页上构造不出 `depth=1` 的会话。训练域：
+`trainer.cpp:174-178` 在既没给 `--records` 也没给 `--samples` 时跳过整步采集数据——没有地方可写，且它打印
+`skipping data games this round: ...`，不是静默；README:181 的第 4 步是流程叙述，不是「把四盘自我对弈算完再扔掉」
+的承诺。`verification` 一局未成仍 `elo_.record_result`（`trainer.cpp:127` + `:350`）需要引擎产出非法着法或外部
+stop，训练侧恒传 `nullptr`——无法构造。记录→回放域：`app.js:710` 用原始 `base.length` 供奇偶、`baseStones`
+却过 filter——`base` 只来自 `board_.move_history()`，`session_from_json:213-217` 对越界 base 直接拒绝加载，
+filter 无从丢子；`handleMoveMade:1750` 清 `moveHistory` 不清 `analysis`——进入那分支的两条路
+（`handlePositionSet:1327`、`applyAuthoritativeSession:313`）都已清空 `analysis`，同一 socket 严格 FIFO，
+无法构造。`flush_entry` 先会话文件后 JSONL、`entry->exported = from->record.is_decisive()`、
+`handle_undo` 无条件 `exported = false` 三条是轮次104/轮次85 结过的旧账。视角变换、坐标标注、回放计时器、
+帧形状对照、self_play 主循环、RetryExplorer、`play_match` 轮换、genetic/hill_climbing 的 `run()` 复位、
+elo 公式与 K 档、data_collector 去重键、`next_data_id` 记账、空闲重挂与重连退避表，逐函数读回后 CLEAN。
+
+**Verified.** 测试会话只写 `tests/web_frontend_check.js`：8 条新用例（4 条判别 + 4 条对照），**+273/0**，
+既有用例一条未改，**合约过期：无**。HEAD 反证由我自己重跑一遍——`/mnt/d/tmp/r114_head/`（只读
+`git show ac74166:web/app.js` + 同一份套件副本），红点恰好落在这四条判别上：RR1 `got: 0`、RR2 旧建议环
+`got 1`、RR3 迟到的 progress 把 `aiThinking` 重新点亮 `got: true`、RR4 被拒的发送仍留下恢复标记
+`got: true`，HEAD 总 **78/82**。修复树由我自己跑：`node tests/web_frontend_check.js` **82/82**，
+`node tests/readme_anchor_check.js` **98 citations / 0 problems**（新用例注释里的 README 引用把 94 抬到
+98；README 里没有任何一条按行号指向 `web/app.js`，所以本次行号位移不影响锚点），`wc -l README.md` **658**，
+`node --check web/app.js` 通过，ctest 由我自己重跑：**100% tests passed, 0 failed out of 8 / 69.70 s**。
+
+**下一轮（轮次115）预告.** 本轮判定为「按文档设计 / 无可观察差异 / 无法构造」的条目不动，特别是：冷架上
+空会话文件保留原 token、重连丢弃摆棋工作副本、深度输入框 2–20 的网页规则、`trainer` 无输出路径时跳过采集、
+`base` 越界与 `analysis` 越界两处的 FIFO/拒绝加载前提、`verification` 零局仍记 Elo、RR2 在服务器一侧的
+对位判据（需要慢搜索与悔棋交错的 WS 时序）。下一轮先派三只只读审计：逐手耗时与深度/节点归属从
+`search_engine` 到 `replay` 帧再到评估曲线的呈现链、会话文件 schema 的新旧兼容（`base`/`moves`/`record`
+三态与 `--resume`）、落子记录与状态分级的渲染不变量。回来仍由我逐函数读回核验后才下发。
+
 ## 轮次113 推荐的那条构建路不出测试，却喊「Build complete!」 — bugfix round 113 batch QQ
 
 **Found.** 两份只读审计（长驻资源与性能、运行期文件与路径）逐条读回之后，只有一条站在需求文档上：
