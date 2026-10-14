@@ -1061,6 +1061,8 @@ class GomokuGame {
         // stays disabled while that answer is in flight instead of pretending idle.
         document.getElementById('btn-hint').disabled =
             this.playerColor === null || this.gameStatus === 'game_over' || this.hintInFlight;
+        // The replay cluster was greyed with aiThinking, so it comes back with it.
+        this.refreshReplayControls();
     }
     
     // ---- 摆棋 (position setup) ---------------------------------------
@@ -1208,9 +1210,9 @@ class GomokuGame {
         setup.record = [];
         setup.view = null;
         setup.preview = null;
-        this.renderSetupPanel();
+        // The note rides into renderSetupPanel so README:360's count line stays.
+        this.renderSetupPanel('棋盘已清空（落子记录仍在，取消可还原）。');
         this.drawBoard();
-        this.updatePositionStatus('棋盘已清空（落子记录仍在，取消可还原）。', false);
     }
 
     // Taking a recognised board as the working copy. The record is row-major
@@ -1793,6 +1795,7 @@ class GomokuGame {
         // view exits unconditionally; the loaded record itself is dropped only
         // when it actually covers the popped plies.
         this.stopReplayAuto();
+        this.recommendation = null;
         this.replayIndex = null;
         this.updateReplayInfo();
         if (this.analysis.length > played) {
@@ -2058,8 +2061,9 @@ class GomokuGame {
             ctx.fill();
         }
 
-        if (this.recommendation) {
-            // Painted from state so no later repaint (applyView, placeStone) can lose it.
+        if (this.recommendation && !this.setup.active && this.replayIndex === null) {
+            // Painted from state so no later repaint (applyView, placeStone) can lose it,
+            // and only on the live board: 摆棋's copy and a replay ply are other positions.
             const shown = this.displayOf(this.recommendation.row, this.recommendation.col);
             const p = this.cellCenter(shown[0], shown[1]);
             ctx.beginPath();

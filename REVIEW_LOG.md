@@ -1979,6 +1979,67 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次108 关停那一遍扫描少了一条内容规则，与三处越界的建议环 — bugfix round 108 batch LL
+
+**Found.** 三个只读审计（摆棋导入核 / 前端视角与分析面板 / 搜索编排与配置管线）回来 8 条，我把每一条读回
+被引用的整个函数后判下 5 条真缺陷：
+
+- **LL2** `src/server/server.cpp:1531-1544` 的 `flush_all()` 先 `export_game_record` 再看内容，缺了
+  `flush_entry:1486` 那条「一子未落就不留」。README:571 说「一子未落的空会话不写」，而离开摆棋唯一能造出
+  零子终局的路是**执黑然后认输**——`handle_resign:1078` 承认 `side_chosen` 即已开局，且选黑之后轮到黑，
+  不会派 AI worker，棋盘真空。HEAD 在这种局上 Ctrl+C：会话文件被 `flush_entry` 拒了，`records.jsonl`
+  却收下一条 `moves: []` 的「完局」行并盖上 `exported`，训练流里多出一条不描述任何对局的记录。
+- **LL3** `web/app.js:1211-1213` `clearSetupBoard` 先 `renderSetupPanel()` 再用 `updatePositionStatus`
+  写「棋盘已清空」，把整行顶掉；README:360 要求「底栏下面一行显示当前计数」，而清空是摆棋**内部**的一步。
+  同族其它写手（导入 `:1415`、`paintSetupCell`、`swapMarks`）都是把提示语传进 `renderSetupPanel(note)`。
+- **LL4a** `drawBoard` 的建议环门只查 `this.recommendation`，于是摆棋副本与任意 replay 手上都照画上一局
+  搜出来的那一圈；README:326-327 把求招的结果定在「当前局面」。
+- **LL4b** `handleUndoSuccess` 作废了 replay/分析却没有作废建议环——悔掉一手正是「局面又落了一手」的反向，
+  旧建议已不属于这个局面。
+- **LL5** `stopThinking`（`:1050-1066`）把 `aiThinking` 置 false 并恢复 停止/悔棋/求招 三个控件，唯独不
+  `refreshReplayControls()`；回放簇在 `:821` 随 `aiThinking` 被置灰后就没人替它解开。其余六个
+  `aiThinking = false` 之后都跟着刷新，这是唯一的漏网，与 JJ3 同形。
+
+**Fixed.** `src/server/server.cpp` +7/0（守卫与 `flush_entry` 同式，仍由 `flush_entry` 负责删残留文件）、
+`web/app.js` +8/−4（LL3 改走 `renderSetupPanel(note)`；LL4a 门改成 `this.recommendation && !this.setup.active
+&& this.replayIndex === null`，是**扣住不画**而不是丢弃，切回实时视角环自己回来；LL4b 在 `stopReplayAuto()`
+后 `this.recommendation = null;`；LL5 末尾补 `this.refreshReplayControls();`）。README 不动：360/326-327/571
+三条本来就已写明，代码只是回到文档。
+
+**裁决（不是缺陷）.** 优化器与训练消费侧四条：`hill_climbing.cpp:26` 把 0 个基因夹成 1（README 未约定可达集）、
+`trainer.cpp:126` 不可下棋的匹配返回 0.0（构造不出来，`--verification-games` 走 `require_int(minimum=1)`）、
+`genetic.cpp:45-46` 的注释措辞（轮次 87 的用例已钉住当前分类）、`trainer.cpp:216-224` 注释与 `:236/:240` 的
+id 不致密（无 README 依据）。审计里被我自己否掉的三条：`self_play.h` 的 `max_moves = 80` 默认值与
+`evaluate_position_both` 都没有消费者；position 域里 INVALID id 密度的注释与代码不一致只是注释问题。
+搜索编排审计交回**空表**，它逐条读过并自杀的五条留给后续轮次别再重提：终止后的 `greedy` 尾巴（轮次 94 已否）、
+VCT 的 90000 分（= Z4，与 README:338/P1 一起挂起）、终帧 `thinking_progress` 的 `depth 0 / nodes > 0`
+（`tests/test_search.cpp:2729-2730` 钉住了它）、`halt_search` 丢弃 hint 不回帧（每条置 `discard_pending_`
+的路都另发 `game_over`/`game_restarted`，前端状态无差异）、`controller.*` 的竞态（生产无调用方）。
+前端视角审计同样**空表**，并重钉：`displayOf`/`logicalOf` 八种视图互逆、`coordName` 与
+`columnLabel`/`rowLabel` 对齐、`reasonText` 恰好覆盖服务器能发的三种 reason。
+
+**Verified（测试会话写用例，我本人跑门禁与反证）.** 只写 `tests/`：`tests/test_server.cpp` +48/0 一条
+`test_shutdown_flush_keeps_a_zero_stone_resign_out_of_the_records`（执黑→认输→`flush_all()`，断言
+`records_lines == 0`，对照是同一个 Harness 换 `five_restore(BLACK)` 仍导出 1 行、盖章、留文件），
+`tests/web_frontend_check.js` +216/0 九条（LL3 两条、LL4a 三条、LL4b 两条、LL5 两条），0 删除行 ⇒
+**合约过期：无**。HEAD 反证：我在 host 侧用 `git archive 317c12f` 另开一份工作树跑同一份新前端用例 ⇒
+**67/72**，红的正好是 LL3 / LL4a×2 / LL4b / LL5 这五条判别行，四条对照行在两棵树都绿；LL2 由测试会话用
+「HEAD 的 `server.cpp` 单独重编后按 `link.txt` 的对象表重链（排除 `.o` 要按全路径，否则连
+`tests/test_server.cpp.o` 一起掉）」证明在 `tests/test_server.cpp:669` 红。门禁我亲自四段跑完：
+`cmake .. && make -j4 && ctest` ⇒「100% tests passed, 0 tests failed out of 8」/
+「Total Test time (real) = 50.18 sec」，web **72/72**，锚点 **66 处引用/0 问题**（60→66：新注释里
+`README:571`、`README:360`、`README:326-327` 等引用全部落在真实行上），README **658**。
+
+**轮次109 已有第一条并逐条自核.** MM1 `src/server/position_json.cpp:23-34` 的 `token_of`：
+`is_number_integer()` 也覆盖 nlohmann 存在 `number_unsigned` 里的大于 `INT64_MAX` 的值，而
+`get<long long>()` 只做 `static_cast`（`deps/json/include/nlohmann/detail/conversions/from_json.hpp`），
+于是 `18446744073709551615` 变成字符串 `"-1"`——README:240 表里那格正是**白棋**标志。README:245-246
+要求「识别不了就直接拒绝并列出看到的符号，绝不猜」，README:215 更把这条立成整个文件的规矩（`get<int>`
+截断那类文件一律拒绝），这里却把一个认不出的值猜成了认得出的棋子：黑 1 白 1 的假局面，`check_position`
+也回 `ok:true`。修法是在同处先分 `is_number_unsigned()` 走 `get<uint64_t>()` 再 `to_string`，让那个值
+自报成 `18446744073709551615`，被识别器正常拒绝并回显；`word_of:59-73` 已经是这个写法，可作对位证据。
+其余候选等第四个审计（训练记录/采集/Elo/参数写回链）回来再判。
+
 ## 轮次107 同一个对象上的第二次进化 — bugfix round 107 batch KK
 
 **Found.** 优化器域两条，都是「一个函数的私有状态与它自己写在头文件里的契约不一致」：

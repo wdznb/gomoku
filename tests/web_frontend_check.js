@@ -2613,6 +2613,222 @@ check('JJ3 a state_sync with no replay running needs no release', () => {
     }
 });
 
+// Round 108 LL, three frontend rows.
+//
+// LL3 (B) README:360 makes the bottom bar's second line 摆棋's running count, and 清空 is a
+// step inside 摆棋, not an exit from it. clearSetupBoard used to write its note through
+// updatePositionStatus, which replaces the whole line, so the player who just emptied the
+// board lost the count they are supposed to set the next stone by. The fix routes the note
+// through renderSetupPanel(note), which prepends it to the count it recomputes.
+//
+// LL4 (C/D) README:326-327 places 求招's answer on 当前局面, and round 106 JJ1 made that
+// answer display state painted by drawBoard. Two views are not the current position - 摆棋's
+// working copy (displayView, :1941) and any replay ply - so the ring must not be painted on
+// either; an undo changes the position outright, so the answer is void. The first two cases
+// below prove the ring is held back, the third proves holding it back does not throw it away.
+//
+// LL5 (E) handleThinkingProgress greys the whole replay cluster with aiThinking (:821), and
+// stopThinking restored the other three controls but not that one, so 终止 left 逐手分析 and
+// its nav dead until the next frame arrived.
+check('LL3 清空 keeps 摆棋的计数行在提示之后', () => {
+    const game = newGame();
+    game.board = emptyBoard();
+    game.enterSetup();
+    const pad = game.geom.pad;
+    const cell = game.geom.cell;
+    const spot = (row, col) => ({ clientX: pad + col * cell, clientY: pad + row * cell });
+
+    // A cell cycles 空 → 黑 → 白 → 空 (paintSetupCell, :1185), so two clicks on (3,3) and
+    // one on (4,4) is the cheapest position with a stone of each colour.
+    game.handleCanvasClick(spot(3, 3));
+    game.handleCanvasClick(spot(4, 4));
+    game.handleCanvasClick(spot(3, 3));
+    const painted = el('position-status').textContent;
+    assert(painted.indexOf('摆棋中：黑 1 子、白 1 子') === 0,
+           "the count line is the panel's own output before 清空, got: " + painted);
+
+    assert(fireClick('btn-setup-clear'), 'btn-setup-clear registers a click handler');
+    const line = el('position-status').textContent;
+    assert(line.indexOf('棋盘已清空') === 0, 'the note still reaches the player, got: ' + line);
+    assert(line.indexOf('摆棋中：黑 0 子、白 0 子') !== -1,
+           "and README:360's count line stays with it, got: " + line);
+});
+
+check('LL3 清空 still empties the working copy it counts', () => {
+    const game = newGame();
+    game.board = emptyBoard();
+    game.enterSetup();
+    const pad = game.geom.pad;
+    const cell = game.geom.cell;
+    game.handleCanvasClick({ clientX: pad + 3 * cell, clientY: pad + 3 * cell });
+    game.handleCanvasClick({ clientX: pad + 4 * cell, clientY: pad + 4 * cell });
+
+    assert(fireClick('btn-setup-clear'), 'btn-setup-clear registers a click handler');
+    assert(game.setup.active === true, 'the panel is still open - this is a step, not an exit');
+    assert(game.setup.record.length === 0, "the copy's record is empty");
+    const stones = game.setup.board.flat().filter((v) => v !== 0).length;
+    assert(stones === 0, 'and no stone is left on it, got ' + stones);
+
+    // The count line is recomputed from the copy, so a stone painted after 清空 reads 1 again.
+    game.handleCanvasClick({ clientX: pad + 5 * cell, clientY: pad + 5 * cell });
+    assert(el('position-status').textContent.indexOf('摆棋中：黑 1 子、白 0 子') === 0,
+           'a later paint restores its own count, got: ' + el('position-status').textContent);
+});
+
+check('LL4a 摆棋的副本上不画上一局的建议环', () => {
+    const game = adviceGame();
+    const rec = ringRecorder();
+    try {
+        game.handleServerMessage({ type: 'hint_result', row: 7, col: 7, score: 1234 });
+        assert(adviceRings(rec, game).length === 1, 'the live board shows the answer');
+        rec.clear();
+
+        game.enterSetup();
+        const rings = adviceRings(rec, game).length;
+        assert(rings === 0, 'the 摆棋 repaint draws no ring over the working copy, got ' + rings);
+    } finally {
+        rec.restore();
+    }
+});
+
+check('LL4a a replay ply paints no answer for a position it is not', () => {
+    const game = adviceGame();
+    game.moveHistory = [
+        { row: 7, col: 7, color: BLACK },
+        { row: 8, col: 8, color: WHITE },
+    ];
+    game.hintMoveCount = 2;
+    const rec = ringRecorder();
+    try {
+        game.handleServerMessage({ type: 'hint_result', row: 0, col: 0, score: 5 });
+        assert(adviceRings(rec, game).length === 1, 'the live board shows the answer');
+        rec.clear();
+
+        game.showReplayMove(0);
+        assert(game.replayIndex === 0, 'the view really moved onto the first ply');
+        const rings = adviceRings(rec, game).length;
+        assert(rings === 0, 'the replay repaint draws no ring on a historical board, got ' + rings);
+    } finally {
+        rec.restore();
+    }
+});
+
+check('LL4a holding the ring back keeps the answer, and the live view gets it back', () => {
+    const game = adviceGame();
+    game.moveHistory = [{ row: 7, col: 7, color: BLACK }];
+    game.hintMoveCount = 1;
+    const rec = ringRecorder();
+    try {
+        game.handleServerMessage({ type: 'hint_result', row: 7, col: 7, score: 1234 });
+        rec.clear();
+
+        // Suppressed, not destroyed - neither of the two hidden views touches the display
+        // state, and returning to the live position repaints it. This half is behaviour the
+        // page already had, so it holds on both trees; it is what stops the gates above from
+        // being a deletion dressed as a guard.
+        game.enterSetup();
+        assert(game.recommendation !== null && game.recommendation.row === 7 &&
+               game.recommendation.col === 7, '摆棋 does not throw the answer away');
+        // Clear after the copy is open: at HEAD that repaint is itself the defect, and this
+        // case must count only the repaint that is supposed to bring the ring back.
+        rec.clear();
+        game.exitSetup(false);
+        assert(adviceRings(rec, game).length === 1, 'and leaving 摆棋 brings the ring back');
+
+        game.showReplayMove(0);
+        assert(game.recommendation !== null, 'nor does a replay view');
+        rec.clear();
+        game.exitReplay();
+        assert(adviceRings(rec, game).length === 1, 'and exiting the replay paints it again');
+    } finally {
+        rec.restore();
+    }
+});
+
+check('LL4b an undo retires the answer whose position it popped', () => {
+    const game = adviceGame();
+    game.moveHistory = [{ row: 7, col: 7, color: BLACK }];
+    game.hintMoveCount = 1;
+    const rec = ringRecorder();
+    try {
+        game.handleServerMessage({ type: 'hint_result', row: 8, col: 8, score: 9 });
+        assert(adviceRings(rec, game).length === 1, 'the answer is on the live board first');
+        rec.clear();
+
+        game.handleUndoSuccess({ move_count: 0, game_status: 'playing' });
+        assert(game.recommendation === null, '悔棋 changes the position, so the answer is void');
+        const rings = adviceRings(rec, game).length;
+        assert(rings === 0, 'and the repaint it triggers draws no ring, got ' + rings);
+    } finally {
+        rec.restore();
+    }
+});
+
+check('LL4b the same undo still leaves everything it does not cover', () => {
+    const game = adviceGame();
+    game.moveHistory = [
+        { row: 7, col: 7, color: BLACK },
+        { row: 8, col: 8, color: WHITE },
+    ];
+    game.analysis = [{ method: 'alphabeta', score: 40, depth: 4, nodes: 100, elapsed_ms: 5 }];
+    game.hintMoveCount = 2;
+    game.handleServerMessage({ type: 'hint_result', row: 0, col: 0, score: 9 });
+    game.handleUndoSuccess({ move_count: 1, game_status: 'playing' });
+
+    assert(game.moveHistory.length === 1, 'one ply was popped');
+    assert(game.analysis.length === 1,
+           'the loaded record it does not reach survives, got ' + game.analysis.length);
+    assert(game.replayIndex === null, 'and the replay view exits the way it always did');
+    assert(game.board[8][8] === 0, 'the popped stone left the board');
+});
+
+check('LL5 终止 hands the replay cluster back with the other controls', () => {
+    const game = newGame();
+    game.sendMessage = () => true;
+    game.playerColor = BLACK;
+    game.gameStatus = 'playing';
+    game.setup.active = false;
+    game.moveHistory = [
+        { row: 7, col: 7, color: BLACK },
+        { row: 8, col: 8, color: WHITE },
+    ];
+    game.analysis = [];
+    game.replayIndex = null;
+    game.aiThinking = true;
+    game.refreshReplayControls();
+    assert(el('btn-replay-play').disabled === true, '思考中 the cluster is greyed');
+
+    assert(fireClick('btn-stop'), 'btn-stop registers a click handler');
+    assert(game.aiThinking === false, 'and 终止 cleared the flag it was greyed for');
+    assert(el('btn-replay-play').disabled === false,
+           'so the cluster comes back too, got disabled=' + el('btn-replay-play').disabled);
+    assert(el('btn-replay').disabled === false, 'and 载入回放 with it');
+    assert(el('btn-replay-first').disabled === false, 'and the whole nav group');
+});
+
+check('LL5 the greying 终止 undoes is the one handleThinkingProgress arms', () => {
+    const game = newGame();
+    game.playerColor = BLACK;
+    game.gameStatus = 'playing';
+    game.setup.active = false;
+    game.moveHistory = [{ row: 7, col: 7, color: BLACK }];
+    game.analysis = [];
+    game.replayIndex = null;
+
+    // Green on both trees: aiThinking is the switch for this cluster, so the control
+    // LL5 above asserts is genuinely the one that was left stuck.
+    game.aiThinking = true;
+    game.refreshReplayControls();
+    assert(el('btn-replay-play').disabled === true, 'thinking greys the cluster');
+    game.aiThinking = false;
+    game.refreshReplayControls();
+    assert(el('btn-replay-play').disabled === false, 'and a false flag releases it');
+    game.aiThinking = false;
+    game.moveHistory = [];
+    game.refreshReplayControls();
+    assert(el('btn-replay-play').disabled === true, 'while an empty record still keeps it away');
+});
+
 let failed = 0;
 for (const result of results) {
     console.log(`${result.ok ? 'PASS' : 'FAIL'} ${result.label}` +

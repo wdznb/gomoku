@@ -644,6 +644,53 @@ void test_shutdown_flush_appends_once_per_ending() {
     std::cout << "test_shutdown_flush_appends_once_per_ending passed" << std::endl;
 }
 
+// Round 108 LL, flush_all: the shutdown sweep must decide what counts as a game by the same
+// content rule flush_entry applies to the session file. README:571 states 一子未落的空会话不写,
+// and away from 摆棋 the one way to end a game with no stone anywhere is 执黑 and then 认输 on
+// move zero - handle_resign (:1078) accepts `side_chosen` as "started", and choosing BLACK
+// leaves BLACK to move, so no AI worker is posted and the board really does stay empty.
+// Without the guard that game reached export_game_record, whose only content test is
+// `base.empty() && record.is_decisive()`, so records.jsonl gained a decisive line with zero
+// moves - a record that describes no game, stamped exported, in the stream the trainer reads.
+void test_shutdown_flush_keeps_a_zero_stone_resign_out_of_the_records() {
+    const auto dir = scratch("zero_stone_sessions");
+    const auto records = scratch("zero_stone_records.jsonl");
+    std::error_code ec;
+    {
+        Harness h(dir, records);
+        h.server.handle_choose_side(h.socket, json{{"color", "black"}});
+        h.server.handle_resign(h.socket);
+        assert(h.entry->game->status() == GameStatus::GAME_OVER);
+        assert(h.entry->game->board().move_count() == 0);
+        h.server.flush_all();
+
+        // The pose this case is about: no line in the record stream. The session file is
+        // gone as well, but that half is flush_entry's own rule and holds on both trees.
+        assert(records_lines(records) == 0);
+        assert(!std::filesystem::exists(h.session_file()));
+    }
+
+    // Control, in a sweep of its own so it is green on both trees: the guard is about the
+    // absence of stones, not about shutdown dropping real games. The same Harness shape with
+    // a finished nine-ply record appends its one line, stamps the export, keeps its file.
+    {
+        const auto kept_dir = scratch("kept_stone_sessions");
+        const auto kept_records = scratch("kept_stone_records.jsonl");
+        Harness h(kept_dir, kept_records);
+        assert(h.entry->game->restore_game(five_restore(BLACK)));
+        h.server.flush_all();
+        assert(records_lines(kept_records) == 1);
+        assert(h.entry->exported);
+        assert(std::filesystem::exists(h.session_file()));
+        std::filesystem::remove_all(kept_dir, ec);
+        std::filesystem::remove(kept_records, ec);
+    }
+    std::filesystem::remove_all(dir, ec);
+    std::filesystem::remove(records, ec);
+    std::cout << "test_shutdown_flush_keeps_a_zero_stone_resign_out_of_the_records passed"
+              << std::endl;
+}
+
 // Round 104 II, the `--no-sessions` shape of the reordered sweep: with both paths
 // cleared (main.cpp:100-103), flush_all now reaches export_game_record without
 // passing flush_entry's first-line short-circuit. The helper's own path test is
@@ -2179,6 +2226,7 @@ int main() {
     test_shutdown_flush_keeps_the_file_behind_a_failed_append();
     test_shutdown_flush_appends_once_per_ending();
     test_shutdown_flush_with_persistence_off_writes_nothing();
+    test_shutdown_flush_keeps_a_zero_stone_resign_out_of_the_records();
     test_request_hint_clears_stale_discard();
     test_position_array_string_payload_answers();
     test_pending_position_direct_move_claims_side();

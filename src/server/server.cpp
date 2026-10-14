@@ -1535,6 +1535,13 @@ void GameServer::flush_all() {
         // file, and a game decided here is decided there - the record cannot grow
         // after the ending, while an undo resets the exported flag.
         const SessionSnapshot snap = snapshot_of(*token_entry.second);
+        // The same content-decides rule flush_entry applies to the file: a game with
+        // no stone anywhere is not kept, so shutdown must not append it to the record
+        // stream either (README:571). flush_entry is still what removes the residue.
+        if (snap.base.empty() && snap.record.moves.empty()) {
+            flush_entry(token_entry.second);
+            continue;
+        }
         std::string error;
         if (!export_game_record(token_entry.second->exported, snap, records_path_, error)) {
             continue;
