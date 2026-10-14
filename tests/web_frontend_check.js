@@ -48,10 +48,16 @@ function makeElement(id) {
         // across games, so fireClick() runs the handler registered last, which is
         // the most recently constructed game's.
         _listeners: [],
+        // Round 103 HH3: the 落子记录 rows are throwaway createElement('div')s, so
+        // recording what was appended is the only way to reach their click handlers.
+        _children: [],
         addEventListener(type, handler) { element._listeners.push({ type, handler }); },
         removeEventListener() {},
         setAttribute() {},
-        appendChild() {},
+        // Round 103 HH1: openImportModal focuses the paste box; a stub without it
+        // threw before the case could reach anything it asserts on.
+        focus() {},
+        appendChild(child) { element._children.push(child); },
         getBoundingClientRect() { return { left: 0, top: 0, width: 760, height: 760 }; },
         getContext() {
             if (!this._ctx) {
@@ -2091,6 +2097,174 @@ check('GG2 with no round trip in flight the companions do their old jobs', () =>
     assert(game.setup.active === false, 'the toggle closes the panel it opened');
     assert(game.board[3][3] === BLACK, 'and the live board is what comes back');
     assert((game.ws ? game.ws.sent.length : 0) === sentBefore, 'neither click wrote to the server');
+});
+
+// HH (round 103): three more round-trip / lock rows. README:369 says 确认 writes
+// *this reading* into the copy, so a 识别 answer for text the player has since
+// edited must not become it; README:307 gives the top bar 轮到谁, which a finished
+// game no longer has; README:310 keeps every 落子记录 row clickable, so the lock
+// the replay cluster gets while the AI thinks has to be checked at the row too.
+// Same caveat as GG2 - the harness sees no CSS and receives no real server frame,
+// so everything below is DOM state and call consequence, never a claim about the
+// wire pipeline.
+function fireOn(element, type) {
+    const listeners = element._listeners;
+    for (let i = listeners.length - 1; i >= 0; --i) {
+        if (listeners[i].type === type) {
+            listeners[i].handler({ target: element, preventDefault() {} });
+            return true;
+        }
+    }
+    return false;
+}
+
+function fireEvent(id, type) {
+    return fireOn(el(id), type);
+}
+
+// A recognised reading the server could answer with; only its ok flag and the
+// shape renderImportState() reads matter here.
+const okReading = () => {
+    const board = emptyBoard();
+    board[7][7] = BLACK;
+    board[7][8] = WHITE;
+    return { ok: true, board, encoding: { black: 'B', white: 'W', empty: '.' } };
+};
+
+check('HH1 an edited paste box drops the 识别 answer it was waiting for', () => {
+    const game = newGame();
+    game.openImportModal();
+    el('position-text').value = '  BBBB  ';
+    game.checkPosition();
+    assert(game.setup.checkedText === 'BBBB', '识别 records the payload it actually sent');
+
+    el('position-text').value = 'WWWW';
+    assert(fireEvent('position-text', 'input'), 'the paste box has an input handler');
+    const note = el('import-status').textContent;
+
+    game.handlePositionPreview(okReading());
+    assert(game.setup.preview === null, 'a reading for text nobody is looking at stays dropped');
+    assert(el('btn-import-apply').disabled === true, 'and never re-arms 确认');
+    assert(el('import-status').textContent === note, 'and never overwrites the changed-content line');
+});
+
+check('HH1 the answer for the text still in the box still writes the reading', () => {
+    const game = newGame();
+    game.openImportModal();
+    el('position-text').value = 'BBBBWWWW';
+    game.checkPosition();
+
+    const reading = okReading();
+    game.handlePositionPreview(reading);
+    assert(game.setup.preview === reading, 'the current reading lands');
+    assert(el('btn-import-apply').disabled === false, 'and 确认 is armed for it');
+    assert(el('import-status').textContent !== '', 'with the panel line rewritten');
+});
+
+check('HH1 a stale refusal is dropped, a current one is shown', () => {
+    const game = newGame();
+    game.openImportModal();
+    el('position-text').value = 'BBBB';
+    game.checkPosition();
+
+    el('position-text').value = 'WWWW';
+    fireEvent('position-text', 'input');
+    const note = el('import-status').textContent;
+
+    game.handlePositionPreview({ ok: false, error: 'nope' });
+    assert(game.setup.preview === null, 'the dropped refusal writes no preview');
+    assert(el('import-status').textContent === note, 'and leaves the changed-content line alone');
+    assert(el('btn-import-apply').disabled === true, 'and leaves 确认 disarmed');
+
+    // Back to the text the request was sent with: the same refusal is now current
+    // and must reach the panel, so the guard is a staleness test, not a mute.
+    el('position-text').value = 'BBBB';
+    game.handlePositionPreview({ ok: false, error: 'nope' });
+    assert(el('import-status').textContent !== note, 'the current refusal is shown');
+});
+
+check('HH2 the ending rewrites the sub-line instead of keeping it', () => {
+    const game = newGame();
+    game.sendMessage = () => true;
+    game.playerColor = BLACK;
+    game.gameStatus = 'playing';
+    game.baseStones = [];
+    game.board = emptyBoard();
+    game.moveHistory = [];
+    game.currentTurn = BLACK;
+
+    game.handleMoveMade({ row: 7, col: 7, color: 'black' });
+    const before = el('turn-info').textContent;
+    assert(before.indexOf('轮到') >= 0 && before.indexOf('思考中') >= 0,
+           'the move_made line claims a turn and a thinking AI, got: ' + before);
+
+    game.handleGameOver({ winner: 'white', reason: 'five' });
+    const after = el('turn-info').textContent;
+    assert(after !== before, 'the ending must rewrite it, got: ' + after);
+    assert(after.indexOf('轮到') < 0 && after.indexOf('思考中') < 0,
+           'and no longer name a side to move or a thinking AI, got: ' + after);
+    assert(after === '', 'it is emptied, got: ' + after);
+});
+
+check('HH3 a 落子记录 row click is locked while the AI thinks', () => {
+    const game = newGame();
+    game.playerColor = BLACK;
+    game.gameStatus = 'playing';
+    game.board = emptyBoard();
+    game.moveHistory = [{ row: 7, col: 7, color: BLACK }, { row: 8, col: 8, color: WHITE }];
+    game.analysis = [];
+    game.replayIndex = null;
+    game.aiThinking = true;
+    el('move-list')._children.length = 0;
+    game.updateMoveList();
+    const rows = el('move-list')._children;
+    assert(rows.length === game.moveHistory.length, 'one row per ply is rendered');
+
+    assert(fireOn(rows[0], 'click'), 'the row carries a click handler');
+    assert(game.replayIndex === null, 'the click must not drop the live view');
+    assert(el('replay-info').textContent === '', 'and the sub-line still shows no replayed ply');
+    assert(el('btn-replay-exit').disabled === true, 'the way out still says there is nothing to exit');
+});
+
+check('HH3 with the AI not thinking the same row click replays ply N', () => {
+    const game = newGame();
+    game.playerColor = BLACK;
+    game.gameStatus = 'playing';
+    game.board = emptyBoard();
+    game.moveHistory = [{ row: 7, col: 7, color: BLACK }, { row: 8, col: 8, color: WHITE }];
+    game.analysis = [];
+    game.replayIndex = null;
+    game.aiThinking = false;
+    el('move-list')._children.length = 0;
+    game.updateMoveList();
+    const rows = el('move-list')._children;
+
+    assert(fireOn(rows[0], 'click'), 'the row carries a click handler');
+    assert(game.replayIndex === 0, 'the click enters the first ply');
+    assert(el('replay-info').textContent !== '', 'and the sub-line names it');
+    assert(el('btn-replay-exit').disabled === false, 'with the way out armed');
+
+    // The nav cluster shares the same entry point, so prove the lock did not take
+    // it away either while nothing is thinking.
+    assert(fireClick('btn-replay-last'), 'btn-replay-last registers a click handler');
+    assert(game.replayIndex === game.moveHistory.length - 1, 'and still steps to the last ply');
+});
+
+check('HH3 the lock leaves the way out of a replay open', () => {
+    const game = newGame();
+    game.playerColor = BLACK;
+    game.gameStatus = 'playing';
+    game.board = emptyBoard();
+    game.moveHistory = [{ row: 7, col: 7, color: BLACK }, { row: 8, col: 8, color: WHITE }];
+    game.analysis = [];
+    game.aiThinking = true;
+    game.replayIndex = 1;
+
+    game.exitReplay();
+    assert(game.replayIndex === null, 'exitReplay is not the locked path');
+    assert(el('replay-info').textContent === '', 'and the live view comes back');
+    assert(fireClick('btn-replay-exit'), 'btn-replay-exit registers a click handler');
+    assert(game.replayIndex === null, 'staying out of the replay is fine');
 });
 
 let failed = 0;

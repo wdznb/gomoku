@@ -96,6 +96,9 @@ class GomokuGame {
             view: null,
             preview: null,
             confirmInFlight: false,
+            // The text the outstanding 识别 request was sent with: a reply for a
+            // paste box the player has since edited is not a read they can 确认.
+            checkedText: null,
         };
         
         this.initWebSocket();
@@ -741,6 +744,9 @@ class GomokuGame {
     showReplayMove(index) {
         if (this.moveHistory.length === 0) return;
         if (this.replayBelongsToOldGame()) return;
+        // The row is always clickable (README:310), so the lock the nav buttons get
+        // in refreshReplayControls() has to be checked here too.
+        if (this.aiThinking) return;
         const clamped = Math.max(0, Math.min(this.moveHistory.length - 1, index));
         this.replayIndex = clamped;
         this.refreshReplayControls();
@@ -1344,11 +1350,15 @@ class GomokuGame {
             return;
         }
         this.setup.preview = null;
+        this.setup.checkedText = text;
         this.renderImportState('');
         this.sendMessage({ type: 'check_position', position: text });
     }
 
     handlePositionPreview(msg) {
+        // A stale reply re-arms 确认 with a reading nobody is looking at, so it is
+        // dropped before it touches preview or the panel.
+        if (this.importPayload() !== this.setup.checkedText) return;
         this.setup.preview = msg.ok ? msg : null;
         this.renderImportState(msg.ok ? '' : (msg.error || '无法识别此局面。'), !msg.ok);
     }
@@ -1872,6 +1882,7 @@ class GomokuGame {
         statusText += ` · ${this.reasonText(msg.reason)}`;
         this.gameOverText = statusText;
         this.updateStatus(statusText, kind);
+        this.updateTurnInfo('');
         
         document.getElementById('btn-undo').disabled = true;
         document.getElementById('btn-hint').disabled = true;

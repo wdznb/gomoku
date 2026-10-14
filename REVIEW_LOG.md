@@ -1979,6 +1979,57 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次103 认错得迟了的那一份读法，与终局之后仍在报的轮次副行 — bugfix round 103 batch HH
+
+**Found.** 两个只读审计（会话落盘/训练记录、前端摆棋与回放状态机）在批次 GG 提交期间交回结果，本轮下发
+其中 3 条，**每一行都由我在含 GG 的当前工作树里重读过**（GG 把 `app.js` 的行号整体推了约 9 行，所以旧行号
+一律重新锚定）：
+
+- **HH1（中，确认写进副本的是没人看见的那份读法）** README 摆棋/导入那一节（:360-370）说 **识别** 只是干跑，
+  随后 **确认** 写进副本的必须是玩家当时看到的那一份读法。`web/app.js` 的 `checkPosition()` 发出
+  `check_position` 时不带任何请求标记，而 `handlePositionPreview` 无条件
+  `this.setup.preview = msg.ok ? msg : null;` + `renderImportState(...)`，后者内部又会调
+  `refreshSetupControls()` 重新武装 `btn-import-apply`。「内容已改动，点"识别"重新检查」那行只是一次
+  render（把 `setup.preview` 置空后重画），拦不住晚到的回复：识别发出后玩家改了粘贴框，旧回复回来照样
+  覆盖提示并武装 确认，最终 `applySetupBoard(setup.preview.board)` 落的是陈旧读法。对照：求招那条路是有
+  跟踪的（`hintMoveCount`）。
+- **HH2（低-中，终局副行不认终局）** README:307 要求顶部状态栏给出当前轮次/思考状态，README:522 又规定
+  `move_made` 在前、`game_over` 在后。`handleGameOver`（`:1848-1884`）设了 `gameOverText` 与
+  `updateStatus(...)` 就结束，全函数**没有** `updateTurnInfo()`（可 grep 证：:315/:708/:1317/:1574/:1684/
+  :1716/:1737/:1793 都有，唯独这里没有），所以上一手画在副行的「轮到白棋 · AI 思考中」在终局帧之后仍挂着。
+- **HH3（低-中，行点击绕过回放锁）** README:310 保证落子记录每一行可点——所以不能靠隐藏行来修。按钮那条路
+  在 `refreshReplayControls()` 里按 `!hasMoves || this.aiThinking || this.setup.active || ...` 置 disabled，
+  而行点击 `:2096` 直调 `showReplayMove(index)`，后者只查 `moveHistory.length === 0` 与
+  `replayBelongsToOldGame()`。AI 思考期间点一行就把棋盘切进「回放 · 第 N 手」，而被禁掉的 ⏮◀▶⏭ 恰好是
+  唯一出不去那个视图的出口。
+
+**Fixed.** 全部只动 `web/app.js`（+11/−0）：`setup` 新增 `checkedText`，`checkPosition()` 记下当时提交的文本，
+`handlePositionPreview` 开头 `if (this.importPayload() !== this.setup.checkedText) return;`——纯客户端判据，
+不改报文，文件导入与拖拽也照旧先落进粘贴框、不例外；`handleGameOver` 补一次既有的
+`this.updateTurnInfo('')`（与 :1317/:1574 同一写法）；`showReplayMove` 加一条与按钮同源的锁
+`if (this.aiThinking) return;`，行、按钮、自动播放共用同一个入口因而一起受锁，而行仍可点。
+
+**Not defects / held.** C4（接管后 `btn-restart` 仍武装 + `handleSession` 先写 token）判非缺陷：重开点击经
+`sendMessage` + `readyState === OPEN` + `takenOver` 三重 fail-closed，且那两个分支里写入的都是本 socket 现在
+持有的 token（README:519-520/526-527）。C5（导出同一任务内 `URL.revokeObjectURL`）审计自评即「潜伏」，
+harness 没有真定时器、测不了，不下发。**N1 机制成立但本轮不动**：`flush_all()`（`server.cpp:1520-1525`）
+丢弃 `flush_entry` 的 bool，`stop()` 在 :583 调完就 `ioc_.stop()`（:589），而 :1465 的
+`payload == entry->saved_payload` 正是「运行期会重试、停机时不会重试」的成因——它的正确修法是终局 flush
+改成先追加记录再写会话文件，那属于轮次85 已定的「绝不重复导出」取舍的持久化次序那一半，必须先设计再下发。
+冷重建把 `exported` 置真那一行经复核**仍是**轮次85 的既有取舍，不再重开；`trainer.cpp:264-267` 的
+`break` + 孤儿样本同理维持原判。
+
+**Verified.** 测试会话只写 `tests/web_frontend_check.js`（+175/−1，唯一删除行是 harness 自身的
+`appendChild() {}` 换成会记 `_children` 的实现——回放行的 listener 由此可达，属基础设施而非断言；我核对了
+diff）。七条新用例：HH1 三条（改了粘贴框后旧 ok:true 回复既不写 `preview` 也不武装 `btn-import-apply`、
+文本未变时同一条回复照常写入、陈旧拒绝同样被丢掉而当前拒绝照常显示）、HH2 一条（终局重写副行而不是留着
+「轮到X · AI 思考中」——它先读了 `updateTurnInfo` 的定义再断言，结论是补的那一行已足够，无需新增分支）、
+HH3 三条（思考中行点击不改 `replayIndex`、不在思考时同一点照旧进第 N 手、这把锁不会把**离开**回放的出路
+一起锁死）。HEAD 侧四条红点来自只读 `git archive ea47e53` 解包树，控制组在两棵树上都绿。
+另：HH1 的新判据我要求它专门去找「把不陈旧的回复也掉掉」的路径（文件导入/拖拽的文本来源是否与
+`importPayload()` 一致），它回报未发现。门禁：ctest **8/8**、web **53/53**、锚点 **47 citations /
+0 problems**、README **658**。合约过期：仅锚点计数基线（43→47 来自新注释引用 README:307/310/360-370/522）。
+
 ## 轮次102 改名成快速路径的那一手仍带着 AlphaBeta 的计数，与确认往返期间仍可弃掉的副本 — bugfix round 102 batch GG
 
 **Found.** 两条都来自轮次101 排到本轮的前端状态机与 replay 契约队列，且**每一行都由我本人读过码**才下发：
