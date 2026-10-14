@@ -3421,6 +3421,249 @@ check('TT2c 确认路径不经过这句新分支', () => {
            'and the top line to its own writer, got: ' + el('status').textContent);
 });
 
+// UU1 (round 117): README:375 makes 确认 the only step that writes the server, and
+// handlePositionSet repaints from the board the server actually received, so an edit
+// made while that round trip was in flight vanished without a word. The canvas already
+// refused; the copy's other two writers were the bar's 交换 trio and 导入.
+//
+// The trio itself is out of the harness's reach: document.querySelectorAll is stubbed
+// as () => [] (tests/web_frontend_check.js:107), so app.js's
+// `#group-swap [data-swap]` loop iterates nothing and no sandbox element carries a
+// data-swap. The lock is therefore pinned through swapMarks, the call those buttons
+// make, rather than through the three disabled flags.
+const armedCopy = () => {
+    const game = newGame();
+    game.sendMessage = () => true;
+    game.board = emptyBoard();
+    game.moveHistory = [];
+    game.enterSetup();
+    game.paintSetupCell(0, 0);
+    // The sandbox shares elements across games, so the pre-flight state is stated.
+    el('btn-setup-import').disabled = false;
+    game.openImportModal();
+    el('position-text').value = 'BW';
+    game.checkPosition();
+    game.handlePositionPreview(okReading());
+    assert(game.setup.preview && game.setup.preview.ok, 'a recognised reading is on the modal');
+    assert(el('btn-import-apply').disabled === false, 'and 确认导入 is armed for it');
+    return game;
+};
+
+const inFlight = () => {
+    const game = armedCopy();
+    game.confirmSetup();
+    assert(game.setup.confirmInFlight === true, '确认 left the socket and is in flight');
+    return game;
+};
+
+check('UU1a 确认往返期间 导入 与 确认导入 一起按住', () => {
+    const game = inFlight();
+    assert(el('btn-setup-import').disabled === true,
+           '导入 is held for the round trip, got: ' + el('btn-setup-import').disabled);
+    assert(el('btn-import-apply').disabled === true,
+           'and 确认导入 with it, got: ' + el('btn-import-apply').disabled);
+    for (const id of ['btn-setup-confirm', 'btn-setup-cancel', 'btn-setup-clear',
+                      'btn-position-toggle']) {
+        assert(el(id).disabled === true, id + ' stays held as the GG2 family pins it');
+    }
+});
+
+check('UU1b 往返期间 黑↔白 写不进摆棋副本', () => {
+    const game = inFlight();
+    const before = game.setup.board.map((row) => row.slice());
+    game.swapMarks(BLACK, WHITE, 'board');
+    let moved = 0;
+    for (let row = 0; row < 15; ++row) {
+        for (let col = 0; col < 15; ++col) {
+            if (before[row][col] !== game.setup.board[row][col]) moved++;
+        }
+    }
+    assert(moved === 0, 'the recolour cannot reach the copy mid-flight, ' + moved + ' cells moved');
+    assert(game.setup.record.length === 1 && game.setup.record[0].color === BLACK,
+           'nor does the 摆棋记录 behind it, got: ' + JSON.stringify(game.setup.record));
+});
+
+check('UU1b 往返期间 确认导入 写不进摆棋副本', () => {
+    const game = inFlight();
+    const reading = game.setup.preview;
+    game.applyImport();
+    assert(game.setup.preview === reading, 'the reading is still waiting, not consumed');
+    assert(game.setup.board[0][0] === BLACK && game.setup.board[7][7] === 0,
+           'and the copy is still the player\'s own, got 0,0=' + game.setup.board[0][0]
+           + ' 7,7=' + game.setup.board[7][7]);
+    assert(game.setup.record.length === 1, 'with its record untouched, got: ' + game.setup.record.length);
+});
+
+// UU1-c: the lock is about the round trip alone - the same two writers work when the
+// server does not hold the position.
+check('UU1c 不在往返期间时 交换 与 确认导入 照常生效', () => {
+    const swapped = armedCopy();
+    assert(swapped.setup.confirmInFlight === false, 'nothing is in flight here');
+    swapped.swapMarks(BLACK, WHITE, 'board');
+    assert(swapped.setup.board[0][0] === WHITE, 'the recolour lands, got: ' + swapped.setup.board[0][0]);
+    assert(swapped.setup.record[0].color === WHITE, 'and the record follows it');
+
+    const imported = armedCopy();
+    imported.applyImport();
+    assert(imported.setup.board[7][8] === WHITE && imported.setup.board[0][0] === 0,
+           'the reading replaces the copy, got 0,0=' + imported.setup.board[0][0]
+           + ' 7,8=' + imported.setup.board[7][8]);
+    assert(imported.setup.preview === null, 'and is consumed');
+});
+
+check('UU1d 往返结束后控件回到可用、确认导入 回到无识别状态', () => {
+    const cancelled = inFlight();
+    cancelled.exitSetup(false);
+    assert(cancelled.setup.active === false, '取消 closed the copy');
+    assert(el('btn-setup-import').disabled === false, '导入 comes back, got: ' + el('btn-setup-import').disabled);
+    for (const id of ['btn-setup-cancel', 'btn-setup-clear', 'btn-position-toggle']) {
+        assert(el(id).disabled === false, id + ' comes back with it');
+    }
+    assert(el('btn-import-apply').disabled === true,
+           'while 确认导入 has no modal left to apply, got: ' + el('btn-import-apply').disabled);
+
+    const confirmed = inFlight();
+    confirmed.exitSetup(true);
+    assert(el('btn-setup-import').disabled === false, 'the 确认 way out restores it too');
+    assert(el('btn-import-apply').disabled === true,
+           'and leaves 确认导入 held, got: ' + el('btn-import-apply').disabled);
+});
+
+// UU2 (round 117): README:307 - an ending is reported at a level (绿 for a win, 琥珀
+// for a loss), and handleGameOver kept only the text, so the two repaints that read it
+// back (exitReplay and exitSetup's 取消 half) silently downgraded it to grey.
+const endedThenSetup = (secondWinner) => {
+    const game = newGame();
+    game.sendMessage = () => true;
+    game.playerColor = BLACK;
+    game.gameStatus = 'playing';
+    game.board = emptyBoard();
+    game.board[7][7] = BLACK;
+    game.moveHistory = [{ row: 7, col: 7, color: BLACK }];
+    game.currentTurn = WHITE;
+    game.handleGameOver({ winner: 'black', reason: 'five' });
+    assert(el('status').className.indexOf('ok') >= 0,
+           'the ending written outside 摆棋 carries its own level, got: ' + el('status').className);
+    game.enterSetup();
+    game.handleGameOver({ winner: secondWinner, reason: 'five' });
+    return game;
+};
+
+check('UU2a 摆棋中等来的胜局，取消后回绘仍是那一级的绿', () => {
+    const game = endedThenSetup('black');
+    assert(game.gameStatus === 'game_over', 'the game settled behind the editor');
+    fireClick('btn-setup-cancel');
+    assert(el('status').textContent === game.gameOverText,
+           'the result is painted back, got: ' + el('status').textContent);
+    assert(el('status').className.indexOf('ok') >= 0,
+           'at the level it was reported with, got: ' + el('status').className);
+});
+
+check('UU2a 摆棋中等来的败局，取消后回绘仍是那一级的琥珀', () => {
+    const game = endedThenSetup('white');
+    fireClick('btn-setup-cancel');
+    assert(el('status').textContent === game.gameOverText,
+           'the result is painted back, got: ' + el('status').textContent);
+    assert(el('status').className.indexOf('warn') >= 0,
+           'a loss is not repainted as narration, got: ' + el('status').className);
+});
+
+const replayAfterEnding = (winner) => {
+    const game = newGame();
+    game.sendMessage = () => true;
+    game.playerColor = BLACK;
+    game.gameStatus = 'playing';
+    game.board = emptyBoard();
+    game.board[7][7] = BLACK;
+    game.board[8][8] = WHITE;
+    game.moveHistory = [{ row: 7, col: 7, color: BLACK }, { row: 8, col: 8, color: WHITE }];
+    game.analysis = [];
+    game.replayIndex = null;
+    game.handleGameOver({ winner, reason: 'five' });
+    const level = el('status').className;
+    game.showReplayMove(0);
+    assert(game.replayIndex === 0, 'the replay view is open');
+    return { game, level };
+};
+
+check('UU2b 回放进出后胜局的颜色不降级', () => {
+    const { game, level } = replayAfterEnding('black');
+    assert(level.indexOf('ok') >= 0, 'reported as a win, got: ' + level);
+    game.exitReplay();
+    assert(el('status').textContent === game.gameOverText,
+           'back on the live board the result is still there, got: ' + el('status').textContent);
+    assert(el('status').className === level,
+           'at the very level it was written with, got: ' + el('status').className);
+});
+
+check('UU2b 回放进出后败局的颜色不降级', () => {
+    const { game, level } = replayAfterEnding('white');
+    assert(level.indexOf('warn') >= 0, 'reported as a loss, got: ' + level);
+    game.exitReplay();
+    assert(el('status').textContent === game.gameOverText,
+           'the text is the ending\'s, got: ' + el('status').textContent);
+    assert(el('status').className === level,
+           'and so is the level, got: ' + el('status').className);
+});
+
+// UU2-c: a game that arrives already over is narration, not a result the player just
+// watched - applyAuthoritativeSession writes the line and the new field keeps it grey.
+check('UU2c 会话回填的已结束对局回绘仍是叙述灰', () => {
+    const game = newGame();
+    game.sendMessage = () => true;
+    const board = emptyBoard();
+    board[7][7] = BLACK;
+    game.handleServerMessage({
+        type: 'session',
+        token: 'a'.repeat(16),
+        resumed: true,
+        player_color: 'black',
+        game_status: 'game_over',
+        current_turn: 'white',
+        move_count: 1,
+        max_depth: 6,
+        timeout_ms: 5000,
+        winner: 'black',
+        reason: 'five',
+        board,
+    });
+    assert(game.gameStatus === 'game_over', 'the resumed game comes back settled');
+    assert(game.gameOverText !== '', 'with the ending line it reports');
+    game.enterSetup();
+    fireClick('btn-setup-cancel');
+    assert(el('status').textContent === game.gameOverText,
+           'and painted back on the way out, got: ' + el('status').textContent);
+    assert(el('status').className.indexOf('idle') >= 0,
+           'still as narration, got: ' + el('status').className);
+});
+
+// The other half of the same guard: with no ending to keep, both repaints stay grey.
+check('UU2d 非终局的两次回绘仍是叙述灰', () => {
+    const replay = newGame();
+    replay.sendMessage = () => true;
+    replay.playerColor = BLACK;
+    replay.gameStatus = 'playing';
+    replay.board = emptyBoard();
+    replay.board[7][7] = BLACK;
+    replay.moveHistory = [{ row: 7, col: 7, color: BLACK }];
+    replay.analysis = [];
+    replay.replayIndex = null;
+    replay.showReplayMove(0);
+    assert(replay.gameOverText === '', 'nothing has ended here');
+    replay.exitReplay();
+    assert(el('status').className.indexOf('idle') >= 0,
+           'the live view is narration, got: ' + el('status').className);
+
+    const copy = newGame();
+    copy.sendMessage = () => true;
+    copy.board = emptyBoard();
+    copy.moveHistory = [];
+    copy.enterSetup();
+    copy.exitSetup(false);
+    assert(el('status').className.indexOf('idle') >= 0,
+           'and so is leaving an open copy, got: ' + el('status').className);
+});
+
 let failed = 0;
 for (const result of results) {
     console.log(`${result.ok ? 'PASS' : 'FAIL'} ${result.label}` +

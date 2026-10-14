@@ -85,6 +85,7 @@ class GomokuGame {
         this.replayIndex = null;
         this.replayTimer = null;
         this.gameOverText = '';
+        this.gameOverKind = 'idle';
         // The stones a hand-set position installed and this client's own move list
         // did not play. The board is base + moves, and anything that rebuilds a
         // position from the record (scrubbing, the 摆棋 record) needs both halves.
@@ -306,6 +307,7 @@ class GomokuGame {
             ? `已结束的对局 · ${msg.winner === 'draw' ? '和棋' : (msg.winner === 'black' ? '黑棋' : '白棋')}胜`
               + `（${this.reasonText(msg.reason)}）`
             : '';
+        this.gameOverKind = 'idle';
         // The move list, the installed stones it sits on and the engine numbers are
         // the server's, so ask for them instead of redrawing a history the board
         // cannot give back.
@@ -820,8 +822,11 @@ class GomokuGame {
         this.updateMoveList();
         this.drawBoard();
         this.updateReplayInfo();
-        this.updateStatus(this.gameStatus === 'game_over' && this.gameOverText
-            ? this.gameOverText : '已回到当前局面');
+        // README:307: the ending keeps the level it was reported with (绿 for a win,
+        // 琥珀 for a loss) - repainting only the text would silently downgrade it.
+        const ended = this.gameStatus === 'game_over' && this.gameOverText;
+        this.updateStatus(ended ? this.gameOverText : '已回到当前局面',
+                          ended ? this.gameOverKind : 'idle');
     }
 
     refreshReplayControls() {
@@ -1172,10 +1177,17 @@ class GomokuGame {
         setup.view = null;
         setup.preview = null;
         setup.confirmInFlight = false;
-        // The round trip is over, so the three companions of 确认 are clickable again.
+        // The round trip is over, so the companions of 确认 are clickable again -
+        // including the two UU1 added, while 确认导入 stays disabled because the modal
+        // just closed and there is no read left to apply.
         document.getElementById('btn-setup-cancel').disabled = false;
         document.getElementById('btn-setup-clear').disabled = false;
         document.getElementById('btn-position-toggle').disabled = false;
+        document.getElementById('btn-setup-import').disabled = false;
+        for (const button of document.querySelectorAll('#group-swap [data-swap]')) {
+            button.disabled = false;
+        }
+        document.getElementById('btn-import-apply').disabled = true;
         this.setSetupBar(false);
         document.getElementById('btn-position-toggle').classList.remove('toggled');
         this.closeImportModal();
@@ -1190,8 +1202,9 @@ class GomokuGame {
         if (!confirmed) {
             // An ending that arrived while the copy was open is painted here, the
             // one place the player stops looking at the working board (README:379).
-            this.updateStatus(this.gameStatus === 'game_over' && this.gameOverText
-                ? this.gameOverText : '已退出摆棋：棋盘已还原，落子记录未清空', 'idle');
+            const ended = this.gameStatus === 'game_over' && this.gameOverText;
+            this.updateStatus(ended ? this.gameOverText
+                : '已退出摆棋：棋盘已还原，落子记录未清空', ended ? this.gameOverKind : 'idle');
             // handleGameOver skips updateTurnInfo('') together with the status line
             // while 摆棋 owns it (its !this.setup.active guard); the status half is
             // repainted above, so the turn half has to be cleared here too, or
@@ -1271,7 +1284,7 @@ class GomokuGame {
             return;
         }
         const setup = this.setup;
-        if (!setup.active) return;
+        if (!setup.active || setup.confirmInFlight) return;
         const matrix = swappedMatrix(setup.board, from, to);
         // Swapping two colours keeps every cell occupied, so the record's order (and
         // with it the move list it was seeded from) survives with the colours
@@ -1428,6 +1441,7 @@ class GomokuGame {
     applyImport() {
         const preview = this.setup.preview;
         if (!preview || !preview.ok) return;
+        if (this.setup.confirmInFlight) return;
         this.applySetupBoard(preview.board);
         this.setup.preview = null;
         this.closeImportModal();
@@ -1508,6 +1522,17 @@ class GomokuGame {
         document.getElementById('btn-setup-cancel').disabled = setup.confirmInFlight;
         document.getElementById('btn-setup-clear').disabled = setup.confirmInFlight;
         document.getElementById('btn-position-toggle').disabled = setup.confirmInFlight;
+        // README:375 makes 确认 the only step that writes the server, and the reply
+        // repaints from the board the server actually got, so an edit made after it
+        // left would vanish without a line of warning. The canvas already refuses
+        // (:965); the copy's other two writers are the bar's 交换 trio and 导入.
+        document.getElementById('btn-setup-import').disabled = setup.confirmInFlight;
+        for (const button of document.querySelectorAll('#group-swap [data-swap]')) {
+            button.disabled = setup.confirmInFlight;
+        }
+        // The modal's 确认导入 is the only way a preview reaches the copy; the modal's
+        // own trio only edits that preview, so it needs no lock of its own.
+        if (setup.confirmInFlight) document.getElementById('btn-import-apply').disabled = true;
     }
 
     updatePositionStatus(text, isError) {
@@ -1597,6 +1622,7 @@ class GomokuGame {
         this.analysisEnded = false;
         this.replayIndex = null;
         this.gameOverText = '';
+        this.gameOverKind = 'idle';
         // A restarted game has no position to set up: the working copy would paint
         // onto a board that no longer exists, so it goes with it. exitSetup first —
         // it hands the buttons back, and every line below then says what the new
@@ -1941,6 +1967,7 @@ class GomokuGame {
         // result the player is owed, not only a status code.
         statusText += ` · ${this.reasonText(msg.reason)}`;
         this.gameOverText = statusText;
+        this.gameOverKind = kind;
         // README:379: 摆棋 owns the top line while it is open; gameOverText keeps
         // the result and exitSetup paints it back when the copy is dropped.
         if (!this.setup.active) {

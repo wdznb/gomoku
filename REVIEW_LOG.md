@@ -1979,6 +1979,68 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次117 确认还在路上，导入与换色却已经能改摆棋副本；终局回绘把绿洗成了灰 — bugfix round 117 batch UU
+
+### Found
+
+Two frontend rows, both from the 摆棋交互/控件快照 auditor, both verified by me line by line before dispatch.
+
+- **UU1** — README:375 makes 确认 the only 摆棋 step that writes the server, and `handlePositionSet` repaints the
+  page from the board the server actually received. `confirmSetup` armed `setup.confirmInFlight` and
+  `refreshSetupControls` locked 确认/取消/清空/开关 (round 102 GG2) plus the canvas (`handleCanvasClick`, which the
+  auditor's row also matched), but the copy had **two more writers** that were never in the lock:
+  `swapMarks` (the `#group-swap` trio, `black↔white` recolours the whole copy) and `applyImport`
+  (`确认导入` replaces the copy with the recognised reading, and consumes `setup.preview`). A recolour or an
+  import issued while the 确认 round trip was in flight was overwritten by the authoritative reply with no
+  warning line — exactly the class GG2 closed for the four labelled buttons, left open for these two.
+- **UU2** — README:307 defines the 顶栏 as text **and a colour level** (绿 = 信息/成功, 琥珀 = 需要注意,
+  红 = 拒绝/错误/断线, 灰 = 叙述). `handleGameOver` stored only `gameOverText`, so the two repaints that read the
+  ending back — `exitReplay` and `exitSetup`'s `!confirmed` half (added by round 116 TT2) — called
+  `updateStatus(text)` and silently downgraded a win or a loss to narration grey.
+
+### Fixed
+
+`web/app.js` +33/−6, `src/` untouched: UU1 adds `if (!setup.active || setup.confirmInFlight) return;` to
+`swapMarks` and `if (this.setup.confirmInFlight) return;` to `applyImport`, and extends `refreshSetupControls`
+with `btn-setup-import`, the `#group-swap [data-swap]` loop and (only while in flight) `btn-import-apply`; the
+manual release block at the head of `exitSetup` gained the same three controls, with `btn-import-apply` returning
+to its armed-by-preview `true` because the modal has just closed. UU2 introduces `this.gameOverKind`, written by
+`handleGameOver` (`= kind`) and reset to `'idle'` in the constructor, in `applyAuthoritativeSession`'s session
+rebuild and in `resetGame`, and read by both repaints as `updateStatus(ended ? gameOverText : …, ended ?
+gameOverKind : 'idle')`.
+
+### 裁决
+
+- **无可观察差异**: `confirmSetup`'s own in-flight guard (`:1295`) was already there — it is not part of this batch.
+  The `#group-swap` trio's *disabled flags* cannot be pinned in the harness at all
+  (`document.querySelectorAll` is stubbed as `() => []`), so the lock is pinned through `swapMarks` instead; the
+  modal's own trio only edits the preview, so it needs no lock.
+- **不是缺陷**: an error frame that arrives during the round trip still repaints (the server's rejection is the
+  authoritative word); 摆棋 editing while a replay step preview is painted (auditor B's one LOW row) — README
+  governs what the preview shows, not who may edit underneath it; a `waiting` session frame vs `playing` —
+  `send_session_state` promotes the reported status for a side-chosen game; 「落子记录未清空」 vs an empty record
+  after 取消 — README:377 only promises that leaving 摆棋 does not itself clear the record, and the empty list came
+  from the authoritative `state_sync` TT1a deliberately pins.
+- **held**: C5 (revocation has no observable surface), QQ2 (documenting the two node gate scripts relabels 42
+  citations), the `test_server.cpp:1985` `'parked'` flake (machine-relative), replay-over-`ai_move` atomicity
+  (needs a server-side design pass). The stale `(:965)` self-line reference inside the UU1 comment is folded into
+  batch VV — zero behavioural effect, the anchor checker does not read `web/app.js` self references.
+
+### Verified
+
+Tester's diff is `tests/web_frontend_check.js` **+243/−0** (11 cases, purely additive ⇒ **合约过期: 无**).
+Discriminators: UU1a (both new flags held with the GG2 family), UU1b×2 (the recolour moves 0 cells and the
+reading is not consumed), UU1d (release restores 导入/取消/清空/开关 and leaves 确认导入 held), UU2a×2 and UU2b×2
+(the className keeps `ok` / `warn`). Controls UU1c (no round trip ⇒ both writers land) and UU2c/UU2d (a
+session-rebuilt ending and both non-ending repaints stay `idle`) are green on **both** trees.
+Numbers, all re-run by me: `ctest` **8/8 / 70.81 s**, web harness **99/99** (88 → 99), `readme_anchor_check`
+**106 citations / 0 problems** (104 → 106), `wc -l README.md` **658**. My own HEAD-negative tree
+(`/d/tmp/r117_head_mine`, `web/app.js` from `git show 626ff6d:web/app.js`, not `626ff6d~1`) reads **91/99** with
+exactly the eight UU rows red — `导入 is held for the round trip, got: false`, `the recolour cannot reach the copy
+mid-flight, 1 cells moved`, `the reading is still waiting, not consumed`, `while 确认导入 has no modal left to
+apply, got: false`, `at the level it was reported with, got: status idle` ×4 — and SS1a/TT1a/TT1b/TT2a/TT2c green
+on that tree as the checkpoint that the inherited rounds still hold.
+
 ## 轮次116 摆棋中的权威帧换掉了指引，终局回来后子行还在替死局思考 — bugfix round 116 batch TT
 
 **Found.** 两域只读审计（摆棋 × 权威帧次序、终局 × 编辑器生命周期）逐条读回整函数之后，站得住的两条都在
