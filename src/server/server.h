@@ -146,6 +146,12 @@ private:
     // Guards every map above. The io thread is the only thread that touches them
     // today, so the lock is the record of that rule rather than a requirement.
     std::mutex games_mutex_;
+    // Only the io thread ever assigns deferred_end_for_, but an AI worker can report
+    // a settlement for the same session pointer concurrently, so this pair needs its
+    // own lock and nothing else may be locked while holding it.
+    std::mutex end_frame_mutex_;
+    WebSocketSession* deferred_end_for_ = nullptr;
+    json deferred_end_frame_;
     
     void do_accept();
     void on_connect(std::shared_ptr<WebSocketSession> session);

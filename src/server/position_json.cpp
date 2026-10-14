@@ -268,7 +268,16 @@ SetupResult position_from_json(const json& doc) {
 }
 
 SetupResult position_from_text(const std::string& text) {
-    const size_t first = text.find_first_not_of(" \t\r\n");
+    // A BOM is not content: left in place its 0xEF is the character the shape test
+    // reads, so a legal JSON document arrives as grid text and reports a wrong cell
+    // count. Only the three bytes at the very start count, whatever follows them.
+    size_t begin = 0;
+    if (text.size() >= 3 && static_cast<unsigned char>(text[0]) == 0xEF &&
+        static_cast<unsigned char>(text[1]) == 0xBB &&
+        static_cast<unsigned char>(text[2]) == 0xBF) {
+        begin = 3;
+    }
+    const size_t first = text.find_first_not_of(" \t\r\n", begin);
     if (first == std::string::npos) return rejected("内容为空");
     // A JSON document starts with either brace, so a bare array reports the
     // parser's complaint rather than a confusing grid-width error.
@@ -276,11 +285,12 @@ SetupResult position_from_text(const std::string& text) {
     if (opening != '{' && opening != '[') {
         GridCells cells;
         std::string error;
+        // The grid reader strips the BOM itself, so the text goes on uncut.
         if (!parse_grid_text(text, cells, error)) return rejected(error);
         return position_from_grid(cells);
     }
     // do_not_throw: a truncated upload is a normal occurrence, not a crash.
-    json doc = json::parse(text, nullptr, false);
+    json doc = json::parse(text.begin() + begin, text.end(), nullptr, false);
     if (doc.is_discarded()) return rejected("JSON 解析失败，请检查括号与逗号");
     return position_from_json(doc);
 }

@@ -52,7 +52,15 @@ bool read_position_payload(const json& msg, json& doc, std::string& error) {
     if (value.is_object()) {
         doc = value;
     } else if (value.is_string()) {
-        const std::string text = value.get<std::string>();
+        std::string text = value.get<std::string>();
+        // Same rule as position_from_text: the three bytes at the very start are a
+        // BOM, not content, and leaving them makes json::parse discard a legal
+        // document, which then takes the grid branch below.
+        if (text.size() >= 3 && static_cast<unsigned char>(text[0]) == 0xEF &&
+            static_cast<unsigned char>(text[1]) == 0xBB &&
+            static_cast<unsigned char>(text[2]) == 0xBF) {
+            text.erase(0, 3);
+        }
         json parsed = json::parse(text, nullptr, false);
         if (parsed.is_object()) {
             doc = std::move(parsed);
@@ -925,7 +933,18 @@ void GameServer::handle_make_move(std::shared_ptr<WebSocketSession> session, con
     // current_turn() is still not read here: it would touch board state outside
     // make_move's ai_thinking_ handshake, racing the AI worker's board write under
     // thinking_mutex_.
+    // The stone can end the game inside make_move, whose callback would then queue
+    // game_over ahead of the move_made below; the AI path sends ai_move first, so
+    // hold the ending until this frame has gone out.
+    {
+        std::lock_guard<std::mutex> lock(end_frame_mutex_);
+        deferred_end_for_ = session.get();
+    }
     if (!game->make_move(row, col)) {
+        {
+            std::lock_guard<std::mutex> lock(end_frame_mutex_);
+            deferred_end_for_ = nullptr;
+        }
         send_error(session, "Invalid move");
         return;
     }
@@ -941,6 +960,13 @@ void GameServer::handle_make_move(std::shared_ptr<WebSocketSession> session, con
     response["col"] = col;
     response["color"] = placed_color == BLACK ? "black" : "white";
     send_message(session, response);
+    json deferred;
+    {
+        std::lock_guard<std::mutex> lock(end_frame_mutex_);
+        deferred_end_for_ = nullptr;
+        deferred.swap(deferred_end_frame_);
+    }
+    if (!deferred.is_null()) send_message(session, deferred);
 }
 
 void GameServer::handle_undo(std::shared_ptr<WebSocketSession> session) {
@@ -1588,7 +1614,18 @@ void GameServer::setup_game_callbacks(std::shared_ptr<WebSocketSession> session,
             msg["winner"] = winner == BLACK ? "black" : "white";
         }
         msg["reason"] = reason;
-        send_message(session, msg);
+        // A human stone that ends the game is answered by handle_make_move, which
+        // arms this deferral and sends the held frame after move_made; every other
+        // source (AI, resign, 判负) goes straight out as before.
+        bool held = false;
+        {
+            std::lock_guard<std::mutex> lock(end_frame_mutex_);
+            if (deferred_end_for_ == session.get()) {
+                deferred_end_frame_ = std::move(msg);
+                held = true;
+            }
+        }
+        if (!held) send_message(session, msg);
         // Settle the game the moment it ends, not at the next 10s tick or a
         // detach: a set_position in between would otherwise wipe the result
         // from both the session file and records.jsonl. This callback can run

@@ -1875,6 +1875,113 @@ check('BB1 a missed resume lands the fresh session it was answered with', () => 
            'with the resumed status line, got: ' + el('status').textContent);
 });
 
+// CC4 (round 98): 摆棋 owns the top bar while it is open, so a live frame that
+// arrives underneath it must paint the board without overwriting the guidance.
+// The two writers here are ai_move and undo_success; handleGameOver is the
+// deliberate exception, because an ending outranks the panel.
+check('CC4 an ai_move during setup keeps 摆棋中 and still paints', () => {
+    const game = newGame();
+    game.sendMessage = () => true;
+    game.playerColor = BLACK;
+    game.gameStatus = 'playing';
+    game.board = emptyBoard();
+    game.moveHistory = [{ row: 7, col: 7, color: BLACK }];
+    game.board[7][7] = BLACK;
+    game.currentTurn = WHITE;
+    game.enterSetup();
+    assert(game.setup.active === true, 'enterSetup arms the panel');
+    const setupStatus = el('status').textContent;
+    assert(setupStatus.indexOf('摆棋中') === 0, 'the setup line is on screen');
+
+    game.aiThinking = true;
+    game.handleAIMove({ row: 8, col: 8, color: 'white', score: 1234, thinking_time_ms: 42 });
+    assert(el('status').textContent === setupStatus,
+           'the 摆棋中 line must survive an ai_move, got: ' + el('status').textContent);
+    assert(el('status').className === 'status warn', 'and its level stays the setup one');
+    assert(game.board[8][8] === WHITE, 'the stone still lands on the live board');
+    assert(game.currentTurn === BLACK, 'the turn still flips');
+    assert(game.moveHistory.length === 2, 'and the record still grows');
+    assert(game.aiThinking === false, 'the flag still releases');
+    assert(el('btn-stop').disabled === true, 'and 终止 goes back to sleep');
+});
+
+check('CC4 an undo_success during setup keeps 摆棋中 and still rebuilds', () => {
+    const game = newGame();
+    game.sendMessage = () => true;
+    game.playerColor = BLACK;
+    game.gameStatus = 'playing';
+    game.baseStones = [];
+    game.moveHistory = [
+        { row: 7, col: 7, color: BLACK },
+        { row: 8, col: 8, color: WHITE },
+    ];
+    game.board = emptyBoard();
+    game.board[7][7] = BLACK;
+    game.board[8][8] = WHITE;
+    game.currentTurn = BLACK;
+    game.enterSetup();
+    const setupStatus = el('status').textContent;
+    assert(setupStatus.indexOf('摆棋中') === 0, 'the setup line is on screen');
+
+    game.handleUndoSuccess({ move_count: 0, game_status: 'waiting' });
+    assert(el('status').textContent === setupStatus,
+           'the 摆棋中 line must survive an undo, got: ' + el('status').textContent);
+    assert(game.board[7][7] === 0 && game.board[8][8] === 0, 'the board still rewinds');
+    assert(game.moveHistory.length === 0, 'and the record');
+    assert(game.currentTurn === BLACK, 'and the turn comes back to black');
+    assert(game.hintInFlight === false, 'and the hint control is handed back');
+});
+
+// The controls: with no panel open both writers still speak for themselves.
+check('CC4 an ai_move outside setup still writes its own line', () => {
+    const game = newGame();
+    game.sendMessage = () => true;
+    game.playerColor = BLACK;
+    game.gameStatus = 'playing';
+    game.board = emptyBoard();
+    game.moveHistory = [{ row: 7, col: 7, color: BLACK }];
+    game.currentTurn = WHITE;
+    game.setup.active = false;
+
+    game.handleAIMove({ row: 8, col: 8, color: 'white', score: 1234, thinking_time_ms: 42 });
+    const line = el('status').textContent;
+    assert(line.indexOf('AI ') === 0, 'the ai_move line is written, got: ' + line);
+    assert(line.indexOf('1234') >= 0 && line.indexOf('42ms') >= 0,
+           'with the score and the measured time, got: ' + line);
+});
+
+check('CC4 an undo_success outside setup still writes its own line', () => {
+    const game = newGame();
+    game.sendMessage = () => true;
+    game.playerColor = BLACK;
+    game.gameStatus = 'playing';
+    game.baseStones = [];
+    game.moveHistory = [{ row: 7, col: 7, color: BLACK }];
+    game.board = emptyBoard();
+    game.board[7][7] = BLACK;
+    game.setup.active = false;
+
+    game.handleUndoSuccess({ move_count: 0, game_status: 'waiting' });
+    const line = el('status').textContent;
+    assert(line.indexOf('已悔至空盘') === 0, 'the undo line is written, got: ' + line);
+});
+
+check('CC4 a game over during setup still owns the top bar', () => {
+    const game = newGame();
+    game.sendMessage = () => true;
+    game.playerColor = BLACK;
+    game.gameStatus = 'playing';
+    game.board = emptyBoard();
+    game.enterSetup();
+    assert(el('status').textContent.indexOf('摆棋中') === 0, 'the setup line is on screen');
+
+    game.handleGameOver({ winner: 'white', reason: 'five' });
+    const line = el('status').textContent;
+    assert(line.indexOf('游戏结束') === 0,
+           'the ending outranks the panel, got: ' + line);
+    assert(game.gameOverText === line, 'and the settled text is the one on screen');
+});
+
 let failed = 0;
 for (const result of results) {
     console.log(`${result.ok ? 'PASS' : 'FAIL'} ${result.label}` +

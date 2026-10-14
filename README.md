@@ -580,8 +580,8 @@ ctest --output-on-failure
 `session` 是权威状态帧：`board` 是服务器此刻的棋盘，`move_count` 是盘上子数，`player_color` 为空
 表示还没有人选边，`position_pending` 表示摆好的局面尚未开局。前端在 `resumed: true` 时照它重画并
 补一次 `request_replay` 取回逐手分析（回来的状态是“已恢复对局 / 已恢复摆好的局面”，且停在实时视角
-而不是回放第 1 手）；在 `resumed: false` 时只保存 token、不动本地状态，免得盖掉同一批请求自己的
-回应。`重开` 会把手上那局结算成文件并换一个新 token，旧文件仍然可以凭 token 找回来看。
+而不是回放第 1 手）；`resumed: false` 分两种：自己请求过 `resume` 却没找回局面的，照这一帧把本地装成
+服务器那副空局（棋盘、落子记录、摆棋与思考标记全清，但不补发 `request_replay`），没请求过的广播帧只保存 token、不动本地状态，免得盖掉同一批请求自己的回应。`重开` 会把手上那局结算成文件并换一个新 token，旧文件仍然可以凭 token 找回来看。
 
 ## 开发计划
 

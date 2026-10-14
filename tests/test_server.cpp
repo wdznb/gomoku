@@ -1547,6 +1547,190 @@ void test_finished_game_answers_a_hint_with_the_error_frame() {
     std::filesystem::remove(records, ec);
 }
 
+// Round 98 CC2: a BOM at the head of a string payload states the file's encoding,
+// it is not document content. It used to reach json::parse, which discarded the
+// text, and the fallback then handed the very same characters to the grid reader -
+// so a perfectly stated board was refused for the shape of its characters.
+void test_check_position_reads_a_bom_prefixed_document() {
+    const std::string bom = "\xEF\xBB\xBF";
+    json matrix = json::array();
+    for (int r = 0; r < BOARD_SIZE; ++r) {
+        json row = json::array();
+        for (int c = 0; c < BOARD_SIZE; ++c) row.push_back(0);
+        matrix.push_back(std::move(row));
+    }
+    matrix[7][7] = 1;
+    matrix[8][8] = 1;
+    matrix[6][6] = 2;
+    matrix[9][9] = 2;
+    json doc;
+    doc["board"] = matrix;
+    doc["encoding"] = {{"black", "1"}, {"white", "2"}, {"empty", "0"}};
+    const std::string text = doc.dump();
+
+    std::string grid;
+    for (int r = 0; r < BOARD_SIZE; ++r) {
+        for (int c = 0; c < BOARD_SIZE; ++c) {
+            const bool black = (r == 7 && c == 7) || (r == 8 && c == 8);
+            const bool white = (r == 6 && c == 6) || (r == 9 && c == 9);
+            grid += black ? "1" : white ? "2" : "0";
+            grid += (c + 1 < BOARD_SIZE) ? "," : "\n";
+        }
+    }
+
+    const auto dir = scratch("r98cc2_sessions");
+    {
+        Harness h(dir, std::string());
+        size_t seen = 0;
+        auto preview = [&h, &seen](const std::string& payload) {
+            h.server.handle_check_position(h.socket, json{{"position", payload}});
+            const std::vector<std::string> frames = drain_frames(h.server, h.socket, seen);
+            assert(frames.size() == 1);
+            const json parsed = json::parse(frames[0]);
+            assert(parsed["type"] == "position_preview");
+            return parsed;
+        };
+
+        const json plain = preview(text);
+        assert(plain["ok"] == true);
+        assert(plain["black_count"] == 2);
+        assert(plain["white_count"] == 2);
+        assert(plain["side_to_move"] == "black");
+
+        // The same document with the mark in front of it, and with a line break
+        // between the mark and the brace: one frame each, and the same board.
+        const std::string prefixed_payloads[] = {bom + text, bom + "\n" + text};
+        for (const std::string& payload : prefixed_payloads) {
+            const json read = preview(payload);
+            assert(read["ok"] == true);
+            assert(read["black_count"] == plain["black_count"]);
+            assert(read["white_count"] == plain["white_count"]);
+            assert(read["side_to_move"] == plain["side_to_move"]);
+            assert(read["board"] == plain["board"]);
+        }
+
+        // The grid branch already stripped a BOM, and it still does.
+        const json grid_plain = preview(grid);
+        const json grid_bom = preview(bom + grid);
+        assert(grid_plain["ok"] == true);
+        assert(grid_bom["ok"] == true);
+        assert(grid_bom["board"] == grid_plain["board"]);
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    std::cout << "test_check_position_reads_a_bom_prefixed_document passed" << std::endl;
+}
+
+// Round 98 CC3: a human stone that finishes the game answered with the ending
+// first and the stone second, because make_move fires the game_over callback on
+// the way in while handle_make_move queued move_made only afterwards. The client
+// paints the winning stone from move_made, so 终局 landed on a board one stone
+// short of the five. The AI path already sends its stone before the end
+// (game_manager.cpp:424-426); the human path now holds the end frame back until
+// the stone has gone out.
+void test_human_move_answers_the_stone_before_the_end() {
+    json matrix = json::array();
+    for (int r = 0; r < BOARD_SIZE; ++r) {
+        json row = json::array();
+        for (int c = 0; c < BOARD_SIZE; ++c) row.push_back(0);
+        matrix.push_back(std::move(row));
+    }
+    // Four black in a row, both ends open, four white far away: black to move and
+    // (7,11) is the five.
+    for (int c = 7; c <= 10; ++c) matrix[7][c] = 1;
+    matrix[5][5] = 2;
+    matrix[6][6] = 2;
+    matrix[9][12] = 2;
+    matrix[10][13] = 2;
+    json four;
+    four["board"] = matrix;
+    four["encoding"] = {{"black", "1"}, {"white", "2"}, {"empty", "0"}};
+
+    auto types_of = [](const std::vector<std::string>& frames) {
+        std::string joined;
+        for (const std::string& frame : frames) {
+            const json parsed = json::parse(frame, nullptr, false);
+            if (parsed.is_discarded() || !parsed.contains("type")) continue;
+            joined += (joined.empty() ? "" : ",") + parsed["type"].get<std::string>();
+        }
+        return joined;
+    };
+
+    const auto dir = scratch("r98cc3_sessions");
+    {
+        // (1) No side chosen: the stone claims black and ends the game, and the
+        // two frames owe their documented order.
+        Harness h(dir, std::string());
+        size_t seen = 0;
+        h.server.handle_set_position(h.socket, json{{"position", four}});
+        std::vector<std::string> frames = drain_frames(h.server, h.socket, seen);
+        assert(frames.size() == 1);
+        assert(json::parse(frames[0])["type"] == "position_set");
+        assert(h.entry->game->current_turn() == BLACK);
+
+        h.server.handle_make_move(h.socket, json{{"row", 7}, {"col", 11}});
+        frames = drain_frames(h.server, h.socket, seen);
+        std::cout << "  [r98cc3] frames after the finishing stone: " << types_of(frames)
+                  << std::endl;
+        assert(h.entry->game->status() == GameStatus::GAME_OVER);
+        assert(types_of(frames) == "move_made,game_over");
+        const json stone = json::parse(frames[0]);
+        assert(stone["row"] == 7 && stone["col"] == 11);
+        assert(stone["color"] == "black");
+        const json end = json::parse(frames[1]);
+        assert(end["winner"] == "black");
+        assert(end["reason"] == "five");
+    }
+    {
+        // (2) Control: a stone that finishes nothing owes no ending at all. The
+        // long budget keeps the armed worker from answering during the drain.
+        Harness h(dir, std::string());
+        size_t seen = 0;
+        h.entry->game->set_config(120000, 20);
+        h.server.handle_make_move(h.socket, json{{"row", 7}, {"col", 7}});
+        h.entry->game->halt_search();
+        const std::vector<std::string> frames = drain_frames(h.server, h.socket, seen);
+        assert(types_of(frames) == "move_made");
+    }
+    {
+        // (3) The same finish after 执黑: still stone-then-end, and the player is
+        // owed no ai_move for a game that stopped with the stone.
+        Harness h(dir, std::string());
+        size_t seen = 0;
+        h.server.handle_set_position(h.socket, json{{"position", four}});
+        h.entry->game->set_config(120000, 20);
+        h.server.handle_choose_side(h.socket, json{{"color", "black"}});
+        assert(h.entry->game->player_color() == BLACK);
+        assert(!h.entry->game->is_ai_thinking());
+        drain_frames(h.server, h.socket, seen);
+
+        h.server.handle_make_move(h.socket, json{{"row", 7}, {"col", 11}});
+        const std::vector<std::string> frames = drain_frames(h.server, h.socket, seen);
+        assert(types_of(frames) == "move_made,game_over");
+        assert(!h.entry->game->is_ai_thinking());
+    }
+    {
+        // (4) 认输 is not the deferred path: the ending goes straight out, once.
+        Harness h(dir, std::string());
+        size_t seen = 0;
+        h.entry->game->set_config(120000, 20);
+        h.server.handle_make_move(h.socket, json{{"row", 7}, {"col", 7}});
+        h.entry->game->halt_search();
+        drain_frames(h.server, h.socket, seen);
+        assert(h.entry->game->player_color() == BLACK);
+
+        h.server.handle_resign(h.socket);
+        assert(h.entry->game->status() == GameStatus::GAME_OVER);
+        const std::vector<std::string> frames = drain_frames(h.server, h.socket, seen);
+        assert(types_of(frames) == "game_over");
+        assert(json::parse(frames[0])["winner"] == "white");
+        assert(json::parse(frames[0])["reason"] == "resign");
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    std::cout << "test_human_move_answers_the_stone_before_the_end passed" << std::endl;
+}
+
 // Round 88, S5: the two halves of a resumed session's search config stand on their
 // own. A file that states max_depth but never states timeout_ms - 0 is the
 // round-86 P2 sentinel for "key absent" - used to lose both at once, because one
@@ -1756,6 +1940,8 @@ int main() {
     test_resume_takeover_notifies_the_loser();
     test_hint_answer_for_a_superseded_position();
     test_finished_game_answers_a_hint_with_the_error_frame();
+    test_check_position_reads_a_bom_prefixed_document();
+    test_human_move_answers_the_stone_before_the_end();
     test_resume_restores_each_config_half();
     test_zero_stone_position_keeps_the_token();
     test_transient_accept_failure_rearms_and_abort_ends();

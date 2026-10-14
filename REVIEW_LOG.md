@@ -1979,6 +1979,90 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次98 十六兆一个分隔符都没有的那份模板，与抢先落地的终局帧 — bugfix round 98 batch CC
+
+**Found.** 三个只读审计（app.js 摆棋×终局×回放、摆棋文档/模板装载边界、game_manager↔server 状态机与
+线程生命周期）交回 11 条，逐条读码后留下 4 条，其余被我否掉或挂起。裁决证据都在行号上：
+
+- **CC3（高）帧序**：AI 那侧 `game_manager.cpp:424` 先 `move_callback_` 再 `:426 check_game_over()`，
+  所以 `ai_move` 总在 `game_over` 之前落地；人这条路是反的 —— `make_move` 内部 `:188` 就跑完
+  `check_game_over()`，而 `server.cpp:938-943` 的 `move_made` 要更晚才发。一记取胜的落子因此回成
+  `game_over, move_made`：前端先按终局收摊（`handleGameOver` 关掉棋盘、写「游戏结束」），随后那帧
+  `move_made` 又去画那颗子。README:519-521 的帧序契约与 :453 的「先答落子再结算」都要求前者。
+- **CC1（中）装载边界**：轮次82 D1 的早停在 `position_setup.cpp:249-252` 数的是 `blocks`，也就是**格数**
+  而不是字符数；`split_row:151-154` 只在 `size() == 15` 时才把一行炸成一格一符号。于是一行 16 MB 无分隔符
+  的 ASCII 只产生**一个** block，`blocks.size() > 225` 永不触发，`:276-278` 先把约 1600 万个单字符
+  `std::string` 全部物化（SSO ≈ 500 MB），直到 `:294`/`:309` 才拒绝。`:283-286` 的 `kinds` 扫描也救不了
+  （全 `.` 文本只有 1 种符号）。
+- **CC4（中）顶栏**：`handleAIMove` 与 `handleUndoSuccess` 的状态写入不受摆棋门禁约束，
+  而 README:379 钉的是「摆棋期间顶栏归那条琥珀色指引…不会把指引冲掉」。`updateTurnInfo:2046-2057` 写的
+  是 `#turn-info` 不是状态行，所以只有 `updateStatus` 会冲；`hintInFlight` 的六个复位点
+  （`chooseSide:977-981`、`handlePositionSet:1297`、`applyAuthoritativeSession:310`、`handleRestart:1527`、
+  错误帧 `:1627-1631`、`handleUndoSuccess:1778`、`handleGameOver:1830`）说明这不是控件卡死，纯粹是那行字。
+- **CC2（低）BOM**：记事本按「UTF-8」存盘的 JSON 模板前面多了 `EF BB BF`。`position_json.cpp:271-281` 的
+  `find_first_not_of(" \t\r\n")` 把 `0xEF` 当成首字节 → 走进棋盘文本分支 → `parse_grid_text` 自己剥掉 BOM
+  （`:213-215`），于是这份除了 BOM 完全合法的文档收到的是「第 N 行有 M 格」这类答非所问的抱怨。WS 入口
+  `server.cpp:56` 同理。
+
+**Fixed.** CC3 把根因放在服务器侧并与 AI 路径对齐：`server.h` 新增 `end_frame_mutex_` /
+`deferred_end_for_` / `deferred_end_frame_`，`handle_make_move` 在调用 `make_move` **之前**记下这把会话，
+`Invalid move` 早退时清掉，`move_made` 发出后再把暂存的终局帧换出来发走；`game_over` 回调
+（`server.cpp:1612-1624`）只有一处改动 —— `deferred_end_for_` 命中自己时持有帧而不是发送，
+那条无条件的 `net::post` 冲刷一字未动，所以认输/超时/求招揭示终局等其它来源仍即时发出。
+CC1 用一次流式扫描替换「全部物化」：新 `for_each_codepoint`（模板参数是谓词，返回是否继续）累加码点数，
+超过 225 后不再存符号，出现第四种符号立即中断（那条消息不打印总数，本就不需要扫完）；`:311` 读 `total == 225`、
+`:326` 读 `std::max(blocks.size(), total)`，两条中文消息与 README:259-260 的优先级（第四种符号在前、
+棋盘有 N 格在后）以及 `:305` 的 `row_error`  precedence 全部逐字保留；`codepoints_of` 随之删除（已无调用者）。
+CC4 在这两处状态写入外包 `if (!this.setup.active)`，其余语句一律不动。`handleGameOver` 是**故意留的**：
+终局帧带来的「游戏结束」必须显示。CC2 在 `position_from_text` 里用偏移量决定形态（`begin = 3` 跳过 BOM，
+`json::parse(text.begin() + begin, text.end(), …)`，不整份拷贝上传内容），`read_position_payload:51-63`
+在字符串载荷上进 `json::parse` 前 `erase` 掉那三个字节；带 BOM 的**棋盘文本**照旧可用（剥离幂等）。
+README 侧 `:583-584` 补完 BB1 的两态口径（主动问 `resume` 落空也要落地权威空盘，未问的回声帧只存 token），
+行数仍是 658。
+
+**Not defects.** 状态机审计的三条全部为真却不可达：BB3/BB4 的**写入方**撞不到新的严格读盘口
+（`created_ms`/`updated_ms` 是 `now_ms()` 赋的 `long long`，`server.cpp:894-895`/`:1457-1459`；
+`game_id`/`move_index` 是 `int`，`data_collector.cpp:164-165`/`:187-188`；nlohmann 写成 `is_number_integer()`）；
+手工改出的未来时间戳没有后果（驱逐用的是内存里的 `entry.detached_ms`，`server.cpp:1509-1510`，
+`open_session` 只取 `created_ms > 0` 当 P2 哨兵 `:1179`）；「处理函数抛异常 ⇒ `do_read:319-326` 吞掉、客户端
+永远等」这一类被 `grep 'throw '` 关门（`src/core/` 与 `src/server/` 一处抛出都没有，入站读取全靠
+`read_json_int`/`is_string()` 闸门，`:16-24` 的注释写着的就是这个意图）。
+`opening_book.cpp:94-135` 干净：`weight` 走严格 `read_json_int`（`:119`），越盘坐标在 `add_line` 的
+`is_valid()`（`:49-51`）里就丢掉，全坏的书整体失败（`:132-134`）。`SearchController`（`src/search/controller.cpp`）
+无生产调用方，只有 `test_search.cpp:816/842/869` —— README:596 说清了搜索是单线程迭代加深，「多线程」指的是
+异步思考控制，与轮次81 E5 同类。终止响应性由代码而非实测背书：`stop_flag` 在每个节点入口和静态搜索子循环
+都被轮询（`alphabeta.cpp:94/147/177/227/313/328`）。审计 B 的 `check_position` 预览回显把 `encoding` 的符号
+配成数字 `board`：机理为真（`server.cpp:802-806`），但 README:247-248 给的工作流正好相反（「模板里写明
+`encoding` 即可直接载入」），客户端 确认 硬编码 `encoding:{black:1,white:2,empty:0}`（`app.js:1253-1255`），
+无文档承诺、无客户端路径。`data/` 七个模板都解成同一合法局面（3 黑 2 白，位棋盘逐字验证过）。
+审计 A 的第 5 条（关摆棋瞬间闪回旧状态行）是轮次96 J4 已钉住的过渡态。
+
+**Queued for round 99.** 构建路径完整性自查这轮全过（25 个 `src/*/*.cpp` 都在某个 target 里、
+`build.sh` 的免 CMake 源码列与 `GOMOKU_SOURCES`（`CMakeLists.txt:52-64`）一致、POST_BUILD 同时拷 `web/` 与
+`data/`（`:90-94`）、链接带 `-lpthread`），只剩一条低优先级的**文档/脚本错位**：README:174-187 在
+方法1（推荐）后面直接写 `./gomoku_train`，从没说训练器是 CMake-only，而脚本自己的
+`To train … (CMake build only)` 提示印在 `if [ "$USE_CMAKE" -eq 1 ]` **里面**，正好是不需要它的时候；
+无 cmake 的机器上推荐路径留下「没有 gomoku_train 也没有提示」。探针 `build/r98cc_trainlink.sh` 证明
+22 个 TU 的免 CMake 训练器链接**成立**（`R98CC_LINK_OK`，`--help` 可用，不需要 Boost），下一轮连同
+`:57-58` 那段只描述服务器列表的注释一起修。
+
+**Verified.** 门禁在同一棵树上：ctest **8/8**（43.07 s，`test_position` 7.35 s、`test_server` 8.57 s）、
+`node tests/web_frontend_check.js` **42/42**、`node tests/readme_anchor_check.js` **33 citations / 0 problems**，
+合约过期**无**。HEAD 反向证明（`git archive cf86935` 到 /tmp）：CC1 `tests/test_position.cpp:1111
+assert(elapsed_ms < 10000) failed`（HEAD 12.7 s / 峰值 RSS 1160 MB，工作树 6.6 s / 135 MB；同一用例在
+`-O2` 下 1585 ms → 429 ms，判据是 RSS 而非墙钟，因为八个测试目标不带 `-O2`，`CMakeLists.txt:87`）；
+CC2 `tests/test_position.cpp:1165 assert(prefixed.ok()) failed`；
+CC3 `tests/test_server.cpp:1676 assert(types_of(frames) == "move_made,game_over") failed`，前面打印
+`frames after the finishing stone: game_over,move_made`；CC4 在 HEAD 上是 `40/42`，两条「摆棋中保持不变」
+分别实测写出 `AI I7 · 分值 1234 · 42ms` 与 `已悔至空盘：轮到黑方，继续落子`。CC3 另钉三条不变量：非终局手
+只有 `move_made`、执黑后终局仍 `move_made,game_over` 且没有多余 `ai_move`、认输仍恰好一帧 `game_over`。
+CC2 的 WS 字符串载荷那条腿在 HEAD 上也过（nlohmann 自己跳 BOM），故 `test_server.cpp:1550` 只是防回归钉；
+CC1b 无可观察差异，未立案。测试会话的 diff 只在 `tests/`（`test_position.cpp` +125、`test_server.cpp` +187、
+`web_frontend_check.js` +107），未碰 `src/`、`web/`、`README.md`、
+`CMakeLists.txt`、`data/`，未做 git 写操作。一处收尾由我完成：它把新用例插在 `test_resume_restores_each_config_half`
+的说明注释**中间**，吃掉了「// Round 88, S5: …」那一起手行（`tests/test_server.cpp:1734` 从半句
+「// own. A file that states…」开始），我按 HEAD 原文补回；既有断言一行未改。工件：`build/r98cc_trainlink.sh`。
+
 ## 轮次97 权威帧被丢掉的那一局，与三个「写了却不认」的读盘口 — bugfix round 97 batch BB
 
 **Found.** 三个只读审计（持久化/训练、app.js↔server 线路、game_manager/server 状态机）交回 8 条，

@@ -1713,8 +1713,10 @@ class GomokuGame {
             this.playerColor === null || this.gameStatus === 'game_over';
         // ai_move is the only live message that carries the engine's verdict for
         // the stone it just placed, so surface it in the status line.
-        this.updateStatus(`AI ${this.coordName(msg.row, msg.col)} · 分值 ${msg.score} · ${msg.thinking_time_ms}ms`,
-                          'idle');
+        if (!this.setup.active) {
+            this.updateStatus(`AI ${this.coordName(msg.row, msg.col)} · 分值 ${msg.score} · ${msg.thinking_time_ms}ms`,
+                              'idle');
+        }
         this.updateTurnInfo();
         this.refreshReplayControls();
     }
@@ -1761,7 +1763,9 @@ class GomokuGame {
             // a game the server still lets them play in.
             this.gameStatus = this.playerColor !== null ? 'playing' : 'waiting';
             if (this.playerColor !== null) {
-                this.updateStatus(`已悔至空盘：轮到${this.currentTurn === BLACK ? '黑' : '白'}方，继续落子`, 'ok');
+                if (!this.setup.active) {
+                    this.updateStatus(`已悔至空盘：轮到${this.currentTurn === BLACK ? '黑' : '白'}方，继续落子`, 'ok');
+                }
             }
         } else if (msg.game_status === 'game_over') {
             this.gameStatus = 'game_over';

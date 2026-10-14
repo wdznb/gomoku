@@ -171,12 +171,12 @@ GridRow split_row(const std::string& stripped) {
     return row;
 }
 
-// The codepoints of a block, so an unseparated 黑/白/空 run explodes by symbol
-// and not by byte. A lead byte whose continuation bytes are missing or malformed
-// yields itself alone, which then matches no alphabet and is reported as an
-// unknown mark rather than silently corrupting a neighbour.
-std::vector<std::string> codepoints_of(const std::string& block) {
-    std::vector<std::string> out;
+// One codepoint at a time, without materialising the run: the flat form has to
+// count every symbol of a block that may be megabytes long, and a vector of one
+// string per codepoint is the cost this avoids. The width comes from the lead
+// byte; a malformed or truncated lead byte stands alone, matching no alphabet.
+template <typename Fn>
+bool for_each_codepoint(const std::string& block, const Fn& fn) {
     size_t i = 0;
     while (i < block.size()) {
         const unsigned char lead = static_cast<unsigned char>(block[i]);
@@ -189,10 +189,10 @@ std::vector<std::string> codepoints_of(const std::string& block) {
             if ((static_cast<unsigned char>(block[i + k]) & 0xC0) != 0x80) well_formed = false;
         }
         if (!well_formed) width = 1;
-        out.push_back(block.substr(i, width));
+        if (!fn(block.substr(i, width))) return false;
         i += width;
     }
-    return out;
+    return true;
 }
 
 GridCells reshape(const std::vector<std::string>& cells) {
@@ -272,18 +272,25 @@ bool parse_grid_text(const std::string& text, GridCells& out, std::string& error
         out = reshape(blocks);
         return true;
     }
+    // One pass with bounded memory: the total is what the complaint reports, so the
+    // scan runs to the end, while the symbols are only kept while they can still be
+    // the 225 of a board and a fourth kind of symbol stops the whole scan at once.
+    size_t total = 0;
     std::vector<std::string> symbols;
+    std::vector<std::string> kinds;
     for (const std::string& block : blocks) {
-        for (const std::string& symbol : codepoints_of(block)) symbols.push_back(symbol);
+        const bool scanned = for_each_codepoint(block, [&](const std::string& symbol) {
+            ++total;
+            if (total <= static_cast<size_t>(BOARD_SIZE * BOARD_SIZE)) symbols.push_back(symbol);
+            const std::string token = normalize(symbol);
+            if (std::find(kinds.begin(), kinds.end(), token) == kinds.end()) kinds.push_back(token);
+            return kinds.size() <= 3;
+        });
+        if (!scanned) break;
     }
     // A fourth kind of symbol means the text cannot be a board however long it is,
     // so it is reported before the cell count: a truncated dump and a file that
     // mixes alphabets need different fixes.
-    std::vector<std::string> kinds;
-    for (const std::string& symbol : symbols) {
-        const std::string token = normalize(symbol);
-        if (std::find(kinds.begin(), kinds.end(), token) == kinds.end()) kinds.push_back(token);
-    }
     if (kinds.size() > 3) {
         std::string seen;
         for (const std::string& kind : kinds) seen += (seen.empty() ? "" : "/") + kind;
@@ -291,7 +298,7 @@ bool parse_grid_text(const std::string& text, GridCells& out, std::string& error
                 ")，只能表示黑/白/空三种";
         return false;
     }
-    if (symbols.size() == static_cast<size_t>(BOARD_SIZE * BOARD_SIZE)) {
+    if (total == static_cast<size_t>(BOARD_SIZE * BOARD_SIZE)) {
         out = reshape(symbols);
         return true;
     }
@@ -306,7 +313,7 @@ bool parse_grid_text(const std::string& text, GridCells& out, std::string& error
         error = row_error;
         return false;
     }
-    const size_t seen_count = std::max(blocks.size(), symbols.size());
+    const size_t seen_count = std::max(blocks.size(), total);
     if (seen_count > static_cast<size_t>(BOARD_SIZE)) {
         error = past_cells
             ? "棋盘有超过 " + std::to_string(BOARD_SIZE * BOARD_SIZE) + " 格（读到 " +

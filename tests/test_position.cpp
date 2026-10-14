@@ -5,6 +5,7 @@
 #include <chrono>
 #include <iostream>
 #include <string>
+#include <sys/resource.h>
 #include <thread>
 #include <vector>
 
@@ -1075,6 +1076,128 @@ void test_blank_cell_is_stray_outside_the_letter_families() {
     std::cout << "test_blank_cell_is_stray_outside_the_letter_families passed" << std::endl;
 }
 
+// Round 98 CC1: the flat form used to be exploded into one std::string per
+// codepoint before its length was judged, so a run far past 225 cells paid for
+// the whole container before it could be refused. The scan is single-pass now -
+// the total keeps counting, symbols are only kept while they can still become a
+// board, and a fourth kind of mark stops the run at once. The bounds below are
+// deliberately loose: they pin the cost class (one pass over the text, no
+// per-symbol container), not a speed, and no wording is asserted.
+void test_oversized_flat_run_is_scanned_in_one_pass() {
+    const size_t bytes = 16 * 1024 * 1024;  // one 16 MB line of dots, no separators
+    const std::string huge(bytes, '.');
+
+    rusage after{};
+    const auto start = std::chrono::steady_clock::now();
+    GridCells cells;
+    std::string error;
+    const bool ok = parse_grid_text(huge, cells, error);
+    const long long elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start).count();
+    getrusage(RUSAGE_SELF, &after);
+
+    assert(!ok);
+    assert(!error.empty());
+    // The complaint is the cell count, so it carries the 225 it wanted.
+    assert(error.find("225") != std::string::npos);
+    assert(cells.empty());
+    std::cout << "  [r98cc1] 16 MB run refused in " << elapsed_ms
+              << " ms, peak RSS " << (after.ru_maxrss / 1024) << " MB" << std::endl;
+    // The suite is what carries the bound, not the clock: the eight test targets
+    // compile without the -O2 the shipped server gets (CMakeLists.txt:87 versus the
+    // test rules), so this run measures the unoptimised per-symbol work. Measured
+    // here: 115 MB and ~6.6 s, against 1155 MB and ~13 s before the one-pass scan;
+    // the same two binaries built with -O2 come down to 429 ms and 1585 ms.
+    assert(elapsed_ms < 10000);
+    // ru_maxrss is the process high-water mark in KB. The text itself is 16 MB and
+    // the readers copy it a few times; a vector of one string per codepoint lands
+    // an order of magnitude above that.
+    assert(after.ru_maxrss < 250LL * 1024);
+
+    // Priority is unchanged: three legal marks plus a fourth is the symbol-kind
+    // complaint however long the run is, and that complaint names no cell count.
+    std::string four_kinds;
+    for (int i = 0; i < 300; ++i) {
+        four_kinds += (i % 3 == 0) ? "黑" : (i % 3 == 1) ? "白" : "空";
+    }
+    four_kinds += "?";
+    std::string kind_error;
+    assert(!parse_grid_text(four_kinds, cells, kind_error));
+    assert(!kind_error.empty());
+    assert(kind_error.find("三种") != std::string::npos);
+    assert(kind_error.find("225") == std::string::npos);
+
+    // The same 300 symbols without the stray mark are read as a length problem.
+    const std::string three_kinds = four_kinds.substr(0, four_kinds.size() - 1);
+    std::string count_error;
+    assert(!parse_grid_text(three_kinds, cells, count_error));
+    assert(count_error.find("225") != std::string::npos);
+
+    std::cout << "test_oversized_flat_run_is_scanned_in_one_pass passed" << std::endl;
+}
+
+// Round 98 CC2: a UTF-8 BOM is not content. Left at the front it is the first
+// character the shape test reads, so a legal JSON document was handed to the grid
+// reader and refused for the wrong cell count. The reader now steps over the
+// three bytes before deciding the form and starts the JSON parse past them, and a
+// payload shorter than three bytes must not read past its end.
+void test_bom_prefix_does_not_change_the_shape() {
+    const std::string bom = "\xEF\xBB\xBF";
+
+    json matrix = json::array();
+    for (int r = 0; r < BOARD_SIZE; ++r) {
+        json row = json::array();
+        for (int c = 0; c < BOARD_SIZE; ++c) row.push_back(0);
+        matrix.push_back(std::move(row));
+    }
+    matrix[7][7] = 1;  // black
+    matrix[8][8] = 1;  // black
+    matrix[6][6] = 2;  // white
+    json doc;
+    doc["board"] = matrix;
+    doc["encoding"] = {{"black", "1"}, {"white", "2"}, {"empty", "0"}};
+    const std::string text = doc.dump();
+
+    const SetupResult plain = position_from_text(text);
+    const SetupResult prefixed = position_from_text(bom + text);
+    const SetupResult bom_newline = position_from_text(bom + "\n" + text);
+    assert(plain.ok());
+    assert(prefixed.ok());
+    assert(bom_newline.ok());
+    assert(same_cells(plain, prefixed));
+    assert(same_cells(plain, bom_newline));
+    // Stated the way the preview states it: stones of each colour and the side to
+    // move, so a BOM that slipped into the board would show up here too.
+    assert(prefixed.black_count == plain.black_count && prefixed.black_count == 2);
+    assert(prefixed.white_count == plain.white_count && prefixed.white_count == 1);
+    assert(prefixed.side_to_move == plain.side_to_move);
+    assert(bom_newline.black_count == plain.black_count);
+    assert(bom_newline.side_to_move == plain.side_to_move);
+
+    // The grid branch keeps working with a BOM in front of it: that reader already
+    // stripped one, and the text it is handed still carries it.
+    const std::string grid = grid_text(kBlack, kWhite, "1", "2", "0", ",");
+    const SetupResult grid_plain = position_from_text(grid);
+    const SetupResult grid_bom = position_from_text(bom + grid);
+    assert(grid_plain.ok() && grid_bom.ok());
+    assert(same_cells(grid_plain, grid_bom));
+
+    // Short payloads are clean refusals, not an out-of-bounds read.
+    GridCells nope;
+    const std::string cases[] = {"", "\xEF", "\xEF\xBB", bom};
+    for (const std::string& payload : cases) {
+        const SetupResult short_read = position_from_text(payload);
+        assert(!short_read.ok());
+        assert(!short_read.error.empty());
+        nope.clear();
+        std::string error;
+        assert(!parse_grid_text(payload, nope, error));
+        assert(!error.empty());
+    }
+
+    std::cout << "test_bom_prefix_does_not_change_the_shape passed" << std::endl;
+}
+
 int main() {
     std::cout << "Running position setup tests..." << std::endl;
     test_grid_parsing();
@@ -1095,6 +1218,8 @@ int main() {
     test_ragged_row_in_a_fifteen_row_grid_names_the_row();
     test_blank_cells_reread_under_the_echoed_encoding();
     test_blank_cell_is_stray_outside_the_letter_families();
+    test_oversized_flat_run_is_scanned_in_one_pass();
+    test_bom_prefix_does_not_change_the_shape();
     std::cout << "All position setup tests passed!" << std::endl;
     return 0;
 }
