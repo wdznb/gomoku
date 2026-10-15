@@ -2494,6 +2494,68 @@ void test_resolve_file_reads_a_single_dot_segment_and_still_refuses_every_escape
                  " passed" << std::endl;
 }
 
+// VV1g/VV1h: the same rule the position layer enforces, driven over the socket so the
+// path is the one the 摆棋 弹窗 actually takes. README:536 keeps `encoding` inside the
+// board form, so a bitboard upload that carries a half-written `encoding` at the top
+// level is still a position - on HEAD the field was read before the form was chosen and
+// the whole document came back as an error frame.
+void test_a_half_written_encoding_does_not_veto_a_bitboard_upload() {
+    const auto dir = scratch("vv1_sessions");
+    {
+        Harness h(dir, std::string());
+        size_t seen = 0;
+
+        json words;
+        words["black"] = json::array({"0x0", "0x0001000000000000", "0x10001", "0x0"});
+        words["white"] = json::array({"0x0", "0x0002000100000000", "0x0", "0x0"});
+        json bitboard;
+        bitboard["version"] = 1;
+        bitboard["bitboard"] = std::move(words);
+
+        // VV1g: the top-level encoding names only black, and the bitboard lands.
+        h.server.handle_set_position(
+            h.socket, json{{"position", bitboard},
+                           {"encoding", {{"black", 1}}}});
+        std::vector<std::string> frames = drain_frames(h.server, h.socket, seen);
+        assert(frames.size() == 1);
+        const json installed = json::parse(frames[0]);
+        std::cout << "  [r118vv1g] frame type: " << installed.value("type", std::string())
+                  << std::endl;
+        assert(installed["type"] == "position_set");
+        assert(installed["position_pending"] == true);
+        assert(installed["black_count"] == 3);
+        assert(installed["white_count"] == 2);
+        assert(installed["current_turn"] == "white");
+        assert(h.entry->game->position_pending());
+        assert(h.entry->game->board().move_count() == 5);
+        assert(h.entry->game->board().get(7, 7) == BLACK);
+        assert(h.entry->game->board().get(8, 8) == BLACK);
+        assert(h.entry->game->board().get(9, 9) == BLACK);
+        assert(h.entry->game->board().get(6, 6) == WHITE);
+        assert(h.entry->game->board().get(7, 8) == WHITE);
+
+        // VV1h control: the same bitboard with no encoding at all is unchanged. A
+        // second socket, because re-setting on a board that already has stones rotates
+        // the session and puts an extra frame in front of the reply.
+        Harness plain(dir, std::string());
+        size_t plain_seen = 0;
+        plain.server.handle_set_position(plain.socket, json{{"position", bitboard}});
+        frames = drain_frames(plain.server, plain.socket, plain_seen);
+        assert(frames.size() == 1);
+        const json answer = json::parse(frames[0]);
+        assert(answer["type"] == "position_set");
+        assert(answer["position_pending"] == true);
+        assert(answer["black_count"] == 3);
+        assert(answer["white_count"] == 2);
+        assert(answer["current_turn"] == "white");
+        assert(plain.entry->game->board().move_count() == 5);
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    std::cout << "test_a_half_written_encoding_does_not_veto_a_bitboard_upload passed"
+              << std::endl;
+}
+
 int main() {
     std::cout << "Running server tests..." << std::endl;
 
@@ -2532,6 +2594,7 @@ int main() {
     test_resolve_file_reads_a_single_dot_segment_and_still_refuses_every_escape();
     test_a_shelved_contentless_session_does_not_keep_its_token();
     test_a_shelved_played_session_keeps_its_token();
+    test_a_half_written_encoding_does_not_veto_a_bitboard_upload();
 
     std::cout << "All server tests passed!" << std::endl;
     return 0;

@@ -80,6 +80,11 @@ function makeElement(id) {
 function buildSandbox() {
     const elements = new Map();
     const sockets = [];
+    // Round 118 VV3a: document-level listeners were invisible because the stub's body
+    // was empty, so a guard that lives on `document` could not be reached. The record
+    // is passive like the round-102 element listeners - registration is stored, the
+    // handler is never executed - so no existing case changes behaviour.
+    const documentListeners = [];
     const elementFor = (id) => {
         if (!elements.has(id)) elements.set(id, makeElement(id));
         return elements.get(id);
@@ -105,7 +110,10 @@ function buildSandbox() {
             createElement: () => makeElement('created'),
             createElementNS: () => makeElement('created-ns'),
             querySelectorAll: () => [],
-            addEventListener() {},
+            // Round 118 VV3: the document-level drag guard was invisible while this
+            // stub swallowed the call. The record is passive like the element
+            // listeners - registration is stored, nothing is executed.
+            addEventListener(type, handler) { documentListeners.push({ type, handler }); },
             body: { classList: { add() {}, remove() {}, toggle() {} } },
         },
         window: {
@@ -130,7 +138,8 @@ function buildSandbox() {
         setInterval: () => 0,
         clearInterval: () => {},
     };
-    return { sandbox, elementFor, sockets };
+    sandbox._documentListeners = documentListeners;
+    return { sandbox, elementFor, sockets, documentListeners };
 }
 
 const source = fs.readFileSync(path.join(__dirname, '..', 'web', 'app.js'), 'utf8');
@@ -3662,6 +3671,56 @@ check('UU2d 非终局的两次回绘仍是叙述灰', () => {
     copy.exitSetup(false);
     assert(el('status').className.indexOf('idle') >= 0,
            'and so is leaving an open copy, got: ' + el('status').className);
+});
+
+// VV3: README:367 offers 拖拽 or 点选 for the import file, but the 弹窗 is a
+// full-viewport mask and only the label ever reads files. The guard therefore lives on
+// `document`, which the harness could not see until its stub recorded registrations.
+const lastDocumentHandler = (type) => {
+    const found = bundle.documentListeners.filter((entry) => entry.type === type);
+    assert(found.length >= 1, `no document-level ${type} handler is registered`);
+    return found[found.length - 1].handler;
+};
+
+for (const type of ['dragenter', 'dragover', 'drop']) {
+    check(`VV3a a stray ${type} on the page refuses the browser default`, () => {
+        let defaultPrevented = false;
+        lastDocumentHandler(type)({ preventDefault() { defaultPrevented = true; } });
+        assert(defaultPrevented, 'the default action was not refused');
+    });
+}
+
+check('VV3b control: the drop on the label itself still reads the file', () => {
+    const game = newGame();
+    game.setup.active = true;
+    const label = el('import-drop');
+    let handler = null;
+    for (const entry of label._listeners) {
+        if (entry.type === 'drop') handler = entry.handler;
+    }
+    assert(handler !== null, 'the label registers no drop listener');
+    // The sandbox has no FileReader, so the read is doubled for this case alone and
+    // removed again below; no other case constructs one.
+    const previousReader = bundle.sandbox.FileReader;
+    bundle.sandbox.FileReader = class {
+        readAsText(file) {
+            this.result = file.text;
+            if (this.onload) this.onload();
+        }
+    };
+    try {
+        handler({
+            preventDefault() {},
+            dataTransfer: { files: [{ name: '局面.txt', text: '1 0\n0 1' }] },
+        });
+    } finally {
+        if (previousReader === undefined) delete bundle.sandbox.FileReader;
+        else bundle.sandbox.FileReader = previousReader;
+    }
+    assert(el('position-text').value === '1 0\n0 1',
+           'the dropped text never reached the paste box, got: '
+           + JSON.stringify(el('position-text').value));
+    assert(game.setup.preview === null, 'a fresh file drops the old recognition');
 });
 
 let failed = 0;

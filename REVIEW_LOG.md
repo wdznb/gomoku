@@ -1979,6 +1979,74 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次118 位棋盘没有标志可言，却被一个标志否决了整盘；弹窗只认标签，别处的拖放带走了这一页 — bugfix round 118 batch VV
+
+### Found
+
+- **VV1** — `position_from_json` read `encoding` at `src/server/position_json.cpp:255-259`, **before** the form
+  was chosen at `:261-271`. A bitboard or move-list document that carried a half-written field therefore died on
+  `read_encoding`'s 「encoding 缺少 "white"」 and came back as a whole-position rejection with 0/0 counts, while the
+  *same* field, when well-formed, was silently ignored on those two forms — one field, two fates. README:231-232
+  («位棋盘与落子序列…不需要标志确认») and README:536 («`encoding` 只在棋盘形式下出现（位棋盘与落子序列没有标志可言»
+  put the field inside the board form only. The path is live, not theoretical: `server.cpp:85` merges a
+  message-level `encoding` into the document, so the 摆棋 弹窗's own `set_position` carries it.
+- **VV3** — README:367 offers 拖拽 **or** 点选 for the import file, but only `#import-drop` bound
+  `dragenter/dragover/drop` (`web/app.js:441-456`, round 62). The 弹窗 is a full-viewport mask, so a file released
+  on the title, the paste box or the backdrop took the browser's default action — the page navigated to the
+  dropped file and unloaded with the unfinished 摆棋 copy.
+- **VV2** — the UU1 comment block I wrote in round 117 referenced its own line number (`(:965)`); the anchor
+  checker does not read `web/app.js` self references, so such a number drifts the moment anything above it moves.
+
+### Fixed
+
+`src/server/position_json.cpp` **7/7**: the early block is gone and the field is read inside the board branch —
+`if (!doc.contains("encoding")) return board_form(doc, nullptr);` then `read_encoding` → `rejected(error)` →
+`board_form(doc, &override)`; `forms != 1` and the `first`-without-`moves` refusal are untouched, and the
+bitboard/moves forms now ignore the field instead of being vetoed by it. `web/app.js` **8/1**: a `document`-level
+`for (const type of ['dragenter','dragover','drop']) document.addEventListener(type, e => e.preventDefault())`
+immediately after the label's own `drop` listener (the label's handlers run first on the way up, so 拖拽到标签 still
+reads the file), plus VV2's line rewritten to name `handleCanvasClick`.
+
+### 裁决
+
+- **无可观察差异**: VV2 (comment only); the board branch itself, which is byte-for-byte the same decision it made
+  before; a *complete* `encoding` beside a bitboard was already ignored (VV1c pins it on both trees).
+- **不是缺陷**: `moves` with `first:"white"` handing the turn by counts — README:220 states the count rule as *the*
+  derivation and README:228 limits `first` to colouring, and `tests/test_position.cpp:273-277` already pins it;
+  `position_preview` not being self-importable — README:539 *requires* its echo to be the family's canonical
+  marks for the confirmation step, and the 原样再导入 promise (README:277-278) belongs to `position_to_json`;
+  `handlePositionPreview`'s text-only staleness gate (state hygiene, no constructible observable — `applyImport`'
+  only door is a `display:none` button and `openImportModal:1379` re-clears); the `swapMarks` preview arm's missing
+  `encoding` test (unreachable: every preview write goes `renderImportState` → `refreshSetupControls`).
+- **held**: the duplicate 「refuses」 the VV2 rewrite leaves on the previous line → **WW-A**; `server.cpp:247-249`
+  still says "60 s" where `kIdleTimeoutSeconds` is 120 → **WW-B**; the vacuous
+  `tests/test_search.cpp:1196-1211` `test_opening_book_rejects_occupied()` → **WW-C**; Beast's single absolute
+  handshake deadline (repro needs ~120 s against a hardcoded constant, so it needs a configurable timeout first);
+  C5, QQ2, the `test_server.cpp:1985` `'parked'` flake and replay-over-`ai_move` atomicity as before.
+
+### Verified
+
+Tester's diff is tests-only and additive on the one change I authorized: `tests/test_position.cpp` **+121/0**
+(VV1a bitboard + black-only, VV1b moves + white-only, controls VV1c complete / VV1d both board arms / VV1e two
+forms / VV1f `first` beside a board), `tests/test_server.cpp` **+63/0** (VV1g over the socket: the frame comes back
+`position_set` with 3/2 and `move_count()==5`, VV1h control on its own `Harness` because re-setting a non-empty
+session rotates and prepends a `session` frame), `tests/web_frontend_check.js` **+61/2** — the 2 deletions are
+exactly the no-op `addEventListener() {}` stub at `:108` and the `buildSandbox` return line the recording stub
+replaced ⇒ **合约过期: 无**.
+Numbers, all re-run by me: `ctest` **8/8 / 75.55 s**, web harness **103/103** (99 → 103), `readme_anchor_check`
+**113 citations / 0 problems** (109 → 113, the four new `README:231`/`:536`/`:367` citations), `wc -l README.md`
+**658**. My own HEAD-negative tree (`/d/tmp/r118_head_mine` = whole-tree `git archive 41e3831` + these three test
+files): web **100/103** red on exactly the three VV3a rows (`no document-level dragenter/dragover/drop handler is
+registered`) with VV3b green; `test_position` aborts at `tests/test_position.cpp:1415` after 22 existing cases
+passed; `test_server` at `tests/test_server.cpp:2524` after 33, having printed `[r118vv1g] frame type: error`.
+Because a binary stops at its first failed assert, VV1b and the four controls were attributed separately with a
+print-only probe: HEAD flips **only** VV1a and VV1b (both `ok=false`, counts 0/0); bare bitboard, bare moves and
+VV1c–VV1f report identical lines on both trees.
+Process note: the tester disclosed that one of its parallel batches briefly appended an unrelated block to
+**`web/app.js`** (a file outside its write set) and `APP-5*` cases to the harness, and reverted both in the same
+turn. I checked before committing: `git diff --numstat` is back to the fixer's exact **8/1** for `web/app.js`,
+`grep -c APP-5 tests/web_frontend_check.js` is 0, and the four gates above ran after the revert.
+
 ## 轮次117 确认还在路上，导入与换色却已经能改摆棋副本；终局回绘把绿洗成了灰 — bugfix round 117 batch UU
 
 ### Found

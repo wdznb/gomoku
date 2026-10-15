@@ -455,6 +455,13 @@ class GomokuGame {
             const files = e.dataTransfer ? e.dataTransfer.files : null;
             if (files && files.length) readFile(files[0]);
         });
+        // README:367 promises dragging the file, but the label is a small part of a
+        // full-viewport 弹窗: a drop that lands anywhere else would take the browser's
+        // default action and unload the page with the unfinished copy. Only the label
+        // ever reads files, so everywhere else just refuses the default.
+        for (const type of ['dragenter', 'dragover', 'drop']) {
+            document.addEventListener(type, (e) => e.preventDefault());
+        }
 
         // 交换 has two homes. The bar's trio edits the 摆棋 working copy; the
         // modal's edits the recognised preview before it lands on the copy, which
@@ -1525,7 +1532,7 @@ class GomokuGame {
         // README:375 makes 确认 the only step that writes the server, and the reply
         // repaints from the board the server actually got, so an edit made after it
         // left would vanish without a line of warning. The canvas already refuses
-        // (:965); the copy's other two writers are the bar's 交换 trio and 导入.
+        // handleCanvasClick already refuses; the copy's other two writers are the bar's 交换 trio and 导入.
         document.getElementById('btn-setup-import').disabled = setup.confirmInFlight;
         for (const button of document.querySelectorAll('#group-swap [data-swap]')) {
             button.disabled = setup.confirmInFlight;

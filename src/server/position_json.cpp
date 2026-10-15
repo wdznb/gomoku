@@ -252,12 +252,6 @@ SetupResult position_from_json(const json& doc) {
         }
     }
 
-    GridEncoding override;
-    if (doc.contains("encoding")) {
-        std::string error;
-        if (!read_encoding(doc, override, error)) return rejected(error);
-    }
-
     const int forms = (doc.contains("board") ? 1 : 0) + (doc.contains("bitboard") ? 1 : 0) +
                       (doc.contains("moves") ? 1 : 0);
     if (forms != 1) {
@@ -267,8 +261,14 @@ SetupResult position_from_json(const json& doc) {
         return rejected("first 只能与 moves 同时出现");
     }
 
+    // README:231/README:536: only a grid carries marks, so only a grid document explains
+    // `encoding`. A bitboard or move list ignores the field instead of being vetoed by it.
     if (doc.contains("board")) {
-        return board_form(doc, doc.contains("encoding") ? &override : nullptr);
+        if (!doc.contains("encoding")) return board_form(doc, nullptr);
+        GridEncoding override;
+        std::string error;
+        if (!read_encoding(doc, override, error)) return rejected(error);
+        return board_form(doc, &override);
     }
     if (doc.contains("bitboard")) return bitboard_form(doc);
     return moves_form(doc);

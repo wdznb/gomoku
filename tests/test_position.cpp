@@ -1362,6 +1362,126 @@ void test_cell_number_beyond_int64_is_never_read_as_minus_one() {
     std::cout << "test_cell_number_beyond_int64_is_never_read_as_minus_one passed" << std::endl;
 }
 
+// VV1: README:231 says a bitboard or a move list carries no symbol ambiguity and so
+// needs no mark confirmation, and README:536 states `encoding` only appears under the
+// board form. A partial `encoding` therefore has nothing to describe on those two
+// forms, and must not be able to veto the document. It is read on the board branch.
+void test_partial_encoding_never_vetoes_a_bitboard_or_move_list() {
+    auto board_rows = [](const json& black, const json& white, const json& blank) {
+        json rows_json = json::array();
+        for (int r = 0; r < BOARD_SIZE; ++r) {
+            json row = json::array();
+            for (int c = 0; c < BOARD_SIZE; ++c) {
+                if (r == 7 && c == 7) row.push_back(white);
+                else if (r == 6 && c == 6) row.push_back(black);
+                else row.push_back(blank);
+            }
+            rows_json.push_back(std::move(row));
+        }
+        return rows_json;
+    };
+    // 3 黑 / 2 白, white to move - the same reading as test_bitboard_form's words.
+    auto bitboard = [] {
+        json words;
+        words["black"] = json::array({"0x0", "0x0001000000000000", "0x10001", "0x0"});
+        words["white"] = json::array({"0x0", "0x0002000100000000", "0x0", "0x0"});
+        json doc;
+        doc["version"] = 1;
+        doc["bitboard"] = std::move(words);
+        return doc;
+    };
+    auto move_list = [] {
+        json doc;
+        doc["version"] = 1;
+        doc["moves"] = json::array({json::array({7, 7}), json::array({6, 6}),
+                                    json::array({8, 8}), json::array({7, 8}),
+                                    json::array({9, 9})});
+        doc["first"] = "black";
+        return doc;
+    };
+
+    const json bare_board = bitboard();
+    const SetupResult alone = position_from_json(bare_board);
+    assert(alone.ok());
+
+    // VV1a: a bitboard with an `encoding` that only explains one mark. On HEAD the
+    // field was validated before the form was even chosen, so this document was vetoed
+    // whole and carried 0/0 counts.
+    json half_black = bare_board;
+    half_black["encoding"] = {{"black", 1}};
+    const SetupResult partial_black = position_from_json(half_black);
+    std::cout << "  [r118vv1] bitboard + black-only encoding ok="
+              << (partial_black.error.empty() ? "true" : "false") << std::endl;
+    assert(partial_black.ok());
+    assert(partial_black.black_count == 3 && partial_black.white_count == 2);
+    assert(partial_black.side_to_move == WHITE);
+    assert(same_cells(alone, partial_black));
+
+    // VV1b: the same on a move list, with only `white` stated.
+    const json bare_moves = move_list();
+    const SetupResult list_alone = position_from_json(bare_moves);
+    assert(list_alone.ok());
+    json half_white = bare_moves;
+    half_white["encoding"] = {{"white", 2}};
+    const SetupResult partial_white = position_from_json(half_white);
+    std::cout << "  [r118vv1] moves + white-only encoding ok="
+              << (partial_white.error.empty() ? "true" : "false") << std::endl;
+    assert(partial_white.ok());
+    assert(partial_white.black_count == 3 && partial_white.white_count == 2);
+    assert(partial_white.side_to_move == WHITE);
+    assert(same_cells(list_alone, partial_white));
+    assert(partial_white.history.size() == 5);
+    assert(partial_white.history[0].color == BLACK && partial_white.history[1].color == WHITE);
+
+    // VV1c control: a *complete* encoding was already ignored on the bitboard form,
+    // both before and after the fix.
+    json stated = bare_board;
+    stated["encoding"] = {{"black", 1}, {"white", 2}, {"empty", 0}};
+    const SetupResult complete = position_from_json(stated);
+    assert(complete.ok());
+    assert(same_cells(alone, complete));
+    assert(complete.black_count == alone.black_count && complete.white_count == alone.white_count);
+
+    // VV1d control: the board form still needs a full encoding, and still auto-detects
+    // without one - the narrowing did not loosen the branch it belongs to.
+    json grid_doc;
+    grid_doc["version"] = 1;
+    grid_doc["board"] = board_rows(json(1), json(2), json(0));
+    const SetupResult detected = position_from_json(grid_doc);
+    assert(detected.ok());
+    assert(detected.black_count == 1 && detected.white_count == 1);
+
+    json grid_half = grid_doc;
+    grid_half["encoding"] = {{"black", 1}, {"white", 2}};
+    const SetupResult grid_refused = position_from_json(grid_half);
+    assert(!grid_refused.ok());
+    assert(grid_refused.black_count == 0 && grid_refused.white_count == 0);
+
+    // VV1e control: two forms at once is still mutual exclusion, refused on both trees.
+    json both_forms;
+    both_forms["version"] = 1;
+    both_forms["board"] = board_rows(json(1), json(2), json(0));
+    both_forms["bitboard"] = bare_board["bitboard"];
+    both_forms["encoding"] = {{"black", 1}};
+    const SetupResult mutual = position_from_json(both_forms);
+    assert(!mutual.ok());
+    assert(mutual.black_count == 0 && mutual.white_count == 0);
+    assert(mutual.board.get(7, 7) == EMPTY && mutual.board.get(6, 6) == EMPTY);
+
+    // VV1f control: `first` beside a board is still refused with no stone placed.
+    json first_on_grid;
+    first_on_grid["version"] = 1;
+    first_on_grid["board"] = board_rows(json(1), json(2), json(0));
+    first_on_grid["first"] = "black";
+    const SetupResult misplaced = position_from_json(first_on_grid);
+    assert(!misplaced.ok());
+    assert(misplaced.black_count == 0 && misplaced.white_count == 0);
+    assert(misplaced.board.get(7, 7) == EMPTY);
+
+    std::cout << "test_partial_encoding_never_vetoes_a_bitboard_or_move_list passed"
+              << std::endl;
+}
+
 int main() {
     std::cout << "Running position setup tests..." << std::endl;
     test_grid_parsing();
@@ -1386,6 +1506,7 @@ int main() {
     test_bom_prefix_does_not_change_the_shape();
     test_every_symbol_kind_of_an_oversized_run_is_named();
     test_cell_number_beyond_int64_is_never_read_as_minus_one();
+    test_partial_encoding_never_vetoes_a_bitboard_or_move_list();
     std::cout << "All position setup tests passed!" << std::endl;
     return 0;
 }
