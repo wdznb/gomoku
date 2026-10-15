@@ -47,10 +47,19 @@ ThreatCoefficients HillClimbingOptimizer::run(const ThreatCoefficients& base,
 
     std::uniform_int_distribution<size_t> pick_index(0, current.size() - 1);
 
+    // Only probes that actually differ are steps: iterations_run, evaluations and
+    // best_history_ all count those, not the raw loop index.
+    int steps = 0;
+
     for (int iteration = 1; iteration <= config_.max_iterations; ++iteration) {
         const size_t index = pick_index(rng_);
         const size_t slot = rng_() % config_.multipliers.size();
         const std::vector<int> candidate = neighbor(current, index, config_.multipliers[slot]);
+        // A rescale can round back to the same integer, and a step that changed
+        // nothing is not a failed probe: counting it as stagnation converges the
+        // walk before it has tried a single different point.
+        if (candidate == current) continue;
+        ++steps;
         const ThreatCoefficients candidate_coefficients = CoefficientVector::from_vector(candidate);
         const double candidate_fitness = fitness_(candidate_coefficients);
         evaluations_++;
@@ -70,14 +79,14 @@ ThreatCoefficients HillClimbingOptimizer::run(const ThreatCoefficients& base,
             stagnation_++;
             if (stagnation_ >= config_.stagnation_limit) {
                 converged_ = true;
-                iterations_run = iteration;
+                iterations_run = steps;
                 best_history_.push_back(best_fitness);
                 return best_coefficients;
             }
         }
 
         best_history_.push_back(best_fitness);
-        iterations_run = iteration;
+        iterations_run = steps;
     }
 
     return best_coefficients;

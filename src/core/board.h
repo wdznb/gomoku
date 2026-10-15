@@ -40,7 +40,6 @@ public:
     
 private:
     static std::array<std::array<uint64_t, 3>, BOARD_SIZE * BOARD_SIZE> random_table_;
-    static bool initialized_;
 };
 
 class Board {

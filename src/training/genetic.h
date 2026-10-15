@@ -16,7 +16,7 @@ using CoefficientFitness = std::function<double(const ThreatCoefficients&)>;
 struct GeneticConfig {
     int population_size = 8;
     // Fraction of each new generation produced from two parents; the rest are
-    // copies of the current best.
+    // copies of a tournament-selected parent.
     double crossover_ratio = 0.6;
     double mutation_rate = 0.5;
     // Standard deviation of the multiplicative noise applied to a mutated gene.

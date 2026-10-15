@@ -13,9 +13,10 @@ std::vector<Move> VCTSearch::generate_attacks(const Board& board, int color) {
 
     for (const auto& pos : candidates) {
         if (!board.is_empty(pos.row, pos.col)) continue;
-        if (color == BLACK && PatternRecognizer::is_forbidden(board, pos.row, pos.col, color)) continue;
-
+        // Recognize once and reuse: is_forbidden would run the same 4-direction
+        // scan a second time on a cell this loop already needs the pattern for.
         PositionPattern pattern = PatternRecognizer::recognize_position(board, pos.row, pos.col, color);
+        if (color == BLACK && PatternRecognizer::is_forbidden_from_pattern(pattern)) continue;
 
         bool is_attack = false;
         for (int d = 0; d < 4; ++d) {
@@ -28,7 +29,8 @@ std::vector<Move> VCTSearch::generate_attacks(const Board& board, int color) {
         }
 
         if (is_attack) {
-            int score = evaluator_.evaluate_position_with_pattern(board, pos.row, pos.col, pattern);
+            int score = evaluator_.evaluate_position_with_pattern(board, pos.row, pos.col, pattern,
+                                                                  color);
             scored_moves.emplace_back(score, Move(pos.row, pos.col, color));
         }
     }
@@ -52,9 +54,11 @@ std::vector<Move> VCTSearch::generate_defenses(const Board& board, int color,
 
     for (const auto& pos : candidates) {
         if (!board.is_empty(pos.row, pos.col)) continue;
-        if (opp == BLACK && PatternRecognizer::is_forbidden(board, pos.row, pos.col, opp)) continue;
-
         PositionPattern pattern = PatternRecognizer::recognize_position(board, pos.row, pos.col, opp);
+        // The forbidden test reads the same four directions the recognition above
+        // already scanned, so it takes the pattern instead of re-running them.
+        if (opp == BLACK && PatternRecognizer::is_forbidden_from_pattern(pattern)) continue;
+
         bool is_threat = false;
         for (int d = 0; d < 4; ++d) {
             PatternType t = pattern.directions[d].type;
@@ -65,31 +69,48 @@ std::vector<Move> VCTSearch::generate_defenses(const Board& board, int color,
         }
 
         if (is_threat) {
-            int score = evaluator_.evaluate_position_with_pattern(board, pos.row, pos.col, pattern);
+            int score = evaluator_.evaluate_position_with_pattern(board, pos.row, pos.col, pattern,
+                                                                  opp);
             scored_defenses.emplace_back(score, Move(pos.row, pos.col, opp));
         }
     }
 
-    if (scored_defenses.empty()) {
-        for (const auto& pos : candidates) {
-            if (!board.is_empty(pos.row, pos.col)) continue;
-            if (opp == BLACK && PatternRecognizer::is_forbidden(board, pos.row, pos.col, opp)) continue;
-            // Chebyshev, not Manhattan: the unique completion cell of a four the
-            // attacker just threatens is at most 4 steps ALONG the line, and a
-            // diagonal line puts that cell at Manhattan distance 8 (e.g. 4 diagonal
-            // steps). A Manhattan <= 4 filter drops those diagonal blocks, leaving
-            // defenses empty, which vct_defend/vct_attack read as "no defense" and
-            // return a 100000+depth win that search_engine then commits without
-            // AlphaBeta - a fabricated forced win. Chebyshev <= 4 covers every
-            // direction's completion cell while only ever ADDING candidate blocks
-            // (monotone-safe: strictly reduces false wins, never invents one).
-            int dist = std::max(std::abs(pos.row - attack_row),
-                                std::abs(pos.col - attack_col));
-            if (dist <= 4) {
-                int score = evaluator_.evaluate_position(board, pos.row, pos.col, opp);
-                scored_defenses.emplace_back(score, Move(pos.row, pos.col, opp));
+    // Merge the proximity blocks into the counter-threat set unconditionally
+    // (deduplicated). The old "only when no counter-threat exists" rule let a
+    // single anywhere-on-board reply exclude the real blocking squares, so
+    // vct_defend/vct_attack minned over an incomplete defense set and proved
+    // fabricated 100000+depth wins. Adding candidates can only ever remove
+    // such false wins, never create one (same monotone-safe argument as the
+    // Chebyshev note below).
+    for (const auto& pos : candidates) {
+        if (!board.is_empty(pos.row, pos.col)) continue;
+        // Chebyshev, not Manhattan: the unique completion cell of a four the
+        // attacker just threatens is at most 4 steps ALONG the line, and a
+        // diagonal line puts that cell at Manhattan distance 8 (e.g. 4 diagonal
+        // steps). A Manhattan <= 4 filter drops those diagonal blocks, leaving
+        // defenses empty, which vct_defend/vct_attack read as "no defense" and
+        // return a 100000+depth win that search_engine then commits without
+        // AlphaBeta - a fabricated forced win. Chebyshev <= 4 covers every
+        // direction's completion cell while only ever ADDING candidate blocks
+        // (monotone-safe: strictly reduces false wins, never invents one).
+        int dist = std::max(std::abs(pos.row - attack_row),
+                            std::abs(pos.col - attack_col));
+        if (dist > 4) continue;
+        bool already_listed = false;
+        for (const auto& d : scored_defenses) {
+            if (d.second.pos.row == pos.row && d.second.pos.col == pos.col) {
+                already_listed = true;
+                break;
             }
         }
+        if (already_listed) continue;
+        // Both tests above are side-effect-free, so the two cheap ones now run
+        // before this one: is_forbidden re-scans the four directions per call,
+        // and the squares it is asked about are down to the 9x9 window around
+        // the attack point instead of every candidate.
+        if (opp == BLACK && PatternRecognizer::is_forbidden(board, pos.row, pos.col, opp)) continue;
+        int score = evaluator_.evaluate_position(board, pos.row, pos.col, opp);
+        scored_defenses.emplace_back(score, Move(pos.row, pos.col, opp));
     }
 
     std::sort(scored_defenses.begin(), scored_defenses.end(),

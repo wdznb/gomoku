@@ -1,5 +1,6 @@
 #include "opening_book.h"
 #include "../core/pattern.h"
+#include "../training/json_int.h"
 #include <nlohmann/json.hpp>
 #include <fstream>
 #include <algorithm>
@@ -96,20 +97,29 @@ bool OpeningBook::load(const std::string& path, std::string& error) {
         std::vector<Position> line;
         bool valid = true;
         for (const auto& m : entry["moves"]) {
-            if (!m.is_array() || m.size() != 2 || !m[0].is_number() || !m[1].is_number()) {
+            if (!m.is_array() || m.size() != 2) {
                 valid = false;
                 break;
             }
-            line.push_back(Position(m[0].get<int>(), m[1].get<int>()));
+            int row = 0;
+            int col = 0;
+            if (!read_json_int(m[0], row) || !read_json_int(m[1], col)) {
+                valid = false;
+                break;
+            }
+            line.push_back(Position(row, col));
         }
 
         if (!valid || line.size() < 2) continue;
 
+        // A weight that does not fit an int is refused with its line: both the
+        // truncated value and a silent fall-back to the default would move the
+        // entry inside the sampling distribution the author never meant.
+        int weight = 1;
+        if (entry.contains("weight") && !read_json_int(entry["weight"], weight)) continue;
+
         // Clamp the per-entry weight: a malformed book with a huge weight would
         // otherwise overflow the int total_weight sum in query() into UB.
-        int weight = entry.contains("weight") && entry["weight"].is_number()
-                         ? entry["weight"].get<int>()
-                         : 1;
         if (weight < 1) weight = 1;
         if (weight > 1000000) weight = 1000000;
         std::string name = entry.contains("name") && entry["name"].is_string()
@@ -161,6 +171,16 @@ bool OpeningBook::query(const std::vector<Move>& history, int color, Move& out_m
     // mismatched Move.
     int expected = (history.size() % 2 == 0) ? BLACK : WHITE;
     if (color != expected) return false;
+
+    // The key is only the sequence of landing squares, so a board whose stones
+    // were placed out of alternation (a hand-set position) can share a book
+    // prefix while the two colours play each other's roles. A book line belongs
+    // to the game that opened BLACK-WHITE-BLACK..., so reject any history whose
+    // per-stone colours disagree with that.
+    for (size_t i = 0; i < history.size(); ++i) {
+        const int stone_color = (i % 2 == 0) ? BLACK : WHITE;
+        if (history[i].color != stone_color) return false;
+    }
 
     std::vector<Position> prefix;
     prefix.reserve(history.size());

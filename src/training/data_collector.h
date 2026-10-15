@@ -66,6 +66,11 @@ public:
                            std::string& error);
 
 private:
+    // 0-24 are the same under every square symmetry, so a ply computes them once
+    // and each orientation variant only rewrites the last-move slots (25-51).
+    void fill_invariants(const Board& board, int side_to_move, std::vector<float>& out) const;
+    void fill_orientation(const Board& board, int side_to_move, std::vector<float>& out) const;
+
     int min_search_depth_ = 1;
     bool keep_undecided_ = true;
 };

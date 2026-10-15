@@ -52,9 +52,15 @@ private:
     // Queue access and write initiation all run on ws_'s executor (posted
     // from send()), so no separate mutex is needed.
     std::queue<std::string> send_queue_;
+    // Set by close() when the queue was not empty: the shutdown waits for the
+    // drain in do_write() so a frame sent just before close() still leaves.
+    bool close_after_drain_ = false;
     
     void do_read();
     void do_write();
+    // TCP shutdown without a handshake; close() reaches it only once the write
+    // queue is empty.
+    void drop_socket();
     // Slide the socket's idle deadline forward. Beast's tcp_stream expiry is one
     // absolute deadline shared by every later operation, so it has to be re-armed
     // by hand or it caps the connection's lifetime instead of its silence.
@@ -133,9 +139,19 @@ private:
     std::string sessions_dir_;
     std::string records_path_;
     net::steady_timer flush_timer_;
+    // Retries do_accept() after a transient accept failure. Without it one bad
+    // accept (descriptor exhaustion, a client resetting mid-accept) would leave no
+    // pending operation and the port would stop being served for the rest of the run.
+    net::steady_timer accept_retry_timer_;
     // Guards every map above. The io thread is the only thread that touches them
     // today, so the lock is the record of that rule rather than a requirement.
     std::mutex games_mutex_;
+    // Only the io thread ever assigns deferred_end_for_, but an AI worker can report
+    // a settlement for the same session pointer concurrently, so this pair needs its
+    // own lock and nothing else may be locked while holding it.
+    std::mutex end_frame_mutex_;
+    WebSocketSession* deferred_end_for_ = nullptr;
+    json deferred_end_frame_;
     
     void do_accept();
     void on_connect(std::shared_ptr<WebSocketSession> session);
@@ -182,8 +198,9 @@ private:
 
     SessionSnapshot snapshot_of(const TrackedGame& entry) const;
     // Writes the session file when the game changed, and appends the record once
-    // the game is over and replayable on its own.
-    void flush_entry(const std::shared_ptr<TrackedGame>& entry);
+    // the game is over and replayable on its own. False means the write did not
+    // settle, so the entry still owes a retry and must not be shelved as cold.
+    bool flush_entry(const std::shared_ptr<TrackedGame>& entry);
     void flush_all();
     // Releases a game its socket no longer holds, keeping it in memory until the
     // reattach window runs out. games_mutex_ must already be held; on_disconnect

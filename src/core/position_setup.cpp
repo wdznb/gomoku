@@ -171,12 +171,13 @@ GridRow split_row(const std::string& stripped) {
     return row;
 }
 
-// The codepoints of a block, so an unseparated 黑/白/空 run explodes by symbol
-// and not by byte. A lead byte whose continuation bytes are missing or malformed
-// yields itself alone, which then matches no alphabet and is reported as an
-// unknown mark rather than silently corrupting a neighbour.
-std::vector<std::string> codepoints_of(const std::string& block) {
-    std::vector<std::string> out;
+// One codepoint at a time, without materialising the run: the flat form has to
+// count every symbol of a block that may be megabytes long, and a vector of one
+// string per codepoint is the cost this avoids. Every codepoint is visited, so the
+// caller may stop storing them but never stop counting. The width comes from the
+// lead byte; a malformed or truncated lead byte stands alone, matching no alphabet.
+template <typename Fn>
+void for_each_codepoint(const std::string& block, const Fn& fn) {
     size_t i = 0;
     while (i < block.size()) {
         const unsigned char lead = static_cast<unsigned char>(block[i]);
@@ -189,10 +190,9 @@ std::vector<std::string> codepoints_of(const std::string& block) {
             if ((static_cast<unsigned char>(block[i + k]) & 0xC0) != 0x80) well_formed = false;
         }
         if (!well_formed) width = 1;
-        out.push_back(block.substr(i, width));
+        fn(block.substr(i, width));
         i += width;
     }
-    return out;
 }
 
 GridCells reshape(const std::vector<std::string>& cells) {
@@ -221,6 +221,8 @@ bool parse_grid_text(const std::string& text, GridCells& out, std::string& error
     std::vector<std::string> blocks;  // every cell of the document, row layout ignored
     std::string row_error;
     bool ragged = false;
+    bool past_rows = false;
+    bool past_cells = false;
     while (std::getline(stream, line)) {
         const std::string stripped = trim(line);
         if (stripped.empty() || stripped[0] == '#') continue;
@@ -235,6 +237,19 @@ bool parse_grid_text(const std::string& text, GridCells& out, std::string& error
             }
         }
         rows.push_back(std::move(row));
+
+        // Tokenising the whole upload before refusing it cost 12 s and 439 MB on a
+        // 16 MB text, on the single io thread and without a session. A grid wider
+        // than 15 rows and any run past 225 cells can no longer become a board, so
+        // reading stops there and the complaint carries the count reached so far.
+        if (!ragged && static_cast<int>(rows.size()) > BOARD_SIZE) {
+            past_rows = true;
+            break;
+        }
+        if (blocks.size() > static_cast<size_t>(BOARD_SIZE * BOARD_SIZE)) {
+            past_cells = true;
+            break;
+        }
     }
 
     if (!ragged && static_cast<int>(rows.size()) == BOARD_SIZE) {
@@ -242,7 +257,11 @@ bool parse_grid_text(const std::string& text, GridCells& out, std::string& error
         return true;
     }
     if (row_error.empty()) {
-        row_error = "棋盘有 " + std::to_string(rows.size()) + " 行，需要 " + std::to_string(BOARD_SIZE) + " 行";
+        row_error = past_rows
+            ? "棋盘有超过 " + std::to_string(BOARD_SIZE) + " 行（读到 " +
+              std::to_string(rows.size()) + " 行），需要 " + std::to_string(BOARD_SIZE) + " 行"
+            : "棋盘有 " + std::to_string(rows.size()) + " 行，需要 " +
+              std::to_string(BOARD_SIZE) + " 行";
     }
 
     // Flat form: the whole document as one long run, row layout ignored - 225
@@ -253,18 +272,23 @@ bool parse_grid_text(const std::string& text, GridCells& out, std::string& error
         out = reshape(blocks);
         return true;
     }
+    // One pass with bounded memory: the complaint names the true number of symbol
+    // kinds and lists them all, so the scan runs to the end; only the storing of
+    // symbols stops, once they can no longer be the 225 of a board.
+    size_t total = 0;
     std::vector<std::string> symbols;
+    std::vector<std::string> kinds;
     for (const std::string& block : blocks) {
-        for (const std::string& symbol : codepoints_of(block)) symbols.push_back(symbol);
+        for_each_codepoint(block, [&](const std::string& symbol) {
+            ++total;
+            if (total <= static_cast<size_t>(BOARD_SIZE * BOARD_SIZE)) symbols.push_back(symbol);
+            const std::string token = normalize(symbol);
+            if (std::find(kinds.begin(), kinds.end(), token) == kinds.end()) kinds.push_back(token);
+        });
     }
     // A fourth kind of symbol means the text cannot be a board however long it is,
     // so it is reported before the cell count: a truncated dump and a file that
     // mixes alphabets need different fixes.
-    std::vector<std::string> kinds;
-    for (const std::string& symbol : symbols) {
-        const std::string token = normalize(symbol);
-        if (std::find(kinds.begin(), kinds.end(), token) == kinds.end()) kinds.push_back(token);
-    }
     if (kinds.size() > 3) {
         std::string seen;
         for (const std::string& kind : kinds) seen += (seen.empty() ? "" : "/") + kind;
@@ -272,22 +296,29 @@ bool parse_grid_text(const std::string& text, GridCells& out, std::string& error
                 ")，只能表示黑/白/空三种";
         return false;
     }
-    if (symbols.size() == static_cast<size_t>(BOARD_SIZE * BOARD_SIZE)) {
+    if (total == static_cast<size_t>(BOARD_SIZE * BOARD_SIZE)) {
         out = reshape(symbols);
         return true;
     }
 
     // Rows that are all 15 cells wide but the wrong number of them: say so, that
     // is the honest complaint. Otherwise the document was meant to be flat, so
-    // count its cells instead of blaming a row width.
-    if (!ragged) {
+    // count its cells instead of blaming a row width. A ragged grid that still has
+    // exactly 15 rows is reported by row as well (README:261-262): 第 N 行有 M 格
+    // names the line to fix, where a cell total could not tell a layout slip apart
+    // from a truncated flat dump. row_error is non-empty whenever ragged is set.
+    if (!ragged || static_cast<int>(rows.size()) == BOARD_SIZE) {
         error = row_error;
         return false;
     }
-    const size_t seen_count = std::max(blocks.size(), symbols.size());
+    const size_t seen_count = std::max(blocks.size(), total);
     if (seen_count > static_cast<size_t>(BOARD_SIZE)) {
-        error = "棋盘有 " + std::to_string(seen_count) + " 格，需要 " +
-                std::to_string(BOARD_SIZE * BOARD_SIZE) + " 格（15x15，分隔或连写皆可）";
+        error = past_cells
+            ? "棋盘有超过 " + std::to_string(BOARD_SIZE * BOARD_SIZE) + " 格（读到 " +
+              std::to_string(seen_count) + " 格），需要 " +
+              std::to_string(BOARD_SIZE * BOARD_SIZE) + " 格（15x15，分隔或连写皆可）"
+            : "棋盘有 " + std::to_string(seen_count) + " 格，需要 " +
+              std::to_string(BOARD_SIZE * BOARD_SIZE) + " 格（15x15，分隔或连写皆可）";
         return false;
     }
     error = row_error;
@@ -329,12 +360,34 @@ SetupResult position_from_grid(const GridCells& cells, const GridEncoding* force
         encoding.black = normalize(encoding.black);
         encoding.white = normalize(encoding.white);
         encoding.empty = normalize(encoding.empty);
+        // The three tokens have to name three different things: black == white
+        // reads every white stone as black, and an empty that collides with either
+        // makes that side's stones vanish.
+        if (encoding.black == encoding.white) {
+            result.error = "指定的标志里黑和白共用 \"" + encoding.black + "\"，无法分出双方";
+            return result;
+        }
+        if (encoding.black == encoding.empty) {
+            result.error = "指定的标志里黑和空共用 \"" + encoding.black + "\"，黑子会被读成空位";
+            return result;
+        }
+        if (encoding.white == encoding.empty) {
+            result.error = "指定的标志里白和空共用 \"" + encoding.white + "\"，白子会被读成空位";
+            return result;
+        }
         // An explicitly supplied mapping is trusted as stated, but every token
         // still has to be covered by it - otherwise a stray symbol would be read
         // as empty and quietly delete a stone.
+        // A "" cell is the documented way the array form spells an empty point, and
+        // the detector reads it as empty for the symbol families; it is covered here
+        // exactly when those are, and stays a stray token under a numeric mapping.
+        const bool blank_is_empty = encoding.empty == "." || encoding.empty == "_" ||
+                                    encoding.empty == "-" || encoding.empty == "·" ||
+                                    encoding.empty == "空";
         for (const GridRow& row : cells) {
             for (const std::string& cell : row) {
                 const std::string token = normalize(cell);
+                if (token.empty() && blank_is_empty) continue;
                 if (!same_sign(token, encoding.black) && !same_sign(token, encoding.white) &&
                     !same_sign(token, encoding.empty)) {
                     result.error = "指定的标志不含 \"" + token + "\"，请确认黑/白/空分别对应哪个符号";

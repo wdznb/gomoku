@@ -1,5 +1,6 @@
 #include "server/server.h"
 #include "training/params.h"
+#include <filesystem>
 #include <iostream>
 #include <string>
 
@@ -10,27 +11,68 @@ int main(int argc, char* argv[]) {
     std::string sessions_dir = "data/sessions";
     std::string records_path = "data/training/records.jsonl";
     std::string params_path;
+    bool no_sessions = false;
+    // Which of the two persistence paths the caller actually wrote down, as
+    // opposed to the defaults above - --no-sessions needs to tell them apart.
+    bool sessions_stated = false;
+    bool records_stated = false;
 
     try {
         for (int i = 1; i < argc; ++i) {
             std::string arg = argv[i];
             if (arg == "--port" && i + 1 < argc) {
-                port = std::stoi(argv[++i]);
+                const std::string text = argv[++i];
+                std::size_t used = 0;
+                const int parsed = std::stoi(text, &used);
+                // stoi stops at the first non-digit, so without this check
+                // --port 9090x would silently bind 9090 as if it were asked for.
+                if (used != text.size()) {
+                    std::cerr << "Invalid --port " << text
+                              << " (must be a whole number)" << std::endl;
+                    return 1;
+                }
+                port = parsed;
             } else if (arg == "--web-dir" && i + 1 < argc) {
                 web_dir = argv[++i];
+                if (web_dir.empty()) {
+                    std::cerr << "Invalid --web-dir (must not be empty)" << std::endl;
+                    return 1;
+                }
             } else if (arg == "--book" && i + 1 < argc) {
                 book_path = argv[++i];
+                if (book_path.empty()) {
+                    std::cerr << "Invalid --book (must not be empty)" << std::endl;
+                    return 1;
+                }
             } else if (arg == "--no-book") {
                 book_path.clear();
             } else if (arg == "--sessions" && i + 1 < argc) {
                 sessions_dir = argv[++i];
+                sessions_stated = true;
+                if (sessions_dir.empty()) {
+                    std::cerr << "Invalid --sessions (must not be empty)" << std::endl;
+                    return 1;
+                }
             } else if (arg == "--no-sessions") {
-                sessions_dir.clear();
-                records_path.clear();
+                // Only the flag is recorded here: clearing the paths in the loop
+                // would let a later --records re-open one half of persistence.
+                no_sessions = true;
             } else if (arg == "--records" && i + 1 < argc) {
                 records_path = argv[++i];
+                records_stated = true;
+                if (records_path.empty()) {
+                    std::cerr << "Invalid --records (must not be empty)" << std::endl;
+                    return 1;
+                }
             } else if (arg == "--params" && i + 1 < argc) {
                 params_path = argv[++i];
+                if (params_path.empty()) {
+                    std::cerr << "Invalid --params (must not be empty)" << std::endl;
+                    return 1;
+                }
+            } else {
+                std::cerr << "Unknown or valueless option: " << arg << std::endl;
+                return 1;
             }
         }
     } catch (const std::exception& e) {
@@ -46,6 +88,20 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    // An explicit path alongside --no-sessions is the same ambiguous instruction
+    // --sessions "" is refused for: clearing the stated directory silently would
+    // re-read what the caller wrote, so the contradiction has to be named here.
+    if (no_sessions && (sessions_stated || records_stated)) {
+        std::cerr << "Conflicting options: --no-sessions cannot be combined with --sessions/--records"
+                  << std::endl;
+        return 1;
+    }
+
+    if (no_sessions) {
+        sessions_dir.clear();
+        records_path.clear();
+    }
+
     // Trained coefficients are optional; a missing or malformed file is fatal
     // rather than silently ignored, because playing strength is exactly what the
     // caller believes it is changing.
@@ -57,6 +113,15 @@ int main(int argc, char* argv[]) {
             return 1;
         }
         std::cout << "Parameters loaded: " << params_path << std::endl;
+    }
+
+    // GameServer answers GETs by reading files out of web_dir, so a mistyped path
+    // would still print the Open URL and leave the browser looking at dead links.
+    // Fail like --params does instead.
+    std::error_code web_ec;
+    if (!std::filesystem::is_directory(web_dir, web_ec)) {
+        std::cerr << "Invalid --web-dir " << web_dir << " (not a directory)" << std::endl;
+        return 1;
     }
 
     // GameServer installs SIGINT/SIGTERM through Asio's signal_set inside

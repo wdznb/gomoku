@@ -1,10 +1,55 @@
 #include "core/board.h"
 #include "core/pattern.h"
+// pattern_score is private; the forbidden-guard tests below re-derive what the
+// pre-round-81 aggregate summed, so the class body has to be readable.
+#define private public
 #include "core/evaluator.h"
+#undef private
 #include <iostream>
 #include <cassert>
 
 using namespace gomoku;
+
+// What evaluate_board computed before the per-side forbidden guard: every
+// candidate's pattern_score on both sides, unconditionally.
+static long long naive_board_total(const Board& board, int my_color, const Evaluator& evaluator) {
+    long long total = 0;
+    for (const Position& pos : board.active_empty()) {
+        PositionPattern mine, theirs;
+        PatternRecognizer::recognize_position_both(board, pos.row, pos.col, my_color, mine, theirs);
+        total += evaluator.pattern_score(mine) - evaluator.pattern_score(theirs);
+    }
+    return total;
+}
+
+// evaluate_board caps the aggregate at five-1 so a busy board cannot pass itself
+// off as a mate score. The cap predates the round-81 guard and is untouched by
+// it, so a "nothing changed" comparison has to apply it to the raw sum too.
+static long long clamp_board_diff(long long diff, const Evaluator& evaluator) {
+    const long long cap = static_cast<long long>(evaluator.coeffs_.five) - 1;
+    if (diff > cap) return cap;
+    if (diff < -cap) return -cap;
+    return diff;
+}
+
+// Candidates whose BLACK-side pattern is a forbidden shape.
+static int black_forbidden_candidates(const Board& board, const Evaluator& evaluator,
+                                      int* first_black_ps = nullptr, int* first_white_ps = nullptr,
+                                      Position* first_pos = nullptr) {
+    int count = 0;
+    for (const Position& pos : board.active_empty()) {
+        PositionPattern mine, theirs;
+        PatternRecognizer::recognize_position_both(board, pos.row, pos.col, BLACK, mine, theirs);
+        if (!PatternRecognizer::is_forbidden_from_pattern(mine)) continue;
+        if (count == 0) {
+            if (first_black_ps) *first_black_ps = evaluator.pattern_score(mine);
+            if (first_white_ps) *first_white_ps = evaluator.pattern_score(theirs);
+            if (first_pos) *first_pos = pos;
+        }
+        ++count;
+    }
+    return count;
+}
 
 void test_evaluator_init() {
     Evaluator evaluator;
@@ -154,6 +199,277 @@ void test_set_coefficients_rebuilds_position_weights() {
     std::cout << "test_set_coefficients_rebuilds_position_weights passed" << std::endl;
 }
 
+// Round 81, E1: pattern_score pays out double_four / double_three / four_three,
+// so a shape BLACK may never legally play banked points for a stone the move
+// generator refuses to place. evaluate_board has to zero that one term and
+// nothing else - no forbidden_penalty is introduced.
+void test_evaluate_board_skips_black_forbidden_point() {
+    Evaluator evaluator;
+    Board board;
+    board.place_stone(7, 5, BLACK);
+    board.place_stone(7, 6, BLACK);
+    board.place_stone(5, 7, BLACK);
+    board.place_stone(6, 7, BLACK);
+    assert(PatternRecognizer::is_forbidden(board, 7, 7, BLACK));
+
+    int black_ps = 0, white_ps = 0;
+    Position spot{0, 0};
+    assert(black_forbidden_candidates(board, evaluator, &black_ps, &white_ps, &spot) == 1);
+    assert(spot.row == 7 && spot.col == 7);
+    assert(black_ps == 31000);   // double_three 30000 + two live three 2x500
+    assert(white_ps == 0);
+
+    const long long before = naive_board_total(board, BLACK, evaluator);
+    assert(before == 38300);
+    const int after_black = evaluator.evaluate_board(board, BLACK);
+    assert(after_black == 7300);
+    assert(after_black == static_cast<int>(before - black_ps));
+    assert(evaluator.evaluate_board(board, WHITE) == -7300);
+    std::cout << "test_evaluate_board_skips_black_forbidden_point passed ("
+              << before << " -> " << after_black << ")" << std::endl;
+}
+
+void test_evaluate_board_double_four_point() {
+    Evaluator evaluator;
+    Board board;
+    board.place_stone(7, 4, BLACK);
+    board.place_stone(7, 5, BLACK);
+    board.place_stone(7, 6, BLACK);
+    board.place_stone(4, 7, BLACK);
+    board.place_stone(5, 7, BLACK);
+    board.place_stone(6, 7, BLACK);
+    assert(PatternRecognizer::is_forbidden(board, 7, 7, BLACK));
+
+    int black_ps = 0;
+    assert(black_forbidden_candidates(board, evaluator, &black_ps) == 1);
+    assert(black_ps == 70000);  // double_four 50000 + two live four 2x10000
+    const long long before = naive_board_total(board, BLACK, evaluator);
+    assert(before == 99800);
+    const int after_black = evaluator.evaluate_board(board, BLACK);
+    assert(after_black == 29800);
+    assert(after_black == static_cast<int>(before - black_ps));
+    std::cout << "test_evaluate_board_double_four_point passed ("
+              << before << " -> " << after_black << ")" << std::endl;
+}
+
+// The square can be forbidden for BLACK and a real shape for WHITE: only the
+// black side of that candidate drops to zero.
+void test_evaluate_board_keeps_white_value_on_forbidden_square() {
+    Evaluator evaluator;
+    Board board;
+    board.place_stone(7, 5, BLACK);
+    board.place_stone(7, 6, BLACK);
+    board.place_stone(5, 7, BLACK);
+    board.place_stone(6, 7, BLACK);
+    board.place_stone(8, 8, WHITE);
+    board.place_stone(9, 9, WHITE);
+
+    int black_ps = 0, white_ps = 0;
+    assert(PatternRecognizer::is_forbidden(board, 7, 7, BLACK));
+    assert(black_forbidden_candidates(board, evaluator, &black_ps, &white_ps) == 1);
+    assert(black_ps == 31000);
+    assert(white_ps == 500);  // WHITE's own 活三 through (7,7)(8,8)(9,9)
+
+    const long long before = naive_board_total(board, BLACK, evaluator);
+    assert(before == 35700);
+    const int after_black = evaluator.evaluate_board(board, BLACK);
+    assert(after_black == 4700);
+    // Exactly the black term vanished; WHITE's 500 is still in the total.
+    assert(before - after_black == 31000);
+    assert(evaluator.evaluate_board(board, WHITE) == -4700);
+    std::cout << "test_evaluate_board_keeps_white_value_on_forbidden_square passed ("
+              << before << " -> " << after_black << ", white term kept)" << std::endl;
+}
+
+// A position with no black forbidden candidate must score identically to the
+// unguarded sum, so the guard changes nothing for ordinary boards.
+void test_evaluate_board_unchanged_without_forbidden() {
+    Evaluator evaluator;
+
+    Board plain;
+    plain.place_stone(7, 7, BLACK);
+    plain.place_stone(7, 8, WHITE);
+    plain.place_stone(8, 8, BLACK);
+    plain.place_stone(6, 6, WHITE);
+    plain.place_stone(9, 9, BLACK);
+    plain.place_stone(5, 5, WHITE);
+    assert(black_forbidden_candidates(plain, evaluator) == 0);
+    assert(evaluator.evaluate_board(plain, BLACK) == 1700);
+    assert(evaluator.evaluate_board(plain, BLACK) ==
+           clamp_board_diff(naive_board_total(plain, BLACK, evaluator), evaluator));
+    assert(evaluator.evaluate_board(plain, WHITE) ==
+           clamp_board_diff(naive_board_total(plain, WHITE, evaluator), evaluator));
+
+    // The round-32 mate-in-one board, unchanged too: WHITE's four is the threat
+    // and BLACK has no forbidden shape anywhere. Its raw sum runs past the mate
+    // cap, which is why the comparison below clamps.
+    Board threat;
+    threat.place_stone(7, 4, WHITE);
+    threat.place_stone(7, 5, WHITE);
+    threat.place_stone(7, 6, WHITE);
+    threat.place_stone(7, 7, WHITE);
+    threat.place_stone(9, 4, BLACK);
+    threat.place_stone(9, 5, BLACK);
+    assert(black_forbidden_candidates(threat, evaluator) == 0);
+    const int threat_value = evaluator.evaluate_board(threat, BLACK);
+    assert(threat_value ==
+           clamp_board_diff(naive_board_total(threat, BLACK, evaluator), evaluator));
+    assert(threat_value == -99999);
+    std::cout << "test_evaluate_board_unchanged_without_forbidden passed ("
+              << 1700 << ", " << threat_value << ")" << std::endl;
+}
+
+// WHITE is never judged: the same shape in WHITE's hands keeps its 31000, from
+// both perspectives.
+void test_evaluate_board_never_judges_white() {
+    Evaluator evaluator;
+    Board board;
+    board.place_stone(7, 5, WHITE);
+    board.place_stone(7, 6, WHITE);
+    board.place_stone(5, 7, WHITE);
+    board.place_stone(6, 7, WHITE);
+    assert(!PatternRecognizer::is_forbidden(board, 7, 7, WHITE));
+    assert(black_forbidden_candidates(board, evaluator) == 0);
+
+    int white_ps = 0;
+    {
+        PositionPattern mine, theirs;
+        PatternRecognizer::recognize_position_both(board, 7, 7, BLACK, mine, theirs);
+        // From BLACK's seat the white shape is the opponent term; it must be
+        // worth its full double_three.
+        white_ps = evaluator.pattern_score(theirs);
+    }
+    assert(white_ps == 31000);
+    assert(evaluator.evaluate_board(board, WHITE) == 38300);
+    assert(evaluator.evaluate_board(board, WHITE) == naive_board_total(board, WHITE, evaluator));
+    assert(evaluator.evaluate_board(board, BLACK) == -38300);
+    assert(evaluator.evaluate_board(board, BLACK) == naive_board_total(board, BLACK, evaluator));
+    std::cout << "test_evaluate_board_never_judges_white passed (white keeps " << white_ps << ")" << std::endl;
+}
+
+// Round 89, T1: candidate_value takes the colour now, so the single-square
+// entries judge a shape BLACK may never legally play the same way evaluate_board
+// already did - and they judge nothing else. The (7,7) centre bias below is 14,
+// the (7,8) one is 13, both untouched by the gate.
+void test_candidate_value_zeroes_black_forbidden_shape() {
+    Evaluator evaluator;
+
+    // Four-four: three black stones in row 7 and three in column 7.
+    Board four_four;
+    four_four.place_stone(7, 4, BLACK);
+    four_four.place_stone(7, 5, BLACK);
+    four_four.place_stone(7, 6, BLACK);
+    four_four.place_stone(4, 7, BLACK);
+    four_four.place_stone(5, 7, BLACK);
+    four_four.place_stone(6, 7, BLACK);
+    assert(PatternRecognizer::is_forbidden(four_four, 7, 7, BLACK));
+    assert(evaluator.evaluate_position(four_four, 7, 7, BLACK) == 0);
+    assert(evaluator.evaluate_position(four_four, 7, 7, WHITE) == 14);
+    // The pair is the two single-colour reads summed, so the black half leaving
+    // takes exactly its own value with it - from either seat.
+    assert(evaluator.evaluate_position_pair(four_four, 7, 7, WHITE) == 14);
+    assert(evaluator.evaluate_position_pair(four_four, 7, 7, BLACK) == 14);
+    assert(evaluator.evaluate_position_pair(four_four, 7, 7, WHITE) ==
+           evaluator.evaluate_position(four_four, 7, 7, BLACK) +
+               evaluator.evaluate_position(four_four, 7, 7, WHITE));
+    // The neighbour is an ordinary candidate on the very same board.
+    assert(evaluator.evaluate_position(four_four, 7, 8, BLACK) == 1063);
+    assert(evaluator.evaluate_position(four_four, 7, 8, WHITE) == 13);
+    assert(evaluator.evaluate_position_pair(four_four, 7, 8, WHITE) == 1076);
+
+    // Double three: two black stones each way.
+    Board three_three;
+    three_three.place_stone(7, 5, BLACK);
+    three_three.place_stone(7, 6, BLACK);
+    three_three.place_stone(5, 7, BLACK);
+    three_three.place_stone(6, 7, BLACK);
+    assert(PatternRecognizer::is_forbidden(three_three, 7, 7, BLACK));
+    assert(evaluator.evaluate_position(three_three, 7, 7, BLACK) == 0);
+    assert(evaluator.evaluate_position(three_three, 7, 7, WHITE) == 14);
+
+    // Overline: five black stones in row 7, so (7,7) would run past five.
+    Board overline;
+    overline.place_stone(7, 2, BLACK);
+    overline.place_stone(7, 3, BLACK);
+    overline.place_stone(7, 4, BLACK);
+    overline.place_stone(7, 5, BLACK);
+    overline.place_stone(7, 6, BLACK);
+    assert(PatternRecognizer::is_forbidden(overline, 7, 7, BLACK));
+    assert(evaluator.evaluate_position(overline, 7, 7, BLACK) == 0);
+    assert(evaluator.evaluate_position(overline, 7, 7, WHITE) == 14);
+
+    // Three live fours and no five: still forbidden.
+    Board three_fours;
+    three_fours.place_stone(7, 4, BLACK);
+    three_fours.place_stone(7, 5, BLACK);
+    three_fours.place_stone(7, 6, BLACK);
+    three_fours.place_stone(5, 7, BLACK);
+    three_fours.place_stone(6, 7, BLACK);
+    three_fours.place_stone(8, 7, BLACK);
+    three_fours.place_stone(5, 5, BLACK);
+    three_fours.place_stone(6, 6, BLACK);
+    three_fours.place_stone(8, 8, BLACK);
+    assert(PatternRecognizer::is_forbidden(three_fours, 7, 7, BLACK));
+    assert(evaluator.evaluate_position(three_fours, 7, 7, BLACK) == 0);
+
+    // Anti-overreach: a single live four is a legal BLACK shape and keeps its
+    // whole price.
+    Board live_four;
+    live_four.place_stone(7, 4, BLACK);
+    live_four.place_stone(7, 5, BLACK);
+    live_four.place_stone(7, 6, BLACK);
+    assert(!PatternRecognizer::is_forbidden(live_four, 7, 7, BLACK));
+    assert(evaluator.evaluate_position(live_four, 7, 7, BLACK) == 10014);
+    assert(evaluator.evaluate_position_pair(live_four, 7, 7, BLACK) == 10028);
+
+    std::cout << "test_candidate_value_zeroes_black_forbidden_shape passed ("
+              << evaluator.evaluate_position(four_four, 7, 7, BLACK) << ", white keeps "
+              << evaluator.evaluate_position(four_four, 7, 7, WHITE) << ")" << std::endl;
+}
+
+// The gate sits behind the exact-five early return (README:27/29 - a five is not
+// a forbidden shape), so BLACK's winning point still pays coeffs.five. This whole
+// case is green on HEAD too: it is the proof the new test did not reprioritise
+// the two checks.
+void test_exact_five_outranks_the_forbidden_gate() {
+    Evaluator evaluator;
+    const int five = ThreatCoefficients().five;
+
+    Board plain_five;
+    plain_five.place_stone(7, 4, BLACK);
+    plain_five.place_stone(7, 5, BLACK);
+    plain_five.place_stone(7, 6, BLACK);
+    plain_five.place_stone(7, 7, BLACK);
+    assert(!PatternRecognizer::is_forbidden(plain_five, 7, 3, BLACK));
+    assert(evaluator.evaluate_position(plain_five, 7, 3, BLACK) == five);
+
+    // A square whose own pattern carries the double-four flag *and* an exact
+    // five: four in row 7 (the five), plus live fours in column 7 and on the
+    // main diagonal. has_four_four is set, yet the point is legal and scores the
+    // mate value, never zero.
+    Board five_and_double_four;
+    five_and_double_four.place_stone(7, 3, BLACK);
+    five_and_double_four.place_stone(7, 4, BLACK);
+    five_and_double_four.place_stone(7, 5, BLACK);
+    five_and_double_four.place_stone(7, 6, BLACK);
+    five_and_double_four.place_stone(5, 7, BLACK);
+    five_and_double_four.place_stone(6, 7, BLACK);
+    five_and_double_four.place_stone(8, 7, BLACK);
+    five_and_double_four.place_stone(5, 5, BLACK);
+    five_and_double_four.place_stone(6, 6, BLACK);
+    five_and_double_four.place_stone(8, 8, BLACK);
+    const PositionPattern shape =
+        PatternRecognizer::recognize_position(five_and_double_four, 7, 7, BLACK);
+    assert(shape.has_four_four);
+    assert(!PatternRecognizer::is_forbidden_from_pattern(shape));
+    assert(!PatternRecognizer::is_forbidden(five_and_double_four, 7, 7, BLACK));
+    assert(evaluator.evaluate_position(five_and_double_four, 7, 7, BLACK) == five);
+    assert(evaluator.evaluate_position_pair(five_and_double_four, 7, 7, BLACK) == five + 14);
+
+    std::cout << "test_exact_five_outranks_the_forbidden_gate passed (" << five << ")"
+              << std::endl;
+}
+
 int main() {
     std::cout << "Running evaluator tests..." << std::endl;
     
@@ -167,6 +483,13 @@ int main() {
     test_pattern_score_includes_five();
     test_evaluate_board_sees_mate_one();
     test_set_coefficients_rebuilds_position_weights();
+    test_evaluate_board_skips_black_forbidden_point();
+    test_evaluate_board_double_four_point();
+    test_evaluate_board_keeps_white_value_on_forbidden_square();
+    test_evaluate_board_unchanged_without_forbidden();
+    test_evaluate_board_never_judges_white();
+    test_candidate_value_zeroes_black_forbidden_shape();
+    test_exact_five_outranks_the_forbidden_gate();
     
     std::cout << "All evaluator tests passed!" << std::endl;
     return 0;

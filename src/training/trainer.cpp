@@ -4,11 +4,14 @@
 #include "../core/transforms.h"
 #include <nlohmann/json.hpp>
 #include <fstream>
+#include <filesystem>
+#include <iostream>
 #include <sstream>
 #include <map>
 #include <thread>
 #include <algorithm>
 #include <cmath>
+#include <atomic>
 
 using json = nlohmann::json;
 
@@ -33,8 +36,16 @@ void Trainer::set_fitness_override(CoefficientFitness fitness) {
 }
 
 double Trainer::measure_fitness(const ThreatCoefficients& coefficients) {
-    if (fitness_override_) return fitness_override_(coefficients);
-    return play_match(coefficients, champion(), config_.fitness_games);
+    // Rule constants are not genes (README:607-608): from_vector default-constructs
+    // on purpose because sanitize relies on those defaults, so a candidate arrives
+    // carrying the compiled-in five and forbidden_penalty while the champion carries
+    // the parameter file's. Flatten the baseline before comparing - the override
+    // included, so a test hook measures the same pairing the games do.
+    ThreatCoefficients scored = coefficients;
+    scored.five = champion().five;
+    scored.forbidden_penalty = champion().forbidden_penalty;
+    if (fitness_override_) return fitness_override_(scored);
+    return play_match(scored, champion(), config_.fitness_games);
 }
 
 SearchEngine& Trainer::prepare(SearchEngine& engine) const {
@@ -46,7 +57,8 @@ SearchEngine& Trainer::prepare(SearchEngine& engine) const {
     return engine;
 }
 
-double Trainer::play_game(SearchEngine& black, SearchEngine& white, int black_owner) {
+double Trainer::play_game(SearchEngine& black, SearchEngine& white, int black_owner,
+                          bool* played) {
     SelfPlayConfig settings;
     settings.max_depth = config_.search_depth;
     settings.timeout_ms = config_.timeout_ms;
@@ -54,11 +66,16 @@ double Trainer::play_game(SearchEngine& black, SearchEngine& white, int black_ow
 
     SelfPlay play(black, white, settings);
     GameRecord record = play.run(std::vector<Move>(), nullptr, nullptr);
-    games_played_++;
+    const bool valid = record.reason != GameEndReason::INVALID;
+    if (played) *played = valid;
+    // Same yardstick as the data side: an INVALID game is discarded, so it
+    // must not inflate games_played_ in the checkpoint or the progress line.
+    if (valid) games_played_++;
+    if (!valid) return 0.0;
 
     if (record.winner == EMPTY) {
-        // Unfinished or discarded games score half: they must not hand either
-        // side a result the board does not show.
+        // Unfinished games score half: they must not hand either side a result
+        // the board does not show.
         return 0.5;
     }
     const int winner_owner = record.winner == BLACK ? black_owner : 3 - black_owner;
@@ -86,14 +103,29 @@ double Trainer::play_match(const ThreatCoefficients& candidate,
     prepare(reference_engine);
 
     // Every pairing runs twice with the colours swapped, so a candidate cannot
-    // pass on the strength of having the first move.
-    const int pairs = std::max(1, games / 2);
+    // pass on the strength of having the first move. Odd requests round UP to
+    // the next even count, as the config comment promises.
+    const int pairs = std::max(1, (games + 1) / 2);
     double score = 0.0;
+    int played_games = 0;
     for (int i = 0; i < pairs; ++i) {
-        score += play_game(candidate_engine, reference_engine, 1);
-        score += play_game(reference_engine, candidate_engine, 2);
+        bool valid = false;
+        const double first = play_game(candidate_engine, reference_engine, 1, &valid);
+        if (valid) {
+            score += first;
+            ++played_games;
+        }
+        valid = false;
+        const double second = play_game(reference_engine, candidate_engine, 2, &valid);
+        if (valid) {
+            score += second;
+            ++played_games;
+        }
     }
-    return score / (2.0 * pairs);
+    // A discarded game has no result to average, so it leaves the denominator
+    // rather than counting as a half; one that never got played cannot promote.
+    if (played_games == 0) return 0.0;
+    return score / played_games;
 }
 
 std::vector<Move> Trainer::random_opening_line(int plies, uint64_t seed) {
@@ -137,6 +169,13 @@ std::vector<Move> Trainer::random_opening_line(int plies, uint64_t seed) {
 
 int Trainer::generate_data_games(int games, int threads) {
     if (games <= 0 || fitness_override_) return 0;
+    // Nothing to write means nothing to play for: without either output path
+    // the games would only burn the round's budget and be dropped at merge.
+    if (config_.records_path.empty() && config_.samples_path.empty()) {
+        if (log_) log_("skipping data games this round: no --records or --samples "
+                       "output path was given");
+        return 0;
+    }
 
     const int worker_count = std::max(1, std::min(threads, games));
     const int per_worker = games / worker_count;
@@ -150,6 +189,15 @@ int Trainer::generate_data_games(int games, int threads) {
     std::vector<std::thread> workers;
     workers.reserve(worker_count);
 
+    // One id per game that actually yields samples, claimed from this counter
+    // instead of computed from the worker number: the claim count equals the merged
+    // record count, so the games_played_ advance after join and the ids already
+    // handed out stay exactly aligned. A fixed 1000 stride makes two workers overlap
+    // once a worker's count passes 1000, and its offset relative to games_played_ is
+    // legitimately re-reached in later rounds; both show up as a repeated
+    // (game_id, move_index) in samples.jsonl - the identity of the training data,
+    // which README:181's append stream has to keep separable.
+    std::atomic<int> next_data_id{games_played_ + 1};
     DataCollector collector;
     const ThreatCoefficients current_champion = champion();
 
@@ -175,7 +223,16 @@ int Trainer::generate_data_games(int games, int threads) {
             explorer.set_start_line(random_opening_line(config_.data_opening_plies, seed));
 
             const int count = per_worker + (t < remainder ? 1 : 0);
-            const int game_id_base = rounds_completed_ * 100000 + t * 1000;
+            // Data-game ids use the games_played_ high-water mark (persisted with
+            // the checkpoint) rather than rounds_completed_: they then number the
+            // played games densely, and INVALID games - skipped below - never
+            // consume one. It is not crash protection: the count advances here,
+            // but the checkpoint is only written at the end of the round, so a
+            // kill between the data append and the checkpoint still reissues this
+            // round's ids on --resume. Real protection needs an export marker and
+            // is not built yet. Workers only read games_played_; each id is claimed
+            // from next_data_id, so several threads claiming at once is atomic and
+            // not a data race.
             for (int i = 0; i < count; ++i) {
                 GameRecord record;
                 if (!explorer.explore(record, nullptr)) {
@@ -183,11 +240,14 @@ int Trainer::generate_data_games(int games, int threads) {
                     if (!explorer.explore(record, nullptr)) break;
                 }
 
-                local.records.push_back(record);
+                // INVALID games are junk: keep them out of local.records too, so
+                // neither games_played_ nor the JSONL stream counts or writes a
+                // discarded game.
                 if (record.reason == GameEndReason::INVALID) continue;
+                local.records.push_back(record);
 
-                std::vector<TrainingSample> samples =
-                    collector.collect(record, game_id_base + i, true);
+                std::vector<TrainingSample> samples = collector.collect(
+                    record, next_data_id.fetch_add(1), true);
                 for (auto& sample : samples) local.samples.push_back(std::move(sample));
             }
         });
@@ -209,15 +269,17 @@ int Trainer::generate_data_games(int games, int threads) {
     std::string error;
     if (!config_.records_path.empty() && !records.empty()) {
         for (const auto& record : records) {
-            if (!record.append_to_jsonl(config_.records_path, error) && log_) {
-                log_("could not append record: " + error);
+            // Write failures go to stderr regardless of --quiet: silence is
+            // for progress lines, not for lost data.
+            if (!record.append_to_jsonl(config_.records_path, error)) {
+                std::cerr << "could not append record: " << error << std::endl;
                 break;
             }
         }
     }
     if (!config_.samples_path.empty() && !samples.empty()) {
-        if (!collector.write_jsonl(samples, config_.samples_path, error) && log_) {
-            log_("could not append samples: " + error);
+        if (!collector.write_jsonl(samples, config_.samples_path, error)) {
+            std::cerr << "could not append samples: " << error << std::endl;
         }
     }
 
@@ -271,6 +333,12 @@ TrainerRound Trainer::run_round() {
                  std::to_string(best_fitness));
         }
     }
+    // Rule constants are not genes: the optimisers rebuild candidates from a
+    // default-constructed struct, so carry the champion's values over or the
+    // verification match compares two different rule sets and a promotion would
+    // rewrite the parameter file's constants with defaults.
+    candidate.five = result.champion.five;
+    candidate.forbidden_penalty = result.champion.forbidden_penalty;
     result.candidate = candidate;
 
     result.verification_score =
@@ -286,8 +354,8 @@ TrainerRound Trainer::run_round() {
         best_version_ = candidate_index;
         if (!config_.params_path.empty()) {
             std::string error;
-            if (!CoefficientVector::save(config_.params_path, champion(), error) && log_) {
-                log_("could not save parameters: " + error);
+            if (!CoefficientVector::save(config_.params_path, champion(), error)) {
+                std::cerr << "could not save parameters: " << error << std::endl;
             }
         }
     }
@@ -317,8 +385,8 @@ TrainerRound Trainer::run_round() {
         if (save_checkpoint(config_.checkpoint_path, error)) {
             if (log_) log_("round " + std::to_string(result.round) +
                            ": checkpoint saved to " + config_.checkpoint_path);
-        } else if (log_) {
-            log_("could not save checkpoint: " + error);
+        } else {
+            std::cerr << "could not save checkpoint: " << error << std::endl;
         }
     }
 
@@ -357,14 +425,31 @@ bool Trainer::save_checkpoint(const std::string& path, std::string& error) const
     root["versions"] = entries;
     root["elo"] = json::parse(elo_.to_json());
 
-    std::ofstream file(path, std::ios::trunc);
-    if (!file.is_open()) {
-        error = "cannot write " + path;
-        return false;
+    // Write-then-rename, mirroring save_session: a kill or power loss mid-write
+    // must leave the previous checkpoint intact, not a truncated file that
+    // load_checkpoint cannot parse.
+    const std::string tmp = path + ".tmp";
+    {
+        std::ofstream file(tmp, std::ios::trunc);
+        if (!file.is_open()) {
+            error = "cannot write " + tmp;
+            return false;
+        }
+        file << root.dump(2);
+        // The rename below is only safe once the bytes are really on the device:
+        // a buffered failure would surface at close, after the good() check and
+        // after the truncated .tmp had replaced a working checkpoint.
+        file.flush();
+        if (!file.good()) {
+            error = "failed while writing " + tmp;
+            return false;
+        }
     }
-    file << root.dump(2);
-    if (!file.good()) {
-        error = "failed while writing " + path;
+    std::error_code ec;
+    std::filesystem::rename(tmp, path, ec);
+    if (ec) {
+        std::filesystem::remove(tmp);
+        error = "cannot replace " + path + ": " + ec.message();
         return false;
     }
     return true;
@@ -423,11 +508,19 @@ bool Trainer::load_checkpoint(const std::string& path, std::string& error) {
     } else {
         for (size_t i = 0; i < restored_versions.size(); ++i) restored_elo.add_player(version_name(i));
     }
-    // Player ids are used as version indices, so the two lists must stay the same
-    // length or later results would be attributed to the wrong version.
+    // Player ids are used as version indices, so the two lists must agree by name
+    // and not merely by length: equal lengths with the names shifted would
+    // attribute results to another version, and every later checkpoint would then
+    // be unreadable.
     if (restored_elo.players().size() != restored_versions.size()) {
         error = "checkpoint ratings and versions disagree";
         return false;
+    }
+    for (size_t i = 0; i < restored_versions.size(); ++i) {
+        if (restored_elo.players()[i].name != version_name(i)) {
+            error = "checkpoint ratings and versions disagree";
+            return false;
+        }
     }
 
     // Everything is read into locals and only assigned once the whole file

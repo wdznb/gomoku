@@ -51,7 +51,10 @@ private:
     std::vector<std::vector<Position>> lines_;
     int max_depth_ = 0;
 
-    mutable std::mt19937 rng_;
+    // Seeded once per book: the default-constructed engine replays the same
+    // sequence in every process, which made the first weighted draw - the common
+    // "play one game on a fresh server" case - fully deterministic.
+    mutable std::mt19937 rng_{std::random_device{}()};
     mutable std::mutex rng_mutex_;
 
     static std::string make_key(const std::vector<Position>& moves);

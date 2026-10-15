@@ -16,6 +16,16 @@ int clamp_timeout_ms(int timeout_ms) {
     if (timeout_ms > 120000) return 120000;
     return timeout_ms;
 }
+
+// max_depth is client-controlled through the same two doors, and the page's
+// 2..20 is only an input rule: iterative deepening runs depth 1..max_depth and
+// is stopped by nothing but the deadline, so an unbounded value buys no stronger
+// move and a socket client can ask for one. Clamp to what the page can express.
+int clamp_max_depth(int max_depth) {
+    if (max_depth < 1) return 1;
+    if (max_depth > 20) return 20;
+    return max_depth;
+}
 }
 
 GameManager::GameManager() 
@@ -139,6 +149,14 @@ bool GameManager::make_move(int row, int col) {
     if (ai_thinking_.load()) return false;
     
     int turn = current_turn();
+    // While a hand-set position is still pending, no side has been claimed yet,
+    // so this stone is the claim (README lets 落子 start the game instead of
+    // choose_side). It has to happen before the colour guard below, which would
+    // otherwise compare the turn against the default player_color_.
+    if (position_pending_) {
+        player_color_ = turn;
+        ai_color_ = opponent(turn);
+    }
     // Only the human side may call make_move. If stop_thinking aborted the AI
     // worker before it placed a stone, the board still shows AI's color to
     // move; without this guard the human's next make_move would silently
@@ -178,11 +196,21 @@ bool GameManager::make_move(int row, int col) {
 
 bool GameManager::undo(int& out_move_count, GameStatus& out_status) {
     if (ai_thinking_.load()) return false;
+    if (position_pending_) return false;
     if (board_.move_count() == 0) return false;
-    
+    // Base stones are not a history: 摆棋 put them there and only another 摆棋
+    // takes them off. With no analysed move to give back there is nothing to
+    // undo, so a board of nothing but pre-placed stones refuses.
+    if (analyses_.empty()) return false;
+
     int undo_count = 1;
     if (board_.move_count() >= 2 && current_turn() == player_color_) {
         undo_count = 2;
+    }
+    // Never pop more board stones than the replay list can account for, or the
+    // two views of the same history would drift apart.
+    if (undo_count > static_cast<int>(analyses_.size())) {
+        undo_count = static_cast<int>(analyses_.size());
     }
     
     int undone = 0;
@@ -264,8 +292,12 @@ void GameManager::resign_now(int color) {
 }
 
 bool GameManager::request_hint(int timeout_ms, int max_depth) {
+    // 死局不再求招：其余入口都已在终局处拒绝，放行只会为一局不会再落的棋
+    // 烧掉整段 timeout，再回一手无人能落的推荐。
+    if (status_ == GameStatus::GAME_OVER) return false;
     if (ai_thinking_.load() || hint_active_.load()) return false;
     timeout_ms = clamp_timeout_ms(timeout_ms);
+    max_depth = clamp_max_depth(max_depth);
 
     if (hint_thread_ && hint_thread_->joinable()) {
         hint_thread_->join();
@@ -273,14 +305,38 @@ bool GameManager::request_hint(int timeout_ms, int max_depth) {
 
     hint_active_.store(true);
     stop_flag_.store(false);
+    // A hint is a fresh delivery, so it has to undo the discard mark the last
+    // halt_search left: 摆棋/重开 route through halt_search, and without this the
+    // next hint searches to completion and then drops the answer in silence.
+    discard_pending_.store(false);
     int turn = current_turn();
     Board board_snapshot = board_;
+    const int snapshot_move_count = board_snapshot.move_count();
 
     hint_thread_ = std::make_unique<std::thread>(
-        [this, board_snapshot, turn, timeout_ms, max_depth]() mutable {
+        [this, board_snapshot, turn, timeout_ms, max_depth, snapshot_move_count]() mutable {
             SearchResult result = engine_.search(board_snapshot, turn, max_depth, timeout_ms, stop_flag_);
 
-            if (!stop_flag_.load() && hint_callback_) {
+            // A user stop_thinking only raises stop_flag_, so delivering on the
+            // discard flag alone still answers a stopped hint and releases the
+            // client's 求招 button; reset / resign / the destructor set
+            // discard_pending_ first and must stay silent.
+            if (!discard_pending_.load() && hint_callback_) {
+                // The answer describes board_snapshot. make_move and undo do not
+                // wait for an in-flight hint, so a stone landed in the meantime
+                // makes it advice about a board that no longer exists; compare
+                // under thinking_mutex_, which is what the AI commit path takes
+                // when it changes board_.
+                int move_count_now = 0;
+                {
+                    std::lock_guard<std::mutex> commit_guard(thinking_mutex_);
+                    move_count_now = board_.move_count();
+                }
+                if (move_count_now != snapshot_move_count) {
+                    hint_callback_(Move(), 0);
+                    hint_active_.store(false);
+                    return;
+                }
                 // Deliver even when best_move is invalid (timeout with no PV):
                 // the server distinguishes valid (hint_result) from invalid
                 // (error) so the client is never left waiting on silence.
@@ -341,7 +397,10 @@ void GameManager::ai_thinking_worker(int timeout_ms, int max_depth) {
 
     if (result.resigned) {
         std::lock_guard<std::mutex> lock(thinking_mutex_);
-        if (!discard_pending_.load() && !stop_flag_.load() && status_ == GameStatus::PLAYING) {
+        // Interruption is not a refutation: the proven loss is the engine's own
+        // conclusion, so 终止 must still end the game. Skipping it here would
+        // leave the session with ai_color_ to move and no frame coming.
+        if (!discard_pending_.load() && status_ == GameStatus::PLAYING) {
             resign_now(ai_color_);
         }
         ai_thinking_.store(false);
@@ -406,7 +465,7 @@ void GameManager::set_opening_book(const OpeningBook* book) {
 
 void GameManager::set_config(int timeout_ms, int max_depth) {
     timeout_ms_ = clamp_timeout_ms(timeout_ms);
-    max_depth_ = max_depth;
+    max_depth_ = clamp_max_depth(max_depth);
 }
 
 }

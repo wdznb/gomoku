@@ -81,9 +81,12 @@ void EloSystem::record_result(int id_a, int id_b, double score_a) {
 
     a.games++;
     b.games++;
-    if (score_a > 0.75) {
+    // Only exactly half is a draw: a match score is the mean of per-game 1/0.5/0,
+    // so anything above half means the side took more than the other. A stricter
+    // win test would print --verification-games 4 and a 3-1 match (0.75) as a draw.
+    if (score_a > 0.5) {
         a.wins++; b.losses++;
-    } else if (score_a < 0.25) {
+    } else if (score_a < 0.5) {
         a.losses++; b.wins++;
     } else {
         a.draws++; b.draws++;
@@ -173,6 +176,9 @@ bool EloSystem::save(const std::string& path, std::string& error) const {
         return false;
     }
     file << to_json();
+    // A buffered failure only shows up when the stream closes, which is after
+    // this check would have called the write a success.
+    file.flush();
     if (!file.good()) {
         error = "failed while writing " + path;
         return false;

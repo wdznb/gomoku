@@ -1,5 +1,7 @@
 #include "position_json.h"
 
+#include "training/json_int.h"
+
 #include <array>
 #include <cctype>
 #include <cstdlib>
@@ -19,6 +21,13 @@ SetupResult rejected(const std::string& error) {
 // One grid value as a token: numbers become their own text, so 0/1/2 arrays and
 // "0"/"1"/"2" arrays read identically and a stated encoding can mix them.
 bool token_of(const json& value, std::string& out, std::string& error) {
+    // Unsigned first, exactly as word_of does: get<long long>() only casts a
+    // number_unsigned, so 18446744073709551615 would arrive as "-1" - a
+    // documented white symbol - and place a stone no file ever named.
+    if (value.is_number_unsigned()) {
+        out = std::to_string(value.get<uint64_t>());
+        return true;
+    }
     if (value.is_number_integer()) {
         out = std::to_string(value.get<long long>());
         return true;
@@ -72,9 +81,19 @@ bool word_of(const json& value, uint64_t& out, std::string& error) {
     }
     if (value.is_string()) {
         const std::string text = value.get<std::string>();
+        // Same rule as the numeric path: a negative is an error, never a
+        // silent wrap — std::stoull("-1") returns 2^64-1.
+        if (text.find('-') != std::string::npos) {
+            error = "位棋盘的字不能为负";
+            return false;
+        }
         try {
             size_t consumed = 0;
-            out = std::stoull(text, &consumed, 0);
+            // Not base 0: that reads a leading zero as octal, so a zero-padded
+            // decimal word would move every stone to another square and still
+            // validate. Only 0x/0X is hexadecimal, everything else is decimal.
+            const bool hex = text.size() > 2 && text[0] == '0' && (text[1] == 'x' || text[1] == 'X');
+            out = std::stoull(text, &consumed, hex ? 16 : 10);
             // Trailing junk would otherwise read as a different mask than the
             // file says ("0xFF " and "0xFF0" both parse to something).
             while (consumed < text.size() && std::isspace(static_cast<unsigned char>(text[consumed]))) ++consumed;
@@ -110,13 +129,21 @@ bool read_words(const json& list, std::array<uint64_t, BITBOARD_WORDS>& out, con
 bool position_of(const json& entry, Position& out, size_t index, std::string& error) {
     int row = -1;
     int col = -1;
+    // get<int> only casts, so 4294967304 would read as 8 and put a stone on a
+    // square no document named. Both shapes are range-checked instead; a
+    // coordinate that does not fit an int rejects the document rather than
+    // clamping to the nearest legal one.
     if (entry.is_array() && entry.size() == 2 && entry[0].is_number_integer() && entry[1].is_number_integer()) {
-        row = entry[0].get<int>();
-        col = entry[1].get<int>();
+        if (!read_json_int(entry[0], row) || !read_json_int(entry[1], col)) {
+            error = "第 " + std::to_string(index + 1) + " 个坐标超出可表示的行列范围";
+            return false;
+        }
     } else if (entry.is_object() && entry.contains("row") && entry.contains("col") &&
                entry["row"].is_number_integer() && entry["col"].is_number_integer()) {
-        row = entry["row"].get<int>();
-        col = entry["col"].get<int>();
+        if (!read_json_int(entry["row"], row) || !read_json_int(entry["col"], col)) {
+            error = "第 " + std::to_string(index + 1) + " 个坐标超出可表示的行列范围";
+            return false;
+        }
     } else {
         error = "第 " + std::to_string(index + 1) + " 个坐标需为 [row, col] 或 {\"row\":…,\"col\":…}";
         return false;
@@ -191,6 +218,16 @@ SetupResult moves_form(const json& doc) {
         first = side == "black" ? BLACK : WHITE;
     }
 
+    // The wire allows a 16 MiB frame, and a moves list longer than the board
+    // can never place: a 226th coordinate must repeat a cell. Refusing by size
+    // before the walk keeps a giant list from being parsed entry by entry on
+    // the single io thread, the same early reject the grid reader got.
+    if (value.size() > static_cast<size_t>(BOARD_SIZE * BOARD_SIZE)) {
+        return rejected("moves 最多 " + std::to_string(BOARD_SIZE * BOARD_SIZE) +
+                        " 个坐标（15x15 棋盘的最大子数），收到 " +
+                        std::to_string(value.size()) + " 个");
+    }
+
     std::vector<Position> moves;
     moves.reserve(value.size());
     size_t index = 0;
@@ -209,15 +246,10 @@ SetupResult moves_form(const json& doc) {
 SetupResult position_from_json(const json& doc) {
     if (!doc.is_object()) return rejected("局面文档必须是 JSON 对象");
     if (doc.contains("version")) {
-        if (!doc["version"].is_number_integer() || doc["version"].get<int>() != 1) {
+        int version = 0;
+        if (!read_json_int(doc["version"], version) || version != 1) {
             return rejected("不支持的局面版本，当前只认 version 1");
         }
-    }
-
-    GridEncoding override;
-    if (doc.contains("encoding")) {
-        std::string error;
-        if (!read_encoding(doc, override, error)) return rejected(error);
     }
 
     const int forms = (doc.contains("board") ? 1 : 0) + (doc.contains("bitboard") ? 1 : 0) +
@@ -229,15 +261,30 @@ SetupResult position_from_json(const json& doc) {
         return rejected("first 只能与 moves 同时出现");
     }
 
+    // README:231/README:536: only a grid carries marks, so only a grid document explains
+    // `encoding`. A bitboard or move list ignores the field instead of being vetoed by it.
     if (doc.contains("board")) {
-        return board_form(doc, doc.contains("encoding") ? &override : nullptr);
+        if (!doc.contains("encoding")) return board_form(doc, nullptr);
+        GridEncoding override;
+        std::string error;
+        if (!read_encoding(doc, override, error)) return rejected(error);
+        return board_form(doc, &override);
     }
     if (doc.contains("bitboard")) return bitboard_form(doc);
     return moves_form(doc);
 }
 
 SetupResult position_from_text(const std::string& text) {
-    const size_t first = text.find_first_not_of(" \t\r\n");
+    // A BOM is not content: left in place its 0xEF is the character the shape test
+    // reads, so a legal JSON document arrives as grid text and reports a wrong cell
+    // count. Only the three bytes at the very start count, whatever follows them.
+    size_t begin = 0;
+    if (text.size() >= 3 && static_cast<unsigned char>(text[0]) == 0xEF &&
+        static_cast<unsigned char>(text[1]) == 0xBB &&
+        static_cast<unsigned char>(text[2]) == 0xBF) {
+        begin = 3;
+    }
+    const size_t first = text.find_first_not_of(" \t\r\n", begin);
     if (first == std::string::npos) return rejected("内容为空");
     // A JSON document starts with either brace, so a bare array reports the
     // parser's complaint rather than a confusing grid-width error.
@@ -245,11 +292,12 @@ SetupResult position_from_text(const std::string& text) {
     if (opening != '{' && opening != '[') {
         GridCells cells;
         std::string error;
+        // The grid reader strips the BOM itself, so the text goes on uncut.
         if (!parse_grid_text(text, cells, error)) return rejected(error);
         return position_from_grid(cells);
     }
     // do_not_throw: a truncated upload is a normal occurrence, not a crash.
-    json doc = json::parse(text, nullptr, false);
+    json doc = json::parse(text.begin() + begin, text.end(), nullptr, false);
     if (doc.is_discarded()) return rejected("JSON 解析失败，请检查括号与逗号");
     return position_from_json(doc);
 }

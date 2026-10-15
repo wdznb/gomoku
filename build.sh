@@ -54,10 +54,11 @@ else
         cd build
     fi
     
-    # Compile. The source list mirrors GOMOKU_SOURCES in CMakeLists.txt: the
+    # Compile. The two commands mirror CMakeLists.txt: the first the server's
+    # GOMOKU_SOURCES, the second gomoku_train's core plus training lists. The
     # transport is Boost.Beast (header-only here, so no websocketpp and no
-    # -lboost_system), and skipping a core source only shows up later as an
-    # undefined reference.
+    # -lboost_system), and skipping a source only shows up later as an undefined
+    # reference.
     echo "Compiling..."
     g++ -std=c++17 -O2 -Wall -Wextra \
         -I../src \
@@ -77,17 +78,57 @@ else
         ../src/optimization/transposition.cpp \
         ../src/optimization/opening_book.cpp \
         ../src/training/params.cpp \
+        ../src/training/game_record.cpp \
         ../src/server/server.cpp \
         ../src/server/game_manager.cpp \
         ../src/server/position_json.cpp \
+        ../src/server/session_store.cpp \
         -o gomoku_server \
         -lpthread
-    
+
+    # The trainer needs no server, no Boost and none of the session code, so its
+    # list is main_trainer.cpp plus the two CMake lists it is built from.
+    g++ -std=c++17 -O2 -Wall -Wextra \
+        -I../src \
+        -I../deps/json/include \
+        ../src/training/main_trainer.cpp \
+        ../src/core/board.cpp \
+        ../src/core/pattern.cpp \
+        ../src/core/evaluator.cpp \
+        ../src/core/transforms.cpp \
+        ../src/core/position_setup.cpp \
+        ../src/search/greedy.cpp \
+        ../src/search/vcf.cpp \
+        ../src/search/vct.cpp \
+        ../src/search/alphabeta.cpp \
+        ../src/search/search_engine.cpp \
+        ../src/search/controller.cpp \
+        ../src/optimization/transposition.cpp \
+        ../src/optimization/opening_book.cpp \
+        ../src/training/params.cpp \
+        ../src/training/game_record.cpp \
+        ../src/training/elo.cpp \
+        ../src/training/self_play.cpp \
+        ../src/training/data_collector.cpp \
+        ../src/training/genetic.cpp \
+        ../src/training/hill_climbing.cpp \
+        ../src/training/trainer.cpp \
+        -o gomoku_train \
+        -lpthread
+
     # Copy web files
     echo "Copying web files..."
     cp -r ../web .
     cp -r ../data .
     
+    # The two binaries above are all this fallback branch compiles: the eight
+    # test executables and the ctest entry are CMake targets, so README's 测试
+    # chapter cannot be followed from here. Say so - a bare "Build complete!"
+    # otherwise reads as if the suite were present but failing to launch.
+    echo ""
+    echo "Note: this fallback build compiles only gomoku_server and gomoku_train."
+    echo "      The eight test binaries and ctest come from the CMake build:"
+    echo '      mkdir build && cd build && cmake .. && make -j$(nproc)'
     echo ""
     echo "Build complete!"
 fi
@@ -99,10 +140,8 @@ echo "To run the server:"
 echo "  cd build"
 echo "  ./gomoku_server"
 echo ""
-if [ "$USE_CMAKE" -eq 1 ]; then
-    echo "To train the threat coefficients (CMake build only):"
-    echo "  cd build && ./gomoku_train --help"
-    echo ""
-fi
+echo "To train the threat coefficients:"
+echo "  cd build && ./gomoku_train --help"
+echo ""
 echo "Then open http://localhost:8080 in your browser"
 echo ""

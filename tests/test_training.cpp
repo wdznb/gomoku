@@ -10,17 +10,32 @@
 #include "training/data_collector.h"
 #include "training/genetic.h"
 #include "training/hill_climbing.h"
-#include "training/trainer.h"
 #include <algorithm>
 #include <cassert>
+#include <cctype>
 #include <cmath>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <map>
+#include <random>
 #include <set>
+#include <sstream>
 #include <string>
 #include <vector>
+
+#ifndef _WIN32
+#include <sys/wait.h>
+#endif
+
+// Trainer::play_game() is private, and the games_played counter can only be
+// observed first-hand by playing one. Every header trainer.h pulls in is
+// included above, so the macro rewrites trainer.h's class body and nothing else.
+#define private public
+#include "training/trainer.h"
+#undef private
 
 using namespace gomoku;
 
@@ -258,6 +273,92 @@ void test_game_record_roundtrip() {
     std::cout << "test_game_record_roundtrip passed" << std::endl;
 }
 
+// Round 78, M3: winner and reason are outcomes, not metadata. Defaulting a
+// missing one turned a win into a draw in every sample derived from the record;
+// an unknown name would read as INVALID and quietly drop a decided game. Both
+// are refused, "invalid" itself stays a legal reason, and a rejected parse must
+// leave the caller's record untouched.
+void test_game_record_requires_outcome() {
+    std::string error;
+
+    GameRecord sentinel;
+    sentinel.winner = WHITE;
+    sentinel.reason = GameEndReason::RESIGN;
+
+    const char* rejected[] = {
+        R"({"moves":[]})",                                    // no winner at all
+        R"({"moves":[],"reason":"five"})",                    // reason but no winner
+        R"({"moves":[],"winner":"black"})",                   // winner but no reason
+        R"({"moves":[],"winner":1,"reason":"five"})",         // winner is not a string
+        R"({"moves":[],"winner":"black","reason":1})",        // reason is not a string
+        R"({"moves":[],"winner":"grey","reason":"five"})",    // winner name not written
+        R"({"moves":[],"winner":"black","reason":"fiv"})",    // reason name not written
+        R"({"moves":[],"winner":"black","reason":"fiveinarow"})",
+    };
+    for (const char* text : rejected) {
+        GameRecord out = sentinel;
+        error.clear();
+        assert(!GameRecord::from_json(text, out, error));
+        assert(!error.empty());
+        // The failed parse may not leave half of itself in the caller's record.
+        assert(out.winner == WHITE && out.reason == GameEndReason::RESIGN);
+        assert(out.moves.empty());
+        std::cout << "  rejected " << text << " -> " << error << std::endl;
+    }
+
+    // The three refusal messages are distinct, so a caller can tell "missing"
+    // from "misspelled".
+    GameRecord out;
+    error.clear();
+    assert(!GameRecord::from_json(R"({"moves":[]})", out, error));
+    assert(error.find("must state winner") != std::string::npos);
+    error.clear();
+    assert(!GameRecord::from_json(R"({"moves":[],"winner":"black"})", out, error));
+    assert(error.find("must state reason") != std::string::npos);
+    error.clear();
+    assert(!GameRecord::from_json(R"({"moves":[],"winner":"grey","reason":"five"})", out, error));
+    assert(error.find("unknown winner colour") != std::string::npos);
+    error.clear();
+    assert(!GameRecord::from_json(R"({"moves":[],"winner":"black","reason":"fiv"})", out, error));
+    assert(error.find("unknown end reason") != std::string::npos);
+
+    // Legal: "invalid" is itself one of the written reason names, and every
+    // written name round-trips through the writer unchanged.
+    error.clear();
+    assert(GameRecord::from_json(
+        R"({"moves":[],"winner":"draw","reason":"invalid"})", out, error));
+    assert(out.winner == EMPTY && out.reason == GameEndReason::INVALID);
+
+    const GameEndReason reasons[] = {
+        GameEndReason::FIVE,    GameEndReason::FORBIDDEN, GameEndReason::RESIGN,
+        GameEndReason::BOARD_FULL, GameEndReason::MOVE_LIMIT, GameEndReason::INVALID,
+    };
+    const int winners[] = {BLACK, WHITE, WHITE, EMPTY, EMPTY, EMPTY};
+    for (size_t i = 0; i < sizeof(reasons) / sizeof(reasons[0]); ++i) {
+        GameRecord written;
+        written.winner = winners[i];
+        written.reason = reasons[i];
+        GameRecord back;
+        error.clear();
+        assert(GameRecord::from_json(written.to_json(), back, error));
+        assert(back.winner == winners[i]);
+        assert(back.reason == reasons[i]);
+    }
+
+    // A record a real game produces round-trips whole through the same door.
+    SearchEngine engine;
+    SelfPlay play(engine, engine, quick_play_config());
+    const GameRecord played = play.run(std::vector<Move>(), nullptr, nullptr);
+    assert(played.reason != GameEndReason::INVALID);
+    GameRecord restored;
+    error.clear();
+    assert(GameRecord::from_json(played.to_json(), restored, error));
+    assert(restored.winner == played.winner && restored.reason == played.reason);
+    assert(restored.moves.size() == played.moves.size());
+
+    std::cout << "test_game_record_requires_outcome passed" << std::endl;
+}
+
 void test_elo_system() {
     EloSystem elo(1500.0, 32.0);
     assert(EloSystem::expected_score(1500, 1500) == 0.5);
@@ -329,6 +430,64 @@ void test_elo_system() {
     assert(threw);
 
     std::cout << "test_elo_system passed" << std::endl;
+}
+
+// Round 101 FF1: the bracket behind the rating table disagreed with the promotion
+// rule it sits next to. README:198 makes a verification match 8 games, so a 5-3
+// candidate scores 0.625, which trainer.cpp:336 promotes (>= the 0.56 accept score)
+// while the old `>= 0.75 / <= 0.25` test booked *both* sides a draw - the table
+// printed a match somebody had clearly taken as nobody winning. The bracket now
+// follows what a match score means: above half is a win, below half a loss, exactly
+// half the only draw. The two scores the stricter test already called correctly
+// (0.75 from round 99's D6, 0.25) stay correct, and the rating itself is computed
+// from score_a before any bracketing, so every arm pins the Elo delta too - the
+// bookkeeping is the only thing that changed.
+void test_elo_scores_a_majority_match_as_a_win() {
+    struct Arm {
+        double score;
+        int wins_a;
+        int losses_a;
+        int draws_a;
+    };
+    const Arm arms[] = {
+        {1.000, 1, 0, 0},
+        {0.750, 1, 0, 0},   // 3-1 of 4: win before and after (round 99, D6)
+        {0.625, 1, 0, 0},   // 5-3 of 8: the score that used to print as a draw
+        {0.500, 0, 0, 1},   // exactly half is still the only draw
+        {0.375, 0, 1, 0},   // 3-5 of 8: the mirror of the arm above
+        {0.250, 0, 1, 0},
+        {0.000, 0, 1, 0},
+    };
+
+    for (const Arm& arm : arms) {
+        EloSystem elo(1500.0, 32.0);
+        const int a = elo.add_player("candidate");
+        const int b = elo.add_player("champion");
+        elo.record_result(a, b, arm.score);
+
+        std::cout << "  [r101ff1] score " << arm.score << " -> candidate w/l/d "
+                  << elo.player(a).wins << "/" << elo.player(a).losses << "/"
+                  << elo.player(a).draws << ", champion w/l/d " << elo.player(b).wins << "/"
+                  << elo.player(b).losses << "/" << elo.player(b).draws << ", elo "
+                  << elo.player(a).elo << std::endl;
+
+        assert(elo.player(a).wins == arm.wins_a);
+        assert(elo.player(a).losses == arm.losses_a);
+        assert(elo.player(a).draws == arm.draws_a);
+        // The opponent is scored on the same match, so its counters mirror a's.
+        assert(elo.player(b).wins == arm.losses_a);
+        assert(elo.player(b).losses == arm.wins_a);
+        assert(elo.player(b).draws == arm.draws_a);
+        assert(elo.player(a).games == 1 && elo.player(b).games == 1);
+
+        // Equal starting ratings make the expected score exactly half, so the
+        // rating move is k * (score - 0.5) whichever bracket the score lands in.
+        const double delta = 32.0 * (arm.score - 0.5);
+        assert(std::abs(elo.player(a).elo - (1500.0 + delta)) < 1e-9);
+        assert(std::abs(elo.player(b).elo - (1500.0 - delta)) < 1e-9);
+    }
+
+    std::cout << "test_elo_scores_a_majority_match_as_a_win passed" << std::endl;
 }
 
 void test_coefficient_vector() {
@@ -688,6 +847,83 @@ void test_data_collector_samples() {
     std::cout << "test_data_collector_samples passed" << std::endl;
 }
 
+// R86 Q3: collect() with augmentation evaluates all eight board orientations,
+// but slots 0..24 are read off the whole board and are identical under every
+// symmetry - the fix hoists that part out of the variant loop and recomputes
+// only 25..51 per orientation. The reorder must be behaviour-preserving: every
+// kept sample has to equal extract_features(transform_board(board_i, v), side)
+// for one of the eight v, and the identity orientation must still be kept.
+void test_augmented_samples_match_manual_transforms() {
+    // Six plies on purpose: the board is asymmetric from ply 1 on ((7,8) and
+    // (7,6) are mirror images, but (8,8) and (5,5) are not), so the late plies
+    // really carry all eight orientations, not a deduplicated subset.
+    GameRecord record;
+    record.winner = BLACK;
+    record.reason = GameEndReason::FIVE;
+    const Position line[6] = {{7, 7}, {7, 8}, {8, 8}, {6, 6}, {5, 5}, {7, 6}};
+    for (int i = 0; i < 6; ++i) {
+        MoveRecord entry;
+        entry.move = Move(line[i].row, line[i].col, i % 2 == 0 ? BLACK : WHITE);
+        entry.score = 0;
+        entry.depth = 4;
+        entry.nodes = 100;
+        entry.elapsed_ms = 5;
+        entry.method = "alphabeta";
+        record.moves.push_back(entry);
+    }
+    record.total_nodes = 600;
+    record.max_depth = 4;
+
+    // boards[i] is the position before record.moves[i] is played.
+    std::vector<Board> boards(record.moves.size() + 1);
+    for (size_t i = 0; i < record.moves.size(); ++i) {
+        boards[i + 1] = boards[i];
+        boards[i + 1].place_stone(record.moves[i].move.pos.row, record.moves[i].move.pos.col,
+                                  record.moves[i].move.color);
+    }
+
+    DataCollector collector;
+    const std::vector<TrainingSample> augmented = collector.collect(record, 9090, true);
+    assert(!augmented.empty());
+
+    std::map<int, std::vector<std::vector<float>>> kept;
+    for (const auto& sample : augmented) {
+        assert(sample.move_index >= 0 && sample.move_index < static_cast<int>(record.moves.size()));
+        assert(static_cast<int>(sample.features.size()) == DataCollector::FEATURE_COUNT);
+        kept[sample.move_index].push_back(sample.features);
+    }
+    assert(static_cast<int>(kept.size()) == static_cast<int>(record.moves.size()));
+
+    for (const auto& entry : kept) {
+        const int side = record.moves[entry.first].move.color;
+        std::vector<std::vector<float>> want;
+        for (int v = 0; v < SYMMETRY_COUNT; ++v) {
+            want.push_back(collector.extract_features(transform_board(boards[entry.first], v), side));
+        }
+        assert(entry.second.size() >= 1 && entry.second.size() <= static_cast<size_t>(SYMMETRY_COUNT));
+        // Every kept sample is one of the eight orientations, bit for bit.
+        for (const auto& features : entry.second) {
+            assert(std::find(want.begin(), want.end(), features) != want.end());
+        }
+        // The identity orientation is the board itself: it must be kept, and
+        // every distinct orientation must survive as a sample of its own.
+        assert(std::find(entry.second.begin(), entry.second.end(), want[0]) != entry.second.end());
+        for (const auto& features : want) {
+            assert(std::find(entry.second.begin(), entry.second.end(), features) != entry.second.end());
+        }
+    }
+
+    // Anti-overreach: without augmentation there is exactly one sample per ply,
+    // equal to the untransformed board's full 52-slot vector.
+    const std::vector<TrainingSample> plain = collector.collect(record, 9091, false);
+    assert(plain.size() == record.moves.size());
+    for (const auto& sample : plain) {
+        assert(sample.features == collector.extract_features(boards[sample.move_index], record.moves[sample.move_index].move.color));
+    }
+
+    std::cout << "test_augmented_samples_match_manual_transforms passed" << std::endl;
+}
+
 void test_hill_climbing() {
     ThreatCoefficients base;
     const double initial = deviation_score(base);
@@ -770,7 +1006,7 @@ void test_genetic() {
     assert(generations >= 1 && generations <= settings.max_generations);
     assert(optimizer.population().size() == static_cast<size_t>(settings.population_size));
     assert(optimizer.evaluations() ==
-           settings.population_size * (generations + 1));
+           settings.population_size + generations * (settings.population_size - 1));
     // Elitism: the best member of the final population is the returned answer.
     double strongest = 0.0;
     for (const auto& member : optimizer.population()) {
@@ -813,6 +1049,183 @@ void test_genetic() {
     assert(flat_generations == flat_settings.stagnation_generations);
 
     std::cout << "test_genetic passed" << std::endl;
+}
+
+// R87: one half of the seeded population is redrawn across each bound's whole
+// box. The old draw was min + noise * span with noise in (-0.5, 0.5), so every
+// reseeded gene landed in the lower half of its range - for double_four the old
+// maximum is 50000 - 1, and the top half of every box was unreachable at
+// seeding time, which is exactly the region a wider search of these bounds
+// needs to start from.
+void test_genetic_seed_covers_the_whole_box() {
+    ThreatCoefficients base;
+    const std::vector<int> base_genes = CoefficientVector::to_vector(base);
+
+    GeneticConfig settings;
+    settings.population_size = 12;
+    // Zero generations leaves run() with nothing to evolve, so population() is
+    // exactly what seed_population() wrote.
+    settings.max_generations = 0;
+
+    // Seeds chosen after a sweep of candidates: the draw is deterministic per
+    // seed, and gene 9 (span 20) truncates to its min about 5% of the time, so
+    // these two are picked where that coincidence does not occur.
+    const std::vector<uint64_t> seeds = {202, 505};
+    bool upper_half_seen = false;
+
+    // The most one inner step can add to a gene is span / 8 (noise is bounded
+    // by 0.5 and then the 0.25 factor halves it again), and a nudge member
+    // spends one step per gene. Ladder repairs only move a value towards
+    // another gene that is itself within this budget of its own base.
+    long nudge_budget = 0;
+    for (int g = 0; g < TUNABLE_COUNT; ++g) {
+        const ParamBound bound = CoefficientVector::bound_for(static_cast<TunableParam>(g));
+        nudge_budget += (bound.max_value - bound.min_value) / 8;
+    }
+    std::cout << "[r87r] nudge_budget=" << nudge_budget << std::endl;
+
+    for (uint64_t seed : seeds) {
+        GeneticOptimizer optimizer([](const ThreatCoefficients&) { return 0.0; },
+                                   settings, seed);
+        int generations = -1;
+        double best = -1.0;
+        optimizer.run(base, generations, best);
+        assert(generations == 0);
+        assert(optimizer.population().size() ==
+               static_cast<size_t>(settings.population_size));
+
+        // Seat 0 is the founder: the hand-tuned base itself, gene for gene.
+        assert(optimizer.population()[0].genes == base_genes);
+
+        for (int i = 1; i < settings.population_size; ++i) {
+            const std::vector<int>& genes = optimizer.population()[i].genes;
+            const bool reseeded = i % 2 == 1;
+            std::cout << "[r87r] seed=" << seed << " member[" << i << "]"
+                      << (reseeded ? " reseed:" : " nudge: ");
+            for (int v : genes) std::cout << ' ' << v;
+            std::cout << std::endl;
+            if (reseeded) {
+                for (int g = 0; g < TUNABLE_COUNT; ++g) {
+                    const ParamBound bound =
+                        CoefficientVector::bound_for(static_cast<TunableParam>(g));
+                    assert(genes[g] != bound.min_value);
+                }
+                if (genes[static_cast<size_t>(TunableParam::DOUBLE_FOUR)] > 50000) {
+                    upper_half_seen = true;
+                }
+            } else {
+                for (int g = 0; g < TUNABLE_COUNT; ++g) {
+                    assert(std::abs(genes[g] - base_genes[g]) <= nudge_budget);
+                }
+            }
+        }
+    }
+    // 50000 - 1 is the old draw's ceiling for double_four, so a member above
+    // the midpoint of that box proves the whole box is reachable now.
+    assert(upper_half_seen);
+
+    std::cout << "test_genetic_seed_covers_the_whole_box passed" << std::endl;
+}
+
+// B6: empty steps (candidate == current) must neither count as evaluations nor
+// trigger stagnation. A multiplier of 1.0 with sanitize makes every neighbor a
+// no-op for the base genes.
+void test_hill_climbing_empty_steps() {
+    ThreatCoefficients base;
+    const std::vector<int> genes = CoefficientVector::to_vector(base);
+    for (size_t g = 0; g < genes.size(); ++g) {
+        assert(HillClimbingOptimizer::neighbor(genes, g, 1.0) == genes);
+    }
+
+    HillClimbingConfig settings;
+    settings.max_iterations = 40;
+    settings.stagnation_limit = 12;
+    settings.multipliers = {1.0};
+    HillClimbingOptimizer optimizer([](const ThreatCoefficients&) { return 0.0; },
+                                    settings, 4242);
+    int iterations = 0;
+    double best = 0.0;
+    optimizer.run(base, iterations, best);
+
+    assert(iterations == 0);
+    assert(optimizer.evaluations() == 1);
+    assert(optimizer.converged() == false);
+    assert(optimizer.best_history().size() == 1);
+
+    std::cout << "test_hill_climbing_empty_steps passed" << std::endl;
+}
+
+// B6: invariant iterations_run == evaluations - 1 == best_history.size() - 1
+// holds when some steps are empty (mixed multipliers 1.0 and 1.6).
+void test_hill_climbing_effective_steps() {
+    ThreatCoefficients base;
+    HillClimbingConfig settings;
+    settings.max_iterations = 40;
+    settings.stagnation_limit = 1000;
+    settings.multipliers = {1.0, 1.6};
+    HillClimbingOptimizer optimizer([](const ThreatCoefficients& c) {
+        long sum = 0;
+        for (int v : CoefficientVector::to_vector(c)) sum += v;
+        return static_cast<double>(sum);
+    }, settings, 7);
+    int iterations = 0;
+    double best = 0.0;
+    optimizer.run(base, iterations, best);
+
+    // Effective steps < raw loop iterations (some 1.0 multipliers produced no-ops).
+    assert(iterations < settings.max_iterations);
+    // Pin the invariant.
+    assert(iterations == optimizer.evaluations() - 1);
+    assert((size_t)iterations == optimizer.best_history().size() - 1);
+    assert(optimizer.converged() == false);
+
+    std::cout << "test_hill_climbing_effective_steps passed" << std::endl;
+}
+
+// B7: elitism means the incumbent is appended after evaluate(), so the elite
+// slot itself never gets scored a second time. Scoring by gene-vector was
+// dropped: a produced child can coincide with a vector that is already in the
+// population, and that child is scored again - that is what the current
+// implementation does (measured on c14854a: seed=3 a non-winner vector was
+// scored 4 times, seed=11 the founder vector 3 times, seed=4242 the winning
+// vector 2 times), so calls-per-vector measured vector uniqueness rather than
+// elite re-scoring, and it was not independent of the seeding distribution.
+// What stays observable here is the elite slot and the evaluation count.
+void test_genetic_elite_single_evaluation() {
+    ThreatCoefficients base;
+    GeneticConfig settings;
+    settings.population_size = 8;
+    settings.max_generations = 1;
+    settings.stagnation_generations = 50;
+    settings.crossover_ratio = 0.85;
+    settings.mutation_rate = 0.0;
+
+    auto sum_fitness = [](const ThreatCoefficients& c) -> double {
+        long sum = 0;
+        for (int v : CoefficientVector::to_vector(c)) sum += v;
+        return static_cast<double>(sum);
+    };
+
+    GeneticOptimizer optimizer(sum_fitness, settings, 3);
+    int generations = 0;
+    double best = 0.0;
+    ThreatCoefficients winner = optimizer.run(base, generations, best);
+
+    // Population is full (elite appended, not pre-filled before evaluate).
+    assert(optimizer.population().size() == static_cast<size_t>(settings.population_size));
+
+    // The last slot is the incumbent carried across the generation: it holds the
+    // fitness run() reports as best, and its coefficients are the returned
+    // champion, without having been scored again by the append.
+    assert(optimizer.population().back().fitness == best);
+    assert(CoefficientVector::to_vector(optimizer.population().back().coefficients) ==
+           CoefficientVector::to_vector(winner));
+
+    // Total evaluations = population_size + generations * (population_size - 1).
+    assert(optimizer.evaluations() ==
+           settings.population_size + generations * (settings.population_size - 1));
+
+    std::cout << "test_genetic_elite_single_evaluation passed" << std::endl;
 }
 
 void test_random_opening_line() {
@@ -931,6 +1344,41 @@ void test_trainer_round_rejects_regression() {
     std::cout << "test_trainer_round_rejects_regression passed" << std::endl;
 }
 
+void test_trainer_keeps_rule_constants_through_promotion() {
+    // Round 74: the optimisers rebuild candidates from a default-constructed
+    // struct, so before the fix a promoted candidate lost the rule constants
+    // the run started from - the written parameter file carried the built-in
+    // five (100000) and forbidden_penalty (50000) instead of the loaded ones.
+    TrainingConfig config = fast_training_config();
+    config.params_path = temp_path("constant_params.json").string();
+    config.checkpoint_path = temp_path("constant_checkpoint.json").string();
+
+    ThreatCoefficients base;
+    base.five = 88888;
+    base.forbidden_penalty = 77777;
+
+    Trainer trainer(base, config);
+    trainer.set_fitness_override(deviation_score);
+
+    const TrainerRound round = trainer.run_round();
+    assert(round.accepted);                       // the injected objective promotes
+    assert(round.candidate.five == 88888);
+    assert(round.candidate.forbidden_penalty == 77777);
+    assert(trainer.champion().five == 88888);
+    assert(trainer.champion().forbidden_penalty == 77777);
+
+    std::string error;
+    ThreatCoefficients from_file;
+    assert(CoefficientVector::load(config.params_path, from_file, error));
+    assert(from_file.five == 88888);
+    assert(from_file.forbidden_penalty == 77777);
+
+    std::ifstream checkpoint(config.checkpoint_path);
+    assert(checkpoint.is_open());
+
+    std::cout << "test_trainer_keeps_rule_constants_through_promotion passed" << std::endl;
+}
+
 void test_trainer_genetic_round_and_status() {
     TrainingConfig config = fast_training_config();
     config.optimizer = OptimizerKind::GENETIC;
@@ -1015,6 +1463,32 @@ void test_trainer_rejects_bad_checkpoint() {
     assert(!trainer.load_checkpoint(path.string(), error));
     assert(error.find("disagree") != std::string::npos);
 
+    // Round 78, M5: equal lengths are not agreement. Names shifted by one
+    // attribute the results to another version, so the pair is checked name by
+    // name, index by index.
+    {
+        std::ofstream file(path);
+        file << "{\"versions\":[" << CoefficientVector::to_json_string(ThreatCoefficients())
+             << "," << CoefficientVector::to_json_string(ThreatCoefficients())
+             << "],\"elo\":{\"players\":[{\"name\":\"v1\"},{\"name\":\"v0\"}]}}";
+    }
+    error.clear();
+    assert(!trainer.load_checkpoint(path.string(), error));
+    assert(error.find("disagree") != std::string::npos);
+    assert(trainer.versions().size() == 1);
+
+    // Control: the same shape with the names in index order loads, so the
+    // refusal above is the shift and not the file shape.
+    {
+        std::ofstream file(path);
+        file << "{\"versions\":[" << CoefficientVector::to_json_string(ThreatCoefficients())
+             << "," << CoefficientVector::to_json_string(ThreatCoefficients())
+             << "],\"elo\":{\"players\":[{\"name\":\"v0\"},{\"name\":\"v1\"}]}}";
+    }
+    assert(trainer.load_checkpoint(path.string(), error));
+    assert(trainer.versions().size() == 2);
+    assert(trainer.ratings().players().size() == 2);
+
     assert(!trainer.load_checkpoint((path.string() + ".missing").c_str(), error));
 
     std::cout << "test_trainer_rejects_bad_checkpoint passed" << std::endl;
@@ -1064,10 +1538,12 @@ void test_readers_reject_out_of_range_numbers() {
     assert(error.find("32-bit") != std::string::npos);
 
     // Coordinates decide the position, so an unusable one rejects the whole record
-    // instead of replaying whatever the low half of the number points at.
+    // instead of replaying whatever the low half of the number points at. The
+    // record states its outcome so the off-board check is the one that fires.
     GameRecord record;
     assert(!GameRecord::from_json(
-        "{\"moves\":[{\"row\":99999999999,\"col\":3,\"color\":\"black\"}]}", record, error));
+        "{\"moves\":[{\"row\":99999999999,\"col\":3,\"color\":\"black\"}],"
+        "\"winner\":\"black\",\"reason\":\"five\"}", record, error));
     assert(error.find("off the board") != std::string::npos);
 
     TrainingSample sample;
@@ -1081,7 +1557,9 @@ void test_readers_reject_out_of_range_numbers() {
 
     // Metadata decides nothing, so it falls back to its default instead.
     GameRecord metadata;
-    assert(GameRecord::from_json("{\"moves\":[],\"total_nodes\":99999999999}", metadata, error));
+    assert(GameRecord::from_json(
+        "{\"moves\":[],\"winner\":\"draw\",\"reason\":\"invalid\",\"total_nodes\":99999999999}",
+        metadata, error));
     assert(metadata.total_nodes == 0);
 
     EloSystem elo;
@@ -1089,6 +1567,2228 @@ void test_readers_reject_out_of_range_numbers() {
     assert(elo.player(0).games == 0);
 
     std::cout << "test_readers_reject_out_of_range_numbers passed" << std::endl;
+}
+
+// Round 79, A5: TrainingSample::from_json now requires the label (move object,
+// numeric value, numeric weight) and the 52-long feature vector, so a damaged
+// line is refused whole instead of training on a half-read sample. The writer's
+// own payload must still read back.
+void test_sample_from_json_rejects_damaged() {
+    const auto features = [](int count) {
+        std::string out = "[";
+        for (int i = 0; i < count; ++i) {
+            if (i) out += ",";
+            out += "0";
+        }
+        return out + "]";
+    };
+    const int n = DataCollector::FEATURE_COUNT;
+    const std::string move = "\"move\":{\"row\":7,\"col\":7,\"color\":\"black\"}";
+
+    TrainingSample sample;
+    std::string error;
+    const std::string ok =
+        "{\"features\":" + features(n) + ",\"value\":0.5,\"weight\":1.0," + move + "}";
+    assert(TrainingSample::from_json(ok, sample, error) && error.empty());
+    assert(static_cast<int>(sample.features.size()) == n);
+    assert(sample.move == Move(7, 7, BLACK));
+    assert(sample.value == 0.5f && sample.weight == 1.0f);
+
+    // No move at all: the features describe a label that is missing.
+    error.clear();
+    assert(!TrainingSample::from_json(
+        "{\"features\":" + features(n) + ",\"value\":0.5,\"weight\":1.0}", sample, error));
+    assert(error.find("move") != std::string::npos);
+
+    // move present but not an object.
+    error.clear();
+    assert(!TrainingSample::from_json(
+        "{\"features\":" + features(n) + ",\"value\":0.5,\"weight\":1.0,\"move\":5}", sample, error));
+    assert(error.find("move") != std::string::npos);
+
+    // Missing value / weight, and their non-numeric shapes.
+    error.clear();
+    assert(!TrainingSample::from_json(
+        "{\"features\":" + features(n) + ",\"weight\":1.0," + move + "}", sample, error));
+    assert(error.find("value") != std::string::npos);
+    assert(!TrainingSample::from_json(
+        "{\"features\":" + features(n) + ",\"value\":\"high\",\"weight\":1.0," + move + "}",
+        sample, error));
+    assert(error.find("value") != std::string::npos);
+    error.clear();
+    assert(!TrainingSample::from_json(
+        "{\"features\":" + features(n) + ",\"value\":0.5," + move + "}", sample, error));
+    assert(error.find("weight") != std::string::npos);
+    assert(!TrainingSample::from_json(
+        "{\"features\":" + features(n) + ",\"value\":0.5,\"weight\":null," + move + "}",
+        sample, error));
+    assert(error.find("weight") != std::string::npos);
+
+    // A feature vector of the wrong length is another model layout.
+    error.clear();
+    assert(!TrainingSample::from_json(
+        "{\"features\":" + features(n - 1) + ",\"value\":0.5,\"weight\":1.0," + move + "}",
+        sample, error));
+    assert(error.find("51 features, needs 52") != std::string::npos);
+    assert(!TrainingSample::from_json(
+        "{\"features\":" + features(n + 1) + ",\"value\":0.5,\"weight\":1.0," + move + "}",
+        sample, error));
+    assert(error.find("53 features, needs 52") != std::string::npos);
+
+    // Positive round trip: the writer's own payload reads back whole.
+    TrainingSample written;
+    written.features.assign(n, 0.25f);
+    written.value = -1.0f;
+    written.weight = 0.5f;
+    written.move = Move(3, 12, WHITE);
+    written.search_score = 42;
+    written.search_depth = 3;
+    written.nodes = 99;
+    written.game_id = 7;
+    written.move_index = 5;
+    TrainingSample back;
+    error.clear();
+    assert(TrainingSample::from_json(written.to_json(), back, error) && error.empty());
+    assert(static_cast<int>(back.features.size()) == n);
+    assert(back.features[0] == 0.25f && back.features[n - 1] == 0.25f);
+    assert(back.move == Move(3, 12, WHITE));
+    assert(back.value == -1.0f && back.weight == 0.5f);
+    assert(back.search_score == 42 && back.search_depth == 3 && back.nodes == 99);
+    assert(back.game_id == 7 && back.move_index == 5);
+
+    std::cout << "test_sample_from_json_rejects_damaged passed" << std::endl;
+}
+
+// R86 P3: the move colour is the label's side, so only the writer's own two
+// spellings may read back. Anything else - "BLACK", "b", the empty string, a
+// CJK word - used to fall through to WHITE and load a sample whose label says
+// the wrong player moved. The coordinate gates above the colour read are
+// pinned alongside, so a fix cannot trade one for another.
+void test_sample_move_color_must_be_exact() {
+    const auto features = [](int count) {
+        std::string out = "[";
+        for (int i = 0; i < count; ++i) {
+            if (i) out += ",";
+            out += "0";
+        }
+        return out + "]";
+    };
+    const int n = DataCollector::FEATURE_COUNT;
+    const auto sample_text = [&](const std::string& color_json) {
+        return "{\"features\":" + features(n) + ",\"value\":0.5,\"weight\":1.0," +
+               "\"move\":{\"row\":7,\"col\":7,\"color\":" + color_json + "}}";
+    };
+
+    TrainingSample sample;
+    std::string error;
+    assert(TrainingSample::from_json(sample_text("\"black\""), sample, error) && error.empty());
+    assert(sample.move == Move(7, 7, BLACK));
+    assert(sample.move.color == BLACK);
+    error.clear();
+    assert(TrainingSample::from_json(sample_text("\"white\""), sample, error) && error.empty());
+    assert(sample.move == Move(7, 7, WHITE));
+    assert(sample.move.color == WHITE);
+
+    for (const char* bad : {"\"BLACK\"", "\"b\"", "\"\"", "\"\\u767d\""}) {
+        error.clear();
+        assert(!TrainingSample::from_json(sample_text(bad), sample, error));
+        assert(!error.empty());
+    }
+
+    // The coordinate gates stay where they were: an off-board row and a 64-bit
+    // row a truncating read would fold onto the board both still refuse.
+    error.clear();
+    assert(!TrainingSample::from_json(
+        "{\"features\":" + features(n) +
+            ",\"value\":0.5,\"weight\":1.0,"
+            "\"move\":{\"row\":15,\"col\":7,\"color\":\"black\"}}",
+        sample, error));
+    error.clear();
+    assert(!TrainingSample::from_json(
+        "{\"features\":" + features(n) +
+            ",\"value\":0.5,\"weight\":1.0,"
+            "\"move\":{\"row\":4294967303,\"col\":7,\"color\":\"black\"}}",
+        sample, error));
+
+    std::cout << "test_sample_move_color_must_be_exact passed" << std::endl;
+}
+
+// R97 BB3: game_id and move_index are the sample's identity, and samples.jsonl
+// leans on (game_id, move_index) being unique. The reader used to fall back to
+// the -1 default whenever the key was written but unreadable, so a batch of
+// such lines collapsed into one phantom game carrying the same index. A key that
+// is absent stays legal - the writer simply has no id to give - but a key that
+// is present is a claim and must read back.
+void test_sample_refuses_unreadable_identity_keys() {
+    const auto features = [](int count) {
+        std::string out = "[";
+        for (int i = 0; i < count; ++i) {
+            if (i) out += ",";
+            out += "0";
+        }
+        return out + "]";
+    };
+    const int n = DataCollector::FEATURE_COUNT;
+    const std::string move = "\"move\":{\"row\":7,\"col\":7,\"color\":\"black\"}";
+    const auto sample_with = [&](const std::string& tail) {
+        return "{\"features\":" + features(n) + ",\"value\":0.5,\"weight\":1.0," +
+               move + "," + tail + "}";
+    };
+
+    TrainingSample sample;
+    std::string error;
+
+    // 7.0 is a float, "7" a string, null nothing, 4294967297 an integer that
+    // does not fit an int: all four state an identity the reader cannot carry.
+    const char* bad[] = {
+        "\"game_id\":7.0",
+        "\"game_id\":\"7\"",
+        "\"game_id\":null",
+        "\"game_id\":4294967297",
+        "\"move_index\":5.0",
+        "\"move_index\":\"five\"",
+        "\"move_index\":null",
+        "\"move_index\":-2147483649",
+    };
+    for (const char* key : bad) {
+        error.clear();
+        const bool ok = TrainingSample::from_json(sample_with(key), sample, error);
+        assert(!ok);
+        assert(!error.empty());
+    }
+
+    // Both keys absent stays the ordinary case: a legal sample, and the -1
+    // default for each identity field.
+    error.clear();
+    assert(TrainingSample::from_json(
+        "{\"features\":" + features(n) + ",\"value\":0.5,\"weight\":1.0," + move + "}",
+        sample, error) && error.empty());
+    assert(sample.game_id == -1 && sample.move_index == -1);
+
+    // One readable key next to a broken one still refuses the line, and the
+    // readable id does not smuggle the row through.
+    error.clear();
+    assert(!TrainingSample::from_json(
+        sample_with("\"game_id\":7,\"move_index\":3.5"), sample, error));
+    error.clear();
+    assert(!TrainingSample::from_json(
+        sample_with("\"game_id\":7.0,\"move_index\":3"), sample, error));
+
+    // The positive side of the same door: readable integers land on their own
+    // values, including the -1 the writer emits for an unlabelled sample.
+    error.clear();
+    assert(TrainingSample::from_json(
+        sample_with("\"game_id\":7,\"move_index\":5"), sample, error) && error.empty());
+    assert(sample.game_id == 7 && sample.move_index == 5);
+    error.clear();
+    assert(TrainingSample::from_json(
+        sample_with("\"game_id\":-1,\"move_index\":-1"), sample, error) && error.empty());
+    assert(sample.game_id == -1 && sample.move_index == -1);
+
+    // The engine numbers keep the fallback behaviour they always had: a broken
+    // search_score is not an identity claim, so it stays a default.
+    error.clear();
+    assert(TrainingSample::from_json(
+        sample_with("\"search_score\":\"loud\""), sample, error) && error.empty());
+    assert(sample.search_score == 0);
+
+    std::cout << "test_sample_refuses_unreadable_identity_keys passed" << std::endl;
+}
+
+// Round 72: play_game() discards an INVALID game, and the discarded game must
+// not inflate games_played_ - every checkpoint and status line would otherwise
+// overstate the work done. The counter is private and only alive through
+// play_game(), so the test drives it directly and pins the ordinary counting.
+//
+// Round 78, M2: play_match() counts its games through the same `played`
+// out-parameter, so a discarded game leaves the denominator instead of
+// counting as a half. An INVALID record cannot be produced deterministically
+// through this door: play_game passes an empty prefix and a null stop flag
+// (trainer.cpp:59), SelfPlay::run only reports INVALID for an illegal prefix
+// (self_play.cpp:32-42), an external stop (:122-131) or an engine illegal move
+// (:71-82), and every move generator filters forbidden points. So the out-
+// parameter is pinned on the valid side here and through the denominator
+// identity below; the negative proof for the exclusion is at compile level.
+void test_play_game_counts_only_valid_games() {
+    TrainingConfig config = fast_training_config();
+    config.search_depth = 1;
+    config.timeout_ms = 100;
+    config.max_moves = 1;
+
+    Trainer trainer(ThreatCoefficients(), config);
+    SearchEngine black;
+    SearchEngine white;
+
+    // One stone then the move cap: a MOVE_LIMIT game, not INVALID, so it counts
+    // once, and an unfinished game scores half.
+    assert(trainer.games_played() == 0);
+    bool played = false;
+    assert(trainer.play_game(black, white, 1, &played) == 0.5);
+    assert(played);
+    assert(trainer.games_played() == 1);
+    SearchEngine black_b;
+    SearchEngine white_b;
+    assert(trainer.play_game(black_b, white_b, 2) == 0.5);
+    assert(trainer.games_played() == 2);
+
+    // An explicit null out-parameter is not a crash and not a behaviour change.
+    SearchEngine black_c;
+    SearchEngine white_c;
+    assert(trainer.play_game(black_c, white_c, 1, nullptr) == 0.5);
+    assert(trainer.games_played() == 3);
+
+    // Every game in a match is undecided (MOVE_LIMIT), so the average is 0.5
+    // and cannot cross the promotion line: an undecided game must never read
+    // as a win.
+    Trainer matcher(ThreatCoefficients(), config);
+    const double match = matcher.play_match(ThreatCoefficients(), ThreatCoefficients(), 2);
+    assert(match == 0.5);
+    assert(match < config.accept_score);
+    assert(matcher.games_played() == 2);
+
+    // The injected-objective fast path is untouched by the counting change:
+    // win, loss and draw are still decided by the two scores.
+    Trainer fast(ThreatCoefficients(), config);
+    fast.set_fitness_override([](const ThreatCoefficients& c) { return c.live_four > 15000 ? 1.0 : 0.0; });
+    ThreatCoefficients strong;
+    strong.live_four = 20000;
+    ThreatCoefficients weak;
+    weak.live_four = 5000;
+    assert(fast.play_match(strong, weak, 2) == 1.0);
+    assert(fast.play_match(weak, strong, 2) == 0.0);
+    assert(fast.play_match(strong, strong, 2) == 0.5);
+    assert(fast.games_played() == 0);
+
+    std::cout << "test_play_game_counts_only_valid_games passed" << std::endl;
+}
+
+// Round 72: CoefficientVector::save() writes a temporary and renames it over
+// the target, so a failed save must not destroy the parameters already on disk
+// and a successful one must replace them wholesale.
+void test_parameter_save_replaces_atomically() {
+    const std::filesystem::path path = temp_path("atomic_params.json");
+    const std::string tmp = path.string() + ".tmp";
+    std::error_code ec;
+    std::filesystem::remove_all(tmp, ec);
+    std::string error;
+
+    // A successful save leaves the target in place and no temporary behind.
+    assert(CoefficientVector::save(path.string(), target_coefficients(), error));
+    assert(error.empty());
+    assert(std::filesystem::exists(path));
+    assert(!std::filesystem::exists(tmp));
+
+    // A second save replaces the first outright: the reader sees the second
+    // content, never a half-rewritten mixture under the old name.
+    const ThreatCoefficients second;
+    assert(CoefficientVector::save(path.string(), second, error));
+    assert(!std::filesystem::exists(tmp));
+    ThreatCoefficients loaded;
+    assert(CoefficientVector::load(path.string(), loaded, error));
+    assert(CoefficientVector::to_vector(loaded) == CoefficientVector::to_vector(second));
+
+    // A temporary that cannot be created aborts the save before the rename, so
+    // the previous file survives the failure instead of being truncated.
+    std::filesystem::create_directory(tmp, ec);
+    assert(!ec);
+    assert(!CoefficientVector::save(path.string(), target_coefficients(), error));
+    assert(!error.empty());
+    ThreatCoefficients still;
+    assert(CoefficientVector::load(path.string(), still, error));
+    assert(CoefficientVector::to_vector(still) == CoefficientVector::to_vector(second));
+
+    std::filesystem::remove_all(tmp, ec);
+    std::filesystem::remove(path, ec);
+    std::cout << "test_parameter_save_replaces_atomically passed" << std::endl;
+}
+
+// Round 72: Trainer::save_checkpoint() gets the same write-then-rename
+// treatment, because a truncated checkpoint is what load_checkpoint refuses.
+void test_checkpoint_save_replaces_atomically() {
+    TrainingConfig config = fast_training_config();
+    config.params_path = temp_path("atomic_ckpt_params.json").string();
+
+    const std::filesystem::path path = temp_path("atomic_checkpoint.json");
+    const std::string tmp = path.string() + ".tmp";
+    std::error_code ec;
+    std::filesystem::remove_all(tmp, ec);
+    std::string error;
+
+    Trainer first(ThreatCoefficients(), config);
+    assert(first.save_checkpoint(path.string(), error));
+    assert(error.empty());
+    assert(!std::filesystem::exists(tmp));
+
+    // A second trainer with a different champion overwrites the checkpoint; a
+    // resume reads the second state, not a mixture of the two.
+    Trainer second(target_coefficients(), config);
+    assert(second.save_checkpoint(path.string(), error));
+    assert(!std::filesystem::exists(tmp));
+    Trainer resumed(ThreatCoefficients(), config);
+    assert(resumed.load_checkpoint(path.string(), error));
+    assert(CoefficientVector::to_vector(resumed.champion()) ==
+           CoefficientVector::to_vector(second.champion()));
+
+    // A blocked temporary makes the save fail before the rename, so the old
+    // checkpoint stays loadable instead of being left half-written.
+    std::filesystem::create_directory(tmp, ec);
+    assert(!ec);
+    Trainer third(target_coefficients(), config);
+    assert(!third.save_checkpoint(path.string(), error));
+    assert(!error.empty());
+    Trainer again(ThreatCoefficients(), config);
+    assert(again.load_checkpoint(path.string(), error));
+    assert(CoefficientVector::to_vector(again.champion()) ==
+           CoefficientVector::to_vector(second.champion()));
+
+    std::filesystem::remove_all(tmp, ec);
+    std::filesystem::remove(path, ec);
+    std::cout << "test_checkpoint_save_replaces_atomically passed" << std::endl;
+}
+
+// Round 73, rewind_to_next_branch: a branch point one ply short of the move cap
+// replays the whole game and lets the engine decide nothing, so the rewind must
+// skip such plies. Every explored game keeps at least one engine-decided ply,
+// and the cap itself still produces MOVE_LIMIT endings rather than an error.
+void test_retry_rewind_keeps_engine_decisions() {
+    SearchEngine black;
+    SearchEngine white;
+    black.set_resign_detection(false);
+    white.set_resign_detection(false);
+    SelfPlayConfig settings = quick_play_config();
+    settings.max_moves = 5;
+
+    RetryExplorer explorer(black, white, settings);
+    std::vector<Move> opening;
+    opening.emplace_back(7, 7, BLACK);
+    explorer.set_start_line(opening);
+
+    int explored = 0;
+    for (int i = 0; i < 6; ++i) {
+        GameRecord record;
+        if (!explorer.explore(record, nullptr)) break;
+        int engine_moves = 0;
+        for (const auto& entry : record.moves) {
+            if (entry.method != "replay") ++engine_moves;
+        }
+        assert(engine_moves >= 1);
+        // Five plies cannot finish a five, so the cap is what ends every game.
+        assert(record.reason == GameEndReason::MOVE_LIMIT);
+        assert(record.winner == EMPTY);
+        assert_playable(record);
+        ++explored;
+    }
+    assert(explored >= 3);
+    assert(explorer.games_played() == explored);
+
+    std::cout << "test_retry_rewind_keeps_engine_decisions passed" << std::endl;
+}
+
+// Round 73, generate_data_games: with neither --records nor --samples there is
+// nothing to write, so no game may be played at all. The old code paid the full
+// self-play cost and dropped every result at merge. One output path restores
+// the collection.
+void test_generate_data_games_requires_outputs() {
+    TrainingConfig config = fast_training_config();
+    config.search_depth = 2;
+    config.timeout_ms = 120;
+    config.max_moves = 8;
+    config.data_opening_plies = 2;
+    config.data_threads = 2;
+    config.seed = 98765;
+    config.records_path.clear();
+    config.samples_path.clear();
+
+    Trainer trainer(ThreatCoefficients(), config);
+    assert(trainer.games_played() == 0);
+    assert(trainer.generate_data_games(2, 2) == 0);
+    assert(trainer.games_played() == 0);
+    assert(trainer.samples_collected() == 0);
+
+    // With the records path present the games are played, counted and appended.
+    const std::filesystem::path records = temp_path("data_records.jsonl");
+    trainer.config_.records_path = records.string();
+    assert(trainer.generate_data_games(2, 2) > 0);
+    assert(trainer.games_played() >= 2);
+    std::ifstream records_file(records);
+    std::string line;
+    int record_lines = 0;
+    while (std::getline(records_file, line)) {
+        if (!line.empty()) ++record_lines;
+    }
+    assert(record_lines >= 2);
+
+    std::cout << "test_generate_data_games_requires_outputs passed" << std::endl;
+}
+
+// Round 73, game_id_base: ids follow the games_played_ high-water mark, so a
+// second batch - in the same run or after a kill and resume - can never reissue
+// a game_id the first batch already used. The old rounds_completed_-based base
+// repeated ids whenever a batch was collected again in the same round, exactly
+// what a resume after a kill does, and two different games then shared one
+// (game_id, move_index) identity in samples.jsonl. Note move_index alone cannot
+// name a row: collection augments every ply into SYMMETRY_COUNT oriented
+// variants that share the ply's index, so the identity under test is the
+// game_id itself.
+void test_data_game_ids_unique_across_batches() {
+    TrainingConfig config = fast_training_config();
+    config.search_depth = 2;
+    config.timeout_ms = 120;
+    config.max_moves = 8;
+    config.data_opening_plies = 2;
+    config.seed = 24680;
+    config.records_path.clear();
+    const std::filesystem::path samples = temp_path("ids_samples.jsonl");
+    config.samples_path = samples.string();
+    config.checkpoint_path = temp_path("ids_checkpoint.json").string();
+
+    Trainer trainer(ThreatCoefficients(), config);
+    assert(trainer.generate_data_games(2, 1) > 0);
+    assert(trainer.games_played() >= 2);
+
+    std::vector<TrainingSample> first;
+    std::string error;
+    assert(DataCollector::read_jsonl(samples.string(), first, error));
+    assert(!first.empty());
+    std::set<int> first_ids;
+    for (const auto& sample : first) first_ids.insert(sample.game_id);
+    assert(first_ids.size() >= 2);
+
+    // The second batch is collected by a trainer resumed from the checkpoint,
+    // the shape a run killed between the data append and the next round takes.
+    assert(trainer.save_checkpoint(config.checkpoint_path, error));
+    Trainer resumed(ThreatCoefficients(), config);
+    assert(resumed.load_checkpoint(config.checkpoint_path, error));
+    assert(resumed.games_played() == trainer.games_played());
+    assert(resumed.generate_data_games(2, 1) > 0);
+
+    std::vector<TrainingSample> all;
+    assert(DataCollector::read_jsonl(samples.string(), all, error));
+    assert(all.size() > first.size());
+
+    // Every id in the file is either from the first batch or fresh; the old
+    // code would have collapsed the second batch back onto the first ids and
+    // left fresh_ids empty.
+    std::set<int> all_ids;
+    for (const auto& sample : all) all_ids.insert(sample.game_id);
+    std::set<int> fresh_ids;
+    for (int id : all_ids) {
+        if (first_ids.count(id) == 0) fresh_ids.insert(id);
+    }
+    assert(fresh_ids.size() == first_ids.size());
+    assert(*fresh_ids.begin() > *first_ids.rbegin());
+    assert(all_ids.size() == first_ids.size() + fresh_ids.size());
+
+    std::cout << "test_data_game_ids_unique_across_batches passed" << std::endl;
+}
+
+// Round 112 PP1: the id a data game got used to be games_played_ + 1 + t * 1000, i.e. a
+// fixed offset off a counter every round advances (trainer.cpp:72 and :256 add each
+// merged record, plus the fitness and verification games). A long run therefore
+// re-reaches the offset legitimately: on the round where games_played_ is 1000, worker
+// 0's base is exactly the base worker 1 used on the games_played_ = 0 round, so two
+// different games are written under one game_id, and samples.jsonl loses the
+// (game_id, move_index) identity README:181's append stream needs. The fix claims every
+// id from one atomic counter, so claims equal merged records and no id is handed out
+// twice.
+//
+// The same stride also overlaps INSIDE one call once a worker's own count passes 1000:
+// games=2001, threads=2 gives per_worker=1000 and remainder=1, so t=0 plays 1001 games
+// and its 1001st lands on games_played_ + 1001, the very id t=1's first game uses. That
+// arm is deliberately not built here - it needs 2001 games really played - so the
+// arithmetic stays in this comment and the case below covers the cross-round reissue,
+// which is what a long run actually hits.
+//
+// The claim is pinned as two disjoint id sets rather than "distinct ids == games played":
+// generate_data_games answers with the sample count, not the game count, and a recorded
+// game whose plies all fall under the collector's search-depth gate claims an id without
+// contributing a row, so the file's id count is a lower bound on the games.
+void test_data_game_ids_do_not_repeat_across_rounds() {
+    TrainingConfig config = fast_training_config();
+    config.search_depth = 2;
+    config.timeout_ms = 120;
+    config.max_moves = 8;
+    config.data_opening_plies = 2;
+    config.seed = 13579;
+    config.records_path.clear();
+    const std::filesystem::path samples = temp_path("pp1_samples.jsonl");
+    config.samples_path = samples.string();
+
+    // One ply is owed up to SYMMETRY_COUNT rows: collection augments it into oriented
+    // variants that all carry that ply's move_index (see the per-ply counts in
+    // test_collector_keeps_the_variant_that_moved_the_last_stone). So a (game_id,
+    // move_index) pair repeats by design - what it may never do is name two different
+    // games, which is exactly what one id handed out twice amounts to. Judge the pair by
+    // its row count, and the two batches by whether they share an id.
+    const auto busiest_pair = [](const std::vector<TrainingSample>& rows) {
+        std::map<std::pair<int, int>, int> counts;
+        for (const auto& row : rows) counts[{row.game_id, row.move_index}] += 1;
+        int busiest = 0;
+        for (const auto& entry : counts) if (entry.second > busiest) busiest = entry.second;
+        return busiest;
+    };
+    const auto ids_of = [](const std::vector<TrainingSample>& rows) {
+        std::set<int> ids;
+        for (const auto& row : rows) ids.insert(row.game_id);
+        return ids;
+    };
+
+    Trainer trainer(ThreatCoefficients(), config);
+    assert(trainer.generate_data_games(4, 2) > 0);
+
+    std::vector<TrainingSample> first_batch;
+    std::string error;
+    assert(DataCollector::read_jsonl(samples.string(), first_batch, error));
+    assert(!first_batch.empty());
+
+    // Control, green on both trees: inside one call the two workers still sit 1000
+    // apart, so no id is shared and no pair leaves its ply.
+    assert(busiest_pair(first_batch) <= SYMMETRY_COUNT);
+    const std::set<int> first_ids = ids_of(first_batch);
+    assert(first_ids.size() >= 2);
+    const size_t first_rows = first_batch.size();
+
+    // A real long-run state, not an invented one: games_played_ only ever climbs, and
+    // this is the value where HEAD's t=1 offset from the very first round becomes t=0's
+    // offset for this round.
+    trainer.games_played_ = 1000;
+    assert(trainer.generate_data_games(4, 2) > 0);
+
+    std::vector<TrainingSample> all;
+    assert(DataCollector::read_jsonl(samples.string(), all, error));
+    assert(all.size() > first_rows);
+
+    // The second batch's rows are exactly what the append added after the first read.
+    const std::vector<TrainingSample> second_batch(all.begin() +
+                                                       static_cast<long>(first_rows),
+                                                   all.end());
+    const std::set<int> second_ids = ids_of(second_batch);
+    assert(!second_ids.empty());
+
+    // Discriminator: HEAD numbers this batch's worker 0 from 1000 + 1, which is where
+    // the first batch's worker 1 already started, so the same game_id names two
+    // different games and their plies pile up under one pair.
+    for (int id : second_ids) assert(first_ids.count(id) == 0);
+    assert(ids_of(all).size() == first_ids.size() + second_ids.size());
+    assert(busiest_pair(all) <= SYMMETRY_COUNT);
+
+    std::cout << "test_data_game_ids_do_not_repeat_across_rounds passed" << std::endl;
+}
+
+// Round 73, play_match: an odd game request rounds UP to the next even count -
+// every pairing plays both colours - and the score is normalised by the games
+// actually played: --fitness-games 3 means four games, not two.
+void test_play_match_rounds_up_to_even() {
+    TrainingConfig config = fast_training_config();
+    config.search_depth = 2;
+    config.timeout_ms = 120;
+    config.max_moves = 8;
+    config.resign_enabled = false;
+
+    Trainer trainer(ThreatCoefficients(), config);
+    const int before = trainer.games_played();
+    const double score = trainer.play_match(ThreatCoefficients(), target_coefficients(), 3);
+    assert(trainer.games_played() - before == 4);
+    // Eight plies cannot finish a five, so every game is a MOVE_LIMIT draw:
+    // four halves over four games pins the normalisation to exactly 0.5.
+    assert(std::abs(score - 0.5) < 1e-12);
+
+    const int before_single = trainer.games_played();
+    trainer.play_match(ThreatCoefficients(), target_coefficients(), 1);
+    assert(trainer.games_played() - before_single == 2);
+
+    std::cout << "test_play_match_rounds_up_to_even passed" << std::endl;
+}
+
+// Round 73: write failures on params, checkpoint, records and samples must
+// reach std::cerr even with no log callback installed. --quiet only silences
+// progress lines; data loss has to stay visible.
+void test_write_failures_report_to_stderr() {
+    const std::filesystem::path blocker = temp_path("stderr_blocker");
+    {
+        std::ofstream file(blocker);
+        file << "not a directory";
+    }
+
+    // run_round: an accepted candidate whose params and checkpoint live under a
+    // regular file reports both failed saves.
+    TrainingConfig config = fast_training_config();
+    config.accept_score = 0.0;
+    config.params_path = (blocker / "params.json").string();
+    config.checkpoint_path = (blocker / "checkpoint.json").string();
+    Trainer trainer(ThreatCoefficients(), config);
+    trainer.set_fitness_override([](const ThreatCoefficients&) { return 0.5; });
+    std::ostringstream round_log;
+    std::streambuf* previous = std::cerr.rdbuf(round_log.rdbuf());
+    const TrainerRound round = trainer.run_round();
+    std::cerr.rdbuf(previous);
+    assert(round.accepted);
+    assert(round_log.str().find("could not save parameters") != std::string::npos);
+    assert(round_log.str().find("could not save checkpoint") != std::string::npos);
+
+    // Data collection: an unwritable records path reports the failed append,
+    // and the samples the round did produce are still returned.
+    TrainingConfig record_config = fast_training_config();
+    record_config.search_depth = 2;
+    record_config.timeout_ms = 120;
+    record_config.max_moves = 8;
+    record_config.seed = 13579;
+    record_config.records_path = (blocker / "records.jsonl").string();
+    record_config.samples_path.clear();
+    Trainer record_trainer(ThreatCoefficients(), record_config);
+    std::ostringstream record_log;
+    previous = std::cerr.rdbuf(record_log.rdbuf());
+    const int record_samples = record_trainer.generate_data_games(2, 1);
+    std::cerr.rdbuf(previous);
+    assert(record_samples > 0);
+    assert(record_log.str().find("could not append record") != std::string::npos);
+
+    // ... and an unwritable samples path reports its own failure.
+    TrainingConfig sample_config = record_config;
+    sample_config.records_path.clear();
+    sample_config.samples_path = (blocker / "samples.jsonl").string();
+    Trainer sample_trainer(ThreatCoefficients(), sample_config);
+    std::ostringstream sample_log;
+    previous = std::cerr.rdbuf(sample_log.rdbuf());
+    const int sample_samples = sample_trainer.generate_data_games(2, 1);
+    std::cerr.rdbuf(previous);
+    assert(sample_samples > 0);
+    assert(sample_log.str().find("could not append samples") != std::string::npos);
+
+    std::error_code ec;
+    std::filesystem::remove(blocker, ec);
+    std::cout << "test_write_failures_report_to_stderr passed" << std::endl;
+}
+
+// Round 75, E6: the six file.flush() sites. A buffered stream reports a full
+// disk only when its buffer leaves for the device, so a good() read right after
+// the last << could call a write that reached nothing a success: the record was
+// silently dropped and the parameter file was renamed over by a truncated .tmp.
+// /dev/full fails every write with ENOSPC, which is the cheapest full disk
+// there is.
+void test_buffered_write_failures_are_caught() {
+    if (!std::filesystem::exists("/dev/full")) {
+        std::cout << "test_buffered_write_failures_are_caught skipped: /dev/full missing"
+                  << std::endl;
+        return;
+    }
+    auto file_bytes = [](const std::string& p) {
+        std::ifstream in(p, std::ios::binary);
+        std::string content;
+        char buffer[512];
+        while (in.read(buffer, sizeof(buffer)) || in.gcount() > 0) {
+            content.append(buffer, static_cast<size_t>(in.gcount()));
+        }
+        return content;
+    };
+    std::string error;
+
+    // Control experiment for the mechanism the fix addresses: one small write to
+    // /dev/full still reads as good() until the buffer is flushed; the flush is
+    // what the six sites gained, and what makes the failures below observable.
+    {
+        std::ofstream probe("/dev/full", std::ios::binary | std::ios::trunc);
+        probe << "x";
+        const bool good_before_flush = probe.good();
+        probe.flush();
+        std::cout << "  /dev/full probe: good() before flush="
+                  << (good_before_flush ? "true" : "false") << " after="
+                  << (probe.good() ? "true" : "false") << std::endl;
+        assert(!probe.good());
+    }
+
+    // append_to_jsonl: the server marks a game exported on this return value, so
+    // a record that never left the buffer must come back as a failure.
+    GameRecord record;
+    record.winner = WHITE;
+    record.reason = GameEndReason::FIVE;
+    error.clear();
+    assert(!record.append_to_jsonl("/dev/full", error));
+    assert(!error.empty());
+    std::cout << "  append_to_jsonl -> " << error << std::endl;
+
+    // The single-file writers report their failure the same way.
+    error.clear();
+    assert(!record.save("/dev/full", error));
+    assert(!error.empty());
+    EloSystem elo;
+    error.clear();
+    assert(!elo.save("/dev/full", error));
+    assert(!error.empty());
+    const std::vector<TrainingSample> one_sample(1);
+    DataCollector collector;
+    error.clear();
+    assert(!collector.write_jsonl(one_sample, "/dev/full", error));
+    assert(!error.empty());
+    std::cout << "  record/elo/collector saves -> " << error << std::endl;
+
+    // The two rename guards: point the temporary at /dev/full and the old file
+    // has to survive byte for byte. The params guard now also drops the failed
+    // temporary; the checkpoint guard still documents one being left behind.
+    std::error_code ec;
+    const std::filesystem::path params = temp_path("flush_params.json");
+    const std::string params_tmp = params.string() + ".tmp";
+    std::filesystem::remove_all(params_tmp, ec);
+    error.clear();
+    assert(CoefficientVector::save(params.string(), target_coefficients(), error));
+    const std::string params_before = file_bytes(params.string());
+    std::filesystem::create_symlink("/dev/full", params_tmp, ec);
+    assert(!ec);
+    error.clear();
+    assert(!CoefficientVector::save(params.string(), ThreatCoefficients(), error));
+    assert(!error.empty());
+    assert(!std::filesystem::is_symlink(params));
+    assert(file_bytes(params.string()) == params_before);
+    // Round 88, S8: a write that died at flush no longer leaves its temporary
+    // behind, so the poisoned symlink the test planted is gone. The rename never
+    // ran, which the two asserts above still prove. The checkpoint writer below
+    // was not given the same cleanup, so it still keeps its failed temporary.
+    assert(!std::filesystem::is_symlink(params_tmp));
+    assert(!std::filesystem::exists(params_tmp));
+    ThreatCoefficients loaded;
+    assert(CoefficientVector::load(params.string(), loaded, error));
+    assert(CoefficientVector::to_vector(loaded) ==
+           CoefficientVector::to_vector(target_coefficients()));
+    std::cout << "  params save with a poisoned temporary -> " << error << std::endl;
+    std::filesystem::remove(params_tmp, ec);
+    std::filesystem::remove(params, ec);
+
+    TrainingConfig ckpt_config = fast_training_config();
+    ckpt_config.params_path = temp_path("flush_ckpt_params.json").string();
+    const std::filesystem::path ckpt = temp_path("flush_checkpoint.json");
+    const std::string ckpt_tmp = ckpt.string() + ".tmp";
+    std::filesystem::remove_all(ckpt_tmp, ec);
+    Trainer trainer(ThreatCoefficients(), ckpt_config);
+    error.clear();
+    assert(trainer.save_checkpoint(ckpt.string(), error));
+    const std::string ckpt_before = file_bytes(ckpt.string());
+    std::filesystem::create_symlink("/dev/full", ckpt_tmp, ec);
+    assert(!ec);
+    error.clear();
+    assert(!trainer.save_checkpoint(ckpt.string(), error));
+    assert(!error.empty());
+    assert(!std::filesystem::is_symlink(ckpt));
+    assert(file_bytes(ckpt.string()) == ckpt_before);
+    assert(std::filesystem::is_symlink(ckpt_tmp));
+    std::cout << "  checkpoint save with a poisoned temporary -> " << error << std::endl;
+    std::filesystem::remove(ckpt_tmp, ec);
+    std::filesystem::remove(ckpt, ec);
+
+    std::cout << "test_buffered_write_failures_are_caught passed" << std::endl;
+}
+
+// Round 75, F1: a present `coefficients` that is not an object is a malformed
+// parameter file, not an absent one. The old reader fell through to the root,
+// found none of the twelve names there and reported a successful load of pure
+// defaults - the server then printed "Parameters loaded" for a file it had
+// never honored. A file that carries only part of the keys is still legal:
+// absent keys keep their defaults and are not an error.
+void test_params_rejects_non_object_coefficients() {
+    ThreatCoefficients parsed;
+    std::string error;
+    const char* malformed[] = {R"({"coefficients":[]})", R"({"coefficients":"x"})",
+                               R"({"coefficients":null})"};
+
+    for (const char* text : malformed) {
+        error.clear();
+        assert(!CoefficientVector::from_json_string(text, parsed, error));
+        assert(error == "coefficients must be an object");
+    }
+
+    // Through the file door as well: load() refuses the same three shapes.
+    for (const char* text : malformed) {
+        const std::filesystem::path path = temp_path("bad_coefficients.json");
+        { std::ofstream(path) << text; }
+        error.clear();
+        assert(!CoefficientVector::load(path.string(), parsed, error));
+        assert(error == "coefficients must be an object");
+    }
+
+    // Control 1: an object holding only some of the twelve keys loads, and the
+    // keys it does not name keep their defaults.
+    error.clear();
+    assert(CoefficientVector::from_json_string(R"({"coefficients":{"live_four":12345}})",
+                                               parsed, error));
+    assert(error.empty());
+    assert(parsed.live_four == 12345);
+    const ThreatCoefficients defaults;
+    assert(parsed.rush_four == defaults.rush_four);
+    assert(parsed.five == defaults.five);
+
+    // Control 2: the partial file form works through load() too.
+    const std::filesystem::path partial = temp_path("partial_coefficients.json");
+    { std::ofstream(partial) << R"({"coefficients":{"double_four":54321}})"; }
+    error.clear();
+    assert(CoefficientVector::load(partial.string(), parsed, error));
+    assert(parsed.double_four == 54321);
+    assert(parsed.live_four == defaults.live_four);
+
+    // Control 3: the bare root form (no `coefficients` wrapper) is unchanged.
+    error.clear();
+    assert(CoefficientVector::from_json_string(R"({"live_three":321})", parsed, error));
+    assert(parsed.live_three == 321);
+
+#ifndef _WIN32
+    // The CLI doors: a malformed --params file makes both binaries exit 1 with
+    // their own refusal, and neither may print the success line (README:155:
+    // the server exits rather than falling back to defaults).
+    if (std::filesystem::exists("gomoku_server") &&
+        std::filesystem::exists("gomoku_train")) {
+        const std::filesystem::path bad = temp_path("params_bad_cli.json");
+        { std::ofstream(bad) << R"({"coefficients":[]})"; }
+        const std::filesystem::path out = temp_path("params_cli_stdout.txt");
+        const std::filesystem::path err = temp_path("params_cli_stderr.txt");
+        auto read_all = [](const std::filesystem::path& p) {
+            std::ifstream in(p);
+            std::ostringstream text;
+            text << in.rdbuf();
+            return text.str();
+        };
+        auto run = [&](const std::string& command) {
+            const int status = std::system(command.c_str());
+            assert(status != -1);
+            return WEXITSTATUS(status);
+        };
+        const std::string redirect = " > '" + out.string() + "' 2> '" + err.string() + "'";
+        std::error_code ec;
+        std::filesystem::remove(out, ec);
+
+        assert(run("./gomoku_server --params '" + bad.string() + "' --no-book" + redirect) == 1);
+        assert(read_all(out).find("Parameters loaded") == std::string::npos);
+        const std::string server_err = read_all(err);
+        assert(server_err.find("Cannot load --params") != std::string::npos);
+        std::cout << "  server --params: "
+                  << server_err.substr(0, server_err.find('\n')) << std::endl;
+
+        assert(run("./gomoku_train --params '" + bad.string() + "'" + redirect) == 1);
+        assert(read_all(out).find("Starting from") == std::string::npos);
+        const std::string trainer_err = read_all(err);
+        assert(trainer_err.find("cannot use --params") != std::string::npos);
+        std::cout << "  trainer --params: "
+                  << trainer_err.substr(0, trainer_err.find('\n')) << std::endl;
+
+#if defined(__linux__)
+        // Positive control: the same reader accepts a partial object file and
+        // the server says so before `timeout` ends it, so the absence of the
+        // line above is a refusal, not an inability to ever print it.
+        const std::filesystem::path good = temp_path("params_good_cli.json");
+        { std::ofstream(good) << R"({"coefficients":{"live_four":12345}})"; }
+        std::filesystem::remove(out, ec);
+        std::system(("timeout 3 ./gomoku_server --params '" + good.string() +
+                     "' --no-book --port 8123 > '" + out.string() + "' 2>&1").c_str());
+        assert(read_all(out).find("Parameters loaded:") != std::string::npos);
+        std::cout << "  server --params control: the partial file prints Parameters loaded"
+                  << std::endl;
+#endif
+    } else {
+        std::cout << "  CLI --params probes skipped: binaries not in the working directory"
+                  << std::endl;
+    }
+#endif
+
+    std::cout << "test_params_rejects_non_object_coefficients passed" << std::endl;
+}
+
+// R77 L1: the two rule constants behind every mate score are checked at the
+// door. five <= 0 collapses the evaluation scale (ordinary scores are capped at
+// five - 1), and forbidden_penalty <= 0 turns the forbidden-move cost into a
+// bonus; at the 100000 mate threshold AlphaBeta reads our own penalty as a
+// proven loss and resigns. A rejected file must leave `out` untouched.
+void test_params_rejects_broken_rule_constants() {
+    ThreatCoefficients sentinel;
+    sentinel.five = 31337;
+    sentinel.forbidden_penalty = 4242;
+
+    const char* rejected[] = {
+        R"({"coefficients":{"five":0}})",
+        R"({"coefficients":{"five":-1}})",
+        R"({"coefficients":{"five":100001}})",
+        R"({"coefficients":{"forbidden_penalty":0}})",
+        R"({"coefficients":{"forbidden_penalty":-5}})",
+        R"({"coefficients":{"forbidden_penalty":100000}})",
+        R"({"coefficients":{"forbidden_penalty":100001}})",
+        R"({"five":0})",
+    };
+    std::string error;
+    for (const char* text : rejected) {
+        ThreatCoefficients out = sentinel;
+        error.clear();
+        assert(!CoefficientVector::from_json_string(text, out, error));
+        assert(!error.empty());
+        assert(out.five == sentinel.five);
+        assert(out.forbidden_penalty == sentinel.forbidden_penalty);
+        std::cout << "  rejected " << text << " -> " << error << std::endl;
+    }
+
+    // Accepted: a file that names a known key but keeps the two constants out
+    // of it (round 78, M1: a file naming no known key at all is now refused as
+    // the wrong file - see test_params_rejects_unrecognised_keys), the boundary
+    // values, and a round-trip through the writer.
+    const ThreatCoefficients defaults;
+    ThreatCoefficients parsed;
+    error.clear();
+    assert(CoefficientVector::from_json_string(R"({"live_four":16000})", parsed, error));
+    assert(parsed.live_four == 16000);
+    assert(parsed.five == defaults.five);
+    assert(parsed.forbidden_penalty == defaults.forbidden_penalty);
+
+    error.clear();
+    assert(CoefficientVector::from_json_string(
+        R"({"coefficients":{"five":100000,"forbidden_penalty":50000}})", parsed, error));
+    assert(parsed.five == 100000);
+    assert(parsed.forbidden_penalty == 50000);
+    std::cout << "  accepted the 100000/50000 boundary" << std::endl;
+
+    ThreatCoefficients round_trip;
+    round_trip.five = 88888;
+    round_trip.forbidden_penalty = 77777;
+    error.clear();
+    assert(CoefficientVector::from_json_string(
+        CoefficientVector::to_json_string(round_trip), parsed, error));
+    assert(parsed.five == 88888);
+    assert(parsed.forbidden_penalty == 77777);
+    std::cout << "  round-tripped 88888/77777 through the writer" << std::endl;
+
+    std::cout << "test_params_rejects_broken_rule_constants passed" << std::endl;
+}
+
+// Round 100 EE1: the guard behind that boundary stopped one step short. Evaluator
+// clamps the aggregate at five - 1 (evaluator.cpp:175-177), so five == 1 is not a
+// smaller scale but a cap of zero - evaluate_board answers 0 for every board, the
+// engine plays blind, and the server still prints the file as loaded. The other
+// side of the boundary (five == 2) must stay legal, and a rejected file must leave
+// the caller's coefficients untouched.
+void test_params_refuses_a_five_that_flattens_the_scale() {
+    ThreatCoefficients sentinel;
+    sentinel.five = 31337;
+    sentinel.forbidden_penalty = 4242;
+
+    std::string error;
+    ThreatCoefficients out = sentinel;
+    error.clear();
+    assert(!CoefficientVector::from_json_string(R"({"coefficients":{"five":1}})", out, error));
+    assert(!error.empty());
+    assert(out.five == sentinel.five);
+    assert(out.forbidden_penalty == sentinel.forbidden_penalty);
+    std::cout << "  [r100ee1] rejected five:1" << std::endl;
+
+    ThreatCoefficients parsed;
+    error.clear();
+    assert(CoefficientVector::from_json_string(R"({"coefficients":{"five":2}})", parsed, error));
+    assert(parsed.five == 2);
+    assert(error.empty());
+    std::cout << "  [r100ee1] accepted the five:2 boundary" << std::endl;
+
+    // What the guard buys: the same black live four scored with a cap of 0 and a
+    // cap of 1. The flattening is reproduced by handing the Evaluator the
+    // coefficients directly - the loader no longer lets five == 1 through.
+    Board board;
+    board.place_stone(7, 4, BLACK);
+    board.place_stone(7, 5, BLACK);
+    board.place_stone(7, 6, BLACK);
+    board.place_stone(7, 7, BLACK);
+    board.place_stone(0, 0, WHITE);
+    ThreatCoefficients flat;
+    flat.five = 1;
+    ThreatCoefficients working;
+    working.five = 2;
+    const int flattened = Evaluator(flat).evaluate_board(board, BLACK);
+    const int scored = Evaluator(working).evaluate_board(board, BLACK);
+    std::cout << "  [r100ee1] evaluate_board: five=1 -> " << flattened
+              << ", five=2 -> " << scored << std::endl;
+    assert(flattened == 0);
+    assert(scored != 0);
+
+    std::cout << "test_params_refuses_a_five_that_flattens_the_scale passed" << std::endl;
+}
+
+// Round 78, M1: a parameter file that names none of the twelve coefficients is
+// the wrong file (or a wholesale rename), and the old reader loaded it as a
+// successful load of pure defaults - training ran against parameters the file
+// never stated. An unrecognised key next to real ones is a typo (live_fourx)
+// that would silently leave its coefficient at the default. Both are refused,
+// the second naming the key; a partial but well-spelled file stays legal.
+void test_params_rejects_unrecognised_keys() {
+    std::string error;
+    ThreatCoefficients parsed;
+
+    const char* no_known[] = {
+        R"({"live_fourx":1})",
+        R"({"foo":1,"bar":2})",
+        R"({"coefficients":{}})",
+        R"({"coefficients":{"live_fourx":1500,"rush_fourx":300}})",
+    };
+    for (const char* text : no_known) {
+        error.clear();
+        assert(!CoefficientVector::from_json_string(text, parsed, error));
+        assert(error == "no known coefficient key found in the file");
+        std::cout << "  rejected " << text << " -> " << error << std::endl;
+    }
+
+    // A known key that is also out of range must not mask the unknown-key
+    // report: the file is checked for shape before its values are trusted.
+    error.clear();
+    assert(!CoefficientVector::from_json_string(
+        R"({"coefficients":{"five":1000,"junk":1}})", parsed, error));
+    assert(error == "unknown coefficient key: junk");
+    std::cout << "  rejected {\"coefficients\":{\"five\":1000,\"junk\":1}} -> " << error
+              << std::endl;
+
+    error.clear();
+    assert(!CoefficientVector::from_json_string(
+        R"({"coefficients":{"live_four":16000,"live_fourx":1}})", parsed, error));
+    assert(error == "unknown coefficient key: live_fourx");
+
+    // Controls: the writer's own output still loads whole, a partial file naming
+    // real keys still loads with the rest at their defaults, and the bare-root
+    // form is unchanged.
+    ThreatCoefficients written;
+    written.live_four = 20000;
+    written.five = 32411;
+    error.clear();
+    assert(CoefficientVector::from_json_string(
+        CoefficientVector::to_json_string(written), parsed, error));
+    assert(parsed.live_four == 20000 && parsed.five == 32411);
+
+    const ThreatCoefficients defaults;
+    error.clear();
+    assert(CoefficientVector::from_json_string(R"({"live_three":321})", parsed, error));
+    assert(parsed.live_three == 321);
+    assert(parsed.live_four == defaults.live_four);
+    assert(parsed.five == defaults.five);
+
+    std::cout << "test_params_rejects_unrecognised_keys passed" << std::endl;
+}
+
+// R84 E3: a parameter file is an instruction, so an out-of-range tunable must be
+// refused with the key and its allowed range named - sanitize() clamping the
+// value and reporting a successful load let a file ask for 500000 and silently
+// get 40000. The clamps stay for the optimizers, whose moves are always inside
+// the bounds, which is why sanitize_vector / from_vector are pinned below.
+void test_params_rejects_out_of_range_tunables() {
+    std::string error;
+    ThreatCoefficients parsed;
+
+    const struct {
+        const char* text;
+        const char* key;
+        const char* range;
+    } cases[] = {
+        {R"({"live_four":500000})", "live_four", "[1500, 40000]"},
+        {R"({"live_three":-1})", "live_three", "[150, 8000]"},
+        {R"({"coefficients":{"rush_four":99999}})", "rush_four", "[300, 15000]"},
+        {R"({"position_weight_scale":-50})", "position_weight_scale", "[0, 20]"},
+        {R"({"coefficients":{"sleepy_two":0}})", "sleepy_two", "[1, 500]"},
+    };
+    for (const auto& c : cases) {
+        error.clear();
+        const bool ok = CoefficientVector::from_json_string(c.text, parsed, error);
+        assert(!ok);
+        assert(error.find(c.key) != std::string::npos);
+        assert(error.find(c.range) != std::string::npos);
+        std::cout << "  rejected " << c.text << " -> " << error << std::endl;
+    }
+
+    // The boundary values themselves are inside the range and still load.
+    error.clear();
+    assert(CoefficientVector::from_json_string(R"({"live_four":40000})", parsed, error));
+    assert(parsed.live_four == 40000);
+    error.clear();
+    assert(CoefficientVector::from_json_string(R"({"live_four":1500})", parsed, error));
+    assert(parsed.live_four == 1500);
+
+    // A whole valid file (the writer's own output) is unaffected.
+    ThreatCoefficients normal;
+    normal.live_four = 12000;
+    normal.live_three = 480;
+    error.clear();
+    assert(CoefficientVector::from_json_string(CoefficientVector::to_json_string(normal),
+                                               parsed, error));
+    assert(parsed.live_four == normal.live_four);
+    assert(parsed.live_three == normal.live_three);
+
+    // Anti-regression: sanitize_vector still clamps to the bounds (the genetic
+    // and hill-climbing paths depend on it), and from_vector still accepts an
+    // out-of-range vector instead of throwing it away.
+    std::vector<int> values = CoefficientVector::to_vector(ThreatCoefficients());
+    values[static_cast<int>(TunableParam::LIVE_FOUR)] = 500000;
+    values[static_cast<int>(TunableParam::LIVE_THREE)] = -9;
+    CoefficientVector::sanitize_vector(values);
+    assert(values[static_cast<int>(TunableParam::LIVE_FOUR)] == 40000);
+    assert(values[static_cast<int>(TunableParam::LIVE_THREE)] == 150);
+
+    std::vector<int> wild = CoefficientVector::to_vector(ThreatCoefficients());
+    wild[static_cast<int>(TunableParam::LIVE_FOUR)] = -1;
+    const ThreatCoefficients clamped = CoefficientVector::from_vector(wild);
+    assert(clamped.live_four == 1500);
+
+    std::cout << "test_params_rejects_out_of_range_tunables passed" << std::endl;
+}
+
+// R85 F1: a file's stated values must survive the load. from_json_string used to
+// check each key against its own bound and then call sanitize(), whose two
+// cross-key repairs (the strength ladder and the double_*/four_three floor)
+// silently rewrote file values inside their bounds: live_two=1000 loaded as 30,
+// double_four=10000 under live_four=40000 loaded as 40000. The reader must refuse
+// such a file with the offending keys named instead.
+void test_params_rejects_cross_key_rewrites() {
+    std::string error;
+    ThreatCoefficients parsed;
+
+    // A. Every adjacent pair of the strength ladder, inverted one at a time, all
+    // values inside their own bounds so only the cross-key rule can catch them.
+    // The refusal names the first adjacent pair the ladder finds broken, so the
+    // only key pinned here is the one this file asks too much of - the sentence
+    // around it, and the counterpart it is compared against, are free to change.
+    const struct {
+        const char* text;
+        const char* weaker;
+        int asked;
+        int neighbour;
+    } ladder[] = {
+        {R"({"live_four":1500,"rush_four":2000})", "rush_four", 2000, 1500},
+        {R"({"rush_four":300,"live_three":8000})", "live_three", 8000, 300},
+        {R"({"live_three":150,"sleepy_three":2000})", "sleepy_three", 2000, 150},
+        {R"({"sleepy_three":30,"live_two":1000})", "live_two", 1000, 30},
+        {R"({"live_two":10,"sleepy_two":500})", "sleepy_two", 500, 10},
+    };
+    for (const auto& c : ladder) {
+        error.clear();
+        const bool ok = CoefficientVector::from_json_string(c.text, parsed, error);
+        assert(!ok);
+        assert(!error.empty());
+        assert(error.find(c.weaker) != std::string::npos);
+        const std::string asked = std::to_string(c.asked);
+        const std::string neighbour = std::to_string(c.neighbour);
+        assert(error.find(asked) != std::string::npos ||
+               error.find(neighbour) != std::string::npos);
+        std::cout << "  refused " << c.text << " -> " << error << std::endl;
+    }
+
+    // B. A combination floor below live_four: the file asks for a pair worth less
+    // than the single threat it contains, which sanitize() would raise for it.
+    const struct {
+        const char* text;
+        const char* key;
+    } floors[] = {
+        {R"({"live_four":40000,"double_four":10000})", "double_four"},
+        {R"({"live_four":40000,"double_three":5000})", "double_three"},
+        {R"({"live_four":40000,"double_four":50000,"double_three":40000,)"
+         R"("four_three":5000})", "four_three"},
+    };
+    for (const auto& c : floors) {
+        error.clear();
+        const bool ok = CoefficientVector::from_json_string(c.text, parsed, error);
+        assert(!ok);
+        assert(!error.empty());
+        assert(error.find(c.key) != std::string::npos);
+        assert(error.find("live_four") != std::string::npos);
+        std::cout << "  refused " << c.text << " -> " << error << std::endl;
+    }
+
+    // F1b: the refusal is narrowed to the end sanitize would actually rewrite. A
+    // written key the defaults would clamp is refused; a default a written key
+    // would raise is repaired in place instead - the file stated nothing about it.
+    error.clear();
+    assert(CoefficientVector::from_json_string(R"({"live_four":40000})", parsed, error));
+    assert(parsed.live_four == 40000);
+    assert(parsed.double_three == 40000);  // default 30000, raised to live_four
+    assert(parsed.four_three == 40000);    // default 20000, raised to live_four
+    assert(parsed.double_four == 50000);   // already above, untouched
+
+    const struct {
+        const char* text;
+        const char* written;
+    } written_violations[] = {
+        {R"({"live_two":1000})", "live_two"},        // default sleepy_three=100 pins it to 100
+        {R"({"rush_four":15000})", "rush_four"},     // default live_four=10000 pins it to 10000
+        {R"({"sleepy_two":500})", "sleepy_two"},     // default live_two=50 pins it to 50
+        {R"({"double_four":1500})", "double_four"},  // default live_four=10000 raises it
+    };
+    for (const auto& c : written_violations) {
+        error.clear();
+        const bool ok = CoefficientVector::from_json_string(c.text, parsed, error);
+        assert(!ok);
+        assert(error.find(c.written) != std::string::npos);
+        std::cout << "  refused " << c.text << " -> " << error << std::endl;
+    }
+
+    // Written values the defaults leave alone still load: the line is "would
+    // sanitize change what the file wrote", not "does a neighbour differ".
+    error.clear();
+    assert(CoefficientVector::from_json_string(R"({"live_two":50})", parsed, error));
+    assert(parsed.live_two == 50);
+    error.clear();
+    assert(CoefficientVector::from_json_string(R"({"sleepy_two":10})", parsed, error));
+    assert(parsed.sleepy_two == 10);
+    error.clear();
+    assert(CoefficientVector::from_json_string(R"({"rush_four":1500})", parsed, error));
+    assert(parsed.rush_four == 1500);
+
+    // C. Not an over-reach: a file whose ladder holds (several adjacent pairs
+    // exactly equal) and whose combinations clear live_four loads with every
+    // value byte for byte as written.
+    error.clear();
+    assert(CoefficientVector::from_json_string(
+        R"({"live_four":20000,"rush_four":5000,"live_three":5000,)"
+        R"("sleepy_three":500,"live_two":500,"sleepy_two":500,)"
+        R"("double_four":60000,"double_three":60000,"four_three":60000})",
+        parsed, error));
+    assert(parsed.live_four == 20000);
+    assert(parsed.rush_four == 5000);
+    assert(parsed.live_three == 5000);
+    assert(parsed.sleepy_three == 500);
+    assert(parsed.live_two == 500);
+    assert(parsed.sleepy_two == 500);
+    assert(parsed.double_four == 60000);
+    assert(parsed.double_three == 60000);
+    assert(parsed.four_three == 60000);
+
+    // D. A partial file is still a file: the defaults behind the written keys
+    // already satisfy both invariants.
+    const ThreatCoefficients defaults;
+    error.clear();
+    assert(CoefficientVector::from_json_string(R"({"live_four":20000})", parsed, error));
+    assert(parsed.live_four == 20000);
+    assert(parsed.rush_four == defaults.rush_four);
+    assert(parsed.double_four == defaults.double_four);
+    assert(parsed.sleepy_two == defaults.sleepy_two);
+
+    error.clear();
+    const std::string default_text = CoefficientVector::to_json_string(defaults);
+    assert(CoefficientVector::from_json_string(default_text, parsed, error));
+    assert(CoefficientVector::to_vector(parsed) == CoefficientVector::to_vector(defaults));
+
+    // E. Anti-regression: the optimizers' silent repairs stay in place - they feed
+    // candidate vectors, not files, and have to be clamped rather than refused.
+    ThreatCoefficients inverted;
+    inverted.live_two = 1000;
+    inverted.sleepy_three = 30;
+    CoefficientVector::sanitize(inverted);
+    assert(inverted.live_two == 30);
+    assert(inverted.sleepy_three == 30);
+
+    std::vector<int> values = CoefficientVector::to_vector(ThreatCoefficients());
+    values[static_cast<int>(TunableParam::LIVE_TWO)] = 1000;
+    values[static_cast<int>(TunableParam::SLEEPY_THREE)] = 30;
+    CoefficientVector::sanitize_vector(values);
+    assert(values[static_cast<int>(TunableParam::LIVE_TWO)] == 30);
+
+    std::vector<int> raised = CoefficientVector::to_vector(ThreatCoefficients());
+    raised[static_cast<int>(TunableParam::LIVE_FOUR)] = 40000;
+    raised[static_cast<int>(TunableParam::DOUBLE_FOUR)] = 10000;
+    const ThreatCoefficients clamped = CoefficientVector::from_vector(raised);
+    assert(clamped.double_four == 40000);
+    assert(clamped.double_three >= 40000);
+    assert(clamped.four_three >= 40000);
+
+    // F. Round trip: what to_json_string writes is exactly what from_json_string
+    // reads back, for the legal file above and for the built-in defaults.
+    ThreatCoefficients legal;
+    legal.live_four = 20000;
+    legal.rush_four = 5000;
+    legal.live_three = 5000;
+    legal.sleepy_three = 500;
+    legal.live_two = 500;
+    legal.sleepy_two = 500;
+    legal.double_four = 60000;
+    legal.double_three = 60000;
+    legal.four_three = 60000;
+    const std::string legal_text = CoefficientVector::to_json_string(legal);
+    error.clear();
+    assert(CoefficientVector::from_json_string(legal_text, parsed, error));
+    assert(CoefficientVector::to_vector(parsed) == CoefficientVector::to_vector(legal));
+    assert(CoefficientVector::to_json_string(parsed) == legal_text);
+    assert(CoefficientVector::to_json_string(
+               CoefficientVector::from_vector(CoefficientVector::to_vector(legal))) == legal_text);
+
+    std::cout << "test_params_rejects_cross_key_rewrites passed" << std::endl;
+}
+
+// R77 L2: stod() parses "nan"/"inf" with used == text.size(), and a NaN then
+// sails through every range guard below it (all comparisons are false), so
+// --accept-score nan used to start a training run whose promotion threshold no
+// score can clear. The reader must refuse non-finite numbers like any other
+// malformed text, and the ordinal threshold must still parse.
+void test_trainer_cli_rejects_non_finite_accept_score() {
+#ifndef _WIN32
+    if (!std::filesystem::exists("gomoku_train")) {
+        std::cout << "  trainer CLI --accept-score probes skipped: binary not in the"
+                     " working directory" << std::endl;
+        return;
+    }
+    const std::filesystem::path out = temp_path("accept_cli_stdout.txt");
+    const std::filesystem::path err = temp_path("accept_cli_stderr.txt");
+    auto read_all = [](const std::filesystem::path& p) {
+        std::ifstream in(p);
+        std::ostringstream text;
+        text << in.rdbuf();
+        return text.str();
+    };
+    auto run = [&](const std::string& command) {
+        const int status = std::system(command.c_str());
+        assert(status != -1);
+        return WEXITSTATUS(status);
+    };
+    const std::string redirect = " > '" + out.string() + "' 2> '" + err.string() + "'";
+    std::error_code ec;
+
+    for (const char* value : {"nan", "inf", "-inf"}) {
+        std::filesystem::remove(out, ec);
+        std::filesystem::remove(err, ec);
+        assert(run(std::string("./gomoku_train --accept-score ") + value + redirect) == 1);
+        const std::string message = read_all(err);
+        assert(message.find("invalid number for --accept-score") != std::string::npos);
+        std::cout << "  --accept-score " << value << ": "
+                  << message.substr(0, message.find('\n')) << std::endl;
+    }
+
+    // Positive control: a finite value parses, so --help still runs and prints
+    // the usage text - the refusals above are about the value, not the flag.
+    std::filesystem::remove(out, ec);
+    assert(run("./gomoku_train --accept-score 0.9 --help" + redirect) == 0);
+    assert(read_all(out).find("Usage:") != std::string::npos);
+    std::cout << "  --accept-score 0.9: parsed, --help printed the usage text" << std::endl;
+#endif
+    std::cout << "test_trainer_cli_rejects_non_finite_accept_score passed" << std::endl;
+}
+
+// Round 90, U1: the optimisers hand candidates back as gene vectors, and
+// from_vector default-constructs on purpose, so a candidate arrived at the
+// objective carrying the compiled-in five and forbidden_penalty while the
+// champion carried this run's. Every pairing measure_fitness makes has to be
+// rule-identical on both sides - which is observable as the constants the
+// injected objective is called with.
+void test_measure_fitness_flattens_rule_constants_for_candidates() {
+    TrainingConfig config = fast_training_config();
+    config.params_path = temp_path("u1_flat_params.json").string();
+    config.checkpoint_path = temp_path("u1_flat_checkpoint.json").string();
+
+    ThreatCoefficients base;
+    base.five = 90000;
+    base.forbidden_penalty = 40000;
+    // The point of the two numbers above is that they are not the defaults.
+    assert(base.five != ThreatCoefficients().five);
+    assert(base.forbidden_penalty != ThreatCoefficients().forbidden_penalty);
+
+    std::vector<std::pair<int, int>> seen;  // five / forbidden_penalty per call
+    Trainer trainer(base, config);
+    trainer.set_fitness_override([&seen](const ThreatCoefficients& coeffs) {
+        seen.emplace_back(coeffs.five, coeffs.forbidden_penalty);
+        return deviation_score(coeffs);
+    });
+
+    trainer.run_round();
+
+    // run_round reads the champion itself (that call is not a candidate and is
+    // the same on both trees), then the walk evaluates at least its starting
+    // point, so there is more than one pairing to look at.
+    assert(seen.size() >= 2);
+    for (const std::pair<int, int>& call : seen) {
+        assert(call.first == 90000);
+        assert(call.second == 40000);
+    }
+
+    std::cout << "test_measure_fitness_flattens_rule_constants_for_candidates passed ("
+              << seen.size() << " pairings, all " << seen.front().first << "/"
+              << seen.front().second << ")" << std::endl;
+}
+
+// Anti-overreach: a run that starts from the compiled defaults has nothing to
+// flatten, so the pairing stays exactly what it was - defaults in, defaults out.
+void test_measure_fitness_leaves_default_rule_constants_alone() {
+    TrainingConfig config = fast_training_config();
+    config.params_path = temp_path("u1_default_params.json").string();
+    config.checkpoint_path = temp_path("u1_default_checkpoint.json").string();
+
+    const ThreatCoefficients defaults;
+    std::vector<std::pair<int, int>> seen;
+    Trainer trainer(defaults, config);
+    trainer.set_fitness_override([&seen](const ThreatCoefficients& coeffs) {
+        seen.emplace_back(coeffs.five, coeffs.forbidden_penalty);
+        return deviation_score(coeffs);
+    });
+
+    trainer.run_round();
+
+    assert(seen.size() >= 2);
+    for (const std::pair<int, int>& call : seen) {
+        assert(call.first == defaults.five);
+        assert(call.second == defaults.forbidden_penalty);
+    }
+
+    std::cout << "test_measure_fitness_leaves_default_rule_constants_alone passed ("
+              << seen.size() << " pairings, all " << defaults.five << "/"
+              << defaults.forbidden_penalty << ")" << std::endl;
+}
+
+// R91 V1: the per-ply dedup key has to carry the last stone's cell as well as
+// the played one. Slots 0-24 are invariant, but 25-51 are read off the oriented
+// board's last move - so a symmetry that fixes the played cell while moving that
+// stone yields a genuinely different sample, and dropping it loses data.
+//
+// A record whose leading plies are replays (collect() ignores those) plus one
+// searched ply that is the only sampled one.
+static GameRecord sampled_record(const std::vector<Move>& placement, Move sampled) {
+    GameRecord record;
+    record.winner = BLACK;
+    record.reason = GameEndReason::FIVE;
+    for (const Move& m : placement) {
+        MoveRecord entry;
+        entry.move = m;
+        entry.method = "replay";
+        record.moves.push_back(entry);
+    }
+    MoveRecord entry;
+    entry.move = sampled;
+    entry.score = 120;
+    entry.depth = 4;
+    entry.nodes = 500;
+    entry.elapsed_ms = 9;
+    entry.method = "alphabeta";
+    record.moves.push_back(entry);
+    record.total_nodes = 500;
+    record.max_depth = 4;
+    return record;
+}
+
+// The board the sampled ply is played on: every ply but the last.
+static Board sampled_prefix(const GameRecord& record) {
+    Board board;
+    for (size_t i = 0; i + 1 < record.moves.size(); ++i) {
+        board.place_stone(record.moves[i].move.pos, record.moves[i].move.color);
+    }
+    return board;
+}
+
+// The part augmentation is supposed to multiply: slots 25-51 plus the move.
+static std::vector<float> orientation_key(const TrainingSample& sample) {
+    std::vector<float> key(sample.features.begin() + DataCollector::FEATURE_LAST_ROW,
+                           sample.features.end());
+    key.push_back(static_cast<float>(sample.move.pos.to_index()));
+    key.push_back(static_cast<float>(sample.move.color));
+    return key;
+}
+
+// The number of samples whose (25-51, move) key is unique in the batch.
+static int distinct_orientation_keys(const std::vector<TrainingSample>& samples) {
+    std::set<std::vector<float>> seen;
+    for (const TrainingSample& sample : samples) seen.insert(orientation_key(sample));
+    return static_cast<int>(seen.size());
+}
+
+void test_collector_keeps_the_variant_that_moved_the_last_stone() {
+    // The main-diagonal mirror (variant 4) maps this placement back onto itself:
+    // (7,7) holds, the black pair (6,8)/(8,6) swaps, the white pair (7,6)/(6,7)
+    // swaps. It also fixes the played cell (5,5) - but it moves the last stone.
+    const std::vector<Move> placement{Move(7, 7, BLACK), Move(6, 8, BLACK), Move(8, 6, BLACK),
+                                      Move(7, 6, WHITE), Move(6, 7, WHITE)};
+    const GameRecord record = sampled_record(placement, Move(5, 5, BLACK));
+    const Board before = sampled_prefix(record);
+
+    // The fixture really is self-symmetric, really fixes the played cell, and
+    // really relocates the last move - otherwise the count below proves nothing.
+    const std::vector<int> symmetries = self_symmetries(before);
+    assert(symmetries.size() == 2);
+    assert(std::find(symmetries.begin(), symmetries.end(), 4) != symmetries.end());
+    assert(transform_position(Position(5, 5), 4) == Position(5, 5));
+    const Position last = before.last_move().pos;
+    assert(last == Position(6, 7));
+    assert(transform_position(last, 4) != last);
+    assert(transform_board(before, 4).zobrist_hash() == before.zobrist_hash());
+    assert(transform_board(before, 4).last_move().pos == Position(7, 6));
+
+    DataCollector collector;
+    const std::vector<TrainingSample> augmented = collector.collect(record, 7101, true);
+
+    // Eight orientations, four distinct placements, two last-stone cells each:
+    // none of them is a duplicate of another.
+    assert(augmented.size() == static_cast<size_t>(SYMMETRY_COUNT));
+    assert(distinct_orientation_keys(augmented) == SYMMETRY_COUNT);
+
+    // The identity reading and the main-diagonal reading share the played cell
+    // (5,5) and the placement hash - they are the pair the old key threw away.
+    // Both must be present, anchored at the two different last-move cells.
+    int at_played_cell = 0;
+    bool anchored_before = false;
+    bool anchored_after = false;
+    for (const TrainingSample& sample : augmented) {
+        if (sample.move.pos != Position(5, 5)) continue;
+        ++at_played_cell;
+        const std::vector<float>& f = sample.features;
+        const int row = static_cast<int>(f[DataCollector::FEATURE_LAST_ROW] * 7.0f + 7.0f + 0.5f);
+        const int col = static_cast<int>(f[DataCollector::FEATURE_LAST_COL] * 7.0f + 7.0f + 0.5f);
+        if (row == 6 && col == 7) anchored_before = true;
+        if (row == 7 && col == 6) anchored_after = true;
+    }
+    assert(at_played_cell == 2);
+    assert(anchored_before && anchored_after);
+
+    // One orientation only ever means one sample for this ply.
+    const std::vector<TrainingSample> plain = collector.collect(record, 7102, false);
+    assert(plain.size() == 1);
+    assert(plain[0].move.pos == Position(5, 5));
+
+    std::cout << "test_collector_keeps_the_variant_that_moved_the_last_stone passed ("
+              << augmented.size() << " augmented, " << plain.size() << " plain)" << std::endl;
+}
+
+// Anti-overreach for V1: when the symmetry fixes the last stone too the two
+// variants ARE one and the same sample, and a fully asymmetric placement has
+// eight distinct readings to begin with. Both answers must stay as they were.
+void test_collector_still_drops_genuine_symmetry_duplicates() {
+    DataCollector collector;
+
+    // (i) Both the last stone (9,9) and the played cell (5,5) sit on the main
+    // diagonal, so variant 4 reproduces the identity sample exactly.
+    const std::vector<Move> diagonal{Move(7, 7, BLACK), Move(6, 8, BLACK), Move(8, 6, BLACK),
+                                     Move(6, 6, WHITE), Move(9, 9, WHITE)};
+    const GameRecord fixed_record = sampled_record(diagonal, Move(5, 5, BLACK));
+    const Board fixed_before = sampled_prefix(fixed_record);
+    assert(self_symmetries(fixed_before).size() == 2);
+    assert(transform_position(fixed_before.last_move().pos, 4) == fixed_before.last_move().pos);
+    const std::vector<TrainingSample> fixed = collector.collect(fixed_record, 7103, true);
+    assert(fixed.size() == 4);
+    assert(distinct_orientation_keys(fixed) == 4);
+
+    // (ii) No self-symmetry at all: all eight readings are different boards, so
+    // all eight are kept.
+    const std::vector<Move> asymmetric{Move(7, 7, BLACK), Move(6, 8, BLACK), Move(8, 6, BLACK),
+                                       Move(7, 6, WHITE), Move(4, 9, WHITE)};
+    const GameRecord loose_record = sampled_record(asymmetric, Move(5, 5, BLACK));
+    const Board loose_before = sampled_prefix(loose_record);
+    assert(self_symmetries(loose_before).size() == 1);
+    const std::vector<TrainingSample> loose = collector.collect(loose_record, 7104, true);
+    assert(loose.size() == SYMMETRY_COUNT);
+    assert(distinct_orientation_keys(loose) == SYMMETRY_COUNT);
+
+    std::cout << "test_collector_still_drops_genuine_symmetry_duplicates passed ("
+              << fixed.size() << " duplicate-keeping, " << loose.size() << " asymmetric)"
+              << std::endl;
+}
+
+// Round 99 DD5: an empty flag value is nearly always an unexpanded shell variable,
+// and for a path it is destructive - `--resume ""` used to parse as "no resume" and
+// the run then wrote the default checkpoint as if nothing had been asked for.
+// require_value now throws on an empty value and the existing catch answers with
+// exit 1. Each probe carries `--rounds 0` so a tree that still accepts the empty
+// value stops at the round-count guard instead of starting a training run: what is
+// under test is which of the two refusals the parser produces, and that is read off
+// the exit code and the flag name in stderr - no wording is asserted.
+void test_trainer_refuses_an_empty_flag_value() {
+#ifndef _WIN32
+    if (!std::filesystem::exists("gomoku_train")) {
+        std::cout << "  trainer empty-value probes skipped: gomoku_train is not in the "
+                     "working directory" << std::endl;
+        std::cout << "test_trainer_refuses_an_empty_flag_value passed" << std::endl;
+        return;
+    }
+    const std::filesystem::path err = temp_path("r99_dd5_stderr.txt");
+    auto read_all = [](const std::filesystem::path& p) {
+        std::ifstream in(p);
+        std::ostringstream text;
+        text << in.rdbuf();
+        return text.str();
+    };
+    std::string last_err;
+    auto run = [&](const std::string& arguments) {
+        const std::string command = "./gomoku_train " + arguments + " > /dev/null 2> '" +
+                                    err.string() + "'";
+        const int status = std::system(command.c_str());
+        assert(status != -1);
+        last_err = read_all(err);
+        return WEXITSTATUS(status);
+    };
+
+    for (const char* flag : {"--resume", "--params", "--out"}) {
+        const int status = run(std::string(flag) + " '' --rounds 0");
+        std::cout << "  [r99dd5] " << flag << " with an empty value => exit " << status << ": "
+                  << last_err.substr(0, last_err.find('\n')) << std::endl;
+        assert(status == 1);
+        // The empty value was refused, ahead of the round-count guard behind it.
+        assert(last_err.find(flag) != std::string::npos);
+        assert(last_err.find("--rounds") == std::string::npos);
+    }
+
+    // Control: the same flags with a stated value still reach the guard that
+    // follows the parser, so the refusal above is about emptiness, not the flag.
+    const int stated = run("--out '/tmp/r99_dd5_out.json' --rounds 0");
+    std::cout << "  [r99dd5] --out with a value => exit " << stated << ": "
+              << last_err.substr(0, last_err.find('\n')) << std::endl;
+    assert(stated == 1);
+    assert(last_err.find("--rounds") != std::string::npos);
+
+    std::cout << "test_trainer_refuses_an_empty_flag_value passed" << std::endl;
+#endif
+}
+
+// Round 99 DD6, labelled as what it is: a help-text assert. Only the usage
+// entries for --stagnation and --hill-iterations were rewritten, and the two
+// claims they now make are the code's existing behaviour - the 3x probe budget is
+// trainer.cpp:312 and the N+1 ceiling is hill_climbing.cpp skipping a step whose
+// neighbour is identical. No call path changes, so there is nothing else to pin.
+void test_trainer_help_states_the_probe_budget() {
+#ifndef _WIN32
+    if (!std::filesystem::exists("gomoku_train")) {
+        std::cout << "  trainer help probe skipped: gomoku_train is not in the working "
+                     "directory" << std::endl;
+        std::cout << "test_trainer_help_states_the_probe_budget passed" << std::endl;
+        return;
+    }
+    const std::filesystem::path out = temp_path("r99_dd6_usage.txt");
+    const int status = std::system(("./gomoku_train --help > '" + out.string() +
+                                    "' 2>&1").c_str());
+    assert(status != -1);
+    std::ifstream usage(out);
+    std::ostringstream text;
+    text << usage.rdbuf();
+    const std::string help = text.str();
+    std::cout << "  [r99dd6] --help => exit " << WEXITSTATUS(status) << ", " << help.size()
+              << " bytes of usage" << std::endl;
+    assert(WEXITSTATUS(status) == 0);
+    assert(help.find("--stagnation") != std::string::npos);
+    assert(help.find("3x") != std::string::npos);
+    assert(help.find("N+1") != std::string::npos);
+
+    std::cout << "test_trainer_help_states_the_probe_budget passed" << std::endl;
+#endif
+}
+
+// Round 100 EE2: --no-sessions next to a directory the caller actually wrote down
+// used to mean "the directory you named is dropped on the floor" - the same
+// ambiguous instruction `--sessions ""` is refused for (README:169-172's rationale).
+// The parser now answers exit 1 naming both sides. Every probe also carries a
+// nonexistent --web-dir, so a tree without the conflict guard stops at the web-dir
+// refusal (main.cpp:122) instead of binding a port, and a tree with it never gets
+// that far: the --port value below is therefore never bound in either. What is
+// under test is which refusal the process produces, read off the exit code and the
+// flag names in stderr - no wording is asserted.
+void test_server_refuses_no_sessions_with_a_stated_path() {
+#ifndef _WIN32
+    if (!std::filesystem::exists("gomoku_server")) {
+        std::cout << "  --no-sessions conflict probes skipped: gomoku_server is not in the "
+                     "working directory" << std::endl;
+        std::cout << "test_server_refuses_no_sessions_with_a_stated_path passed" << std::endl;
+        return;
+    }
+    const std::filesystem::path err = temp_path("r100_ee2_stderr.txt");
+    const std::string missing_web = temp_path("r100_ee2_no_such_web").string();
+    auto read_all = [](const std::filesystem::path& p) {
+        std::ifstream in(p);
+        std::ostringstream text;
+        text << in.rdbuf();
+        return text.str();
+    };
+    std::string last_err;
+    auto run = [&](const std::string& arguments) {
+        const std::string command = "./gomoku_server " + arguments + " --web-dir '" +
+                                    missing_web + "' --port 59321 > /dev/null 2> '" +
+                                    err.string() + "'";
+        const int status = std::system(command.c_str());
+        assert(status != -1);
+        last_err = read_all(err);
+        return WEXITSTATUS(status);
+    };
+
+    const char* const conflicts[] = {
+        "--no-sessions --sessions '/tmp/r100_ee2_sessions'",
+        "--sessions '/tmp/r100_ee2_sessions' --no-sessions",
+        "--no-sessions --records '/tmp/r100_ee2_records.jsonl'",
+    };
+    for (const char* arguments : conflicts) {
+        const int status = run(arguments);
+        std::cout << "  [r100ee2] " << arguments << " => exit " << status << ": "
+                  << last_err.substr(0, last_err.find('\n')) << std::endl;
+        assert(status == 1);
+        // The contradiction is named, and it is named instead of the web-dir
+        // refusal that every one of these commands would otherwise reach.
+        assert(last_err.find("--no-sessions") != std::string::npos);
+        assert(last_err.find("--web-dir") == std::string::npos);
+    }
+
+    // Controls: each half on its own still parses, so the refusal above is about
+    // the combination rather than either flag. Both fall through to the web-dir
+    // guard, which is what keeps these runs from ever listening.
+    const int alone = run("--no-sessions");
+    std::cout << "  [r100ee2] --no-sessions alone => exit " << alone << ": "
+              << last_err.substr(0, last_err.find('\n')) << std::endl;
+    assert(alone == 1);
+    assert(last_err.find("--web-dir") != std::string::npos);
+    assert(last_err.find("--no-sessions") == std::string::npos);
+
+    const int stated = run("--sessions '/tmp/r100_ee2_sessions'");
+    std::cout << "  [r100ee2] --sessions alone => exit " << stated << ": "
+              << last_err.substr(0, last_err.find('\n')) << std::endl;
+    assert(stated == 1);
+    assert(last_err.find("--web-dir") != std::string::npos);
+
+    std::cout << "test_server_refuses_no_sessions_with_a_stated_path passed" << std::endl;
+#endif
+}
+
+// Round 101 FF2: `--resume CK --seed N` used to start, parse N, and then let the
+// resume overwrite it (trainer.cpp:551 assigns the seed the checkpoint recorded, and
+// trainer.cpp:409 always writes one), so the reproducibility the caller asked for was
+// not the run that actually happened. The parser now refuses the pair, the same class
+// as the --params/--resume contradiction it sits next to.
+//
+// Arms that must merely *run* use the cheapest knobs the guards allow (one round, one
+// generation, depth 1, a 1 ms slice, two moves per game, two verification games,
+// --no-data), which takes tens of milliseconds, and every artefact is a temp path so
+// data/ is never written. Judgement is the exit code, which flag names appear in
+// stderr, and the seed number the checkpoint ends up carrying - no wording is
+// asserted. NOTE for the next CLI probe here: run a full `make -j4` first, or an
+// unchanged gomoku_train from before the fix is exec'd and the arms read as failures.
+void test_trainer_refuses_a_seed_that_a_resume_would_drop() {
+#ifndef _WIN32
+    if (!std::filesystem::exists("gomoku_train")) {
+        std::cout << "  --seed/--resume probes skipped: gomoku_train is not in the working "
+                     "directory" << std::endl;
+        std::cout << "test_trainer_refuses_a_seed_that_a_resume_would_drop passed" << std::endl;
+        return;
+    }
+    const std::string base =
+        "--rounds 1 --population 2 --generations 1 --depth 1 --timeout-ms 1 --max-moves 2 "
+        "--fitness-games 1 --verification-games 2 --no-data --quiet";
+    const std::filesystem::path err = temp_path("r101_ff2_stderr.txt");
+    auto read_all = [](const std::filesystem::path& p) {
+        std::ifstream in(p);
+        std::ostringstream text;
+        text << in.rdbuf();
+        return text.str();
+    };
+    // The number the writer put behind the "seed" key, read without assuming any
+    // particular spacing or field order.
+    auto seed_in = [&read_all](const std::filesystem::path& p) -> long long {
+        const std::string text = read_all(p);
+        const size_t key = text.find("\"seed\"");
+        if (key == std::string::npos) return -1;
+        size_t i = text.find_first_of("0123456789", key + 6);
+        if (i == std::string::npos) return -1;
+        long long value = 0;
+        for (; i < text.size() && std::isdigit(static_cast<unsigned char>(text[i])); ++i) {
+            value = value * 10 + (text[i] - '0');
+        }
+        return value;
+    };
+    std::string last_err;
+    auto run = [&](const std::string& arguments) {
+        const std::string command = "./gomoku_train " + base + " " + arguments +
+                                    " > /dev/null 2> '" + err.string() + "'";
+        const int status = std::system(command.c_str());
+        assert(status != -1);
+        last_err = read_all(err);
+        return WEXITSTATUS(status);
+    };
+
+    // Setup, and the both-absent control: a run that never mentions --seed writes a
+    // checkpoint carrying a seed of its own.
+    const std::filesystem::path params = temp_path("r101_ff2_params.json");
+    const std::filesystem::path ck = temp_path("r101_ff2_ck.json");
+    std::error_code ec;
+    std::filesystem::remove(ck, ec);
+    const int setup = run("--out '" + params.string() + "' --checkpoint '" + ck.string() + "'");
+    const long long stored_seed = seed_in(ck);
+    std::cout << "  [r101ff2] neither flag => exit " << setup << ", checkpoint seed "
+              << stored_seed << std::endl;
+    assert(setup == 0);
+    assert(std::filesystem::exists(ck));
+    assert(stored_seed != 7);
+
+    // Both given, in either order: refused, naming both flags.
+    const std::string quoted_ck = "'" + ck.string() + "'";
+    for (const std::string arguments : {"--resume " + quoted_ck + " --seed 7",
+                                        "--seed 7 --resume " + quoted_ck}) {
+        const int status = run(arguments);
+        std::cout << "  [r101ff2] " << arguments << " => exit " << status << ": "
+                  << last_err.substr(0, last_err.find('\n')) << std::endl;
+        assert(status == 1);
+        assert(last_err.find("--seed") != std::string::npos);
+        assert(last_err.find("--resume") != std::string::npos);
+    }
+    // The refusal happens before the run, so the checkpoint it named is untouched.
+    assert(seed_in(ck) == stored_seed);
+
+    // Control: --resume on its own still resumes (a fresh copy, because the run
+    // advances the file it read).
+    const std::filesystem::path resume_copy = temp_path("r101_ff2_resume_copy.json");
+    std::filesystem::copy_file(ck, resume_copy, std::filesystem::copy_options::overwrite_existing);
+    const int resume_only = run("--resume '" + resume_copy.string() + "'");
+    std::cout << "  [r101ff2] --resume alone => exit " << resume_only << ", stderr "
+              << last_err.size() << " bytes, checkpoint seed " << seed_in(resume_copy)
+              << std::endl;
+    assert(resume_only == 0);
+    assert(last_err.empty());
+    assert(seed_in(resume_copy) == stored_seed);
+
+    // Control: --seed on its own takes effect, which is the whole point of the
+    // refusal above - the value is only dropped when a resume is in play.
+    const std::filesystem::path seed_params = temp_path("r101_ff2_seed_params.json");
+    const std::filesystem::path seed_ck = temp_path("r101_ff2_seed_ck.json");
+    std::filesystem::remove(seed_ck, ec);
+    const int seed_only = run("--seed 7 --out '" + seed_params.string() + "' --checkpoint '" +
+                              seed_ck.string() + "'");
+    std::cout << "  [r101ff2] --seed 7 alone => exit " << seed_only << ", checkpoint seed "
+              << seed_in(seed_ck) << std::endl;
+    assert(seed_only == 0);
+    assert(seed_in(seed_ck) == 7);
+
+    std::cout << "test_trainer_refuses_a_seed_that_a_resume_would_drop passed" << std::endl;
+#endif
+}
+
+// Round 106 JJ2: --out and --checkpoint name the two files a run owns - the champion
+// parameters it writes at the end and the resume state it writes every round. Pointing both
+// at one path meant the closing champion write replaced the checkpoint, so the next
+// --resume read coefficients where it expected a round counter. README:204 records the
+// refusal, which sits with the --params/--resume and --seed/--resume ones ahead of every
+// file operation.
+//
+// The judgement is the exit code plus what the named path ends up holding. `--rounds 0`
+// cannot be used here: the round-count guard is ahead of this refusal in the same parser, so
+// both trees would answer 1 and nothing would discriminate. The arms therefore run the
+// cheapest legal round round 101 FF2 established, and every artefact is a temp path so
+// data/ is never written. No wording is asserted beyond the two flag names.
+void test_trainer_refuses_one_file_for_both_out_and_checkpoint() {
+#ifndef _WIN32
+    if (!std::filesystem::exists("gomoku_train")) {
+        std::cout << "  --out/--checkpoint probes skipped: gomoku_train is not in the working "
+                     "directory" << std::endl;
+        std::cout << "test_trainer_refuses_one_file_for_both_out_and_checkpoint passed" << std::endl;
+        return;
+    }
+    const std::string base =
+        "--rounds 1 --population 2 --generations 1 --depth 1 --timeout-ms 1 --max-moves 2 "
+        "--fitness-games 1 --verification-games 2 --no-data --quiet";
+    const std::filesystem::path err = temp_path("r106_jj2_stderr.txt");
+    auto read_all = [](const std::filesystem::path& p) {
+        std::ifstream in(p);
+        std::ostringstream text;
+        text << in.rdbuf();
+        return text.str();
+    };
+    std::string last_err;
+    auto run = [&](const std::string& arguments) {
+        const std::string command = "./gomoku_train " + base + " " + arguments +
+                                    " > /dev/null 2> '" + err.string() + "'";
+        const int status = std::system(command.c_str());
+        assert(status != -1);
+        last_err = read_all(err);
+        return WEXITSTATUS(status);
+    };
+
+    // Control: the same cheapest run with two distinct paths finishes and writes both.
+    const std::filesystem::path out = temp_path("r106_jj2_out.json");
+    const std::filesystem::path ck = temp_path("r106_jj2_ck.json");
+    const int apart = run("--out '" + out.string() + "' --checkpoint '" + ck.string() + "'");
+    std::cout << "  [r106jj2] two paths => exit " << apart << ", stderr " << last_err.size()
+              << " bytes" << std::endl;
+    assert(apart == 0);
+    assert(last_err.empty());
+    assert(std::filesystem::exists(out));
+    assert(std::filesystem::exists(ck));
+
+    // Discriminator: one path for both roles is refused, and nothing is created.
+    const std::filesystem::path one = temp_path("r106_jj2_one.json");
+    const int refused = run("--out '" + one.string() + "' --checkpoint '" + one.string() + "'");
+    std::cout << "  [r106jj2] --out == --checkpoint => exit " << refused << ": "
+              << last_err.substr(0, last_err.find('\n')) << std::endl;
+    assert(refused == 1);
+    assert(last_err.find("--out") != std::string::npos);
+    assert(last_err.find("--checkpoint") != std::string::npos);
+    // Ahead of ensure_parent_directory and both writers, so the name it refused is absent.
+    assert(!std::filesystem::exists(one));
+
+    // The stronger half: a checkpoint already sitting at that name survives the attempt
+    // byte for byte. Replacing it is exactly the loss the refusal exists to prevent.
+    const std::filesystem::path kept = temp_path("r106_jj2_kept.json");
+    {
+        std::ofstream writer(kept);
+        writer << "{\"seed\":12345,\"rounds_completed\":7}\n";
+    }
+    const std::string before = read_all(kept);
+    const int kept_status =
+        run("--out '" + kept.string() + "' --checkpoint '" + kept.string() + "'");
+    const std::string after = read_all(kept);
+    std::cout << "  [r106jj2] one existing file => exit " << kept_status << ", bytes "
+              << before.size() << " -> " << after.size() << std::endl;
+    assert(kept_status == 1);
+    assert(after == before);
+    assert(after.find("rounds_completed") != std::string::npos);
+
+    std::cout << "test_trainer_refuses_one_file_for_both_out_and_checkpoint passed" << std::endl;
+#endif
+}
+
+// Round 107 KK1: run() clears everything that describes *this* run - generations_run,
+// converged_, best_history_ - and it did not clear the stagnation counter
+// `generations_since_improvement_`. genetic.h:39-41 states the contract as "evolves until
+// the best result stops improving", i.e. this run's own improvement history, so a second run
+// on the same object inherited the first one's count and, with fitness that cannot improve,
+// hit `generations_since_improvement_ >= stagnation_generations` inside generation 1 and
+// reported generations_run == 1. The trainer builds one optimizer per round loop, so every
+// round after the first of a stagnating search was billed as a single generation.
+//
+// `evaluations_` is intentionally left alone (genetic.h:50-51 - it is the caller's cumulative
+// cost counter), which is why the accumulation is pinned in the same test: a future sweep
+// that zeroed it too would silently under-report the training budget. A constant fitness
+// makes the outcome independent of the RNG draws - no generation can beat the incumbent, so
+// the only exit is stagnation - and population_size == 2 means each generation scores
+// exactly one new member (the incumbent carries over unscored), fixing a run's cost at
+// population_size + generations * (population_size - 1).
+void test_genetic_stagnation_count_is_per_run() {
+    ThreatCoefficients base;
+
+    GeneticConfig settings;
+    settings.population_size = 2;
+    settings.stagnation_generations = 2;
+    settings.max_generations = 2;
+
+    auto flat = [](const ThreatCoefficients&) { return 1.0; };
+
+    GeneticOptimizer optimizer(flat, settings, 20261015);
+    int first_generations = 0;
+    double first_best = 0.0;
+    optimizer.run(base, first_generations, first_best);
+    const int first_cost = optimizer.evaluations();
+    std::cout << "  [r107kk1] run 1 => generations " << first_generations << ", converged "
+              << optimizer.converged() << ", evaluations " << first_cost << std::endl;
+    assert(first_generations == settings.stagnation_generations);
+    assert(optimizer.converged());
+    assert(std::abs(first_best - 1.0) < 1e-12);
+    assert(first_cost ==
+           settings.population_size + first_generations * (settings.population_size - 1));
+
+    // Discriminator: a second run on the same object owes the caller its own stagnation
+    // history, so the flat fitness again takes stagnation_generations generations.
+    int second_generations = 0;
+    double second_best = 0.0;
+    optimizer.run(base, second_generations, second_best);
+    std::cout << "  [r107kk1] run 2 on the same object => generations " << second_generations
+              << ", evaluations " << optimizer.evaluations() << std::endl;
+    assert(second_generations == settings.stagnation_generations);
+    assert(optimizer.converged());
+    assert(std::abs(second_best - 1.0) < 1e-12);
+
+    // Control: a fresh object with the same config and seed needs the same number of
+    // generations, which is exactly what the second run above was owed.
+    GeneticOptimizer fresh(flat, settings, 20261015);
+    int fresh_generations = 0;
+    double fresh_best = 0.0;
+    fresh.run(base, fresh_generations, fresh_best);
+    std::cout << "  [r107kk1] a brand-new object => generations " << fresh_generations
+              << std::endl;
+    assert(fresh_generations == first_generations);
+    assert(std::abs(fresh_best - 1.0) < 1e-12);
+
+    // The opposite invariant, and it must stay green: the cost counter keeps counting across
+    // runs. Written as a delta it holds whichever way the second run ended, and it goes red
+    // the moment run() resets evaluations_.
+    const int second_cost = optimizer.evaluations();
+    std::cout << "  [r107kk1] evaluations accumulate " << first_cost << " -> " << second_cost
+              << std::endl;
+    assert(second_cost > first_cost);
+    assert(second_cost - first_cost ==
+           settings.population_size + second_generations * (settings.population_size - 1));
+
+    std::cout << "test_genetic_stagnation_count_is_per_run passed" << std::endl;
+}
+
+// Round 110 NN1: README:204 refuses --out when it names the same file as --checkpoint, and
+// README:206 requires --checkpoint to name the same file as --resume. HEAD compared the two
+// command-line *strings*, so 同一个文件 written two ways went the wrong way in both
+// directions: `目录/ck.json` beside `目录/./ck.json` slipped past README:204 and the closing
+// champion write replaced a real checkpoint, while the same pair beside --resume was refused
+// as a mismatch even though README:206 was satisfied. The guards now compare
+// std::filesystem::weakly_canonical results - the file, not its spelling.
+//
+// Both arms therefore judge exit codes and what the named files end up holding, never the
+// wording of a message beyond the flag names the refusal must print. Every path is absolute,
+// temp_path-built, with the "." segment injected through parent_path()/"."/filename() so no
+// arm depends on anything but ./gomoku_train, and data/ is never opened. --rounds 0 still
+// cannot discriminate (the round-count guard sits ahead of both refusals), so each arm runs
+// the cheapest legal round round 106 JJ2 and round 101 FF2 established.
+void test_trainer_refuses_one_file_written_two_ways_for_out_and_checkpoint() {
+#ifndef _WIN32
+    if (!std::filesystem::exists("gomoku_train")) {
+        std::cout << "  --out/--checkpoint spelling probes skipped: gomoku_train is not in the "
+                     "working directory" << std::endl;
+        std::cout << "test_trainer_refuses_one_file_written_two_ways_for_out_and_checkpoint passed"
+                  << std::endl;
+        return;
+    }
+    const std::string base =
+        "--rounds 1 --population 2 --generations 1 --depth 1 --timeout-ms 1 --max-moves 2 "
+        "--fitness-games 1 --verification-games 2 --no-data --quiet";
+    const std::filesystem::path err = temp_path("r110_nn1a_stderr.txt");
+    auto read_all = [](const std::filesystem::path& p) {
+        std::ifstream in(p);
+        std::ostringstream text;
+        text << in.rdbuf();
+        return text.str();
+    };
+    std::string last_err;
+    auto run = [&](const std::string& arguments) {
+        const std::string command = "./gomoku_train " + base + " " + arguments +
+                                    " > /dev/null 2> '" + err.string() + "'";
+        const int status = std::system(command.c_str());
+        assert(status != -1);
+        last_err = read_all(err);
+        return WEXITSTATUS(status);
+    };
+
+    // A real checkpoint to protect: a run that owns two differently named files leaves a
+    // resume state on disk, and its bytes are what README:204's refusal exists to keep.
+    const std::filesystem::path out = temp_path("r110_nn1a_out.json");
+    const std::filesystem::path ck = temp_path("r110_nn1a_ck.json");
+    const int setup = run("--out '" + out.string() + "' --checkpoint '" + ck.string() + "'");
+    const std::string before = read_all(ck);
+    std::cout << "  [r110nn1a] two distinct names => exit " << setup << ", checkpoint "
+              << before.size() << " bytes" << std::endl;
+    assert(setup == 0);
+    assert(!before.empty());
+    assert(std::filesystem::exists(out));
+
+    // Discriminator: 目录/ck.json and 目录/./ck.json are one file. HEAD compares the
+    // spellings, sees two, runs the round and overwrites the checkpoint with the champion -
+    // exit 0 and a different file.
+    const std::filesystem::path dotted = ck.parent_path() / "." / ck.filename();
+    const int refused = run("--out '" + ck.string() + "' --checkpoint '" + dotted.string() + "'");
+    const std::string after = read_all(ck);
+    std::cout << "  [r110nn1a] --out 目录/ck.json vs --checkpoint 目录/./ck.json => exit "
+              << refused << ", bytes " << before.size() << " -> " << after.size() << std::endl;
+    assert(refused == 1);
+    assert(after == before);
+    assert(last_err.find("--out") != std::string::npos);
+    assert(last_err.find("--checkpoint") != std::string::npos);
+
+    // Control, green before and after: the identical spelling was already refused, so
+    // resolving the paths did not loosen README:204's real case.
+    const std::filesystem::path kept = temp_path("r110_nn1a_kept.json");
+    const std::string kept_before = [&kept, &before] {
+        std::ofstream writer(kept);
+        writer << before;
+        return before;
+    }();
+    const int same_spelling =
+        run("--out '" + kept.string() + "' --checkpoint '" + kept.string() + "'");
+    std::cout << "  [r110nn1a] --out == --checkpoint, one spelling => exit " << same_spelling
+              << ", bytes " << kept_before.size() << " -> " << read_all(kept).size() << std::endl;
+    assert(same_spelling == 1);
+    assert(read_all(kept) == kept_before);
+
+    // Control: two genuinely different files still train and still write both - the
+    // canonicalizing guard must not turn the ordinary run into a refusal.
+    const std::filesystem::path apart_out = temp_path("r110_nn1a_apart_out.json");
+    const std::filesystem::path apart_ck = temp_path("r110_nn1a_apart_ck.json");
+    const int apart =
+        run("--out '" + apart_out.string() + "' --checkpoint '" + apart_ck.string() + "'");
+    std::cout << "  [r110nn1a] two genuinely different files => exit " << apart << ", stderr "
+              << last_err.size() << " bytes" << std::endl;
+    assert(apart == 0);
+    assert(last_err.empty());
+    assert(std::filesystem::exists(apart_out));
+    assert(std::filesystem::exists(apart_ck));
+
+    std::cout
+        << "test_trainer_refuses_one_file_written_two_ways_for_out_and_checkpoint passed"
+        << std::endl;
+#endif
+}
+
+// Round 110 NN1, the other direction: --resume and --checkpoint may name one file in two
+// spellings (README:206). HEAD's string comparison called `目录/ck.json` and `目录/./ck.json`
+// different, so a legal resume aborted with exit 1 and the run never started.
+//
+// The same-cheapest-round driver as the case above, and the guard ordering is what makes the
+// arms readable: the --resume/--checkpoint comparison sits ahead of the --params, --seed and
+// --out refusals and ahead of every file operation, so --out here deliberately names a third
+// file - pointing it at the checkpoint would answer 1 for the README:204 reason and mask this
+// guard. The control that matters most is the two-genuinely-different-files arm: it must stay
+// red for the caller on both trees, i.e. the fix did not soften README:207's real refusal.
+void test_trainer_accepts_a_resume_and_checkpoint_that_differ_only_by_a_dot_segment() {
+#ifndef _WIN32
+    if (!std::filesystem::exists("gomoku_train")) {
+        std::cout << "  --resume/--checkpoint spelling probes skipped: gomoku_train is not in "
+                     "the working directory" << std::endl;
+        std::cout << "test_trainer_accepts_a_resume_and_checkpoint_that_differ_only_by_a_dot"
+                     "_segment passed" << std::endl;
+        return;
+    }
+    const std::string base =
+        "--rounds 1 --population 2 --generations 1 --depth 1 --timeout-ms 1 --max-moves 2 "
+        "--fitness-games 1 --verification-games 2 --no-data --quiet";
+    const std::filesystem::path err = temp_path("r110_nn1b_stderr.txt");
+    auto read_all = [](const std::filesystem::path& p) {
+        std::ifstream in(p);
+        std::ostringstream text;
+        text << in.rdbuf();
+        return text.str();
+    };
+    std::string last_err;
+    auto run = [&](const std::string& arguments) {
+        const std::string command = "./gomoku_train " + base + " " + arguments +
+                                    " > /dev/null 2> '" + err.string() + "'";
+        const int status = std::system(command.c_str());
+        assert(status != -1);
+        last_err = read_all(err);
+        return WEXITSTATUS(status);
+    };
+
+    // A checkpoint a resume can legitimately read: written here by a real run, so
+    // load_checkpoint() accepts it and an exit 1 can only come from the guards.
+    const std::filesystem::path ck = temp_path("r110_nn1b_ck.json");
+    const std::filesystem::path setup_out = temp_path("r110_nn1b_setup_out.json");
+    const int setup =
+        run("--out '" + setup_out.string() + "' --checkpoint '" + ck.string() + "'");
+    std::cout << "  [r110nn1b] setup => exit " << setup << ", checkpoint "
+              << read_all(ck).size() << " bytes" << std::endl;
+    assert(setup == 0);
+    assert(std::filesystem::exists(ck));
+
+    // Discriminator: one file, two spellings. README:206 is satisfied, so the run should
+    // proceed; HEAD refuses it and writes nothing.
+    const std::filesystem::path dotted = ck.parent_path() / "." / ck.filename();
+    const std::filesystem::path resume_out = temp_path("r110_nn1b_resume_out.json");
+    const int accepted = run("--resume '" + ck.string() + "' --checkpoint '" + dotted.string() +
+                             "' --out '" + resume_out.string() + "'");
+    std::cout << "  [r110nn1b] --resume 目录/ck.json --checkpoint 目录/./ck.json => exit "
+              << accepted << ", stderr " << last_err.size() << " bytes, --out "
+              << (std::filesystem::exists(resume_out) ? "written" : "absent") << std::endl;
+    assert(accepted == 0);
+    assert(last_err.empty());
+    assert(std::filesystem::exists(resume_out));
+
+    // Control, green on both trees: the identical spelling was never refused, so the fix
+    // keeps the run it already allowed.
+    const std::filesystem::path same_out = temp_path("r110_nn1b_same_out.json");
+    const int same_spelling = run("--resume '" + ck.string() + "' --checkpoint '" + ck.string() +
+                                  "' --out '" + same_out.string() + "'");
+    std::cout << "  [r110nn1b] --resume == --checkpoint, one spelling => exit " << same_spelling
+              << ", stderr " << last_err.size() << " bytes" << std::endl;
+    assert(same_spelling == 0);
+    assert(last_err.empty());
+    assert(std::filesystem::exists(same_out));
+
+    // Control, the one that must stay red for a loosened guard: two genuinely different
+    // files are still refused before anything is opened (README:207).
+    const std::filesystem::path other_ck = temp_path("r110_nn1b_other_ck.json");
+    const std::filesystem::path refusal_out = temp_path("r110_nn1b_refusal_out.json");
+    const int refused = run("--resume '" + ck.string() + "' --checkpoint '" + other_ck.string() +
+                            "' --out '" + refusal_out.string() + "'");
+    std::cout << "  [r110nn1b] --resume and --checkpoint two files => exit " << refused
+              << ", checkpoint " << other_ck << " exists "
+              << (std::filesystem::exists(other_ck) ? "yes" : "no") << std::endl;
+    assert(refused == 1);
+    assert(last_err.find("--resume") != std::string::npos);
+    assert(last_err.find("--checkpoint") != std::string::npos);
+    assert(!std::filesystem::exists(other_ck));
+    assert(!std::filesystem::exists(refusal_out));
+
+    std::cout
+        << "test_trainer_accepts_a_resume_and_checkpoint_that_differ_only_by_a_dot_segment passed"
+        << std::endl;
+#endif
 }
 
 int main() {
@@ -1100,7 +3800,9 @@ int main() {
     test_self_symmetries_and_canonical_cells();
     test_transform_board();
     test_game_record_roundtrip();
+    test_game_record_requires_outcome();
     test_elo_system();
+    test_elo_scores_a_majority_match_as_a_win();
     test_coefficient_vector();
     test_self_play_records_legal_game();
     test_self_play_replays_prefix();
@@ -1109,15 +3811,53 @@ int main() {
     test_retry_explorer_forced_line();
     test_feature_extraction();
     test_data_collector_samples();
+    test_augmented_samples_match_manual_transforms();
     test_hill_climbing();
     test_genetic();
+    test_genetic_seed_covers_the_whole_box();
+    test_hill_climbing_empty_steps();
+    test_hill_climbing_effective_steps();
+    test_genetic_elite_single_evaluation();
     test_random_opening_line();
     test_trainer_round_promotes();
     test_trainer_round_rejects_regression();
+    test_trainer_keeps_rule_constants_through_promotion();
     test_trainer_genetic_round_and_status();
     test_trainer_rejects_bad_checkpoint();
     test_trainer_checkpoint_seed_and_counters();
     test_readers_reject_out_of_range_numbers();
+    test_sample_from_json_rejects_damaged();
+    test_sample_move_color_must_be_exact();
+    test_sample_refuses_unreadable_identity_keys();
+    test_play_game_counts_only_valid_games();
+    test_parameter_save_replaces_atomically();
+    test_checkpoint_save_replaces_atomically();
+    test_retry_rewind_keeps_engine_decisions();
+    test_generate_data_games_requires_outputs();
+    test_data_game_ids_unique_across_batches();
+    test_play_match_rounds_up_to_even();
+    test_write_failures_report_to_stderr();
+    test_buffered_write_failures_are_caught();
+    test_params_rejects_non_object_coefficients();
+    test_params_rejects_broken_rule_constants();
+    test_params_refuses_a_five_that_flattens_the_scale();
+    test_params_rejects_unrecognised_keys();
+    test_params_rejects_out_of_range_tunables();
+    test_params_rejects_cross_key_rewrites();
+    test_trainer_cli_rejects_non_finite_accept_score();
+    test_measure_fitness_flattens_rule_constants_for_candidates();
+    test_measure_fitness_leaves_default_rule_constants_alone();
+    test_collector_keeps_the_variant_that_moved_the_last_stone();
+    test_collector_still_drops_genuine_symmetry_duplicates();
+    test_trainer_refuses_an_empty_flag_value();
+    test_trainer_help_states_the_probe_budget();
+    test_server_refuses_no_sessions_with_a_stated_path();
+    test_trainer_refuses_a_seed_that_a_resume_would_drop();
+    test_trainer_refuses_one_file_for_both_out_and_checkpoint();
+    test_genetic_stagnation_count_is_per_run();
+    test_trainer_refuses_one_file_written_two_ways_for_out_and_checkpoint();
+    test_trainer_accepts_a_resume_and_checkpoint_that_differ_only_by_a_dot_segment();
+    test_data_game_ids_do_not_repeat_across_rounds();
 
     std::cout << "All training tests passed" << std::endl;
     return 0;

@@ -27,6 +27,7 @@
 - ✅ 棋型识别（活四、冲四、活三、眠三等），含缺口棋型：`XXX_X`/`XX_XX`/`X_XXX` 识为冲四（唯一五点即缺口），`X_XX`/`XX_X` 识为跳三
 - ✅ 组合棋型检测（四四、四三、三三）
 - ✅ 黑棋禁手检测（三三禁手、四四禁手、长连禁手），并已修正“只能成长连的四”：黑棋的四必须有恰好成五的冲点才算威胁（`XXXX_X` 是冲四而非活四，`X_XXXX_X` 不算四）
+- ✅ 单格评分按行棋方颜色判禁手：黑棋永远落不了的点（三三/四四/长连）不为黑棋记分，白棋也就不会把“防住”它算成防守价；恰好成五的点除外（成五是赢棋，不是禁手）。全盘评估一直是这条规则，现已覆盖 `evaluate_position` / `evaluate_position_pair` 及其下游（走法排序、贪心防守价、VCF/VCT 的静态分）
 - ✅ 贪心搜索算法
 - ✅ WebSocket 实时通信
 - ✅ 纯前端 Canvas 棋盘渲染
@@ -113,7 +114,7 @@ make -j$(nproc)
 ### 方法3：手动编译
 
 不推荐。服务器需要 `CMakeLists.txt` 里 `GOMOKU_SOURCES` 列出的**全部**源文件（core / search /
-optimization / server，外加 `src/training/params.cpp`）一起编译，头文件目录指向 Boost 与
+optimization / server，外加 `src/training/params.cpp` 与 `src/training/game_record.cpp`）一起编译，头文件目录指向 Boost 与
 nlohmann/json，链接 `-lpthread`，再把 `web/` 与 `data/` 复制到可执行文件旁边——开局库和局面模板
 都是按相对路径打开的。单独挑几个文件编译只会缺符号，文件清单以 `CMakeLists.txt` 为准。
 
@@ -158,12 +159,17 @@ cd build
 ```bash
 ./gomoku_server --sessions data/sessions        # 会话文件目录（默认值）
 ./gomoku_server --records data/x/records.jsonl  # 完局追加到的训练记录流
-./gomoku_server --no-sessions                   # 完全关闭落盘，对局只活在 socket 里
+./gomoku_server --no-sessions                   # 关闭落盘：不写会话文件，对局只活在这个进程的内存里（同进程重挂仍可续，进程一停就无可恢复）
 ```
 
 每局一个文件 `data/sessions/<token>.json`，内容见「会话与断线续局」。目录建不出来时服务器打印
 原因并关闭落盘继续运行——端口能服务、棋能下，比一个写不进去的目录重要；写盘失败同样只报在
 stdout，不会打断对局。`data/sessions/` 与 `data/training/` 都在 `.gitignore` 里。
+
+路径类选项（`--web-dir`、`--book`、`--sessions`、`--records`、`--params`）**给空串就是启动即报错退出**
+（退出码 1，错误信息点名是哪个 flag）：空路径多半是 shell 变量没展开，而不是「不要这个功能」，
+关闭有专门的 `--no-book` / `--no-sessions`。把 `--book ""` 当成禁用会让人以为开局库还在，
+把 `--sessions ""` 当成关闭则会让完局静默地不落盘。
 
 ## 自我训练（阶段3）
 
@@ -172,8 +178,8 @@ stdout，不会打断对局。`data/sessions/` 与 `data/training/` 都在 `.git
 1. 用遗传算法或爬山法在系数空间中搜索一个候选参数集；
 2. 让候选与当前冠军对战（每对组合执黑白各一次），得到验证分；
 3. 验证分 ≥ `--accept-score`（默认 0.56）才晋升为新冠军，并写入 `--out`；
-4. 生成若干盘自我对弈作为训练数据（对局记录 + 特征样本，JSONL 追加）；
-5. 保存 checkpoint，中断后可 `--resume` 继续。
+4. 生成若干盘自我对弈作为训练数据（对局记录 + 特征样本，JSONL 追加）；样本的 8 方向增强只折叠**真正重复**的读法——去重键同时含摆放、落子格与上一手格，自对称局面里被对称搬开的上一手各自留一份；
+5. 保存 checkpoint，中断后可 `--resume PATH`（断点文件路径）继续，续跑进度写回同一个文件。
 
 ```bash
 cd build
@@ -194,11 +200,11 @@ cd build
 | `--data-games` / `--threads` | 4 / 2 | 每轮采集数据的自我对弈盘数与并发线程 |
 | `--no-data` | — | 只调参，不采集数据 |
 | `--no-resign` | — | 训练对局中禁止认输（认输会截断数据） |
-| `--params` | 内置默认 | 起始参数文件 |
-| `--out` | `data/training/best_params.json` | 冠军参数输出位置 |
+| `--params` | 内置默认 | 起始参数文件；**不能与 `--resume` 同时给出**，两者都声称是本轮的起点，同给时启动即报错退出（退出码 1），因为续训会把断点里的系数整套换掉，这里载入的文件根本用不上 |
+| `--out` | `data/training/best_params.json` | 冠军参数输出位置；与 `--checkpoint` 指向同一个文件时启动即报错退出（退出码 1）——收尾的冠军写入会把断点换成参数文件，之后的 `--resume` 再也读不回来 |
 | `--records` / `--samples` | 空 | 对局记录 / 训练样本 JSONL |
-| `--checkpoint` | `data/training/checkpoint.json` | 断点文件 |
-| `--resume` | — | 从断点继续训练 |
+| `--checkpoint` | `data/training/checkpoint.json` | 断点文件；与 `--resume` 同时给出时必须指向同一个文件 |
+| `--resume` | — | 从断点继续训练，需要一个断点文件路径；进度写回该文件，与 `--checkpoint` 路径不同、或与 `--params`、`--seed` 同时给出，都是启动即报错退出（退出码 1）：续训的起点和随机种子都由断点文件说了算，另给的那一个只会读了被丢掉 |
 
 产物目录 `data/training/` 已被 `.gitignore` 忽略，训练不会污染仓库。
 
@@ -317,7 +323,8 @@ AI 不会自动落子。玩家随后选择执子颜色或直接落子，这局�
 
 - **执黑 / 执白**: 选择执子颜色（黑棋先行）
 - **悔棋**: 撤销上一步（会同时撤销 AI 的回应）
-- **求招**: 让 AI 给出当前最佳落子建议，结果标在棋盘上并写入状态栏
+- **求招**: 让 AI 给出当前最佳落子建议，结果标在棋盘上并写入状态栏；推荐算好后局面如果又落了一手，
+  这一份建议作废，服务器回一条错误而不是把旧局面里的着法画到新局面上；**已结束的对局一律拒绝求招**
 - **认输**: 认输结束对局
 - **终止**: 中断 AI 的当前思考
 - **重开**: 重置棋盘开始新对局
@@ -328,7 +335,7 @@ AI 不会自动落子。玩家随后选择执子颜色或直接落子，这局�
   之后可用 ⏮ ◀ ▶ ⏭ 逐手回看、**自动** 连续播放（再点变 **暂停**）、**✕** 退出回放回到当前局面
 - 回放中的棋盘左下角会标出“回放 · 第 N 手”；落子记录里的每一手都可以直接点击跳转
 - 评估曲线按**黑棋视角**绘制：引擎的分值属于刚落子的一方，因此白棋的分值取反后入图；
-  红点表示该手分值超出曲线量程（已证胜负）。曲线宽度随左栏宽度自适应
+  红点表示该手已证胜负（`|score| >= 99999`），而曲线本身只按 ±2000 截断——超量程的分值贴在边缘但并不画红点。曲线宽度随左栏宽度自适应
 - 悔棋会使已载入的分析失效（手数与索引都对不上），需要重新载入
 
 ### AI 设置
@@ -336,9 +343,11 @@ AI 不会自动落子。玩家随后选择执子颜色或直接落子，这局�
 - **超时秒**: AI 思考的最大时间（**秒**）。搜索越深需要越长的截止时间，所以这个框的取值范围由深度决定：
   最小 `深度 × 2`、最大 `深度 × 4`，改深度时自动回到该区间的最小值（默认即是），手填越界会被夹回来。
   下发服务器时换算成毫秒，服务器限制在 100–120000
-- **深度**: AI 搜索的最大深度（2–20）
+- **深度**: AI 搜索的最大深度（2–20）。输入框的范围只是网页规则，服务器对 `set_config` 与
+  `request_hint` 送来的 `max_depth` 一律夹到 1–20，回读到的即是夹取后的值
 - 两项改动会通过 `set_config` 立即下发，对本局后续的 AI 落子生效；恢复会话时按会话保存的值回填
-  （只刷新区间，不改动会话自带的截止时间）
+  （只刷新区间，不改动会话自带的截止时间）。回填是**逐键**的：会话文件里没写的那一项（`0`）沿用
+  服务器当前值，不会因为一项缺席就把另一项已保存的值一起丢掉
 
 ### 摆棋
 
@@ -367,7 +376,7 @@ AI 不会自动落子。玩家随后选择执子颜色或直接落子，这局�
   底栏换回对局面、摆棋记录随即消失，落子记录仍保留，**选择执子颜色后**才清空落子记录、按新局运行
 - **取消**: 退出摆棋，棋盘还原为对局当前局面，落子记录保留
 - 服务器拒绝（例如 AI 正在思考、局面不合法）时留在摆棋里，改好再点 **确认** 即可重试
-- **旋转 / 镜像** 是显示层变换，摆棋中同样可用，改的是视角而不是局面本身
+- **旋转 / 镜像** 是显示层变换，摆棋中同样可用，改的是视角而不是局面本身；摆棋期间顶栏归那条琥珀色指引，旋转/镜像只更新按钮自身与棋盘显示，不会把指引冲掉
 
 ## 项目结构
 
@@ -435,17 +444,20 @@ ctest --output-on-failure
 ./test_search
 ./test_position
 ./test_session
+./test_server
 ./test_training
 ```
 
 `test_position` 覆盖局面载入的三层：文本/数组/位棋盘/落子序列的解析、分隔与连写两种长串、
 五种标志表与混合符号拒绝、手数差 / 禁手 / 已有五连 / 满盘校验、`data/` 里七个模板文件都能载入、
 `set_position` 之后不开新局、可选边、可替换、可悔到空盘的行为，以及 `restore_game` 从记录重建整局
-（含摆棋的 `base` 子、悔棋后 `base` 跟着缩、摆不回来的记录整条拒绝）。
+（含摆棋的 `base` 子、**悔棋不会吃掉 `base` 子**——只剩摆棋子的局直接拒绝悔棋、摆不回来的记录整条拒绝）。
 
 `test_session` 对着真实的临时目录测会话文件：token 只认小写十六进制（`../etc/passwd` 这类一律拒绝，
 非法 token 连磁盘都不碰）、快照字段与内嵌 `GameRecord` 的原样往返、版本 / 状态 / `base` 损坏时的
-拒绝、`.tmp` + rename 之后不留临时文件、目录列举跳过 `*.txt` 与 `*.json.tmp`、被截断的 JSON 读不出来。
+拒绝、文本字段（`player_color` / `status` / `winner` / `reason`）**写了就必须是字符串**、写错类型整份拒收
+（缺失仍是「未设置」）、`created_ms` / `updated_ms` 写了就必须是整数、`timeout_ms` / `max_depth` 只允许 0（未设置）或落在 100–120000 / 1–20、
+`.tmp` + rename 之后不留临时文件、目录列举跳过 `*.txt` 与 `*.json.tmp`、被截断的 JSON 读不出来。
 
 ## WebSocket 消息协议
 
@@ -471,9 +483,10 @@ ctest --output-on-failure
 `position` 可以是局面对象，也可以是文本（粘贴的棋盘——分行、带分隔符或 225 格连写成一串，
 或整份 JSON 文档字符串）；顶层 `encoding` 会并入文档，作为调用方声明的标志映射。
 
-`resume` 是握手后的第一件事：token 认得就接回那局（`resumed: true`），认不得或格式不对就另开一局
-（`resumed: false` + 新 token），任何情况下都回一帧 `session`。token 只允许小写十六进制（它同时是
-文件名），非法值不会碰到磁盘。
+`resume` 是握手后的第一件事：token 认得就接回那局（`resumed: true`）；认不得、格式不对，或记录读得
+出来却重建不出棋盘的，就另开一局（`resumed: false` + 一个新 token）——那种不可读的记录文件原地保留
+在磁盘上、不再被覆写，供人工查看。任何情况下都回一帧 `session`。token 只允许小写十六进制（它同时
+是文件名），非法值不会碰到磁盘。
 
 ### 服务器 → 客户端
 
@@ -487,8 +500,9 @@ ctest --output-on-failure
 {"type": "game_over", "winner": "black", "reason": "five"}
 {"type": "game_restarted", "game_status": "waiting"}
 {"type": "session", "token": "9af83343549460e1", "resumed": true, "player_color": "black",
- "game_status": "playing", "current_turn": "white", "position_pending": false, "move_count": 6,
+ "game_status": "playing", "current_turn": "white", "position_pending": false, "move_count": 5,
  "winner": "", "reason": "", "timeout_ms": 5000, "max_depth": 8, "board": [[...]]}
+{"type": "session_taken_over", "token": "9af83343549460e1"}
 {"type": "replay", "game_over": true, "winner": "white", "reason": "resign",
  "moves": [{"row": 7, "col": 7, "color": "black", "method": "human",
             "score": 0, "depth": 0, "nodes": 0, "elapsed_ms": 0}],
@@ -505,11 +519,16 @@ ctest --output-on-failure
 `state_sync`（`choose_side` 的回应）与 `session`（`resume` 的回应、服务器开局新会话时的主动播报）
 携带**服务器权威棋盘**：前端必须照它们重画棋盘并采用其中的 `current_turn`，否则页面上可能显示服务器
 并没有的子。`thinking_progress` 的 `elapsed_ms` 与 `depth` 随迭代加深推进，`ai_move` 是这一次思考的
-终点。
+终点。终结全局的那一手先回落子帧再结算：玩家一子先 `move_made`、AI 一子先 `ai_move`，其后才是 `game_over`。
 
-`replay` 是本会话对局的逐手分析：`method` 为 `human` 表示玩家落子（无搜索数据），
-其余为引擎返回路径（`book` / `vcf` / `vct` / `alphabeta` / `greedy`）；
-`score` 是**刚落子一方**视角的分值，非 AlphaBeta 路径不填 `depth` / `nodes`。`base` 是摆棋摆上去、
+`session_taken_over` 只在同一个 token 被另一个标签页 `resume` 接管时出现：服务器把它发给被替掉的
+那个连接，随后立即 `close`（见「会话与断线续局」里的后到者接管）。客户端收到后取消重连定时器、
+不再自动重连（`reconnect` / `resume`），但 `localStorage` 里的 token 保留——刷新页面仍可把这局拿
+回来。
+
+`replay` 是本会话对局的逐手分析：`method` 为 `human` 表示玩家落子（无搜索数据），其余为引擎返回路径
+（`book` / `vcf` / `vct` / `alphabeta` / `greedy` / `forced` / `greedy_five` / `must_block`），后三条是搜索前的
+快速路径（只剩一个候选点、自己一手成五、对方一手成五不得不挡），它们照样落子、照样进分析；`score` 是**刚落子一方**视角的分值，非 AlphaBeta 路径不填 `depth` / `nodes`，这三条也一样。`must_block` 的 99000 只是防守标记分：它低于前端判定已证胜负的阈值（`|score| >= 99999`），既不会显示成「胜/负」，也不会在评估曲线上画红点，只是被 ±2000 截断后贴在曲线边缘的一个大分。`base` 是摆棋摆上去、
 `moves` 里没有的那些子：只有 `moves` 读不出摆棋对局的棋盘，前端重画时先铺 `base` 再按顺序落 `moves`，
 轮次也按两者之和取。
 
@@ -517,7 +536,12 @@ ctest --output-on-failure
 `error` 消息，方便表单内联显示。`encoding` 只在棋盘形式下出现（位棋盘与落子序列没有标志可言）。
 `set_position` 失败才走 `error`，成功回 `position_set`，其中 `position_pending: true` 表示局面已
 摆好但尚未开局：此时 `choose_side` 仍然可用，AI 不会自己落子。带 `board` 的文档必须说明 `encoding`
-（文件里写好，或 `check_position` 之后由玩家确认再带上），否则会被拒绝。
+（文件里写好，或 `check_position` 之后由玩家确认再带上），否则会被拒绝；数组形式把空格写成 `""` 时，识别就按该族的空位读它，回显给出的是该族的规范标志（`.` 或 `空`），照这份回显带回来仍能原样载入同一份格子。
+
+`set_position` 抹掉上一局之前会先把它结算回它自己的会话文件：上一局有内容（落过子、摆过子或选过边）
+时按 `重开` 同款换一个新 token——旧文件留在旧 token 名下不再被覆写，客户端从随后的 `session` 帧里
+拿到新 token；只有没动过的空局才原地接着用——摆棋摆了一份**全空**的局面同样算没动过，它一颗子都没摆。摆棋开局的上一局按已有导出规则不进 `records.jsonl`，
+只留在会话文件里。新局的会话文件 `created_ms` 从这一刻重新起算。
 
 ### 连接保活与重连
 
@@ -540,8 +564,9 @@ ctest --output-on-failure
 - 连接断开只是 **detach**：停止并 join 那条正在写这个 socket 的搜索线程、清空回调、立刻落一次盘，
   棋局本身留在表里 30 分钟。期间 `resume` 回来是热挂载；超过 30 分钟则退回磁盘态（快照进 cold
   索引、引擎释放掉），再 `resume` 时按记录重建棋盘——token 依旧有效。
-- 同一个 token 被第二个标签页 `resume` 时后到者接管：先关掉旧连接、停下它可能正在跑的思考，再按
-  当前局面重新武装 AI。
+- 同一个 token 被第二个标签页 `resume` 时后到者接管：先给旧连接发一帧 `session_taken_over` 再关掉
+  它、停下它可能正在跑的思考，再按当前局面重新武装 AI；旧标签页收到告知后不再自动重连（token 仍
+  保留，刷新可取回）。
 - 每 10 秒扫一遍会话表，把**内容变了**的会话原子写入 `data/sessions/<token>.json`（先写 `.tmp`
   再 rename，进程死在中途也不会留下半个文件）；一子未落的空会话不写，所以反复点“重开”不会攒出
   垃圾文件。收到退出信号时同样刷一遍，Ctrl+C 不会丢掉最后一个 10 秒。
@@ -555,8 +580,8 @@ ctest --output-on-failure
 `session` 是权威状态帧：`board` 是服务器此刻的棋盘，`move_count` 是盘上子数，`player_color` 为空
 表示还没有人选边，`position_pending` 表示摆好的局面尚未开局。前端在 `resumed: true` 时照它重画并
 补一次 `request_replay` 取回逐手分析（回来的状态是“已恢复对局 / 已恢复摆好的局面”，且停在实时视角
-而不是回放第 1 手）；在 `resumed: false` 时只保存 token、不动本地状态，免得盖掉同一批请求自己的
-回应。`重开` 会把手上那局结算成文件并换一个新 token，旧文件仍然可以凭 token 找回来看。
+而不是回放第 1 手）；`resumed: false` 分两种：自己请求过 `resume` 却没找回局面的，照这一帧把本地装成
+服务器那副空局（棋盘、落子记录、摆棋与思考标记全清，但不补发 `request_replay`），没请求过的广播帧只保存 token、不动本地状态，免得盖掉同一批请求自己的回应。`重开` 会把手上那局结算成文件并换一个新 token，旧文件仍然可以凭 token 找回来看。
 
 ## 开发计划
 
@@ -580,7 +605,7 @@ ctest --output-on-failure
 - ✅ 训练主循环与断点续训（3.6）
 
 > 说明：训练对象是**威胁系数**，`five` 与 `forbidden_penalty` 不参与调参——前者是 AlphaBeta
-> 的将杀阈值（硬编码 100000）与静态评估上限的公共基准，后者是规则而非棋力。
+> 的将杀阈值（硬编码 100000）与静态评估上限的公共基准，后者是规则而非棋力。轮内给候选算 fitness 时这两个常量一律取**冠军**的取值，比较的双方永远同一条规则。
 > “悔棋再战”从最靠近终局、且还有未尝试分支的那一步重新展开，配合 D4 对称类去重，
 > 使重复的镜像变化不占用探索预算。
 

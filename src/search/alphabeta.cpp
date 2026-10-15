@@ -11,6 +11,13 @@ AlphaBetaSearch::AlphaBetaSearch(const Evaluator& evaluator, TranspositionTable&
       move_time_limit_ms_(5000), nodes_searched_(0) {}
 
 bool AlphaBetaSearch::is_timeout() const {
+    // The engine hands us an absolute move deadline along with the slice of the
+    // budget still left. Once that deadline has passed the whole move is over
+    // budget, so stop instead of running another slice. Without a deadline the
+    // per-search limit is all we have.
+    if (has_deadline_) {
+        return std::chrono::steady_clock::now() >= deadline_;
+    }
     auto now = std::chrono::high_resolution_clock::now();
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         now - start_time_).count();
@@ -32,12 +39,16 @@ std::vector<Move> AlphaBetaSearch::generate_moves(const Board& board, int color)
 
 void AlphaBetaSearch::sort_moves(std::vector<Move>& moves, const Board& board, int color,
                                   const Move& tt_move) {
+    // The TT move earns its place by the previous search, so it must stay at
+    // index 0 and out of the heuristic re-ordering below. Looking for it
+    // anywhere but the front used to leave it unpinned when it already was the
+    // first move, which is exactly the common case.
     bool tt_swapped = false;
     if (tt_move.pos.is_valid()) {
         auto it = std::find_if(moves.begin(), moves.end(),
             [&](const Move& m) { return m.pos.row == tt_move.pos.row && m.pos.col == tt_move.pos.col; });
-        if (it != moves.begin() && it != moves.end()) {
-            std::iter_swap(moves.begin(), it);
+        if (it != moves.end()) {
+            if (it != moves.begin()) std::iter_swap(moves.begin(), it);
             tt_swapped = true;
         }
     }
@@ -48,7 +59,7 @@ void AlphaBetaSearch::sort_moves(std::vector<Move>& moves, const Board& board, i
     //
     // Callers pass a move list that generate_moves has already filtered
     // against is_forbidden for BLACK, so calling evaluate_position_both here
-    // would rerun is_forbidden (which does a second recognize_combined) on
+    // would rerun is_forbidden (which does a second recognize_position) on
     // every node of every ply. Score both sides directly and skip that
     // redundant work.
     int start = tt_swapped ? 1 : 0;
@@ -81,6 +92,7 @@ int AlphaBetaSearch::quiescence(Board& board, int alpha, int beta, int color,
     // an unbounded quiescence subtree.
     nodes_searched_++;
     if (nodes_searched_ > node_limit_ || stop_flag.load() || is_timeout()) {
+        aborted_ = true;
         return evaluator_.evaluate_board(board, color);
     }
 
@@ -95,6 +107,7 @@ int AlphaBetaSearch::quiescence(Board& board, int alpha, int beta, int color,
 
     const auto& candidates = board.active_empty();
     std::vector<std::pair<int, Move>> scored;
+    scored.reserve(candidates.size());
 
     for (const auto& pos : candidates) {
         if (!board.is_empty(pos.row, pos.col)) continue;
@@ -111,12 +124,13 @@ int AlphaBetaSearch::quiescence(Board& board, int alpha, int beta, int color,
         }
 
         if (is_threat) {
-            if (color == BLACK && PatternRecognizer::is_forbidden(board, pos.row, pos.col, color)) {
+            if (color == BLACK && PatternRecognizer::is_forbidden_from_pattern(pattern)) {
                 continue;
             }
             // Score from the pattern we just recognized; calling
             // evaluate_position here would re-run the same four scans.
-            int s = evaluator_.evaluate_position_with_pattern(board, pos.row, pos.col, pattern);
+            int s = evaluator_.evaluate_position_with_pattern(board, pos.row, pos.col, pattern,
+                                                              color);
             scored.emplace_back(s, Move(pos.row, pos.col, color));
         }
     }
@@ -130,7 +144,10 @@ int AlphaBetaSearch::quiescence(Board& board, int alpha, int beta, int color,
 
     for (const auto& entry : scored) {
         const Move& move = entry.second;
-        if (stop_flag.load() || is_timeout()) break;
+        if (stop_flag.load() || is_timeout()) {
+            aborted_ = true;
+            break;
+        }
 
         board.place_stone(move.pos.row, move.pos.col, color);
 
@@ -158,6 +175,7 @@ int AlphaBetaSearch::alphabeta(Board& board, int depth, int alpha, int beta, int
                                 std::atomic<bool>& stop_flag) {
     nodes_searched_++;
     if (nodes_searched_ > node_limit_ || stop_flag.load() || is_timeout()) {
+        aborted_ = true;
         // Only the last-placed stone can have produced a five; check_winner()
         // would scan all 225 cells and then is_game_over() would scan them
         // again. This abort path fires very frequently during iterative
@@ -207,9 +225,10 @@ int AlphaBetaSearch::alphabeta(Board& board, int depth, int alpha, int beta, int
 
     for (const auto& move : moves) {
         if (stop_flag.load() || is_timeout() || nodes_searched_ > node_limit_) {
-            // Search aborted: siblings went unsearched, so only a LOWERBOUND
-            // on the true value is sound. Never store EXACT or UPPERBOUND here.
-            flag = TTFlag::LOWERBOUND;
+            // Search aborted: the scores that made up best_score came out of
+            // short-circuit static evaluations, so not even a LOWERBOUND is
+            // sound and this search stores nothing further (see aborted_).
+            aborted_ = true;
             break;
         }
 
@@ -233,7 +252,7 @@ int AlphaBetaSearch::alphabeta(Board& board, int depth, int alpha, int beta, int
         }
     }
 
-    if (best_score > -100000 && best_score < 100000) {
+    if (!aborted_ && best_score > -100000 && best_score < 100000) {
         tt_.store(hash, depth, best_score, best_move, flag);
     }
 
@@ -244,6 +263,7 @@ Move AlphaBetaSearch::search(const Board& board, int color, int max_depth,
                               int time_limit_ms, std::atomic<bool>& stop_flag) {
     move_time_limit_ms_ = time_limit_ms;
     nodes_searched_ = 0;
+    aborted_ = false;
     // Reset the reported info each search. An aborted or early-return search
     // must not hand the caller the previous search's depth/score.
     info_ = SearchInfo{};
@@ -262,7 +282,9 @@ Move AlphaBetaSearch::search(const Board& board, int color, int max_depth,
 
     auto root_moves = generate_moves(board, color);
     if (root_moves.empty()) {
-        return Move(BOARD_SIZE / 2, BOARD_SIZE / 2, color);
+        // An invalid move says "nothing to play". The centre square may already
+        // be occupied, or be a forbidden point for BLACK.
+        return Move();
     }
 
     if (root_moves.size() == 1) {
@@ -294,6 +316,9 @@ Move AlphaBetaSearch::search(const Board& board, int color, int max_depth,
         int beta = INT_MAX;
         int depth_best_score = -INT_MAX;
         Move depth_best_move;
+        // The layer's own record of whether it ran to the end. A deadline that
+        // crosses after the last root move must not discard a fully searched layer.
+        bool layer_complete = true;
 
         // Re-copied per iteration on purpose. undo_last_move() restores the
         // candidate list by swap-remove, so a board that has already played and
@@ -303,7 +328,10 @@ Move AlphaBetaSearch::search(const Board& board, int color, int max_depth,
         // change which equal-valued moves get searched first.
         Board mutable_board = board;
         for (const auto& move : root_moves) {
-            if (stop_flag.load() || is_timeout() || nodes_searched_ > node_limit_) break;
+            if (stop_flag.load() || is_timeout() || nodes_searched_ > node_limit_) {
+                layer_complete = false;
+                break;
+            }
 
             mutable_board.place_stone(move.pos.row, move.pos.col, color);
 
@@ -321,12 +349,21 @@ Move AlphaBetaSearch::search(const Board& board, int color, int max_depth,
             }
         }
 
-        if (!stop_flag.load() && !is_timeout() && nodes_searched_ <= node_limit_) {
+        if (layer_complete && !stop_flag.load() && !aborted_) {
             best_move = depth_best_move;
             best_score = depth_best_score;
             info_.depth = depth;
             info_.score = best_score;
             info_.best_move = best_move;
+            // Only a completed layer reports: a layer cut short by stop or
+            // timeout never reaches here, so no frame carries a depth that was
+            // not actually searched.
+            if (progress_callback_) {
+                const int elapsed_ms = static_cast<int>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::high_resolution_clock::now() - start_time_).count());
+                progress_callback_(info_.depth, nodes_searched_, elapsed_ms);
+            }
 
             // Feed the shallow iteration's winner back into the root order so
             // deeper iterations inherit the cutoff / TT-move effect that makes

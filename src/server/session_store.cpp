@@ -1,5 +1,7 @@
 #include "session_store.h"
 
+#include "training/json_int.h"
+
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -86,8 +88,11 @@ bool session_from_json(const std::string& text, SessionSnapshot& out, std::strin
         error = "会话文件不是合法 JSON";
         return false;
     }
-    if (!root.is_object() || !root.contains("version") || !root["version"].is_number_integer() ||
-        root["version"].get<int>() != 1) {
+    // get<int> only casts, so a 64-bit version like 4294967297 would read back
+    // as 1 and be accepted as this format.
+    int version = 0;
+    if (!root.is_object() || !root.contains("version") ||
+        !read_json_int(root["version"], version) || version != 1) {
         error = "会话文件版本不认识";
         return false;
     }
@@ -103,24 +108,56 @@ bool session_from_json(const std::string& text, SessionSnapshot& out, std::strin
 
     SessionSnapshot snap;
     snap.token = root["token"].get<std::string>();
-    auto read_string = [&root](const char* key, std::string& dst) {
-        if (root.contains(key) && root[key].is_string()) dst = root[key].get<std::string>();
+    // Absent means the writer never set it. Present has to be the string itself:
+    // read back into "", a non-string winner would look like "not decided" and
+    // resume a game whose ending changed (the rule position_pending/base follow).
+    auto read_string = [&root, &error](const char* key, std::string& dst) {
+        if (!root.contains(key)) return true;
+        if (!root[key].is_string()) {
+            error = std::string("会话里的 ") + key + " 不是字符串";
+            return false;
+        }
+        dst = root[key].get<std::string>();
+        return true;
     };
     auto read_number = [&root](const char* key, long long& dst) {
-        if (root.contains(key) && root[key].is_number_integer()) dst = root[key].get<long long>();
+        if (!root.contains(key)) return true;
+        if (!root[key].is_number_integer()) return false;
+        dst = root[key].get<long long>();
+        return true;
     };
     auto read_int = [&root](const char* key, int& dst) {
-        if (root.contains(key) && root[key].is_number_integer()) dst = root[key].get<int>();
+        return !root.contains(key) || read_json_int(root[key], dst);
     };
-    read_string("player_color", snap.player_color);
-    read_string("status", snap.status);
-    read_string("winner", snap.winner);
-    read_string("reason", snap.reason);
-    read_number("created_ms", snap.created_ms);
-    read_number("updated_ms", snap.updated_ms);
-    read_int("timeout_ms", snap.timeout_ms);
-    read_int("max_depth", snap.max_depth);
-    if (root.contains("position_pending") && root["position_pending"].is_boolean()) {
+    if (!read_string("player_color", snap.player_color)) return false;
+    if (!read_string("status", snap.status)) return false;
+    if (!read_string("winner", snap.winner)) return false;
+    if (!read_string("reason", snap.reason)) return false;
+    // 键存在就不是「没声明」：静默留 0 会让 open_session 把自己的 now_ms 当成
+    // 出生时间写回文件，一个文件里从来没写过的值被改写，真实出生时间消失。
+    if (!read_number("created_ms", snap.created_ms)) {
+        error = "会话里的创建时间不合法";
+        return false;
+    }
+    if (!read_number("updated_ms", snap.updated_ms)) {
+        error = "会话里的更新时间不合法";
+        return false;
+    }
+    if (!read_int("timeout_ms", snap.timeout_ms)) {
+        error = "会话里的超时时间不合法";
+        return false;
+    }
+    if (!read_int("max_depth", snap.max_depth)) {
+        error = "会话里的搜索深度不合法";
+        return false;
+    }
+    // Absent means "not a hand-set position"; present has to be the flag itself,
+    // or a 1 would quietly resume a setup board as a live game.
+    if (root.contains("position_pending")) {
+        if (!root["position_pending"].is_boolean()) {
+            error = "会话里的摆棋待定标记不是布尔值";
+            return false;
+        }
         snap.position_pending = root["position_pending"].get<bool>();
     }
 
@@ -133,6 +170,31 @@ bool session_from_json(const std::string& text, SessionSnapshot& out, std::strin
         error = "会话状态不认识: " + snap.status;
         return false;
     }
+    // An empty player colour is the writer's "nobody has chosen yet"; anything
+    // else outside that set would resume the player on the wrong side.
+    if (snap.player_color != "" && snap.player_color != "black" && snap.player_color != "white") {
+        error = "会话里的玩家颜色不认识: " + snap.player_color;
+        return false;
+    }
+    // Same for the winner: an unreadable one is not a missing result, it is a
+    // damaged file, and the resumed session would announce a different ending.
+    if (snap.winner != "" && snap.winner != "black" && snap.winner != "white" &&
+        snap.winner != "draw") {
+        error = "会话里的胜者不认识: " + snap.winner;
+        return false;
+    }
+    // 0 is the writer's "never set" sentinel (SessionSnapshot's default and the
+    // value server.cpp's resume path tests with > 0); any other value must be a
+    // real config, inside the same intervals clamp_timeout_ms/clamp_max_depth
+    // enforce at message boundaries: [100, 120000] ms for timeout, [1, 20] depth.
+    if (snap.timeout_ms != 0 && (snap.timeout_ms < 100 || snap.timeout_ms > 120000)) {
+        error = "会话里的超时时间不合法";
+        return false;
+    }
+    if (snap.max_depth != 0 && (snap.max_depth < 1 || snap.max_depth > 20)) {
+        error = "会话里的搜索深度不合法";
+        return false;
+    }
     // Absent means no hand-set position, which is the common case. A present but
     // malformed base is refused rather than skipped: silently dropping those
     // stones would resume the player into a different position than they left.
@@ -142,10 +204,14 @@ bool session_from_json(const std::string& text, SessionSnapshot& out, std::strin
             return false;
         }
         for (const auto& entry : root["base"]) {
-            if (!entry.is_object() || !entry.contains("row") || !entry.contains("col") ||
-                !entry["row"].is_number_integer() || !entry["col"].is_number_integer() ||
-                entry["row"].get<int>() < 0 || entry["row"].get<int>() >= BOARD_SIZE ||
-                entry["col"].get<int>() < 0 || entry["col"].get<int>() >= BOARD_SIZE) {
+            if (!entry.is_object() || !entry.contains("row") || !entry.contains("col")) {
+                error = "会话里的摆棋棋子读不出来";
+                return false;
+            }
+            int row = -1;
+            int col = -1;
+            if (!read_json_int(entry["row"], row) || !read_json_int(entry["col"], col) ||
+                row < 0 || row >= BOARD_SIZE || col < 0 || col >= BOARD_SIZE) {
                 error = "会话里的摆棋棋子读不出来";
                 return false;
             }
@@ -157,7 +223,7 @@ bool session_from_json(const std::string& text, SessionSnapshot& out, std::strin
                 error = "会话里的摆棋棋子没有颜色";
                 return false;
             }
-            snap.base.emplace_back(entry["row"].get<int>(), entry["col"].get<int>(), color);
+            snap.base.emplace_back(row, col, color);
         }
     }
     out = std::move(snap);
@@ -188,6 +254,8 @@ bool save_session(const std::string& dir, const SessionSnapshot& snap, std::stri
         file.flush();
         if (!file.good()) {
             error = "写入 " + tmp + " 中途失败";
+            std::error_code remove_ec;
+            std::filesystem::remove(tmp, remove_ec);
             return false;
         }
     }
@@ -209,7 +277,17 @@ bool load_session(const std::string& dir, const std::string& token, SessionSnaps
     }
     std::string text;
     if (!read_file(path, text, error)) return false;
-    return session_from_json(text, out, error);
+    if (!session_from_json(text, out, error)) return false;
+    // A file stands for the session whose token it names: writes and deletes
+    // both go by that name, so a renamed file would be indexed under a name no
+    // later write can ever reach, and the resume would hand back a different
+    // game than the URL promised. Refuse it and leave the file alone - it is the
+    // user's data, not ours to remove.
+    if (out.token != token) {
+        error = "会话文件的文件名与内容里的 token 不一致";
+        return false;
+    }
+    return true;
 }
 
 std::vector<std::string> list_sessions(const std::string& dir) {
@@ -231,13 +309,19 @@ bool delete_session(const std::string& dir, const std::string& token, std::strin
         error = "非法 token";
         return false;
     }
-    std::error_code ec;
-    std::filesystem::remove(path, ec);
-    std::filesystem::remove(path + kTmpSuffix, ec);
-    if (ec) {
-        error = "无法删除 " + path + ": " + ec.message();
+    // Separate error slots: remove() resets ec for a file that is simply
+    // absent, so one shared code let the .tmp sweep overwrite a real failure
+    // on the main file and report success with the session still on disk.
+    std::error_code main_ec;
+    std::filesystem::remove(path, main_ec);
+    if (main_ec) {
+        error = "无法删除 " + path + ": " + main_ec.message();
         return false;
     }
+    // The stray .tmp is best-effort: its absence is not an error, and neither
+    // is failing to sweep it.
+    std::error_code tmp_ec;
+    std::filesystem::remove(path + kTmpSuffix, tmp_ec);
     return true;
 }
 

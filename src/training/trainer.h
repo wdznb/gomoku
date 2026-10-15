@@ -116,8 +116,10 @@ private:
     double play_match(const ThreatCoefficients& candidate, const ThreatCoefficients& reference,
                       int games);
     // Score for whoever holds the stones passed as `black_owner` (1 = the
-    // candidate, 2 = the reference) once the game finishes.
-    double play_game(SearchEngine& black, SearchEngine& white, int black_owner);
+    // candidate, 2 = the reference). `played` says whether the game happened at
+    // all: a discarded INVALID one is not a draw and leaves the denominator.
+    double play_game(SearchEngine& black, SearchEngine& white, int black_owner,
+                     bool* played = nullptr);
     SearchEngine& prepare(SearchEngine& engine) const;
     int generate_data_games(int games, int threads);
 

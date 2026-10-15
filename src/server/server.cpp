@@ -1,5 +1,6 @@
 #include "server.h"
 #include "position_json.h"
+#include "training/json_int.h"
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -17,10 +18,25 @@ namespace {
 // type_error, which unwinds past the handler's own validation into do_read's
 // generic catch and leaves the client with no reply. Read integers defensively
 // so a malformed field is treated as the default and the handler still
-// validates and responds.
+// validates and responds. The same reasoning covers width: get<int> only casts,
+// so {"row":4294967304} would arrive as 8 and pass the 0-14 square check, while
+// read_json_int refuses anything that does not fit an int and the fallback lets
+// the handler reject the move instead of playing a truncated square.
 int get_int(const json& msg, const char* key, int fallback) {
-    if (!msg.contains(key) || !msg[key].is_number_integer()) return fallback;
-    return msg[key].get<int>();
+    int value = 0;
+    if (!msg.contains(key) || !read_json_int(msg[key], value)) return fallback;
+    return value;
+}
+
+// Config fields are per-message overrides: one the frame does not carry keeps the
+// value the session already has, so a client that sends only max_depth does not
+// have the timeout it chose earlier reset under it. A value that is present but
+// not a representable integer counts as not sent, which is also what stops the
+// 64-bit truncation get_int defends against from reaching the game.
+int get_int_or(const json& msg, const char* key, int current) {
+    int value = 0;
+    if (!msg.contains(key) || !read_json_int(msg[key], value)) return current;
+    return value;
 }
 
 // Pull the position payload out of a check_position / set_position message.
@@ -36,10 +52,24 @@ bool read_position_payload(const json& msg, json& doc, std::string& error) {
     if (value.is_object()) {
         doc = value;
     } else if (value.is_string()) {
-        const std::string text = value.get<std::string>();
+        std::string text = value.get<std::string>();
+        // Same rule as position_from_text: the three bytes at the very start are a
+        // BOM, not content, and leaving them makes json::parse discard a legal
+        // document, which then takes the grid branch below.
+        if (text.size() >= 3 && static_cast<unsigned char>(text[0]) == 0xEF &&
+            static_cast<unsigned char>(text[1]) == 0xBB &&
+            static_cast<unsigned char>(text[2]) == 0xBF) {
+            text.erase(0, 3);
+        }
         json parsed = json::parse(text, nullptr, false);
-        if (parsed.is_object() || parsed.is_array()) {
+        if (parsed.is_object()) {
             doc = std::move(parsed);
+        } else if (parsed.is_array()) {
+            // A bare array is the board matrix, not a document: merging
+            // `encoding` into it would index an array with a string and throw out
+            // of the handler before any frame goes back.
+            doc = json::object();
+            doc["board"] = std::move(parsed);
         } else {
             // Not a document, so a grid: CSV, txt, or one long flat run of
             // symbols. A numeric grid parses as a JSON *number* ("100...0" is a
@@ -216,7 +246,7 @@ void WebSocketSession::start() {
 
 // Re-arm rather than replace: the expiry set once at accept would cap how long a
 // connection may live, not how long it may be silent, and every session would
-// drop 60 s after the page loaded no matter how busy the game was.
+// drop one idle timeout after the page loaded no matter how busy the game was.
 void WebSocketSession::arm_idle() {
     ws_.next_layer().expires_after(std::chrono::seconds(kIdleTimeoutSeconds));
 }
@@ -243,6 +273,14 @@ void WebSocketSession::run_websocket() {
         [](websocket::response_type& res) {
             res.set(boost::beast::http::field::server, "GomokuAI");
         }));
+    // The cap on a buffered inbound message is stated here rather than left to
+    // whatever the Boost build happens to default it to, because do_read()
+    // accumulates a fragmented message whole before any handler runs - the 225-stone
+    // and timeout checks downstream come too late. The number is the frame size the
+    // position loader already assumes on this wire (position_json.cpp's "The wire
+    // allows a 16 MiB frame"); past it Beast fails the read with message_too_big and
+    // the existing error path drops the socket.
+    ws_.read_message_max(16u * 1024u * 1024u);
 
     ws_.async_accept(
         req_,
@@ -336,11 +374,31 @@ void WebSocketSession::do_write() {
                 return;
             }
             self->send_queue_.pop();
+            if (self->send_queue_.empty() && self->close_after_drain_) {
+                self->drop_socket();
+                return;
+            }
             self->do_write();
         });
 }
 
 void WebSocketSession::close() {
+    // Deferred behind the write queue: a frame sent just before this (the
+    // takeover notice) must leave first. A plain TCP drop here would discard
+    // the queue, and Beast's close handshake cannot order it either - its
+    // close op takes the write lock the moment the in-flight write ends and
+    // runs before the write completion handler (write.hpp unlocks wr_block and
+    // invokes op_close first), preempting everything still queued.
+    net::post(ws_.get_executor(), [self = shared_from_this()] {
+        if (!self->send_queue_.empty()) {
+            self->close_after_drain_ = true;
+            return;
+        }
+        self->drop_socket();
+    });
+}
+
+void WebSocketSession::drop_socket() {
     // Not Beast's closing handshake: that waits for the peer to answer, and this
     // runs from another socket's handler on the one io thread, so a peer that is
     // already gone or never answers would stop the server for every game on it.
@@ -374,12 +432,17 @@ std::filesystem::path WebSocketSession::resolve_file(const std::string& target) 
     }
 
     std::string rel = p.substr(1);
+    // `..` is refused by name because it asks for a file outside web_dir_. A
+    // single `.` is the opposite: it names this directory, so `/./index.html`
+    // is index.html and must be served. It is left in place - weakly_canonical
+    // below collapses it - and the canonical path is then required to start
+    // with web_dir_, which is what actually decides the matter.
     size_t start = 0;
     while (start <= rel.size()) {
         size_t slash = rel.find('/', start);
         std::string part = rel.substr(start,
             slash == std::string::npos ? std::string::npos : slash - start);
-        if (part == ".." || part == ".") return {};
+        if (part == "..") return {};
         if (slash == std::string::npos) break;
         start = slash + 1;
     }
@@ -418,18 +481,34 @@ std::string WebSocketSession::get_content_type(const std::string& path) {
 void WebSocketSession::handle_http_request() {
     res_ = std::make_shared<http::response<http::string_body>>();
 
-    std::filesystem::path file = resolve_file(std::string(req_.target()));
-    std::ifstream in(file, std::ios::binary);
-    if (!file.empty() && in) {
-        std::ostringstream ss;
-        ss << in.rdbuf();
-        res_->body() = ss.str();
-        res_->result(http::status::ok);
-        res_->set(http::field::content_type, get_content_type(file.string()));
+    // One port, two protocols: a browser GETs index.html/app.js/style.css from
+    // web_dir_ and then upgrades the WebSocket, so a plain request is only ever
+    // a request for a static file. A HEAD asks for the headers of that same
+    // file and is answered with no body; any other method is not a read this
+    // handler knows how to serve, and handing back the file would tell the
+    // client its write had been accepted.
+    const bool is_get = req_.method() == http::verb::get;
+    const bool is_head = req_.method() == http::verb::head;
+
+    if (is_get || is_head) {
+        std::filesystem::path file = resolve_file(std::string(req_.target()));
+        std::ifstream in(file, std::ios::binary);
+        if (!file.empty() && in) {
+            std::ostringstream ss;
+            ss << in.rdbuf();
+            if (is_get) res_->body() = ss.str();
+            res_->result(http::status::ok);
+            res_->set(http::field::content_type, get_content_type(file.string()));
+        } else {
+            res_->result(http::status::not_found);
+            res_->set(http::field::content_type, "text/plain; charset=utf-8");
+            if (is_get) res_->body() = "Not found";
+        }
     } else {
-        res_->result(http::status::not_found);
+        res_->result(http::status::method_not_allowed);
         res_->set(http::field::content_type, "text/plain; charset=utf-8");
-        res_->body() = "Not found";
+        res_->set(http::field::allow, "GET, HEAD");
+        res_->body() = "Method Not Allowed";
     }
 
     res_->version(req_.version());
@@ -457,7 +536,8 @@ GameServer::GameServer(int port, const std::string& web_dir,
                        const std::string& records_path)
     : ioc_(), acceptor_(net::make_strand(ioc_)),
       signals_(ioc_, SIGINT, SIGTERM), web_dir_(web_dir),
-      sessions_dir_(sessions_dir), records_path_(records_path), flush_timer_(ioc_) {
+      sessions_dir_(sessions_dir), records_path_(records_path), flush_timer_(ioc_),
+      accept_retry_timer_(ioc_) {
     if (coefficients) {
         coefficients_ = *coefficients;
         use_loaded_coefficients_ = true;
@@ -525,6 +605,7 @@ void GameServer::stop() {
     beast::error_code ec;
     acceptor_.close(ec);
     flush_timer_.cancel();
+    accept_retry_timer_.cancel();
     signals_.cancel();
     ioc_.stop();
 }
@@ -534,12 +615,21 @@ void GameServer::do_accept() {
         net::make_strand(ioc_),
         [this](beast::error_code ec, tcp::socket socket) {
             if (ec) {
-                if (ec != net::error::operation_aborted) {
-                    std::cerr << "Accept error: " << ec.message() << std::endl;
-                }
+                // Only a shutdown ends the accept loop. Everything else is
+                // transient - no_descriptors and network_down come and go, and a
+                // client that resets mid-accept is one connection, not a dead
+                // server - so the loop re-arms itself rather than leaving the
+                // listening socket with nothing waiting on it. The timer paces the
+                // retry so a failure that does NOT go away cannot spin the loop.
+                if (ec == net::error::operation_aborted) return;
+                std::cerr << "Accept error: " << ec.message() << std::endl;
+                accept_retry_timer_.expires_after(std::chrono::milliseconds(100));
+                accept_retry_timer_.async_wait([this](beast::error_code wait_ec) {
+                    if (!wait_ec) do_accept();
+                });
                 return;
             }
-            
+
             auto session = std::make_shared<WebSocketSession>(std::move(socket), web_dir_);
             on_connect(session);
             session->start();
@@ -595,10 +685,13 @@ void GameServer::handle_message(std::shared_ptr<WebSocketSession> session, const
         handle_resume(session, msg);
         return;
     }
-    if (type != "ping") {
+    if (type != "ping" && type != "check_position") {
         // Every game message is played in a session: the socket's own if it
         // already has one, a new one otherwise. `ping` is excluded because a
         // keepalive is not a player, and `resume` because it brings its own.
+        // `check_position` is excluded because it is a dry run: opening a
+        // session for it would hand the client a fresh token and lose the
+        // game it was about to set a position in.
         if (!ensure_attached(session)) return;
     }
 
@@ -660,16 +753,10 @@ void GameServer::handle_choose_side(std::shared_ptr<WebSocketSession> session, c
         send_error(session, "Cannot choose side after the game has started");
         return;
     }
-    // An empty board can still be in GAME_OVER status if the previous game
-    // was resigned before any move was made. Without clearing that status
-    // here, make_move would reject every subsequent player move (its status
-    // guard short-circuits first) and the AI worker would also refuse to
-    // commit its move, so the session would lock up immediately.
-    if (game->status() == GameStatus::GAME_OVER) {
-        game->reset();
-    }
     // A malformed or unknown color must not silently mean WHITE: the client
     // would get a "playing" state_sync with inverted board colors and no error.
+    // And it must not touch the board either: validating before the reset below
+    // keeps a rejected "red" from wiping a finished game's state.
     if (!msg.contains("color") || !msg["color"].is_string()) {
         send_error(session, "choose_side requires a \"color\" of \"black\" or \"white\"");
         return;
@@ -678,6 +765,18 @@ void GameServer::handle_choose_side(std::shared_ptr<WebSocketSession> session, c
     if (color_str != "black" && color_str != "white") {
         send_error(session, "Invalid color: " + color_str);
         return;
+    }
+    // An empty board can still be in GAME_OVER status if the previous game
+    // was resigned before any move was made. Without clearing that status
+    // here, make_move would reject every subsequent player move (its status
+    // guard short-circuits first) and the AI worker would also refuse to
+    // commit its move, so the session would lock up immediately.
+    if (game->status() == GameStatus::GAME_OVER) {
+        game->reset();
+        // The export stamp describes the game that just ended - a cold resume sets
+        // it from the saved record - and this entry keeps living, so leaving it true
+        // would keep the next finished game out of records.jsonl.
+        if (auto entry = entry_locked(session.get())) entry->exported = false;
     }
     int color = (color_str == "black") ? BLACK : WHITE;
     
@@ -768,11 +867,39 @@ void GameServer::handle_set_position(std::shared_ptr<WebSocketSession> session, 
     auto it = games_.find(session.get());
     if (it == games_.end()) return;
 
-    auto& game = it->second;
-    if (game->is_ai_thinking()) {
+    if (it->second->is_ai_thinking()) {
         send_error(session, "AI 正在思考，请先停止再摆棋");
         return;
     }
+    // Settle the previous game before this position wipes it: the 10s tick and
+    // the detach can both land after the reset, and a game with stones is its
+    // own only copy - a hand-set base keeps its record out of records.jsonl, so
+    // <token>.json is all there is. Rotating it onto its own token first is the
+    // same reuse-vs-rotate decision handle_restart makes; README:541-543 counts
+    // content as 落子/摆子/选边, so a board with none of the three - which includes
+    // a position hand-set with zero stones - has nothing to keep and is merely
+    // flushed in place.
+    if (const std::shared_ptr<TrackedGame> previous = entry_locked(session.get())) {
+        const ReplaySnapshot replay = previous->game->replay_snapshot();
+        const bool nothing_to_keep = replay.move_count == 0 && replay.base.empty() &&
+                                     !previous->side_chosen;
+        if (nothing_to_keep) {
+            flush_entry(previous);
+        } else {
+            // detach_socket flushes the old game under its own token; the fresh
+            // token goes out right away, or the client keeps resuming the
+            // settled record with the token it still holds.
+            detach_socket(session.get());
+            const std::shared_ptr<TrackedGame> fresh = open_session(nullptr);
+            attach_socket(session, fresh);
+            send_session_state(session, fresh, false);
+        }
+    }
+    // The rotation above replaces this socket's game, so the lookup is redone
+    // before the position is installed.
+    it = games_.find(session.get());
+    if (it == games_.end()) return;
+    auto& game = it->second;
     if (!game->set_position(result.board)) {
         send_error(session, "无法摆上此局面");
         return;
@@ -786,6 +913,15 @@ void GameServer::handle_set_position(std::shared_ptr<WebSocketSession> session, 
         // the session file would resume the player into a colour they no longer
         // hold.
         entry->side_chosen = false;
+        // Same for the export stamp: the game that was appended to
+        // records.jsonl is over, and the position starts a fresh one.
+        entry->exported = false;
+        // This position is a new game on a fresh clock: the old creation time
+        // belongs to the record that was just replaced, and leaving it would
+        // date the new file's header before its own board. The cold-rebuild
+        // path resets the same pair.
+        entry->created_ms = now_ms();
+        entry->updated_ms = entry->created_ms;
     }
     json reply;
     reply["type"] = "position_set";
@@ -812,16 +948,38 @@ void GameServer::handle_make_move(std::shared_ptr<WebSocketSession> session, con
         return;
     }
 
-    // make_move only ever commits a stone for player_color_ (it rejects any
-    // call when current_turn() != player_color_). Reading player_color_ avoids
-    // touching board state here: current_turn() would read move_count on the
-    // io thread outside make_move's ai_thinking_ handshake, racing the AI
-    // worker's board write under thinking_mutex_.
-    int placed_color = game->player_color();
+    // make_move only ever commits a stone for player_color_ (it rejects any call
+    // when current_turn() != player_color_), and on a pending position that call
+    // is also what claims the side, so the colour is read once the move is in.
+    // current_turn() is still not read here: it would touch board state outside
+    // make_move's ai_thinking_ handshake, racing the AI worker's board write under
+    // thinking_mutex_.
+    // The stone can end the game inside make_move, whose callback would then queue
+    // game_over ahead of the move_made below; the AI path sends ai_move first, so
+    // hold the ending until this frame has gone out.
+    {
+        std::lock_guard<std::mutex> lock(end_frame_mutex_);
+        deferred_end_for_ = session.get();
+    }
     if (!game->make_move(row, col)) {
+        // Nothing landed, so nothing is owed ahead of a move_made: release the slot
+        // and take back whatever a worker parked in it while the move was rejected,
+        // so that ending goes out to this session as it did before, not to nobody.
+        json held;
+        {
+            std::lock_guard<std::mutex> lock(end_frame_mutex_);
+            deferred_end_for_ = nullptr;
+            held.swap(deferred_end_frame_);
+        }
         send_error(session, "Invalid move");
+        if (!held.is_null()) send_message(session, held);
         return;
     }
+    const int placed_color = game->player_color();
+    // A played stone claims a side even without choose_side: resume/takeover
+    // guards and snapshots key off side_chosen, and a game the AI is actually
+    // playing in must be re-armed after a reconnect.
+    if (auto entry = entry_locked(session.get())) entry->side_chosen = true;
 
     json response;
     response["type"] = "move_made";
@@ -829,6 +987,13 @@ void GameServer::handle_make_move(std::shared_ptr<WebSocketSession> session, con
     response["col"] = col;
     response["color"] = placed_color == BLACK ? "black" : "white";
     send_message(session, response);
+    json deferred;
+    {
+        std::lock_guard<std::mutex> lock(end_frame_mutex_);
+        deferred_end_for_ = nullptr;
+        deferred.swap(deferred_end_frame_);
+    }
+    if (!deferred.is_null()) send_message(session, deferred);
 }
 
 void GameServer::handle_undo(std::shared_ptr<WebSocketSession> session) {
@@ -840,6 +1005,10 @@ void GameServer::handle_undo(std::shared_ptr<WebSocketSession> session) {
     int undo_move_count = 0;
     GameStatus undo_status = GameStatus::WAITING;
     if (game->undo(undo_move_count, undo_status)) {
+        // The exported flag describes the game that just gave back a stone:
+        // whatever follows this board is a new game, and a second finished
+        // game on the same token owes records.jsonl a second export.
+        if (auto entry = entry_locked(session.get())) entry->exported = false;
         json response;
         response["type"] = "undo_success";
         response["move_count"] = undo_move_count;
@@ -908,9 +1077,9 @@ void GameServer::handle_request_hint(std::shared_ptr<WebSocketSession> session, 
     if (it == games_.end()) return;
     
     auto& game = it->second;
-    int timeout_ms = get_int(msg, "timeout_ms", 5000);
-    int max_depth = get_int(msg, "max_depth", 6);
-    
+    const int timeout_ms = get_int_or(msg, "timeout_ms", game->timeout_ms());
+    const int max_depth = get_int_or(msg, "max_depth", game->max_depth());
+
     if (!game->request_hint(timeout_ms, max_depth)) {
         send_error(session, "No hint available");
     }
@@ -920,7 +1089,20 @@ void GameServer::handle_resign(std::shared_ptr<WebSocketSession> session) {
     std::lock_guard<std::mutex> lock(games_mutex_);
     auto it = games_.find(session.get());
     if (it == games_.end()) return;
-    
+
+    // A game that was never started has no side to resign: the opening actions
+    // are choosing a colour or playing the first stone, and settling an untouched
+    // board would hand the opponent a win over zero moves. Only the analysis list
+    // counts as a start - the board's stone count also covers 摆棋 base stones,
+    // which undo refuses to give back for the same reason.
+    const std::shared_ptr<TrackedGame> entry = entry_locked(session.get());
+    const bool started = entry && (entry->side_chosen ||
+                                   !entry->game->replay_snapshot().moves.empty());
+    if (!started) {
+        send_error(session, "Game not started");
+        return;
+    }
+
     auto& game = it->second;
     game->resign(game->player_color());
 }
@@ -939,8 +1121,8 @@ void GameServer::handle_set_config(std::shared_ptr<WebSocketSession> session, co
     if (it == games_.end()) return;
     
     auto& game = it->second;
-    int timeout_ms = get_int(msg, "timeout_ms", 5000);
-    int max_depth = get_int(msg, "max_depth", 8);
+    const int timeout_ms = get_int_or(msg, "timeout_ms", game->timeout_ms());
+    const int max_depth = get_int_or(msg, "max_depth", game->max_depth());
     game->set_config(timeout_ms, max_depth);
 }
 
@@ -953,10 +1135,12 @@ void GameServer::handle_restart(std::shared_ptr<WebSocketSession> session) {
             previous ? previous->game->replay_snapshot() : ReplaySnapshot();
         // 重开 on a board nobody has touched needs no new session: the token and
         // the file already describe nothing, so reusing them keeps a page that
-        // presses the button twice from leaving a trail of empty sessions.
+        // presses the button twice from leaving a trail of empty sessions. Nothing
+        // touched is README:541-543's three-way test - no stone played, no stone
+        // hand-set, no side chosen - and a position hand-set empty is precisely
+        // that, so it stays on its own token instead of rotating one per click.
         const bool nothing_to_keep = replay.move_count == 0 && replay.base.empty() &&
-                                     previous && !previous->side_chosen &&
-                                     !previous->game->position_pending();
+                                     previous && !previous->side_chosen;
         if (nothing_to_keep) {
             previous->game->reset();
             // Back to "nobody has claimed a side", which is also what the client's
@@ -1017,6 +1201,7 @@ std::shared_ptr<GameServer::TrackedGame> GameServer::open_session(const SessionS
     if (use_loaded_coefficients_) game->set_coefficients(coefficients_);
     game->set_opening_book(&book_);
 
+    bool unreadable_record = false;
     if (from) {
         GameRestore restore;
         restore.base = from->base;
@@ -1035,13 +1220,22 @@ std::shared_ptr<GameServer::TrackedGame> GameServer::open_session(const SessionS
         if (!game->restore_game(restore)) {
             std::cerr << "会话 " << from->token << " 的记录摆不出来，改为新开一局" << std::endl;
             game->reset();
+            // A new game on a fresh clock: the file's own creation time belongs
+            // to the record that could not be rebuilt, not to this one.
+            unreadable_record = true;
         } else {
             entry->side_chosen = !from->player_color.empty();
             entry->exported = from->record.is_decisive();
             entry->rebuilt = true;
-            if (from->timeout_ms > 0 && from->max_depth > 0) {
-                game->set_config(from->timeout_ms, from->max_depth);
-            }
+            // The file keeps its own birth time across a cold rebuild, otherwise
+            // every resume would rewrite the header of the record it just read.
+            if (from->created_ms > 0) entry->created_ms = from->created_ms;
+            // 0 means the file never stated the key (round-86 P2 sentinel), so each
+            // half is restored on its own. set_config clamps both arguments, so the
+            // absent half is fed the value this game already has, never 0.
+            const int restored_timeout = from->timeout_ms > 0 ? from->timeout_ms : game->timeout_ms();
+            const int restored_depth = from->max_depth > 0 ? from->max_depth : game->max_depth();
+            game->set_config(restored_timeout, restored_depth);
             SessionSnapshot probe = *from;
             probe.created_ms = 0;
             probe.updated_ms = 0;
@@ -1050,11 +1244,34 @@ std::shared_ptr<GameServer::TrackedGame> GameServer::open_session(const SessionS
     }
     entry->game = game;
 
-    // Tokens name files, so a collision would overwrite another session.
-    std::string token = make_token();
-    while (sessions_.count(token) || cold_sessions_.count(token)) token = make_token();
-    entry->token = std::move(token);
+    // Tokens name files, so a collision would overwrite another session. A
+    // session rebuilt from disk keeps the token it was read under: the caller
+    // already proved that token is not in sessions_, and the player holding the
+    // old URL must land on this game rather than a blank one. The two cases only
+    // diverge when the rebuild FAILED: then the token's file is the unreadable
+    // record itself, which stays on disk for a human to look at and must not be
+    // written over by this fresh game's flushes - so that one gets a new token,
+    // and resumed:false with a new token is what README:487 promises for a
+    // record nobody could read.
+    if (from && !unreadable_record) {
+        entry->token = from->token;
+    } else {
+        std::string token = make_token();
+        while (sessions_.count(token) || cold_sessions_.count(token)) token = make_token();
+        entry->token = std::move(token);
+    }
     sessions_[entry->token] = entry;
+    if (unreadable_record) {
+        // Stamp the fresh empty game with exactly what a flush would write for
+        // it, so flush_entry's dedup returns early instead of taking its
+        // empty-board branch - that branch deletes the file named by the token,
+        // and this game has not created one yet. The unreadable record itself
+        // stays on disk under its own, now unused, token.
+        SessionSnapshot empty_probe = snapshot_of(*entry);
+        empty_probe.created_ms = 0;
+        empty_probe.updated_ms = 0;
+        entry->saved_payload = session_to_json(empty_probe);
+    }
     return entry;
 }
 
@@ -1143,15 +1360,22 @@ void GameServer::handle_resume(std::shared_ptr<WebSocketSession> session, const 
                 entry = hot->second;
                 resumed = true;
                 if (entry->attached && entry->attached != session.get()) {
-                    // Last claim wins, and the tab that loses one gets an error on
-                    // its next read rather than a silent freeze: closing it here is
-                    // what produces that. Its own detach lands later and leaves the
-                    // session alone, because the entry is about to name this socket.
+                    // Last claim wins. The loser is told why before it is dropped:
+                    // without the notice its client reconnects and resumes the
+                    // same token, and the two tabs evict each other in a loop,
+                    // every takeover re-running halt_search and a flush. It then
+                    // gets an error on its next read rather than a silent freeze.
+                    // Its own detach lands later and leaves the session alone,
+                    // because the entry is about to name this socket.
                     WebSocketSession* previous = entry->attached;
                     entry->attached = nullptr;
                     entry->detached_ms = now_ms();
                     games_.erase(previous);
                     socket_tokens_.erase(previous);
+                    json taken_over;
+                    taken_over["type"] = "session_taken_over";
+                    taken_over["token"] = entry->token;
+                    previous->send(taken_over);
                     previous->close();
                     // The search that tab left behind is stopped before this
                     // socket takes over its callbacks: the worker reads them while
@@ -1184,10 +1408,13 @@ void GameServer::handle_resume(std::shared_ptr<WebSocketSession> session, const 
     // A game whose AI was mid-search when the socket went was stopped with it, so
     // the position it comes back to still has the AI to move. Re-arming here is
     // what makes a refresh land on "AI 思考中" rather than a board waiting on a
-    // side that never plays.
+    // side that never plays. However, a session where nobody has chosen a side
+    // yet must not start searching: set_position deliberately leaves status
+    // WAITING until side choice, and arming the AI would violate that invariant.
     GameManager& game = *entry->game;
-    if (resumed && !game.position_pending() && !game.is_ai_thinking() &&
-        game.status() != GameStatus::GAME_OVER && game.current_turn() == game.ai_color()) {
+    if (resumed && entry->side_chosen && !game.position_pending() &&
+        !game.is_ai_thinking() && game.status() != GameStatus::GAME_OVER &&
+        game.current_turn() == game.ai_color()) {
         game.start_ai_thinking();
     }
     send_session_state(session, entry, resumed);
@@ -1246,8 +1473,25 @@ SessionSnapshot GameServer::snapshot_of(const TrackedGame& entry) const {
     return snap;
 }
 
-void GameServer::flush_entry(const std::shared_ptr<TrackedGame>& entry) {
-    if (sessions_dir_.empty()) return;
+// The export decision, in one place for both flush paths: the record stream is
+// appended before a session file is allowed to say the game is over. False means
+// the append failed, so the caller must leave the session file where it was.
+static bool export_game_record(bool& exported, const SessionSnapshot& to_write,
+                               const std::string& records_path, std::string& error) {
+    if (!exported && to_write.base.empty() && to_write.record.is_decisive()) {
+        if (!records_path.empty()) {
+            if (!to_write.record.append_to_jsonl(records_path, error)) {
+                std::cerr << "对局记录追加失败: " << error << std::endl;
+                return false;
+            }
+        }
+        exported = true;
+    }
+    return true;
+}
+
+bool GameServer::flush_entry(const std::shared_ptr<TrackedGame>& entry) {
+    if (sessions_dir_.empty()) return true;
     const SessionSnapshot snap = snapshot_of(*entry);
     // The timestamps say when the write happened, not what changed, so the
     // comparison is made against a copy with them cleared: a session nobody has
@@ -1256,10 +1500,28 @@ void GameServer::flush_entry(const std::shared_ptr<TrackedGame>& entry) {
     probe.created_ms = 0;
     probe.updated_ms = 0;
     const std::string payload = session_to_json(probe);
-    if (payload == entry->saved_payload) return;
-    entry->saved_payload = payload;
-    // A socket that connected and never started anything has no game to keep.
-    if (snap.base.empty() && snap.record.moves.empty() && !entry->side_chosen) return;
+    if (payload == entry->saved_payload) return true;
+    // Content decides: a game with no stone anywhere - base or played - is not
+    // kept, even if a side was chosen and the game resigned at move zero. A
+    // settled previous game on restart always has stones, so it still lands.
+    if (snap.base.empty() && snap.record.moves.empty()) {
+        // And a file from an earlier game on this token must not outlive the
+        // wipe: undo back to an empty board deletes the residue, or a restart
+        // would resurrect the undone game. Only commit the dedup stamp once the
+        // delete actually succeeded, so a failure retries on the next tick.
+        // A game that opened on an unreadable record takes this branch too and
+        // is safe: it holds a NEW token (see open_session), so the file named
+        // here is its own, while the record nobody could read stays under the old
+        // token - and deleting a file that is simply not there reports success.
+        std::string remove_error;
+        if (!delete_session(sessions_dir_, entry->token, remove_error)) {
+            std::cerr << "会话 " << entry->token << " 残留文件删除失败: "
+                      << remove_error << std::endl;
+            return false;
+        }
+        entry->saved_payload = payload;
+        return true;
+    }
 
     SessionSnapshot to_write = snap;
     to_write.created_ms = entry->created_ms;
@@ -1268,27 +1530,43 @@ void GameServer::flush_entry(const std::shared_ptr<TrackedGame>& entry) {
 
     std::string error;
     if (!save_session(sessions_dir_, to_write, error)) {
+        // saved_payload keeps its old value: the next tick sees the difference
+        // and retries, instead of treating a failed write as saved forever.
         std::cerr << "会话 " << entry->token << " 落盘失败: " << error << std::endl;
-        return;
+        return false;
     }
     // Only a game that started from an empty board is a training record on its
     // own: one that began from a hand-set position needs its `base` stones too,
     // which the trainer's reader has no way to place. So those stay in the
     // session file, for review and for resuming, and out of the record stream.
-    if (!entry->exported && to_write.base.empty() && to_write.record.is_decisive()) {
-        if (!records_path_.empty()) {
-            if (!to_write.record.append_to_jsonl(records_path_, error)) {
-                std::cerr << "对局记录追加失败: " << error << std::endl;
-                return;
-            }
-        }
-        entry->exported = true;
-    }
+    if (!export_game_record(entry->exported, to_write, records_path_, error)) return false;
+    // Commit the dedup stamp only once both the file write and the export are
+    // done: committing it before the append meant a failed records.jsonl write
+    // was never retried, and the game vanished from the training stream.
+    entry->saved_payload = payload;
+    return true;
 }
 
+// Shutdown exports first: a failed append leaves the session file at its
+// pre-ending state, so the next start can still write that record.
 void GameServer::flush_all() {
     std::lock_guard<std::mutex> lock(games_mutex_);
     for (const auto& token_entry : sessions_) {
+        // This snapshot is only the append's; flush_entry takes its own for the
+        // file, and a game decided here is decided there - the record cannot grow
+        // after the ending, while an undo resets the exported flag.
+        const SessionSnapshot snap = snapshot_of(*token_entry.second);
+        // The same content-decides rule flush_entry applies to the file: a game with
+        // no stone anywhere is not kept, so shutdown must not append it to the record
+        // stream either (README:571). flush_entry is still what removes the residue.
+        if (snap.base.empty() && snap.record.moves.empty()) {
+            flush_entry(token_entry.second);
+            continue;
+        }
+        std::string error;
+        if (!export_game_record(token_entry.second->exported, snap, records_path_, error)) {
+            continue;
+        }
         flush_entry(token_entry.second);
     }
 }
@@ -1305,19 +1583,33 @@ void GameServer::schedule_flush() {
 void GameServer::on_flush_tick() {
     std::lock_guard<std::mutex> lock(games_mutex_);
     for (auto it = sessions_.begin(); it != sessions_.end();) {
-        flush_entry(it->second);
+        const bool settled = flush_entry(it->second);
         TrackedGame& entry = *it->second;
         const bool overdue = !entry.attached && entry.detached_ms > 0 &&
                              now_ms() - entry.detached_ms >= kReattachWindowSeconds * 1000LL;
-        if (overdue) {
-            // Back onto the shelf. The file is current (flush_entry just ran), so
-            // what is dropped is the engine, not the game: the token still
-            // resumes, by rebuilding from that file.
-            cold_sessions_[entry.token] = snapshot_of(entry);
-            it = sessions_.erase(it);
-        } else {
+        if (!overdue || !settled) {
+            // A failed write leaves the entry in the table, so the next tick retries it
+            // instead of shelving a game whose file is stale.
             ++it;
+            continue;
         }
+        const SessionSnapshot shelved = snapshot_of(entry);
+        if (shelved.base.empty() && shelved.record.moves.empty() &&
+            shelved.player_color.empty()) {
+            // Nothing was ever played here, and flush_entry's empty-content branch
+            // already deleted this token's file. Shelving the snapshot would only let
+            // the old token come back at resume as a resumed:false frame naming the
+            // SAME token, while README:487 asks for a new game with a new token;
+            // dropping the entry leaves the token unknown both on disk and in memory,
+            // so the next resume falls through to open_session(nullptr).
+            it = sessions_.erase(it);
+            continue;
+        }
+        // Back onto the shelf. The file is current (flush_entry just settled
+        // it), so what is dropped is the engine, not the game: the token still
+        // resumes, by rebuilding from that file.
+        cold_sessions_[entry.token] = shelved;
+        it = sessions_.erase(it);
     }
 }
 
@@ -1387,7 +1679,29 @@ void GameServer::setup_game_callbacks(std::shared_ptr<WebSocketSession> session,
             msg["winner"] = winner == BLACK ? "black" : "white";
         }
         msg["reason"] = reason;
-        send_message(session, msg);
+        // A human stone that ends the game is answered by handle_make_move, which
+        // arms this deferral and sends the held frame after move_made; every other
+        // source (AI, resign, 判负) goes straight out as before.
+        bool held = false;
+        {
+            std::lock_guard<std::mutex> lock(end_frame_mutex_);
+            if (deferred_end_for_ == session.get()) {
+                deferred_end_frame_ = std::move(msg);
+                held = true;
+            }
+        }
+        if (!held) send_message(session, msg);
+        // Settle the game the moment it ends, not at the next 10s tick or a
+        // detach: a set_position in between would otherwise wipe the result
+        // from both the session file and records.jsonl. This callback can run
+        // while the worker holds thinking_mutex_ (or, on resign, while the io
+        // thread holds games_mutex_), so the flush is posted to the io thread
+        // where games_mutex_ is taken first. flush_entry is content-deduped and
+        // respects the exported flag, so tick/detach stay cheap.
+        net::post(ioc_, [this, session] {
+            std::lock_guard<std::mutex> lock(games_mutex_);
+            if (auto entry = entry_locked(session.get())) flush_entry(entry);
+        });
     });
 }
 

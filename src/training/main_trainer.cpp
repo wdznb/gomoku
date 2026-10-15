@@ -1,5 +1,7 @@
 #include "trainer.h"
 #include "params.h"
+#include <climits>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -25,29 +27,37 @@ void print_usage(const char* program) {
         "                              additional rounds on top of the checkpoint.\n"
         "  --population N              Genetic population size (8)\n"
         "  --generations N             Genetic generations per round (4)\n"
-        "  --stagnation N              Generations without improvement before a\n"
-        "                              round's optimiser stops (3)\n"
-        "  --hill-iterations N         Hill-climbing evaluations per round (12)\n"
+        "  --stagnation N              Generations without improvement that end\n"
+        "                              a genetic round; hill climbing stops after\n"
+        "                              3x N probes in a row that fail to improve (3)\n"
+        "  --hill-iterations N         Hill-climbing neighbour probes per round;\n"
+        "                              identical neighbours are skipped, and the\n"
+        "                              champion is scored once on top: at most\n"
+        "                              N+1 evaluations per round (12)\n"
         "  --depth N                   Search depth during training games (4)\n"
         "  --timeout-ms N              Per-move thinking budget in ms (400)\n"
         "  --max-moves N               Ply cap for a training game (60)\n"
         "  --fitness-games N           Games used to score one candidate (2)\n"
         "  --verification-games N      Games a candidate must beat the champion\n"
         "                              over before promotion (8)\n"
-        "  --accept-score X            Promotion threshold, 0.5-1.0 (0.56)\n"
+        "  --accept-score X            Promotion threshold, >0.5 and <=1.0 (0.56)\n"
         "  --data-games N              Self-play games kept as training data (4)\n"
         "  --threads N                 Parallel data-collection workers (2)\n"
         "  --no-data                   Collect no self-play data (search only)\n"
         "  --no-resign                 Never resign during training games\n"
         "  --seed N                    RNG seed (20261011)\n"
         "  --params PATH               Starting coefficients (built-in defaults)\n"
+        "                              (not together with --resume)\n"
         "  --out PATH                  Where the champion is written\n"
         "                              (data/training/best_params.json)\n"
         "  --records PATH              Append played games as JSONL\n"
         "  --samples PATH              Append training samples as JSONL\n"
         "  --checkpoint PATH           Round-by-round resume state\n"
         "                              (data/training/checkpoint.json)\n"
-        "  --resume PATH               Continue from this checkpoint\n"
+        "  --resume PATH               Continue from this checkpoint, and write the\n"
+        "                              rest of the run back to it; when --checkpoint\n"
+        "                              is given too, the two must name one file\n"
+        "                              (not together with --params)\n"
         "  --quiet                     Only print the final result\n"
         "  --help                      Show this text\n";
 }
@@ -56,15 +66,28 @@ std::string require_value(const char* flag, int& index, int argc, char** argv) {
     if (index + 1 >= argc) {
         throw std::invalid_argument(std::string("missing value for ") + flag);
     }
-    return argv[++index];
+    const std::string value = argv[++index];
+    // An empty value is usually an unexpanded shell variable, and for a path it is
+    // destructive: --resume "" skips the resume, then overwrites the default checkpoint.
+    if (value.empty()) {
+        throw std::invalid_argument(std::string("Invalid ") + flag + " (must not be empty)");
+    }
+    return value;
 }
 
-int require_int(const char* flag, int& index, int argc, char** argv) {
+// A count of zero for anything but --rounds is not a smaller run, it is a run
+// that silently does nothing (no verification games means no candidate is ever
+// promoted), so the bounds are checked here rather than at each call site.
+int require_int(const char* flag, int& index, int argc, char** argv, int minimum = 1) {
     const std::string text = require_value(flag, index, argc, argv);
     size_t used = 0;
     const int value = std::stoi(text, &used);
     if (used != text.size()) {
         throw std::invalid_argument(std::string("invalid integer for ") + flag + ": " + text);
+    }
+    if (value < minimum) {
+        throw std::invalid_argument(std::string(flag) + " must be >= " +
+                                    std::to_string(minimum) + ", got " + std::to_string(value));
     }
     return value;
 }
@@ -76,17 +99,22 @@ double require_double(const char* flag, int& index, int argc, char** argv) {
     if (used != text.size()) {
         throw std::invalid_argument(std::string("invalid number for ") + flag + ": " + text);
     }
+    // stod parses "nan" and "inf" as numbers with used==size, and a NaN passes
+    // every range guard below it, so the threshold has to be checked here.
+    if (!std::isfinite(value)) {
+        throw std::invalid_argument(std::string("invalid number for ") + flag + ": " + text);
+    }
     return value;
 }
 
 uint64_t require_seed(const char* flag, int& index, int argc, char** argv) {
     const std::string text = require_value(flag, index, argc, argv);
-    size_t used = 0;
-    const unsigned long long value = std::stoull(text, &used);
-    if (used != text.size()) {
+    // stoull does not reject a sign: "-1" wraps to 18446744073709551615 and the
+    // caller believes that is the seed. A seed is digits or nothing.
+    if (text.empty() || text.find_first_not_of("0123456789") != std::string::npos) {
         throw std::invalid_argument(std::string("invalid seed for ") + flag + ": " + text);
     }
-    return static_cast<uint64_t>(value);
+    return static_cast<uint64_t>(std::stoull(text));
 }
 
 // A training run writes several artefacts, and the default paths live in a
@@ -98,6 +126,21 @@ void ensure_parent_directory(const std::string& path) {
     if (parent.empty()) return;
     std::error_code ec;
     std::filesystem::create_directories(parent, ec);
+}
+
+// The path guards below compare the files the arguments name, not the text that
+// names them: "ck.json" and "./ck.json" are one file. weakly_canonical is the
+// form that resolves a path which does not exist yet - the normal state here,
+// since the run itself creates these files. When a path cannot be resolved its
+// stated text is kept: two paths we cannot place are not shown to be the same
+// file, and guessing there would allow the very overwrite the guard exists to
+// prevent.
+std::string file_named(const std::string& path) {
+    if (path.empty()) return path;
+    std::error_code ec;
+    const std::filesystem::path resolved = std::filesystem::weakly_canonical(path, ec);
+    if (ec) return path;
+    return resolved.string();
 }
 
 void print_coefficients(const ThreatCoefficients& coeffs) {
@@ -125,6 +168,8 @@ int main(int argc, char** argv) {
     // a training run should never dirty the repository.
     std::string out_path = "data/training/best_params.json";
     std::string checkpoint_path = "data/training/checkpoint.json";
+    bool checkpoint_given = false;
+    bool seed_given = false;
     bool quiet = false;
 
     try {
@@ -144,7 +189,9 @@ int main(int argc, char** argv) {
                                                 " (use genetic or hill)");
                 }
             } else if (flag == "--rounds") {
-                config.rounds = require_int("--rounds", i, argc, argv);
+                // Only negatives fail here; a zero round count parses and is
+                // refused below, where the run would train nothing.
+                config.rounds = require_int("--rounds", i, argc, argv, 0);
             } else if (flag == "--population") {
                 config.population_size = require_int("--population", i, argc, argv);
             } else if (flag == "--generations") {
@@ -156,9 +203,11 @@ int main(int argc, char** argv) {
             } else if (flag == "--depth") {
                 config.search_depth = require_int("--depth", i, argc, argv);
             } else if (flag == "--timeout-ms") {
-                config.timeout_ms = require_int("--timeout-ms", i, argc, argv);
+                // The bounds are the guard below's business (--timeout-ms at least
+                // 1, --max-moves at least 2), so this parses any integer written.
+                config.timeout_ms = require_int("--timeout-ms", i, argc, argv, INT_MIN);
             } else if (flag == "--max-moves") {
-                config.max_moves = require_int("--max-moves", i, argc, argv);
+                config.max_moves = require_int("--max-moves", i, argc, argv, INT_MIN);
             } else if (flag == "--fitness-games") {
                 config.fitness_games = require_int("--fitness-games", i, argc, argv);
             } else if (flag == "--verification-games") {
@@ -175,6 +224,7 @@ int main(int argc, char** argv) {
                 config.resign_enabled = false;
             } else if (flag == "--seed") {
                 config.seed = require_seed("--seed", i, argc, argv);
+                seed_given = true;
             } else if (flag == "--params") {
                 base_params = require_value("--params", i, argc, argv);
             } else if (flag == "--out") {
@@ -185,6 +235,7 @@ int main(int argc, char** argv) {
                 config.samples_path = require_value("--samples", i, argc, argv);
             } else if (flag == "--checkpoint") {
                 checkpoint_path = require_value("--checkpoint", i, argc, argv);
+                checkpoint_given = true;
             } else if (flag == "--resume") {
                 resume_path = require_value("--resume", i, argc, argv);
             } else if (flag == "--quiet") {
@@ -204,13 +255,58 @@ int main(int argc, char** argv) {
     }
     // 0.5 is a draw score, so anything at or below it would promote a candidate
     // that merely survived.
-    if (config.accept_score < 0.5 || config.accept_score > 1.0) {
-        std::cerr << "Error: --accept-score must be between 0.5 and 1.0" << std::endl;
+    if (config.accept_score <= 0.5 || config.accept_score > 1.0) {
+        std::cerr << "Error: --accept-score must be greater than 0.5 and at most 1.0"
+                  << std::endl;
         return 1;
     }
     if (config.search_depth < 1 || config.timeout_ms < 1 || config.max_moves < 2) {
         std::cerr << "Error: --depth, --timeout-ms and --max-moves must be positive"
                   << " (--max-moves at least 2)" << std::endl;
+        return 1;
+    }
+
+    // --resume names the file being read, so it is also the file being written
+    // back: without this, --resume ck.json without --checkpoint kept writing the
+    // default file and ck.json never advanced, so the next resume replayed the
+    // same rounds. When both are given they must agree - silently picking one
+    // would leave the other stale.
+    if (!resume_path.empty()) {
+        if (!checkpoint_given) {
+            checkpoint_path = resume_path;
+        } else if (file_named(checkpoint_path) != file_named(resume_path)) {
+            std::cerr << "Error: --checkpoint " << checkpoint_path << " and --resume "
+                      << resume_path << " must name the same file when both are given"
+                      << std::endl;
+            return 1;
+        }
+    }
+    // Both name the starting point for this round, and a resume replaces what was
+    // loaded: keeping both would read and announce a file the run never uses.
+    if (!base_params.empty() && !resume_path.empty()) {
+        std::cerr << "Error: --params " << base_params << " and --resume " << resume_path
+                  << " cannot both be given (each names the starting point for this round)"
+                  << std::endl;
+        return 1;
+    }
+
+    // A resume overwrites the seed with the one the checkpoint recorded, so a
+    // stated --seed would be read and then dropped without a word - the same
+    // two-entrypoints-for-one-starting-point contradiction as --params above.
+    if (seed_given && !resume_path.empty()) {
+        std::cerr << "Error: --seed " << config.seed << " and --resume " << resume_path
+                  << " cannot both be given (a resume restores the checkpoint's seed)"
+                  << std::endl;
+        return 1;
+    }
+
+    // The run writes the champion to --out and the resume state to --checkpoint, so
+    // one file for both means the final champion overwrites the checkpoint and the
+    // next resume replays a run that already finished.
+    if (file_named(out_path) == file_named(checkpoint_path)) {
+        std::cerr << "Error: --out " << out_path << " and --checkpoint " << checkpoint_path
+                  << " cannot name the same file (the champion parameters would replace the resume state)"
+                  << std::endl;
         return 1;
     }
 

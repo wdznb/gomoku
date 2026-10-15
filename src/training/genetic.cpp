@@ -36,18 +36,19 @@ void GeneticOptimizer::seed_population(const ThreatCoefficients& base) {
     population_.push_back(founder);
 
     std::uniform_real_distribution<double> noise(-0.5, 0.5);
+    std::uniform_real_distribution<double> uniform(0.0, 1.0);
     for (int i = 1; i < config_.population_size; ++i) {
         std::vector<int> genes = base_genes;
         for (int g = 0; g < static_cast<int>(genes.size()); ++g) {
             const ParamBound bound = CoefficientVector::bound_for(static_cast<TunableParam>(g));
             const double span = static_cast<double>(bound.max_value - bound.min_value);
-            // Half the members get a single broad nudge so the population keeps
-            // recognisably human shapes, the rest are scattered across the box.
+            // Half the members keep the human shape and get one randomly placed
+            // nudge per gene, the rest are redrawn across the whole box.
             if (i % 2 == 0) {
                 const size_t target = rng_() % genes.size();
                 genes[target] += static_cast<int>(noise(rng_) * span * 0.25);
             } else {
-                genes[g] = static_cast<int>(bound.min_value + noise(rng_) * span);
+                genes[g] = static_cast<int>(bound.min_value + uniform(rng_) * span);
             }
         }
         CoefficientVector::sanitize_vector(genes);
@@ -123,6 +124,10 @@ ThreatCoefficients GeneticOptimizer::run(const ThreatCoefficients& base,
     best_fitness = 0.0;
     converged_ = false;
     best_history_.clear();
+    // Stagnation is measured inside one run: a second run on this object would
+    // otherwise inherit the previous one's count and stop after a single
+    // generation. evaluations_ is the caller's cost counter and stays cumulative.
+    generations_since_improvement_ = 0;
 
     seed_population(base);
     evaluate(population_);
@@ -143,11 +148,11 @@ ThreatCoefficients GeneticOptimizer::run(const ThreatCoefficients& base,
     for (int generation = 1; generation <= config_.max_generations; ++generation) {
         std::vector<Individual> next;
         next.reserve(config_.population_size);
-        // Elitism: the incumbent is never lost to a bad recombination.
-        next.push_back(*strongest);
 
         int produced_by_crossover = 0;
-        while (static_cast<int>(next.size()) < config_.population_size) {
+        // One slot stays free for the incumbent, whose fitness is already known,
+        // so evaluate() only ever scores the members this generation produced.
+        while (static_cast<int>(next.size()) + 1 < config_.population_size) {
             std::vector<int> child;
             if (produced_by_crossover < crossover_slots) {
                 const int lhs = select_parent_index();
@@ -168,6 +173,8 @@ ThreatCoefficients GeneticOptimizer::run(const ThreatCoefficients& base,
         }
 
         evaluate(next);
+        // Elitism: the incumbent is never lost to a bad recombination.
+        next.push_back(*strongest);
         population_ = next;
 
         strongest = std::max_element(population_.begin(), population_.end(),

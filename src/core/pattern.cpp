@@ -189,7 +189,11 @@ PatternType match_contiguous_run(const int* cells, int count_left, int count_rig
             bool left_open = (left_pos - 1 >= 0 && cells[left_pos - 1] == 0);
             bool right_open = (right_pos + 1 <= 8 && cells[right_pos + 1] == 0);
 
-            if (left_open && right_open) {
+            // Either side suffices: the far end is ALREADY empty (has_*_space),
+            // so one more stone on the open side makes a four with both ends
+            // free - a live four. `XXXX_X` is only a rush four for the same
+            // reason in reverse: the closed side cannot be reopened for free.
+            if (left_open || right_open) {
                 return PatternType::LIVE_THREE;
             } else {
                 return PatternType::SLEEPY_THREE;
@@ -380,39 +384,40 @@ DirectionPattern PatternRecognizer::finish_direction(const Board& board, int row
         if (board.run_length(dir, row, col, color) >= 6) type = PatternType::LONG_FIVE;
     }
 
-    // A BLACK four is only a threat if one of its completion points makes
-    // EXACTLY five. XXXX_X labels as LIVE_FOUR because both end cells are empty,
-    // but filling the hole is a six-overline, so just one point wins; when every
-    // point overruns (X_XXXX_X) there is no four to speak of. This needs the
-    // board rather than the window: the window labels the shape, not its
-    // completions. WHITE is not affected - a six there is a win.
-    if (color == BLACK && (type == PatternType::LIVE_FOUR || type == PatternType::RUSH_FOUR)) {
+    if (color == BLACK) {
         const int dr = DIRECTIONS[dir][0];
         const int dc = DIRECTIONS[dir][1];
 
         // The run length a fill at (r, c) would produce, counting the square
         // under recognition as already BLACK - the probe stone is part of the
-        // four, but it is still empty on the board, so board.run_length() alone
-        // would stop at it and report one stone short.
-        auto fill_run = [&](int r, int c) {
+        // shape, but it is still empty on the board, so board.run_length() alone
+        // would stop at it and report one stone short. (vr, vc) is a second
+        // virtual stone for the three branch below.
+        auto fill_run = [&](int r, int c, int vr = -1, int vc = -1) {
             int len = 1;
             for (int sign = -1; sign <= 1; sign += 2) {
                 for (int k = 1; k <= 5; ++k) {
                     const int rr = r + sign * k * dr;
                     const int cc = c + sign * k * dc;
                     if (!board.is_valid(rr, cc)) break;
-                    if (board.get(rr, cc) != BLACK && !(rr == row && cc == col)) break;
+                    if (board.get(rr, cc) != BLACK && !(rr == row && cc == col) &&
+                        !(rr == vr && cc == vc)) break;
                     ++len;
                 }
             }
             return len;
         };
 
-        const int run = fill_run(row, col);
-        // Only a contiguous four is in scope: a gap shape's completion point is
-        // its hole, which this end-cell probe cannot reach, and match_gapped_run
-        // already proved that hole makes exactly five.
-        if (run == 4) {
+        // A BLACK four is only a threat if one of its completion points makes
+        // EXACTLY five. XXXX_X labels as LIVE_FOUR because both end cells are empty,
+        // but filling the hole is a six-overline, so just one point wins; when every
+        // point overruns (X_XXXX_X) there is no four to speak of. This needs the
+        // board rather than the window: the window labels the shape, not its
+        // completions. WHITE is not affected - a six there is a win.
+        if (type == PatternType::LIVE_FOUR || type == PatternType::RUSH_FOUR) {
+            // The walk stops on the first empty cell after the group, which is the
+            // hole for a gapped four: only the board can say whether filling it makes
+            // exactly five, since XX_XX does while X_XXXX_X is a six-overline.
             int five_points = 0;
             for (int sign = -1; sign <= 1; sign += 2) {
                 int r = row + sign * dr;
@@ -430,6 +435,51 @@ DirectionPattern PatternRecognizer::finish_direction(const Board& board, int row
             } else if (type == PatternType::LIVE_FOUR && five_points == 1) {
                 type = PatternType::RUSH_FOUR;
             }
+        }
+
+        // The same board-level need applies to a live three: the window sees only
+        // +/-4 cells, so BLACK (7,2)(7,5)(7,6)(7,9)(7,10) with probe (7,7) labels
+        // LIVE_THREE, yet every fill makes a six-overline - it is a sleepy three,
+        // and keeping the live label fabricates a 三三 forbidden. A true live three
+        // has an empty E on the line whose fill makes a four whose BOTH ends are
+        // on-board empties filling to exactly five.
+        if (type == PatternType::LIVE_THREE) {
+            bool live = false;
+            for (int sign = -1; sign <= 1 && !live; sign += 2) {
+                for (int k = 1; k <= 4 && !live; ++k) {
+                    const int er = row + sign * k * dr;
+                    const int ec = col + sign * k * dc;
+                    if (!board.is_valid(er, ec)) break;
+                    if (!board.is_empty(er, ec)) continue;
+
+                    // Expand the contiguous BLACK run through the probe, counting the
+                    // probe and E as black; E must lie inside it, else it does not join.
+                    auto painted = [&](int off) {
+                        const int r = row + off * dr;
+                        const int c = col + off * dc;
+                        if (!board.is_valid(r, c)) return false;
+                        return board.get(r, c) == BLACK ||
+                               (r == row && c == col) || (r == er && c == ec);
+                    };
+                    int lo = 0;
+                    while (painted(lo - 1)) --lo;
+                    int hi = 0;
+                    while (painted(hi + 1)) ++hi;
+                    const int e_off = sign * k;
+                    if (e_off < lo || e_off > hi || hi - lo + 1 != 4) continue;
+
+                    int open_ends = 0;
+                    for (int side = 0; side < 2; ++side) {
+                        const int end_off = side == 0 ? lo - 1 : hi + 1;
+                        const int r = row + end_off * dr;
+                        const int c = col + end_off * dc;
+                        if (board.is_valid(r, c) && board.is_empty(r, c) &&
+                            fill_run(r, c, er, ec) == 5) ++open_ends;
+                    }
+                    if (open_ends == 2) live = true;
+                }
+            }
+            if (!live) type = PatternType::SLEEPY_THREE;
         }
     }
 

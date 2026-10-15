@@ -191,8 +191,12 @@ bool RetryExplorer::explore(GameRecord& out, std::atomic<bool>* stop_flag) {
 // everything before it. Plies after the divergence belong to a different
 // position, so their records are dropped rather than reused.
 bool RetryExplorer::rewind_to_next_branch(const std::vector<Move>& played) {
+    const int max_moves = self_play_.config().max_moves;
     for (int ply = static_cast<int>(played.size()) - 1; ply >= 0; --ply) {
         if (static_cast<size_t>(ply) >= choices_.size()) continue;
+        // A branch point one ply short of the move cap replays a whole game
+        // and lets the engine decide nothing - skip it and go shallower.
+        if (ply + 3 > max_moves) continue;
         const PlyChoices& choices = choices_[ply];
         std::set<int>& already_tried = tried_[ply];
 
