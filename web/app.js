@@ -1158,7 +1158,12 @@ class GomokuGame {
     // not explain — the ones a hand-set position installed — in front of it, so the
     // record and the board always describe the same position.
     setupSeedRecord() {
-        const played = new Set(this.moveHistory.map((m) => m.row * BOARD_SIZE + m.col));
+        // README:376 keeps the 落子记录 through a 确认 until a side is chosen, so the list
+        // can describe the *previous* game while the board is the newly installed one.
+        // Only moves still on the board belong to this position; the stones that are not
+        // explained by them are already picked up as extras below.
+        const moves = this.moveHistory.filter((m) => this.board[m.row][m.col] === m.color);
+        const played = new Set(moves.map((m) => m.row * BOARD_SIZE + m.col));
         const extras = [];
         for (let row = 0; row < BOARD_SIZE; ++row) {
             for (let col = 0; col < BOARD_SIZE; ++col) {
@@ -1168,8 +1173,7 @@ class GomokuGame {
                 }
             }
         }
-        return [...extras,
-                ...this.moveHistory.map((m) => ({ row: m.row, col: m.col, color: m.color }))];
+        return [...extras, ...moves.map((m) => ({ row: m.row, col: m.col, color: m.color }))];
     }
 
     // Dropping the working copy. `confirmed` only picks the words: the board the
@@ -1222,11 +1226,18 @@ class GomokuGame {
 
     paintSetupCell(row, col) {
         const setup = this.setup;
+        // A step preview is an inspection view: the copy still holds the stones it
+        // hides, so cycling from it would delete one the player cannot see. This click
+        // goes back to the whole position instead (README:365), and the next one edits
+        // what is now on screen.
+        if (setup.view !== null) {
+            setup.view = null;
+            this.renderSetupPanel();
+            this.drawBoard();
+            return;
+        }
         const next = (setup.board[row][col] + 1) % 3;
         setup.board[row][col] = next;
-        // Editing is about the whole position, so a step preview ends here rather
-        // than leaving the player painting onto a board they are not looking at.
-        setup.view = null;
         const index = setup.record.findIndex((m) => m.row === row && m.col === col);
         if (next === EMPTY) {
             if (index >= 0) setup.record.splice(index, 1);
