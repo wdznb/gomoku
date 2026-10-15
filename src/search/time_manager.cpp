@@ -22,6 +22,24 @@ long long steady_clock_ms() {
     return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
 }
 
+namespace {
+
+// steady_clock rather than high_resolution_clock because VCF, VCT and the
+// end-of-move deadline a SearchEngine installs are all steady_clock time_points.
+// Mixing the two would compare time-since-boot against time-since-epoch.
+class SystemSearchClock : public SearchClock {
+public:
+    long long now_ms() const override { return steady_clock_ms(); }
+};
+
+const SystemSearchClock kSystemSearchClock;
+
+}
+
+const SearchClock& system_search_clock() {
+    return kSystemSearchClock;
+}
+
 MoveBudget TimeManager::allocate(const Board& board, const SearchLimits& limits,
                                  int prev_move_elapsed_ms) {
     MoveBudget budget;

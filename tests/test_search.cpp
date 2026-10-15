@@ -71,6 +71,55 @@ struct ScriptedClock : SearchClock {
     mutable int readings = 0;
 };
 
+// A clock armed by reading index rather than by time: every reading before the
+// arm point is 0 ms and every reading from it on is far past any deadline. The
+// search reads this clock once at start() and then once per layer boundary, once
+// per 1024 stop tests, and once per emitted frame - so a test can measure how
+// many readings a given layer costs and put the crossing on the poll *inside*
+// the layer it wants interrupted. That is what turns "which layer was it in when
+// the deadline crossed" from a race into an input.
+struct ArmingClock : SearchClock {
+    mutable int readings = 0;
+    int arm_at = INT_MAX;
+    long long now_ms() const override {
+        ++readings;
+        return readings >= arm_at ? 1000000000LL : 0;
+    }
+};
+
+// The layer table one whole (unarmed) think leaves behind: for each completed
+// depth, how many clock readings had happened and how many nodes had been
+// counted. A cut search reproduces these numbers exactly up to its cut point,
+// which is what lets a test aim the cut at a chosen layer.
+struct LayerRecord {
+    std::vector<int> depth;
+    std::vector<int> readings;
+    std::vector<uint64_t> nodes;
+    std::vector<Move> best;
+};
+
+// Runs one search that is never interrupted and records the per-layer table.
+void measure_layers(AlphaBetaSearch& search, const Board& board, int color,
+                    const SearchLimits& limits, std::atomic<bool>& stop,
+                    ArmingClock& clock, LayerRecord* record, SearchStats* final_stats) {
+    clock.arm_at = INT_MAX;
+    clock.readings = 0;
+    record->depth.clear();
+    record->readings.clear();
+    record->nodes.clear();
+    record->best.clear();
+    search.set_clock(&clock);
+    search.set_progress_callback([&](const SearchStats& stats) {
+        record->depth.push_back(stats.completed_depth);
+        record->readings.push_back(clock.readings);
+        record->nodes.push_back(stats.nodes);
+        record->best.push_back(stats.best_move);
+    });
+    search.search(board, color, limits, stop);
+    search.set_progress_callback(nullptr);
+    if (final_stats) *final_stats = search.last_stats();
+}
+
 // Resident set size in KiB, for pinning the default table's real footprint.
 bool read_rss_kb(long long& kb) {
 #if defined(_WIN32)
@@ -199,43 +248,46 @@ void test_transposition_depth_gate_still_applies() {
     const uint64_t hash = board.zobrist_hash();
     std::atomic<bool> stop(false);
 
-    // search() is what normally stamps the clock a fresh search starts on; calling
-    // alphabeta() directly has to do the same, or is_timeout() reads an epoch-old
-    // start_time_ and every node takes the abort branch before the table is read.
+    // search() is what normally opens the budget a fresh think spends; calling
+    // alphabeta() directly has to arm it too, or the context has no clock and
+    // every node takes the abort branch before the table is read.
     //
-    // Round 111 OO3, same reason one notch further down: AlphaBetaSearch's default
-    // move_time_limit_ms_ is 5000 (alphabeta.cpp:10-11), so a saturated gate box can make
-    // this depth-4 call run out of wall time and leave through the abort branch at
-    // alphabeta.cpp:94 - which returns a static-evaluation-magnitude score and turns the
-    // two value asserts below into a load meter. What this case claims is the TT depth
-    // gate, so the clock is taken out of the room it tests: the limit is lifted for these
-    // two blocks only, never in a block that measures a timeout or a node budget.
+    // The budget asked for here is no budget at all: what this case claims is the
+    // TT depth gate, so the clock and the node ceiling are taken out of the room
+    // they test (round 111 OO3 lifted the wall-clock limit for these blocks for the
+    // same reason - a saturated gate box could make this depth-4 call leave through
+    // the abort branch and turn the two value asserts below into a load meter).
+    auto arm = [&stop](AlphaBetaSearch& search) {
+        SearchLimits limits;
+        search.ctx_.start(limits, system_search_clock(), stop);
+    };
+
     {
         TranspositionTable tt(1 << 12);
         AlphaBetaSearch search(evaluator, tt);
-        search.start_time_ = std::chrono::high_resolution_clock::now();
-        search.move_time_limit_ms_ = 600000;
+        arm(search);
         tt.store(hash, 4, 123456, Move(7, 6, BLACK), TTFlag::EXACT);
         tt.new_search();
         Board work = board;
-        const int score = search.alphabeta(work, 4, -INT_MAX, INT_MAX, BLACK, stop);
-        assert(score == 123456);
+        const NodeResult result = search.alphabeta(work, 4, -INT_MAX, INT_MAX, BLACK, stop);
+        assert(result.sound);
+        assert(result.score == 123456);
     }
 
     {
         TranspositionTable tt(1 << 12);
         AlphaBetaSearch search(evaluator, tt);
-        search.start_time_ = std::chrono::high_resolution_clock::now();
-        search.move_time_limit_ms_ = 600000;
+        arm(search);
         tt.store(hash, 3, 123456, Move(7, 6, BLACK), TTFlag::EXACT);
         tt.new_search();
         const TTEntry* hint = tt.lookup(hash);
         assert(hint != nullptr);
         assert(hint->depth < 4);
         Board work = board;
-        const int score = search.alphabeta(work, 4, -INT_MAX, INT_MAX, BLACK, stop);
-        assert(score != 123456);
-        assert(score > -1000000 && score < 1000000);
+        const NodeResult result = search.alphabeta(work, 4, -INT_MAX, INT_MAX, BLACK, stop);
+        assert(result.sound);
+        assert(result.score != 123456);
+        assert(result.score > -1000000 && result.score < 1000000);
     }
 
     // A bound is a value only when it actually cuts: the deep LOWERBOUND above
@@ -243,21 +295,21 @@ void test_transposition_depth_gate_still_applies() {
     {
         TranspositionTable tt(1 << 12);
         AlphaBetaSearch search(evaluator, tt);
-        search.start_time_ = std::chrono::high_resolution_clock::now();
+        arm(search);
         tt.store(hash, 6, 300, Move(7, 6, BLACK), TTFlag::LOWERBOUND);
         tt.new_search();
         Board work = board;
-        assert(search.alphabeta(work, 4, 60, 200, BLACK, stop) == 300);
+        assert(search.alphabeta(work, 4, 60, 200, BLACK, stop).score == 300);
     }
 
     {
         TranspositionTable tt(1 << 12);
         AlphaBetaSearch search(evaluator, tt);
-        search.start_time_ = std::chrono::high_resolution_clock::now();
+        arm(search);
         tt.store(hash, 3, 300, Move(7, 6, BLACK), TTFlag::LOWERBOUND);
         tt.new_search();
         Board work = board;
-        assert(search.alphabeta(work, 4, 60, 200, BLACK, stop) != 300);
+        assert(search.alphabeta(work, 4, 60, 200, BLACK, stop).score != 300);
     }
 
     std::cout << "test_transposition_depth_gate_still_applies passed" << std::endl;
@@ -646,12 +698,15 @@ void test_engine_keeps_alphabeta_time_after_tactics() {
               << result.method << ", depth " << result.depth << ")" << std::endl;
 
     // A budget too small for the tactical phases must not fabricate a deep
-    // answer either: the greedy fallback is allowed, but a depth-0 "alphabeta"
-    // method would claim a search that never completed a layer.
+    // answer either. Before A2 the only way to say "no layer finished" was to
+    // relabel the think "greedy"; now the alphabeta label survives and the reason
+    // has to come with it, so a depth-0 answer either came from a fast path or
+    // names why the search stopped.
     SearchResult quick = engine.search(board, WHITE, 8, 120, stop);
     assert(quick.best_move.pos.is_valid());
-    assert(!(quick.method == "alphabeta" && quick.depth == 0));
+    assert(quick.method != "alphabeta" || quick.stopped != "none");
     std::cout << "  short budget: method " << quick.method << ", depth " << quick.depth
+              << ", stopped " << quick.stopped << ", partial " << quick.partial_depth
               << ", best (" << quick.best_move.pos.row << "," << quick.best_move.pos.col
               << ")" << std::endl;
 }
@@ -2367,6 +2422,10 @@ void test_alphabeta_expired_deadline_returns_root_fallback() {
     assert(board.is_empty(result.pos.row, result.pos.col));
     SearchInfo info = ab.last_search_info();
     assert(info.depth == 0);
+    // The fallback is a root candidate, not a searched move, and the report says
+    // so: no layer was interrupted either, the think never started one.
+    assert(info.stopped == StopReason::TIME_HARD);
+    assert(info.partial_depth == 0);
     assert(elapsed < 1000);
 
     // The fallback is the first root candidate: regenerating the root list the
@@ -2382,13 +2441,21 @@ void test_alphabeta_expired_deadline_returns_root_fallback() {
               << result.pos.row << "," << result.pos.col << ")" << std::endl;
 }
 
-// Round 88, S6: once the node budget trips, every return above that point is a
-// short-circuit static evaluation, so the value the aborted node assembled is no
-// longer a bound on anything. The node used to write it out as a LOWERBOUND, and
-// the next search trusts a LOWERBOUND the way it trusts its own completed work.
-// The quiet board has no five in sight, so the +/-100000 store gate cannot be
-// what keeps the table empty: only the abort can.
-void test_alphabeta_aborted_search_stores_no_bound() {
+// Round 88, S6, restated by A2 (design doc 2.3.3).
+//
+// The rule is now per-node rather than per-search: a value that came out of a
+// budget short-circuit is not a bound, so *that node* stores nothing, while a node
+// whose own subtree ran to the end stores whether or not the search as a whole was
+// cut short. On this engine the two rules select the same set of table entries -
+// after a cut every later node short-circuits too, so there is no sound node left
+// to bank - which is why the store half below is kept as a regression pin and
+// reported as 无可观察差异 against the base commit, not as a HEAD-negative. What A2
+// adds is that the cut itself is described: which layer was interrupted, how far
+// into it, and why.
+//
+// The quiet board has no five in sight, so the +/-100000 store gate cannot be what
+// keeps the table empty: only the abort can.
+void test_alphabeta_aborted_search_stores_only_sound_nodes() {
     Board board;
     board.place_stone(7, 7, BLACK);
     board.place_stone(7, 8, WHITE);
@@ -2422,37 +2489,411 @@ void test_alphabeta_aborted_search_stores_no_bound() {
         child_hash = child.zobrist_hash();
     }
 
-    const int node_limit = 200;
+    // The whole first layer, measured so the cut below lands inside the second one
+    // instead of somewhere in the two.
+    uint64_t layer_one_nodes = 0;
+    {
+        TranspositionTable scratch;
+        AlphaBetaSearch measure(evaluator, scratch);
+        measure.set_node_limit(2000000);
+        measure.search(board, BLACK, 1, 600000, stop);
+        layer_one_nodes = static_cast<uint64_t>(measure.last_search_info().nodes_searched);
+    }
+    assert(layer_one_nodes > 0);
+
+    const int node_limit = static_cast<int>(layer_one_nodes + 1);
     TranspositionTable aborted_tt;
     AlphaBetaSearch aborted(evaluator, aborted_tt);
     aborted.set_node_limit(node_limit);
     aborted.search(board, BLACK, 2, 600000, stop);
-    const SearchInfo aborted_info = aborted.last_search_info();
-    // The search really was cut short, and the child is on the abort path.
-    assert(aborted_info.nodes_searched > node_limit);
-    assert(aborted_info.depth < 2);
+    const SearchInfo cut = aborted.last_search_info();
+    // The first layer is a completed record and the second is the interrupted one.
+    assert(cut.depth == 1);
+    assert(cut.partial_depth == 2);
+    assert(cut.root_moves_done == 0);
+    assert(cut.root_moves_total > 1);
+    assert(cut.stopped == StopReason::NODES);
+    // The cut landed inside the node that would have written this entry, so its
+    // own short-circuit value is not a bound and is not in the table.
     assert(aborted_tt.lookup(child_hash) == nullptr);
+    // A layer did finish, so the move played is that layer's, not a fallback.
+    assert(cut.best_move.pos.is_valid());
 
-    // Control: the same board and depth with a budget the whole tree fits must
-    // still write that entry, so the check above is not looking at a position
-    // the table never records.
+    // Control: the same board and depth with a budget the whole tree fits writes
+    // that entry and reports no interrupted layer, so the check above is not
+    // looking at a position the table never records.
     TranspositionTable full_tt;
     AlphaBetaSearch completed(evaluator, full_tt);
     completed.set_node_limit(2000000);
     completed.search(board, BLACK, 2, 600000, stop);
     const SearchInfo full_info = completed.last_search_info();
     assert(full_info.depth == 2);
+    assert(full_info.partial_depth == 0);
     assert(full_info.nodes_searched < node_limit * 10);
     const TTEntry* entry = full_tt.lookup(child_hash);
     assert(entry != nullptr);
 
-    std::cout << "test_alphabeta_aborted_search_stores_no_bound passed (aborted nodes: "
-              << aborted_info.nodes_searched << ", control nodes: " << full_info.nodes_searched
+    std::cout << "test_alphabeta_aborted_search_stores_only_sound_nodes passed ("
+              << "layer 1 nodes: " << layer_one_nodes << ", cut: d" << cut.depth
+              << "+partial " << cut.partial_depth << " " << cut.root_moves_done << "/"
+              << cut.root_moves_total << " " << stop_reason_name(cut.stopped)
+              << ", control nodes: " << full_info.nodes_searched
               << ", control entry value: " << (entry ? entry->value : 0)
               << ", flag: " << static_cast<int>(entry ? entry->flag : TTFlag::NONE)
               << ", first root: " << first_root.pos.row << "," << first_root.pos.col << ")"
               << std::endl;
 }
+
+// A2, design doc 2.3.2/2.3.3 and verification item 2 of the plan: the deadline
+// crossing inside the deepest layer must report that layer as the interrupted one
+// - the completed depth below it, a partial record above it, the root loop part-way
+// through - rather than silently returning a shallower answer with no explanation.
+// The cut is aimed with the injected clock: pass 1 counts how many readings a whole
+// think spends, and pass 2 arms the crossing on a poll inside the target layer.
+void test_stop_reason_time_hard_lands_mid_layer() {
+    Board board;
+    board.place_stone(7, 7, BLACK);
+    board.place_stone(7, 8, WHITE);
+    board.place_stone(8, 8, BLACK);
+    board.place_stone(6, 6, WHITE);
+
+    Evaluator evaluator;
+    std::atomic<bool> stop(false);
+
+    SearchLimits limits;
+    limits.max_depth = 4;
+    limits.hard_time_ms = 600000;  // never crossed until the clock is armed
+
+    // The deepest layer that costs at least two clock polls is the one the cut can
+    // be aimed into; deeper layers always cost more, so the deepest completed layer
+    // is the natural candidate.
+    TranspositionTable scratch_tt;
+    AlphaBetaSearch probe(evaluator, scratch_tt);
+    ArmingClock clock;
+    LayerRecord table;
+    measure_layers(probe, board, BLACK, limits, stop, clock, &table, nullptr);
+    assert(table.depth.size() == static_cast<size_t>(limits.max_depth));
+
+    int target = 0;
+    int polls = 0;
+    for (size_t i = table.depth.size(); i-- > 1;) {
+        const long long boundary = i == 0 ? 1 : table.readings[i - 1];
+        const int inside = table.readings[i] - static_cast<int>(boundary) - 2;
+        if (inside >= 2) {
+            target = table.depth[i];
+            polls = inside;
+            break;
+        }
+    }
+    assert(target >= 2);
+
+    // Arm on the poll that lands past the middle of the target layer: early enough
+    // that a root candidate is still unsearched, late enough that at least one has
+    // been finished.
+    const int layer_index = target - 1;
+    const long long boundary = layer_index == 0 ? 1 : table.readings[layer_index - 1];
+    TranspositionTable cut_tt;
+    AlphaBetaSearch search(evaluator, cut_tt);
+    ArmingClock armed;
+    armed.arm_at = static_cast<int>(boundary) + 1 + polls * 3 / 4;
+    search.set_clock(&armed);
+    const Move played = search.search(board, BLACK, limits, stop);
+
+    const SearchStats stats = search.last_stats();
+    const SearchInfo info = search.last_search_info();
+    assert(stats.completed_depth == target - 1);
+    assert(stats.partial_depth == target);
+    assert(stats.root_moves_done < stats.root_moves_total);
+    assert(stats.stopped == StopReason::TIME_HARD);
+    assert(info.partial_depth == stats.partial_depth);
+    assert(info.stopped == StopReason::TIME_HARD);
+    // The interrupted layer is not submitted: the move played is the last
+    // completed layer's winner, never the cut layer's.
+    assert(played.pos == stats.best_move.pos);
+    assert(stats.partial_best_move.pos.is_valid() || stats.root_moves_done == 0);
+    // The leaves of a completed layer are quiescence nodes, so the width the old
+    // accounting never reported is present here.
+    assert(stats.qnodes > 0);
+
+    std::cout << "test_stop_reason_time_hard_lands_mid_layer passed (cut in layer "
+              << target << " at reading " << armed.arm_at << " of " << polls
+              << " in-layer polls, root " << stats.root_moves_done << "/"
+              << stats.root_moves_total << ", nodes " << stats.nodes
+              << ", seldepth " << stats.seldepth << ")" << std::endl;
+}
+
+// A2: the node budget is the second way a think ends, and it reports itself as
+// such. Same layered shape as the time case, aimed by node count instead of by
+// clock reading - and the same guarantee that a cut layer cannot overwrite the
+// completed one.
+void test_stop_reason_nodes_cuts_a_layer_and_keeps_the_completed_move() {
+    Board board;
+    board.place_stone(7, 7, BLACK);
+    board.place_stone(7, 8, WHITE);
+    board.place_stone(8, 8, BLACK);
+    board.place_stone(6, 6, WHITE);
+
+    Evaluator evaluator;
+    std::atomic<bool> stop(false);
+
+    SearchLimits limits;
+    limits.max_depth = 3;
+    limits.hard_time_ms = 600000;
+
+    TranspositionTable scratch_tt;
+    AlphaBetaSearch probe(evaluator, scratch_tt);
+    ArmingClock clock;
+    LayerRecord table;
+    measure_layers(probe, board, BLACK, limits, stop, clock, &table, nullptr);
+    assert(table.depth.size() >= 2);
+    const uint64_t after_two = table.nodes[table.depth.size() - 1];
+    const uint64_t after_one = table.nodes[table.depth.size() - 2];
+    assert(after_two > after_one + 4);
+
+    TranspositionTable cut_tt;
+    AlphaBetaSearch search(evaluator, cut_tt);
+    SteadyClock never;
+    search.set_clock(&never);
+    SearchLimits budget = limits;
+    budget.max_nodes = static_cast<int>(after_one + (after_two - after_one) * 3 / 4);
+    const Move played = search.search(board, BLACK, budget, stop);
+
+    const SearchStats stats = search.last_stats();
+    assert(stats.completed_depth == table.depth[table.depth.size() - 2]);
+    assert(stats.partial_depth == 3);
+    assert(stats.root_moves_done < stats.root_moves_total);
+    assert(stats.stopped == StopReason::NODES);
+    assert(played.pos == stats.best_move.pos);
+    // The budget really was the end of the think: the whole layer would have cost
+    // more than it allowed.
+    assert(stats.nodes >= static_cast<uint64_t>(budget.max_nodes));
+
+    std::cout << "test_stop_reason_nodes_cuts_a_layer_and_keeps_the_completed_move passed ("
+              << "budget " << budget.max_nodes << ", nodes " << stats.nodes
+              << ", completed d" << stats.completed_depth << ", cut d" << stats.partial_depth
+              << " root " << stats.root_moves_done << "/" << stats.root_moves_total << ")"
+              << std::endl;
+}
+
+// A2, design doc 2.3.2: the soft window is a decision about starting another layer,
+// never a reason to discard a finished one. A think that spent its soft window but
+// not its hard deadline reports the completed depth, no partial layer, and
+// "time_soft" - which is the state the client shows as 第 N 层 without an
+// interruption marker.
+void test_stop_reason_soft_window_keeps_the_completed_layer() {
+    Board board;
+    build_midgame(board);
+
+    Evaluator evaluator;
+    std::atomic<bool> stop(false);
+
+    SearchLimits limits;
+    limits.max_depth = 6;
+    limits.hard_time_ms = 600000;  // the hard deadline is never reached here
+    limits.soft_time_ms = 250;
+
+    // An advancing clock spends 100 ms per reading, so the soft window is gone by
+    // the second layer boundary while the hard one is still 6000 s away.
+    ScriptedClock clock(100);
+    TranspositionTable tt;
+    AlphaBetaSearch search(evaluator, tt);
+    search.set_clock(&clock);
+    const Move played = search.search(board, BLACK, limits, stop);
+
+    const SearchStats stats = search.last_stats();
+    assert(stats.completed_depth == 1);
+    assert(stats.partial_depth == 0);
+    assert(stats.stopped == StopReason::TIME_SOFT);
+    assert(played.pos == stats.best_move.pos);
+    assert(stats.best_move.pos.is_valid());
+
+    std::cout << "test_stop_reason_soft_window_keeps_the_completed_layer passed (d"
+              << stats.completed_depth << " kept, nodes " << stats.nodes << ", "
+              << clock.readings << " readings)" << std::endl;
+}
+
+// A2: the replacement for round 101 FF4's source-shape pin, which could only pin
+// the shape because is_timeout() read a raw clock no test could steer. The claim is
+// the same one: a deadline that crosses at the instant of committing must not
+// discard a layer whose every root candidate was searched. With the injected clock
+// the crossing is an input, so the window FF4 described as unconstructible is now
+// aimed at directly - the alarm is armed on the reading the commit itself takes,
+// which is after the decision and before the next one.
+void test_stop_reason_crossing_at_the_commit_keeps_the_layer() {
+    Board board;
+    board.place_stone(7, 7, BLACK);
+    board.place_stone(7, 8, WHITE);
+    board.place_stone(8, 8, BLACK);
+    board.place_stone(6, 6, WHITE);
+
+    Evaluator evaluator;
+    std::atomic<bool> stop(false);
+
+    SearchLimits limits;
+    limits.max_depth = 2;
+    limits.hard_time_ms = 600000;
+
+    TranspositionTable scratch_tt;
+    AlphaBetaSearch probe(evaluator, scratch_tt);
+    ArmingClock clock;
+    LayerRecord table;
+    measure_layers(probe, board, BLACK, limits, stop, clock, &table, nullptr);
+    assert(table.depth.size() == 2);
+    const int commit_reading = table.readings[0];
+
+    TranspositionTable tt;
+    AlphaBetaSearch search(evaluator, tt);
+    ArmingClock armed;
+    armed.arm_at = commit_reading;
+    search.set_clock(&armed);
+    const Move played = search.search(board, BLACK, limits, stop);
+
+    const SearchStats stats = search.last_stats();
+    assert(stats.completed_depth == 1);
+    assert(stats.partial_depth == 0);
+    assert(stats.root_moves_done == stats.root_moves_total);
+    assert(stats.stopped == StopReason::TIME_HARD);
+    assert(played.pos == stats.best_move.pos);
+
+    std::cout << "test_stop_reason_crossing_at_the_commit_keeps_the_layer passed (alarm at "
+              << commit_reading << ", kept d" << stats.completed_depth << " of "
+              << stats.root_moves_total << " candidates, nodes " << stats.nodes << ")"
+              << std::endl;
+}
+
+// A2: 终止 / 重开 / 接管 sets the flag, and a flag set between two layers must be
+// reported as a user stop that keeps the layer already on the record. The flag is
+// read at every stop test, so no clock is needed to aim this one: the test sets it
+// from the frame the third layer commits with.
+void test_stop_reason_user_flag_stops_between_layers() {
+    Board board;
+    board.place_stone(7, 7, BLACK);
+    board.place_stone(7, 8, WHITE);
+    board.place_stone(8, 8, BLACK);
+    board.place_stone(6, 6, WHITE);
+
+    Evaluator evaluator;
+    std::atomic<bool> stop(false);
+
+    SearchLimits limits;
+    limits.max_depth = 4;
+    limits.hard_time_ms = 600000;
+
+    TranspositionTable tt;
+    AlphaBetaSearch search(evaluator, tt);
+    SteadyClock never;
+    search.set_clock(&never);
+    int last_completed = 0;
+    search.set_progress_callback([&](const SearchStats& stats) {
+        last_completed = stats.completed_depth;
+        // Press 终止 the moment a layer is on the record, before the next starts.
+        if (stats.completed_depth >= 3) stop.store(true);
+    });
+    const Move played = search.search(board, BLACK, limits, stop);
+
+    const SearchStats stats = search.last_stats();
+    assert(last_completed == 3);
+    assert(stats.completed_depth == 3);
+    assert(stats.partial_depth == 0);
+    assert(stats.stopped == StopReason::USER);
+    assert(played.pos == stats.best_move.pos);
+
+    std::cout << "test_stop_reason_user_flag_stops_between_layers passed (kept d"
+              << stats.completed_depth << ", nodes " << stats.nodes << ")" << std::endl;
+}
+
+// A2: a proven win ends the deepening on purpose. That is a stop, so it has to be
+// labelled as one - and it must not be mistaken for a budget running out, which is
+// what the +-100000 resign threshold downstream reads.
+void test_stop_reason_mate_ends_the_deepening_without_an_abort() {
+    Board board;
+    board.place_stone(7, 4, BLACK);
+    board.place_stone(7, 5, BLACK);
+    board.place_stone(7, 6, BLACK);
+    board.place_stone(7, 7, BLACK);
+    board.place_stone(9, 9, WHITE);
+    board.place_stone(10, 10, WHITE);
+    assert(!board.is_game_over());
+
+    Evaluator evaluator;
+    std::atomic<bool> stop(false);
+    TranspositionTable tt;
+    AlphaBetaSearch search(evaluator, tt);
+    SteadyClock never;
+    search.set_clock(&never);
+
+    SearchLimits limits;
+    limits.max_depth = 4;
+    limits.hard_time_ms = 600000;
+    const Move played = search.search(board, BLACK, limits, stop);
+
+    const SearchStats stats = search.last_stats();
+    assert(stats.score >= 100000);
+    assert(stats.stopped == StopReason::MATE);
+    assert(stats.partial_depth == 0);
+    // One layer is enough to see the five, and deepening stops there: the loop did
+    // not run to max_depth.
+    assert(stats.completed_depth == 1);
+    assert(played.pos.is_valid());
+    assert(board.is_empty(played.pos.row, played.pos.col));
+
+    std::cout << "test_stop_reason_mate_ends_the_deepening_without_an_abort passed (d"
+              << stats.completed_depth << ", score " << stats.score << ", nodes "
+              << stats.nodes << ")" << std::endl;
+}
+
+// A2: an unbounded quiescence is the hole the node budget could not see - the old
+// accounting counted only alphabeta nodes at the places that checked, and never
+// reported the width quiescence added. Quiescence nodes are now counted toward the
+// budget, kept as their own total, and the deepest reach is reported.
+void test_quiescence_nodes_count_toward_the_budget_and_report_seldepth() {
+    // Both sides hold a live three: every quiescence entry has forcing moves to
+    // try, so the subtree runs past its own depth.
+    Board board;
+    build_midgame(board);
+
+    Evaluator evaluator;
+    std::atomic<bool> stop(false);
+
+    SearchLimits limits;
+    limits.max_depth = 1;
+    limits.hard_time_ms = 600000;
+    limits.max_nodes = 4000;
+
+    TranspositionTable tt;
+    AlphaBetaSearch search(evaluator, tt);
+    SteadyClock never;
+    search.set_clock(&never);
+    search.search(board, BLACK, limits, stop);
+
+    const SearchStats stats = search.last_stats();
+    // The budget bounds the whole tree, quiet part included.
+    assert(stats.nodes <= static_cast<uint64_t>(limits.max_nodes) + 1);
+    assert(stats.qnodes > 0);
+    assert(stats.qnodes <= stats.nodes);
+    assert(stats.seldepth >= 1);
+
+    // A control with no quiet work to do must not invent any: on a board where no
+    // candidate makes a four or a live three, quiescence stand-pats at depth 0.
+    Board quiet;
+    quiet.place_stone(0, 0, BLACK);
+    quiet.place_stone(14, 14, WHITE);
+    TranspositionTable quiet_tt;
+    AlphaBetaSearch quiet_search(evaluator, quiet_tt);
+    quiet_search.set_clock(&never);
+    SearchLimits quiet_limits = limits;
+    quiet_limits.max_nodes = 0;
+    quiet_search.search(quiet, BLACK, quiet_limits, stop);
+    const SearchStats quiet_stats = quiet_search.last_stats();
+    assert(quiet_stats.qnodes > 0);
+    assert(quiet_stats.seldepth == 0);
+
+    std::cout << "test_quiescence_nodes_count_toward_the_budget_and_report_seldepth passed ("
+              << "nodes " << stats.nodes << ", qnodes " << stats.qnodes << ", seldepth "
+              << stats.seldepth << "; quiet qnodes " << quiet_stats.qnodes
+              << " seldepth " << quiet_stats.seldepth << ")" << std::endl;
+}
+
 
 // J1: without a deadline the per-search slice remains the only bound: a 200 ms
 // budget on a deep request must return a normal searched move inside a generous
@@ -2671,95 +3112,22 @@ void test_greedy_drops_the_defense_price_of_a_black_forbidden_point() {
               << legal_spot->defense_score << ")" << std::endl;
 }
 
-// Round 101 FF4, labelled as what it is: a source-shape pin, not a behaviour probe.
-// The commit gate of the iterative-deepening loop used to re-read the clock and the
-// node budget at the instant of committing, so a layer whose every root move had
-// been searched could still be thrown away because the deadline crossed in the few
-// instructions after the last one. The replacement trusts the layer's own record.
-// No deterministic seam for that window exists: is_timeout() reads a raw
-// high_resolution_clock (alphabeta.h:63), and every node-level short circuit that
-// could have raised it sets aborted_ in the same breath (:95/:148/:178/:231), which
-// is only cleared once per search (:266) rather than per node - so the new gate can
-// only ever accept a layer the old one also accepted, plus that race window. This
-// row is therefore reported as 无可观察差异 and pinned by shape. The deadline cases
-// already in this file (test_alphabeta_expired_deadline_returns_root_fallback,
-// test_alphabeta_absolute_deadline_stops_search,
-// test_alphabeta_aborted_search_stores_no_bound,
-// test_alphabeta_huge_timeout_does_not_overflow_node_budget) stay as the behaviour
-// guard and are not re-written here.
-void test_alphabeta_commit_gate_trusts_the_layers_own_record() {
-#ifdef GOMOKU_SOURCE_DIR
-    std::ifstream in(std::string(GOMOKU_SOURCE_DIR) + "/src/search/alphabeta.cpp");
-    assert(in.is_open());
-    std::vector<std::string> lines;
-    {
-        std::string line;
-        while (std::getline(in, line)) lines.push_back(line);
-    }
-
-    auto find_line = [&lines](const char* needle) -> long {
-        for (size_t i = 0; i < lines.size(); ++i) {
-            if (lines[i].find(needle) != std::string::npos) return static_cast<long>(i);
-        }
-        return -1;
-    };
-    auto count_lines = [&lines](const char* needle) {
-        int seen = 0;
-        for (const std::string& line : lines) {
-            if (line.find(needle) != std::string::npos) ++seen;
-        }
-        return seen;
-    };
-
-    const long gate = find_line("if (layer_complete");
-    const long declared = find_line("bool layer_complete = true;");
-    const long broken = find_line("layer_complete = false;");
-    const long reset = find_line("aborted_ = false;");
-    std::cout << "  [r101ff4] declared at " << declared << ", broken at " << broken
-              << ", committed at " << gate << ", aborted_ reset at " << reset
-              << ", node abort sites " << count_lines("aborted_ = true;") << std::endl;
-
-    assert(gate >= 0);
-    assert(declared >= 0 && broken >= 0 && reset >= 0);
-    // The record opens before the root loop, the loop's own exit closes it, and the
-    // commit that reads it comes after both.
-    assert(declared < broken);
-    assert(broken < gate);
-    // The invariant the gate leans on: aborted_ is cleared per search, not per node,
-    // so a node that short-circuited anywhere in the layer is still visible here.
-    assert(reset < declared);
-    assert(count_lines("aborted_ = true;") >= 4);
-    assert(count_lines("aborted_ = false;") == 1);
-
-    const std::string& commit = lines[static_cast<size_t>(gate)];
-    assert(commit.find("is_timeout") == std::string::npos);
-    assert(commit.find("node_limit_") == std::string::npos);
-    assert(commit.find("!stop_flag.load()") != std::string::npos);
-    assert(commit.find("!aborted_") != std::string::npos);
-    // The re-read test is gone from the file, not just from that line.
-    assert(find_line("nodes_searched_ <= node_limit_") < 0);
-
-    std::cout << "test_alphabeta_commit_gate_trusts_the_layers_own_record passed" << std::endl;
-#else
-    std::cout << "test_alphabeta_commit_gate_trusts_the_layers_own_record skipped (no "
-                 "GOMOKU_SOURCE_DIR)" << std::endl;
-#endif
-}
-
-// Round 102 GG1: README:530-531 leaves depth/nodes unset for every method but
-// alphabeta. The depth-0 relabel was the one path that broke that -
-// alphabeta.cpp:393 stamps info_.nodes_searched unconditionally, so a hand whose
-// first layer never completed reported {"method":"greedy","depth":0,
-// "nodes":N>0} through game_manager into the replay entry.
+// Round 102 GG1, inverted by A2 (design doc 2.3.3). The case was written to prove
+// the depth-0 relabel could not hide a node count: README:530-531 leaves depth/nodes
+// unset for every method but alphabeta, and the relabel made a hand whose first
+// layer never completed report {"method":"greedy","depth":0,"nodes":N>0}, which is
+// the one combination the table forbids. The redesign removes the relabel instead of
+// the count, so the same hand now reports what it was: an alphabeta think that ran
+// out of budget, with its nodes visible and its reason named.
 //
-// The position below is a 24-stone midgame whose *whole first layer* costs 4858
-// nodes (about 433 ms in this suite's unoptimised build). The engine's smallest
-// node budget is remaining_time * 200 (search_engine.cpp:263) with
-// remaining_time floored at 100 ms, i.e. 20000 nodes, so no node cap can cut a
-// layer that cheap - the interrupt has to come from the absolute deadline. A
-// 10 ms budget is therefore ~43x inside the layer rather than past it, which is
-// what makes the dirty count constructible instead of a shape pin.
-void test_engine_greedy_relabel_zeroes_the_alphabeta_count() {
+// The construction is unchanged and still needed: the position below is a 24-stone
+// midgame whose *whole first layer* costs 4858 nodes (about 433 ms in this suite's
+// unoptimised build). The engine's smallest node budget is remaining_time * 200
+// (search_engine.cpp:263) with remaining_time floored at 100 ms, i.e. 20000 nodes,
+// so no node cap can cut a layer that cheap - the interrupt has to come from the
+// absolute deadline. A 10 ms budget is therefore ~43x inside the layer rather than
+// past it, which is what makes the interrupted layer constructible instead of a race.
+void test_engine_reports_the_interrupted_alphabeta_layer() {
     const int placements[][2] = {
         {9, 11}, {0, 14}, {10, 2},  {6, 6},  {10, 4}, {9, 2},  {4, 2},  {5, 3},
         {2, 3},  {10, 1}, {12, 12}, {2, 6},  {1, 8},  {14, 8}, {4, 1},  {13, 4},
@@ -2794,7 +3162,7 @@ void test_engine_greedy_relabel_zeroes_the_alphabeta_count() {
     const SearchResult interrupted = engine.search(board, WHITE, 4, 10, stop);
 
     // Control: the same position with an ample budget completes layers, so the
-    // count is reported. Zeroing is confined to the depth-0 branch.
+    // count is reported the same way it always was.
     //
     // Round 112 §3(a): this layer measures about 4858 nodes / 433 ms without -O2, so
     // 2000 ms left only ~4.6x headroom and a saturated machine ran out of it and fell to
@@ -2806,21 +3174,31 @@ void test_engine_greedy_relabel_zeroes_the_alphabeta_count() {
     full.set_resign_detection(false);
     const SearchResult completed = full.search(board, WHITE, 4, 20000, stop);
 
-    std::cout << "test_engine_greedy_relabel_zeroes_the_alphabeta_count measured "
+    std::cout << "test_engine_reports_the_interrupted_alphabeta_layer measured "
               << "(interrupted: " << interrupted.method << " d" << interrupted.depth
-              << "/n" << interrupted.nodes_searched
+              << "+partial " << interrupted.partial_depth << "/n" << interrupted.nodes_searched
+              << " " << interrupted.stopped
               << ", last frame d" << frame_depth << "/n" << frame_nodes
               << ", control: " << completed.method << " d" << completed.depth
-              << "/n" << completed.nodes_searched << ")" << std::endl;
+              << "+partial " << completed.partial_depth << "/n"
+              << completed.nodes_searched << " " << completed.stopped << ")" << std::endl;
 
-    // The renamed fast path reports the fast path's own fields: nothing filled.
-    assert(interrupted.method == "greedy");
+    // No relabel: the phase that searched keeps its name and says why it ended.
+    assert(interrupted.method == "alphabeta");
+    assert(interrupted.stopped == "time_hard");
+    // Not one layer finished, and the one that was cut is reported with how far
+    // into it the deadline landed.
     assert(interrupted.depth == 0);
-    assert(interrupted.nodes_searched == 0);
-    // And it is the rename, not the no-search fallback: a move came back.
+    assert(interrupted.partial_depth == 1);
+    assert(interrupted.root_moves_total > 1);
+    assert(interrupted.root_moves_done < interrupted.root_moves_total);
+    // The work is visible instead of zeroed, which is what makes a timeout and a
+    // position with nothing to search two different reports.
+    assert(interrupted.nodes_searched > 0);
+    // And a move came back regardless: the root fallback answers for the player.
     assert(interrupted.best_move.pos.is_valid());
-    // The work really happened - AlphaBeta's own record still reaches the
-    // terminal thinking frame, which is what the client's progress bar reads.
+    assert(board.is_empty(interrupted.best_move.pos.row, interrupted.best_move.pos.col));
+    // The frames carry the same unfinished depth rather than a invented one.
     assert(frame_depth == 0);
     assert(frame_nodes > 0);
 
@@ -2828,7 +3206,7 @@ void test_engine_greedy_relabel_zeroes_the_alphabeta_count() {
     assert(completed.depth >= 1);
     assert(completed.nodes_searched > 0);
 
-    std::cout << "test_engine_greedy_relabel_zeroes_the_alphabeta_count passed" << std::endl;
+    std::cout << "test_engine_reports_the_interrupted_alphabeta_layer passed" << std::endl;
 }
 
 // ---------------------------------------------------------------------------
@@ -3116,7 +3494,7 @@ int main() {
     test_engine_stamps_elapsed_on_tactical_wins();
     test_engine_elapsed_covers_the_tactical_phases();
     test_engine_progress_frames_share_the_search_clock();
-    test_engine_greedy_relabel_zeroes_the_alphabeta_count();
+    test_engine_reports_the_interrupted_alphabeta_layer();
     test_search_engine_finds_five();
     test_controller_async();
     test_controller_stop();
@@ -3151,8 +3529,14 @@ int main() {
     test_alphabeta_huge_timeout_does_not_overflow_node_budget();
     test_alphabeta_absolute_deadline_stops_search();
     test_alphabeta_expired_deadline_returns_root_fallback();
-    test_alphabeta_aborted_search_stores_no_bound();
-    test_alphabeta_commit_gate_trusts_the_layers_own_record();
+    test_alphabeta_aborted_search_stores_only_sound_nodes();
+    test_stop_reason_time_hard_lands_mid_layer();
+    test_stop_reason_nodes_cuts_a_layer_and_keeps_the_completed_move();
+    test_stop_reason_soft_window_keeps_the_completed_layer();
+    test_stop_reason_crossing_at_the_commit_keeps_the_layer();
+    test_stop_reason_user_flag_stops_between_layers();
+    test_stop_reason_mate_ends_the_deepening_without_an_abort();
+    test_quiescence_nodes_count_toward_the_budget_and_report_seldepth();
     test_greedy_drops_the_defense_price_of_a_black_forbidden_point();
     test_alphabeta_large_depth_bounded_by_slice_without_deadline();
     test_sort_moves_pins_tt_move_already_at_front();

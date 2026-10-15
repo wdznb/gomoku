@@ -1979,6 +1979,83 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次121 引擎重构 A2：被打断的那一手，从此说自己是被打断的 — engine redesign stage A2
+
+规格是 `docs/ENGINE_REDESIGN.md`（冻结，不改写）。§1.2 把线上四类缺陷归到同一个结构根因，A2 动的是 P1：一次思考
+只有一只 `aborted_` 布尔，节点级「我的返回值是短路出来的静态评估」和搜索级「别再开新的活」挤在同一个位上，于是
+三处一起坏。
+
+### Found
+
+- **一次短路，全盘作废**。提交门 `if (layer_complete && !stop_flag.load() && !aborted_)` 与写表门
+  `if (!aborted_ && …)` 读同一只标志：一个子树被掐断，已经跑完的兄弟子树连同它们的表项一起被丢掉。
+- **超时与没搜过在协议上不可区分**。`search_engine.cpp` 里 `info.depth == 0 ⇒ method = "greedy"` 并把 depth/nodes
+  归零：一手 4 层预算、第一层就没跑完的思考，被报成一条从未搜索的贪心捷径，且节点数说 0，而同一手自己的进度帧
+  报的是几百个节点。
+- **层边界听的是过期的答案**。节点内的时钟每 1024 节点才读一次，而「要不要再开一层」正是发生在层边界；一个陈旧
+  一层的答复就能决定开一整层。绝对期限与「时限为 0 = 不限」共用一个 `long long`，于是「期限已经过去」和「没有期
+  限」无法区分。
+- **进度帧只有 depth/nodes/elapsed**，客户端在开局与终局之间什么都看不见，只能靠墙钟猜。
+
+### Fixed
+
+产品侧：`NodeResult{score, sound}` 取代裸 `int` 返回值（`sound` 只描述本节点自己，完成的子树照常入库，被短路的
+那个节点的数值不入库）；`SearchContext` 持 `reason_`（粘住的首个中止原因）+ `has_hard_`/`has_soft_` 哨兵 +
+`layer_boundary_stopped()`（在层边界强制读一次时钟）+ `soft_time_up()`（只决定「开不开下一层」，永不丢弃已完成的
+一层）；`alphabeta()`/`quiescence()`/`search_root_layer()` 三个调用点共用这一个判定；`SearchInfo`/`SearchResult`
+**只增字段**（`partial_depth`/`root_moves_done`/`root_moves_total`/`seldepth`/`partial_best_move`/`stopped`），
+`method` 不再改写、保留 `"alphabeta"` 并带上中止原因；`system_search_clock()` 落在 `steady_clock` 上，因为 VCF/VCT
+与 `SearchEngine` 装的绝对期限都是 `steady_clock::time_point`，混用 `high_resolution_clock` 会拿「开机时长」去比
+「epoch」。写用例时在产品里改回两处：`root_moves_done` 原先把「切进去的那一个候选」也计数，于是 `done == total`
+并不等价于「这一层每个候选都跑完了」——而这正是提交门依赖的那条不变量；以及层边界那条 break 没有先
+`refresh_counters()`，任何在那里发出的帧会读到上一层的计数。
+
+新增 7 条行为用例，全部走 A1 那个可注入时钟：`test_stop_reason_time_hard_lands_mid_layer`（两趟：第一趟量每层的
+时钟读数与节点数，第二趟把武装点插进目标层的中段）、`test_stop_reason_nodes_cuts_a_layer_and_keeps_the_completed_move`
+（预算 = 上一层节点 + (全−上一层)×3/4，纯算术，没有魔数）、`test_stop_reason_soft_window_keeps_the_completed_layer`、
+`test_stop_reason_crossing_at_the_commit_keeps_the_layer`、`test_stop_reason_user_flag_stops_between_layers`、
+`test_stop_reason_mate_ends_the_deepening_without_an_abort`、
+`test_quiescence_nodes_count_toward_the_budget_and_report_seldepth`。§4-2 要的三种中止（TIME_HARD / NODES / USER）
+各有独立用例，且都断言返回的着法永远来自已完成的那一层，不来自 `partial_best_move`。
+
+### 合约过期
+
+1. `test_alphabeta_aborted_search_stores_no_bound` → **`test_alphabeta_aborted_search_stores_only_sound_nodes`**。
+   「中止不写表」这条前提按 §2.3.3 反转成「中止仍写 sound 表项，被短路的那个节点自身的返回值不入库」。它的**存储
+   半边对 `0670a6e` 是 无可观察差异**：旧树粘住的 `aborted_` 与新树粘住的 `reason_` 选中的条目集合相同，所以这条
+   用例的判别力在 `aborted_tt.lookup(child_hash) == nullptr` 与 `best_move` 有效性上，不在表项数量上。
+2. `test_engine_greedy_relabel_zeroes_the_alphabeta_count` → **`test_engine_reports_the_interrupted_alphabeta_layer`**，
+   断言方向翻转（见下方实测两棵树的打印）。
+3. **`test_alphabeta_commit_gate_trusts_the_layers_own_record`（round 100 的 FF4 源码文本形状钉）退役**，由
+   `test_stop_reason_crossing_at_the_commit_keeps_the_layer` 的行为断言取代：钉的是「提交门写成什么字样」，而契约
+   要的是「提交那一瞬时钟越线，这一层照样留下」。
+4. `test_engine_keeps_alphabeta_time_after_tactics` 的 `!(method == "alphabeta" && depth == 0)` 改写为
+   `method != "alphabeta" || stopped != "none"`：它钉的正是被本轮有意删除的那次改写。
+
+### Verified
+
+`ctest` **8/8 / 72.68 s**（`test_search` 41.18 s），`node tests/web_frontend_check.js` **103/103**，
+`node tests/readme_anchor_check.js` **113 citations / 0 problems**，README 仍 **658 行**（本轮没动 README；
+:529-531 那三行的 method 枚举里 `greedy` 由 `search_engine.cpp` 的另外两处赋值继续撑着，锚点脚本认这一条）。
+HEAD-negative 用 `git archive 0670a6e` 整树重建后跑它自己的用例，同一 24 子中盘局面打印
+`interrupted: greedy d0/n0`（旧，绿），本树打印 `interrupted: alphabeta d0+partial 1/n493 time_hard`（新，绿）——
+即 §4-2 的 G2 可见化。实测细节：本盒 alphabeta 约 11.2 k 节点/秒，round 112 §3(a) 给那条控制组留的「46 倍余量」
+在这里并不成立（20000 ms 的控制组自己就以 `d3+partial 4 / n252229 / time_hard` 收场），所以我只保留了它受保护的
+三条断言（`completed.method == "alphabeta"` / `depth >= 1` / `nodes_searched > 0`），没有替它发明新的宣称。
+**行号位移**：`tests/test_search.cpp` +530/−146，两条受保护前提从 `:2194` / `:2788-2792` 移到
+**`:2284`**（`assert(result.resigned)`，300 ms 那一段）与 **`:3205`**（`completed.method == "alphabeta"`）。两条
+都没被碰。
+
+Valgrind（`tools/valgrind_check.sh`，`build-vg/` Debug + `-UNDEBUG`）：整套 `test_search` 在 memcheck 下跑了
+**292 s / reports=0**，随后在 `test_engine_progress_callback_reports_each_layer` 上 SIGABRT。那不是内存错误而是
+墙钟脆弱：那条用例给引擎 3000 ms，20× 减速下第一层都跑不完，于是 `depths` 里再也没有一次真正的上升。两棵树单独
+跑这一条用例对照（同一套 memcheck 参数，串行跑以免互相抢 CPU）：本树 `test_search.cpp:658` `Assertion 'rose'
+failed`，`0670a6e` 树同一函数同一断言（它的 `:606`）同样 rc=134 —— **既存脆弱、中止点未前移**，与 §5 里
+`test_training` / `test_server` 那两条同类。A2 真正改到的代码用子集驱动覆盖（`-Dmain=suite_main` 重编套件 + 一个
+挑用例的 driver）：13 条（三个期限/深度切片用例、`stores_only_sound_nodes`、6 条 `test_stop_reason_*`、
+quiescence 记账、两条 TT 探测）**全部通过，rc=0，零报告**。D1 打通 `max_nodes` 后这条脆弱用例应改成节点预算。
+
+
 ## 轮次119 注释里的 60 秒和重复了一遍的 refuses；一条开书用例其实一次也没命中过谱 — bugfix round 119 batch WW
 
 ### Found

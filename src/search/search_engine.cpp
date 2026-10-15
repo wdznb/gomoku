@@ -247,8 +247,9 @@ SearchResult SearchEngine::search(const Board& board, int color,
         // terminal frame below, and a constant offset keeps the sequence non-decreasing.
         const ProgressCallback progress_cb = progress_callback_;
         if (progress_cb) {
-            ab.set_progress_callback([progress_cb, used_ms](int depth, int nodes, int elapsed_ms) {
-                progress_cb(depth, nodes, elapsed_ms + used_ms);
+            ab.set_progress_callback([progress_cb, used_ms](const SearchStats& stats) {
+                progress_cb(stats.completed_depth, static_cast<int>(stats.nodes),
+                            stats.elapsed_ms + used_ms);
             });
         }
 
@@ -291,16 +292,15 @@ SearchResult SearchEngine::search(const Board& board, int color,
         result.depth = info.depth;
         result.nodes_searched = info.nodes_searched;
         result.method = "alphabeta";
-        // Depth 0 means not one iteration finished and AlphaBeta fell back to
-        // root_moves[0]; calling that alphabeta showed depth 0 / score 0 in the
-        // replay panel (README:530 lists greedy as a method).
-        if (info.depth == 0) {
-            result.method = "greedy";
-            // A renamed fast path is not AlphaBeta: README:531 leaves depth/nodes
-            // unset for every other method, and this hand completed no layer.
-            result.depth = 0;
-            result.nodes_searched = 0;
-        }
+        // A think that completed no layer keeps the alphabeta label and says why
+        // it stopped. Relabelling it "greedy" made an interrupted think and a
+        // position with nothing to search indistinguishable, and zeroing the node
+        // count hid the work that had been done (design doc 2.3.3).
+        result.partial_depth = info.partial_depth;
+        result.root_moves_done = info.root_moves_done;
+        result.root_moves_total = info.root_moves_total;
+        result.seldepth = info.seldepth;
+        result.stopped = stop_reason_name(info.stopped);
 
         // AlphaBeta's own count starts with that phase and covers only it; the
         // caller is owed the whole move, so the measure is taken below - after the

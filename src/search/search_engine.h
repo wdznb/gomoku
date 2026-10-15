@@ -28,6 +28,16 @@ struct SearchResult {
     std::string method;
     std::vector<Move> principal_variation;
     bool resigned = false;
+    // AlphaBeta's layered accounting, so a hand that ran out of budget is
+    // distinguishable from a hand that had nothing to search: depth is the last
+    // layer that ran to the end, partial_depth the one that was cut, and stopped
+    // says why ("" is never used - "none" means the think finished). Every fast
+    // path that never ran a layered search leaves these at their defaults.
+    int partial_depth = 0;
+    int root_moves_done = 0;
+    int root_moves_total = 0;
+    int seldepth = 0;
+    std::string stopped = "none";
 };
 
 using ProgressCallback = std::function<void(int depth, int nodes, int elapsed_ms)>;

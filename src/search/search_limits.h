@@ -64,6 +64,11 @@ public:
 // Milliseconds on a monotonic clock, for production use.
 long long steady_clock_ms();
 
+// The clock a search uses when its owner did not install one. A shared instance
+// rather than a fresh subclass per search, so nothing is allocated or virtual
+// called per think.
+const SearchClock& system_search_clock();
+
 }
 
 #endif
