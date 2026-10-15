@@ -1979,6 +1979,37 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次121 附带修复：进度帧与逐手耗时改用同一次读表 — one clock for the move
+
+`test_engine_progress_frames_share_the_search_clock` 在本树（A3 施工中）于合成负载下 SIGABRT，
+`tests/test_search.cpp:1103` `Assertion 'elapsed[i] >= elapsed[i - 1]' failed`；`git archive e6f3f74` 出来的同一棵
+负载树 rc=0。用打印全部帧的 driver 复现，缺陷当场可见：
+
+```
+new: frame 2 depth=2 elapsed=2013 / frame 3 (terminal) elapsed=2012  <-- DECREASE
+```
+
+根因是**两只时钟**：`SearchEngine::search` 的 `start` / `elapsed_since_start()` / `used_ms` 都读
+`high_resolution_clock`（libstdc++ 在 Linux 上是 `CLOCK_REALTIME`），而 A1/A2 装的绝对期限与 `SearchContext` 的
+`elapsed_ms()` 读的是 `steady_clock`；进度帧发的是 `used_ms + stats.elapsed_ms`，即「一只时钟上的一段时长」加「另一只
+时钟上的一段时长」，再加上两次各自的毫秒截断。RTC 被宿主校正的盒子上（VM / WSL）两者相差几十毫秒，于是层落在哪里
+就决定这一帧会不会超过终帧。这不是 A3 引入的语义，是 A3 让每一层跑得更快、层落点换了，才把一个既存的可比性缺陷暴露
+成一条会红的断言。
+
+改法：`search_engine.cpp` 里那一手棋只剩 `steady_clock` 一只时钟（与期限、与 AlphaBeta 的预算同一只），并且每一帧在
+**发出的那一刻**读一次表，而不是把本阶段的自计时叠到前置段上 —— 两个截断之和能比单次读数高出 1 ms，而一条会往回走的
+进度流比一帧晚上几毫秒要糟得多。`method`/`elapsed_ms` 的对外语义不变。
+
+改后同一负载 driver 连跑四次：帧序 `1115 / 1364 / 2023 / 2023`、`1113 / 1359 / 2007 / 2007`、
+`1111 / 1379 / 2003 / 2003`、`1113 / 1382 / 2017 / 2017`，全部单调；同一负载下 `e6f3f74` 树也绿（它的层落点没撞上
+那个偏斜）。**这条修复没有新用例**：它的判别力就在既有的 `:1054` 那条用例上，红/绿两向都是实测，不另造负例。
+
+A2 记录里那条 `test_engine_progress_callback_reports_each_layer` 的墙钟脆弱**仍在，且中止点未前移**：本轮单跑它在
+`build-vg` 下 plain rc=0（`3 layers, last depth 2`），memcheck 下 rc=134 / **reports=0**，中止消息
+`../tests/test_search.cpp:878: Assertion 'rose' failed` —— 与 A2 记的 `:658` 是同一条断言，行号差 220 只是它上方的
+TT 用例块涨了。本轮没动它，D1 的 `max_nodes` 才是它的解。
+
+
 ## 轮次121 引擎重构 A2：被打断的那一手，从此说自己是被打断的 — engine redesign stage A2
 
 规格是 `docs/ENGINE_REDESIGN.md`（冻结，不改写）。§1.2 把线上四类缺陷归到同一个结构根因，A2 动的是 P1：一次思考

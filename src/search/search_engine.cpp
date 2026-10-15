@@ -35,13 +35,20 @@ void SearchEngine::set_coefficients(const ThreatCoefficients& coeffs) {
 SearchResult SearchEngine::search(const Board& board, int color,
                                    int max_depth, int time_limit_ms,
                                    std::atomic<bool>& stop_flag) {
-    auto start = std::chrono::high_resolution_clock::now();
+    // One clock for the whole move, and it is the one the phases already run on:
+    // AlphaBeta's budget and the end-of-move deadline are steady_clock, so
+    // stamping these figures from high_resolution_clock put two timescales into
+    // one progress stream. Where the realtime clock is slewed against the
+    // monotonic one (a VM, WSL) the gap - tens of milliseconds here - shows up
+    // wherever a layer stops, and a layer frame can then read higher than the
+    // terminal frame of the same think.
+    auto start = std::chrono::steady_clock::now();
     SearchResult result;
     // The one wall clock the caller is owed: each phase times itself, but the
     // replay panel and ai_move.thinking_time_ms report a single number per move.
     auto elapsed_since_start = [start]() {
         return static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::high_resolution_clock::now() - start).count());
+            std::chrono::steady_clock::now() - start).count());
     };
 
     auto root_moves = board.active_empty();
@@ -234,22 +241,22 @@ SearchResult SearchEngine::search(const Board& board, int color,
         // move overshoot by that whole share once the tactics phases spent it.
         if (has_deadline) ab.set_deadline(search_deadline);
         int remaining_time = time_limit_ms;
-        auto elapsed = std::chrono::high_resolution_clock::now() - start;
-        int used_ms = static_cast<int>(
-            std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count());
+        const int used_ms = elapsed_since_start();
         remaining_time -= used_ms;
         if (remaining_time < 100) remaining_time = 100;
         // Iteration-level frames for the client: the frame at the end of this
         // function only lands once the whole search is over, which is too late
         // for its 终止 button. The member is copied out first so the hook carries
-        // its own value. AlphaBeta times only its own phase, so the tactics phases
-        // it came after are added on: one clock for the per-depth frames and the
-        // terminal frame below, and a constant offset keeps the sequence non-decreasing.
+        // its own value. A frame is stamped from the move clock at the moment it
+        // is emitted, not by adding this phase's own timing onto the pre-search
+        // segment: two truncated durations added together can land 1 ms above the
+        // single reading the terminal frame takes, and a progress stream that goes
+        // backwards is worse than one whose first frame is a few ms late.
         const ProgressCallback progress_cb = progress_callback_;
         if (progress_cb) {
-            ab.set_progress_callback([progress_cb, used_ms](const SearchStats& stats) {
+            ab.set_progress_callback([progress_cb, elapsed_since_start](const SearchStats& stats) {
                 progress_cb(stats.completed_depth, static_cast<int>(stats.nodes),
-                            stats.elapsed_ms + used_ms);
+                            elapsed_since_start());
             });
         }
 
@@ -316,9 +323,7 @@ SearchResult SearchEngine::search(const Board& board, int color,
         }
 
         if (resign_detection_ && !stop_flag.load() && !result.resigned) {
-            auto elapsed_after_ab = std::chrono::high_resolution_clock::now() - start;
-            int total_used_ms = static_cast<int>(
-                std::chrono::duration_cast<std::chrono::milliseconds>(elapsed_after_ab).count());
+            int total_used_ms = elapsed_since_start();
             int probe_budget_ms = time_limit_ms - total_used_ms;
             // Reserve enough time for the callback / network commit; without
             // this the resign probe (VCF depth 20, node cap 400k) can run for
