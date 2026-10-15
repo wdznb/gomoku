@@ -1210,6 +1210,51 @@ void test_opening_book_rejects_occupied() {
     std::cout << "test_opening_book_rejects_occupied passed" << std::endl;
 }
 
+// WW-C: 把上面那条空转用例的意图做实。add_line 为一条谱登记的 key 只有它的前
+// 1..n-1 手，所以一条 3 手谱并不存在 3 子的 key；旧用例拿 3 子 history 去查，query 在
+// entries_ 找不到 key 时（opening_book.cpp:191-192）就返回 false，`if (found)` 里的
+// 断言体一次也没有执行过 - 它 pin 的是「查不到谱」，不是「拒绝落在已有子上的应着」。
+// 产品行为本来是对的，所以这条用例没有 HEAD 负例，做的是覆盖率做实。
+void test_opening_book_refuses_an_occupied_response_it_really_found() {
+    const std::vector<Move> hit{Move(7, 7, BLACK), Move(7, 8, WHITE)};
+    Move response;
+
+    // 一条畸形谱：key = {7,7} 黑、{7,8} 白，应着却回到 {7,7} - 那一格正被它自己占着。
+    // 中心点在八种对称下都不动，所以这个 key 下每一条变体的应着都是 {7,7}，
+    // covers_position（:194-200）必然把它们全部滤掉，candidates 为空（:202）⇒ 不出手。
+    OpeningBook blocked;
+    blocked.add_line({{7, 7}, {7, 8}, {7, 7}}, 10, "self_blocked");
+    // has_entry 只看 key（:156-162），所以这一行证明 found 分支真的走到了。
+    assert(blocked.has_entry(hit));
+    assert(!blocked.query(hit, BLACK, response));
+
+    // 原用例断言体的语义（交出的应着一定落在空位上）现在才真的被执行：同一把 2 子
+    // key 上放一条正常谱，落点是空位。两个对称变体给出 (6,8) 与 (8,8)，都空着。
+    OpeningBook live;
+    live.add_line({{7, 7}, {7, 8}, {6, 8}}, 10, "pu_yue");
+    assert(live.has_entry(hit));
+    Board board;
+    assert(board.place_stone(7, 7, BLACK));
+    assert(board.place_stone(7, 8, WHITE));
+    assert(live.query(board, BLACK, response));
+    assert(response.color == BLACK);
+    assert(response.pos == Position(6, 8) || response.pos == Position(8, 8));
+    assert(board.is_empty(response.pos.row, response.pos.col));
+
+    // 反证：同样 2 子、但不等于任何 key（{0,0} 是角，任何对称都不会把 {7,8} 映到角上）。
+    // found 为假时 query 也返回 false - 与新用例的命中项相对，这里 has_entry 先证伪，
+    // 说明上面那条红/绿不是又一次空转。
+    const std::vector<Move> miss{Move(7, 7, BLACK), Move(0, 0, WHITE)};
+    assert(!blocked.has_entry(miss));
+    assert(!live.has_entry(miss));
+    assert(!blocked.query(miss, BLACK, response));
+
+    std::cout << "  [r119wwc] blocked-key response refused, live-key response ("
+              << response.pos.row << "," << response.pos.col << ") unused" << std::endl;
+    std::cout << "test_opening_book_refuses_an_occupied_response_it_really_found passed"
+              << std::endl;
+}
+
 void test_opening_book_rejects_swapped_colours() {
     // Round 74: the book key is only the sequence of landing squares, so a
     // hand-set position whose stones were laid down out of colour alternation
@@ -2777,6 +2822,7 @@ int main() {
     test_opening_book_load_json();
     test_opening_book_rejects_wide_numbers();
     test_opening_book_rejects_occupied();
+    test_opening_book_refuses_an_occupied_response_it_really_found();
     test_opening_book_rejects_swapped_colours();
     test_opening_book_large_weight_no_overflow();
     test_search_engine_uses_book();

@@ -1531,8 +1531,8 @@ class GomokuGame {
         document.getElementById('btn-position-toggle').disabled = setup.confirmInFlight;
         // README:375 makes 确认 the only step that writes the server, and the reply
         // repaints from the board the server actually got, so an edit made after it
-        // left would vanish without a line of warning. The canvas already refuses
-        // handleCanvasClick already refuses; the copy's other two writers are the bar's 交换 trio and 导入.
+        // left would vanish without a line of warning. handleCanvasClick already
+        // refuses; the copy's other two writers are the bar's 交换 trio and 导入.
         document.getElementById('btn-setup-import').disabled = setup.confirmInFlight;
         for (const button of document.querySelectorAll('#group-swap [data-swap]')) {
             button.disabled = setup.confirmInFlight;

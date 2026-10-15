@@ -246,7 +246,7 @@ void WebSocketSession::start() {
 
 // Re-arm rather than replace: the expiry set once at accept would cap how long a
 // connection may live, not how long it may be silent, and every session would
-// drop 60 s after the page loaded no matter how busy the game was.
+// drop one idle timeout after the page loaded no matter how busy the game was.
 void WebSocketSession::arm_idle() {
     ws_.next_layer().expires_after(std::chrono::seconds(kIdleTimeoutSeconds));
 }

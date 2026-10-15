@@ -1979,6 +1979,71 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次119 注释里的 60 秒和重复了一遍的 refuses；一条开书用例其实一次也没命中过谱 — bugfix round 119 batch WW
+
+### Found
+
+A documentation-drift round plus the coverage hole it surfaced. Both product rows came out of my own round-118
+adjudications (the wording VV2 left behind; the "60 s" the idle-constant change forgot), and WW-C came from the
+opening-book sweep that was queued behind them.
+
+- **WW-A** — `web/app.js` `refreshSetupControls`' comment block: VV2 renamed the handler on one line but the line
+  above it still ended 「The canvas already refuses」, so the two read as one sentence saying `refuses` twice.
+- **WW-B** — `src/server/server.cpp:247-249`: the comment above `arm_idle()` still promised every session would
+  「drop 60 s after the page loaded」 while `kIdleTimeoutSeconds` (`:120`) is **120** — the leftover of round 61's
+  constant change, and exactly the kind of number a reader trusts.
+- **WW-C** — `tests/test_search.cpp:1196-1211` `test_opening_book_rejects_occupied()` was **vacuous**:
+  `add_line` (`opening_book.cpp:45-70`) registers only the prefixes of length 1..n−1, so a 3-ply line has no
+  3-stone key; the case queried a 3-stone history, `query` returned false at `:191-192` because the key was never
+  there, and its `if (found)` body — the part meant to pin 「拒绝落在已有子上的应着」 — had never executed. The
+  product behaviour was correct; the *test* was pinning "no such book" instead.
+
+### Fixed
+
+Comments only in the product: `web/app.js` **2/2** (「…warning. handleCanvasClick already / refuses; the copy's
+other two writers…」) and `src/server/server.cpp` **1/1** (「drop one idle timeout after the page loaded」, no
+hard-coded seconds). `tests/test_search.cpp` **+46/0** adds
+`test_opening_book_refuses_an_occupied_response_it_really_found` and **leaves the old case untouched** (the
+contract's second option, so nothing existing is weakened): a deliberately self-overlapping line
+`{{7,7},{7,8},{7,7}}` puts the response back on the key's own stone, and because the centre point is fixed under
+all eight symmetries `covers_position` (`:194-200`) removes every candidate ⇒ `query` false, with
+`has_entry(hit)` (`:156-163`, key-only) proving the found branch is really entered. A second fixture
+`{{7,7},{7,8},{6,8}}` runs the original assert body for the first time — the reply is (6,8) **or** (8,8) because
+the row-7 mirror shares the key, so the case asserts set membership plus `is_empty`, never one pinned square.
+The counter-example `{{7,7}B,{0,0}W}` (a corner is no symmetry image of (7,8)) gives `has_entry == false` and
+`query == false`, showing the new green is not another spin.
+
+### 裁决
+
+- **无可观察差异**: WW-A and WW-B, proved rather than asserted — every diff line in both files is `//`-prefixed
+  (numstat 2/2 and 1/1), and all four gates come back byte-identical to the `e4ef71a` baseline (see below). No
+  discriminator case was invented for them, and **WW-C has no HEAD negative** because it is coverage hardening,
+  not a defect regression: the new case is green on HEAD's product code as well.
+- **CLEAN**: the WS/HTTP **message field contract** sweep (all 15 outbound frame families' key spellings, types,
+  毫秒/秒 units and absent-key defaults against README's tables, incl. `session`'s 12 keys vs README:502-504, the
+  `timeout_ms`/`max_depth` 0-means-inherit rule vs README:349-350, and both clamp ranges on both entry points)
+  found nothing and self-refuted seven suspicions. The field tables do not need re-auditing.
+- **escalated to round 120 (batch XX)**: the canvas/geometry auditor's two 中 rows, both verified by me against
+  the whole functions — XX1 `paintSetupCell` (:1223-1241) cycles from `setup.board` while `displayView()`
+  (:2014-2026) shows only the record's prefix, so a click on an empty-*looking* point deletes a stone the player
+  cannot see; XX2 `setupSeedRecord` (:1160-1173) appends the whole `moveHistory` even when README:376's
+  post-确认 window left it describing the *previous* game, so the 摆棋 record and the copy disagree about which
+  stones exist. Its closed list: no hover/ghost stone exists to be wrong, `state_sync`'s single early repaint is
+  on the `choose_side` path where those fields are already clear, a late `hint_result` after 重开 cannot arrive
+  (`detach_socket` → `halt_search`, `server.cpp:1307-1308`), a hint ring surviving 认输 is the same position
+  (README:327), and the `BOARD_MIN=300` floor is round 60's deliberate choice.
+
+### Verified
+
+Tests-only additions on top of the two comment rows ⇒ **合约过期: 无**. Numbers, re-run by me on the worktree:
+`ctest` **8/8 / 74.85 s**, web harness **103/103**, `readme_anchor_check` **113 citations / 0 problems** (gained
+0, lost 0 — WW-A's block still carries its `README:375`, WW-B's never carried one), `wc -l README.md` **658**.
+My own `git archive e4ef71a` whole-tree build of the new book case: `./test_search` exits 0 with the `[r119wwc]`
+line printed on **both** trees, which is WW-C's parity proof.
+Line-shift the next dispatcher must carry: the 45 inserted lines move the two machine-relative budget premises —
+`assert(result.resigned)` of the 300 ms block from `:2149` to **`tests/test_search.cpp:2194`**, and the
+`completed.method == "alphabeta"` block from `:2742` to **`:2788-2792`**. Neither is to be touched.
+
 ## 轮次118 位棋盘没有标志可言，却被一个标志否决了整盘；弹窗只认标签，别处的拖放带走了这一页 — bugfix round 118 batch VV
 
 ### Found
