@@ -179,6 +179,9 @@ bool GameManager::make_move(int row, int col) {
     }
     // Playing a stone is the other way out of a hand-set position.
     position_pending_ = false;
+    // The human's stone ages the table the same way the AI's does: one move, one
+    // step, whichever side played it.
+    engine_.transposition_table().advance_generation();
     analyses_.push_back(MoveAnalysis{Move(row, col, turn), 0, 0, 0, 0, "human"});
     
     if (status_ == GameStatus::WAITING) {
@@ -418,6 +421,11 @@ void GameManager::ai_thinking_worker(int timeout_ms, int max_depth) {
             status_ == GameStatus::PLAYING &&
             current_turn() == ai_color_ &&
             board_.place_stone(result.best_move.pos, ai_color_)) {
+            // The table's clock steps once per committed stone, not once per think:
+            // the records this think wrote stay in the table for the moves that
+            // follow, which is what lets a later think meet the same position by a
+            // different move order and read them.
+            engine_.transposition_table().advance_generation();
             analyses_.push_back(MoveAnalysis{result.best_move, result.score, result.depth,
                                              result.nodes_searched, result.elapsed_ms,
                                              result.method});

@@ -1979,6 +1979,98 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次121 引擎重构 A3：置换表按深度替换，代龄跟着落子走 — engine redesign stage A3
+
+规格 `docs/ENGINE_REDESIGN.md` §2.4（冻结，不改写）。A3 动的是 P2：一张直接映射表把「上一手付出来的深层记录」当
+成「本手浅层记录」的免费受害者，且入口递出来的是桶内裸指针。
+
+### Found
+
+- **替换条件把年龄排在深度前面**。`transposition.cpp` 的 `age != current_age_ || depth >= entry.depth`：一次代龄推进
+  之后桶里每一条旧记录都自动变成可覆写对象，深度不再保护任何东西。而推进点是 `alphabeta.cpp` 里生产代码唯一的
+  `tt_.new_search()` —— 即**一次思考**，不是**一手棋**。
+- **槽号 = `hash % size`**。相邻两手产生的、只差一个面的哈希会撞进同一个槽，上面那条因此天天被踩到。
+- **`lookup()` 交出桶内裸指针**：调用方读它的期间，另一次 `store()` 能就地改写它指向的条目。
+- **mate 分数按「证它的那一层还剩几层」入库**，跨层、跨迭代不可比；`±100000` 的对外哨兵只是勉强能用。
+- 条目里没有静态分的位子（C1 无处落），对外也没有能读代龄的口。
+
+### Fixed
+
+`TranspositionTable` v2：`std::vector<Bucket>`，每桶 `kBucketWays = 4` 路组相联；槽号取
+`(hash * 0x9E3779B97F4A7C15) >> (64 - bucket_bits)` 的高位混合而非取模；条目存 32 位 key（`hash >> 32`），不再存全哈希；
+替换策略 **深度优先** —— 同 key 就地覆写且拒绝更浅、否则先占空槽、满桶才挑最浅的 victim，同深度之间用
+`age_older`（`int8_t(a - b) < 0`，回绕后的代龄仍然可比）做次级判据。`new_search()` 退役，换成 `advance_generation()`，
+推进点从搜索内部搬到**把子落到盘上的三个所有者**：`GameManager::make_move`（人类的子）、`ai_thinking_worker` 的提交
+块（AI 的子）、`SelfPlay::run` 每个 ply。悔棋 / `set_position` / `reset` 不推进；这三条路径也没有缓存的建议可作废
+——服务端求招是算完即回调，`reset()`/`set_position()` 已经 `hint_thread_.reset()` 掐掉在飞的那条 ⇒ 计划里「改为作废
+`hint_move`」在这一版架构里 **无可观察差异**。mate 分数库内按 ply 归一（`store_value`：`≥100000` 加 ply、`≤-100000` 减
+ply），`probe()` 按当前 ply 还原，对外 ±100000 哨兵语义不变（认输判定 `src/search/search_engine.cpp:320` 与 README:338 的红点规则
+都读它）。还原写成**饱和**的而不是精确逆运算：ply 2 入库的记录若在 ply 20 处命中，精确还原会得到 99982 —— 一个已证棋
+从此不再被当成已证棋，而这条线正是剪枝、认输和红点共用的那个数。`lookup()` 换成 `probe(hash, out, ply)` 拷出。条目 **28 B**（`sizeof(TTEntry) == 28` 有用例钉着），2^18 槽
+≈ **7.3 MiB**，比 v1 的 8.4 MiB 还小。
+
+**偏离文档两处，已写进 `transposition.h` 的注释**：§2.4.1 的 24 B/`int16 value` 做不到（合法域 ±99999、哨兵
+±100000 装不进 int16），保留 32 位 `value` + 32 位 `static_eval`；tag 用 32 位而不是 §2.4.1 的 16 位 —— 字节数不变，
+假阳性率低约五个数量级。计划里那条用例叫 `test_tt_key16_collision_miss_safe`，实现后按真实的 32 位 tag 改名为
+`test_tt_key_collision_is_a_miss_not_a_wrong_hit`。
+
+新增 6 条：`test_tt_generation_advances_per_move`（一次 `SearchEngine` 思考不动代龄；`GameManager` 摆两手后恰好 +2，
+悔棋不回拨）、`test_tt_mate_score_normalised_by_ply`（含「恢复是饱和的」：ply 2 入库的记录在 ply 20/40 处仍然读成
+`100000`，不会掉回 99982 而丢掉已证棋的身份）、`test_tt_key_collision_is_a_miss_not_a_wrong_hit`（同桶不同 key
+⇒ 未命中，绝不错读）、`test_tt_full_bucket_replaces_shallowest_then_oldest`（满桶里更浅的新键挑最浅的 victim、同深度
+才挑最老的，深层记录留着）、`test_tt_probe_copies_the_record_out`（先拷出、再覆写同一槽，副本不动）、
+`test_tt_cold_think_cost_and_warm_reuse`（一手思考的**节点上限常量**，见下）。改写 2 条：
+`test_transposition_aging` → `test_tt_depth_first_replacement`，`test_transposition_cross_search_reuse` 整条重写为
+「按代龄推进之后仍然命中」。
+
+### 合约过期
+
+1. `test_transposition_aging`(:103) → **`test_tt_depth_first_replacement`**：「一次新搜索一开始，旧条目就该被换掉」这
+   条前提按 §2.4.2 反转为「旧条目按深度守住自己，年龄只在同深度里当次级判据」。
+2. **`lookup()` / `new_search()` API 退役**，4 条用例（`test_transposition_table`、`test_transposition_cross_search_reuse`、
+   `test_transposition_depth_gate_still_applies`、`test_alphabeta_aborted_search_stores_only_sound_nodes`）改用 `probe()`。
+3. `assert(entry->hash == h)`（条目携带全哈希）**删除** —— v2 的条目只有 32 位 key。
+4. `alphabeta.cpp` 的写表门从排除 `±100000` 放宽到排除 `±1000000`：mate 分数现在入库，而 `-INT_MAX` 那个「什么都没
+   搜过」的占位值仍然被挡在外面。
+5. `test_transposition_default_size` 的注释 8.4 MB → 7.3 MB；RSS 区间 [4 MiB, 20 MiB] 未动，实测增量 **7300 KiB**。
+
+### Verified
+
+`ctest` **8/8 / 91.55 s**（`test_search` 40.74 s），`node tests/web_frontend_check.js` **103/103**，
+`node tests/readme_anchor_check.js` **113 citations / 0 problems**，README 仍 **658 行**。收尾（拆出时钟 commit、
+注释定稿后）在同一棵树上重跑：**8/8 / 83.88 s**（`test_search` 52.49 s，与合成负载同跑）、web **103/103**、
+anchor **113 / 0**。时钟修复独立成 commit `694a181` 后，用 `git archive` 树只换上那一个 `search_engine.cpp`
+重编 `test_search`：build rc=0、套件 rc=0（88 条 passed）。
+
+HEAD-negative 用 `git archive e6f3f74` 整树重建，跑同一个 driver（一对同桶孪生键 x/y，先存一条 depth=5 的记录，然后
+跑一手思考、再用同槽的浅层键去覆写）：旧树打印 `after shallow twin store: lookup(x)=0 depth=0 value=0  lookup(y)=1`
+—— 深层记录被本手的浅层同槽条目挤掉；对照 `control (no think): lookup(x)=1 depth=5 value=500  lookup(y)=0` 在两棵树
+都绿，证明那次驱逐是思考内部的代龄推进造成的。新树两次都 `probe(x)=1 depth=5 value=500`（`probe(y)=1 / 0` 随对照变化
+而深层记录不动）。mate 那条旧树读回 `value=100004`（没有 ply 概念），新树 `100010`（ply 6 入库、ply 0 读回）。
+`probe()` 的 `ply` 参、`static_eval` 字段与 `generation()` 是新 API 面 ⇒ 这三样 **无 HEAD-negative（by construction）**。
+
+G1/G3/G5 的确定性替身数（§4-5 口径：固定局面 + fresh TT + 无墙钟 + 无节点上限，于是 `nodes` 是计数而不是负载表）：
+同一副 16 子局面、`AlphaBetaSearch::search(depth=4, time_limit=0)`、默认 2^18 表 ——
+旧树 `nodes=276131 hits=383`，新树 `nodes=225745 hits=2833`（**同一手 -18.2%**），两棵树选的点与分值一致
+`(6,6) / 100000`；同表重跑这一手 96 个节点（冷跑的 1/2350），即「上一手付出来的记录确实被读到」。
+`depth=2` 与 `depth=3` 在两棵树**逐节点相同**（2595 / 21963），这条对照把差异定位到表而不是搜索。
+新用例把 225745 钉成 `<= 250000` 的回归上限：driver 版在旧树于该断言 rc=134（打印 276131），在新树 rc=0。
+`test_search` 因此从 40.74 s 涨到 50.52 s —— 这 10 s 是这条上限常量的代价，收口的 callgrind Ir 数另取。
+
+Valgrind（`build-vg/`，Debug + `-UNDEBUG`，`tools/valgrind_check.sh` 的同一组参数）分两段 driver（`-Dmain=suite_main`
+重编套件 + 挑用例的 main）：12 条 TT/alphabeta 用例 **rc=0 / reports=0**（含 `test_tt_generation_advances_per_move`
+里那条 500 ms 的 AI worker，也含新的 225745 节点上限用例 —— 它在 memcheck 下独自跑了约 20 分钟，是这段计数的主要
+成本），2 条耗时/进度帧用例 **rc=0 / reports=0** —— `test_engine_progress_frames_share_the_search_clock`
+这一轮在 20× 减速下跑到了结尾（3 帧、单调、终帧 2978 ms 落在 2979 ms 预算内）。`valgrind.bin` 的 0 字节报告文件
+在两段都是空 ⇒ 相对 §5 记的既存基线**零新增**。`test_alphabeta_aborted_search_stores_only_sound_nodes`
+在本树打印 `cut: d1+partial 2 0/40 nodes` —— 中止那一层的 `root_moves_done` 是 0，正是 §2.3.2 要的「切进去的那一个
+候选不算跑完」。
+
+**行号位移**：`tests/test_search.cpp` +289/−62，两条受保护前提从 `:2284` / `:3205` 移到 **`:2504`**
+（`test_search_engine_resigns_when_alphabeta_proves_mate` 的 `assert(result.resigned)`）与 **`:3427`**
+（`test_engine_reports_the_interrupted_alphabeta_layer` 的 `completed.method == "alphabeta"`）。两条都没被碰。
+
+
 ## 轮次121 附带修复：进度帧与逐手耗时改用同一次读表 — one clock for the move
 
 `test_engine_progress_frames_share_the_search_clock` 在本树（A3 施工中）于合成负载下 SIGABRT，

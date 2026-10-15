@@ -99,6 +99,10 @@ GameRecord SelfPlay::run(const std::vector<Move>& prefix,
         }
 
         board.place_stone(chosen.pos, color);
+        // Per committed ply, not per think: the records this ply's search wrote stay
+        // in the table for the rest of the game, so a transposition later in the same
+        // game can still find them.
+        engine.transposition_table().advance_generation();
 
         MoveRecord entry;
         entry.move = chosen;

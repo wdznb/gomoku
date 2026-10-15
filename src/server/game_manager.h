@@ -125,6 +125,9 @@ public:
     void set_game_over_callback(GameOverCallback cb) { game_over_callback_ = cb; }
     
     const Board& board() const { return board_; }
+    // The session's table, exposed so the generation a committed stone advances can
+    // be read by the tests that own that rule.
+    TranspositionTable& transposition_table() { return engine_.transposition_table(); }
     GameStatus status() const { return status_; }
     int winner() const { return winner_; }
     // Copies the session's own game for the replay view. Not const: it takes

@@ -107,8 +107,12 @@ private:
     long long deadline_ms_ = 0;
     bool has_deadline_ = false;
 
+    // `ply` is how far this node sits from the root of the think. The table needs it
+    // to keep a mate score as a distance from that root rather than as the remaining
+    // depth of whichever node proved it, which is only comparable inside one
+    // iteration of one think.
     NodeResult alphabeta(Board& board, int depth, int alpha, int beta, int color,
-                         std::atomic<bool>& stop_flag);
+                         std::atomic<bool>& stop_flag, int ply = 0);
 
     NodeResult quiescence(Board& board, int alpha, int beta, int color,
                           std::atomic<bool>& stop_flag, int qdepth);

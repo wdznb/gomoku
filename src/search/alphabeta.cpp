@@ -165,7 +165,7 @@ NodeResult AlphaBetaSearch::quiescence(Board& board, int alpha, int beta, int co
 }
 
 NodeResult AlphaBetaSearch::alphabeta(Board& board, int depth, int alpha, int beta, int color,
-                                      std::atomic<bool>& stop_flag) {
+                                      std::atomic<bool>& stop_flag, int ply) {
     ctx_.count_node();
     if (ctx_.hard_stopped()) {
         // Only the last-placed stone can have produced a five; check_winner()
@@ -182,26 +182,28 @@ NodeResult AlphaBetaSearch::alphabeta(Board& board, int depth, int alpha, int be
     }
 
     uint64_t hash = board.zobrist_hash();
-    const TTEntry* entry = tt_.lookup(hash);
+    // Copied out, not pointed into the table: the store below can land in this very
+    // bucket and evict the record this node is still reading.
+    TTEntry entry;
     Move tt_move;
     bool node_sound = true;
-    if (entry) {
+    if (tt_.probe(hash, entry, ply)) {
         ctx_.count_tt_hit();
-        if (entry->depth >= depth) {
-            if (entry->flag == TTFlag::EXACT) {
+        if (entry.depth >= depth) {
+            if (entry.flag == TTFlag::EXACT) {
                 ctx_.count_tt_cutoff();
-                return {entry->value, true};
+                return {entry.value, true};
             }
-            if (entry->flag == TTFlag::LOWERBOUND && entry->value >= beta) {
+            if (entry.flag == TTFlag::LOWERBOUND && entry.value >= beta) {
                 ctx_.count_tt_cutoff();
-                return {entry->value, true};
+                return {entry.value, true};
             }
-            if (entry->flag == TTFlag::UPPERBOUND && entry->value <= alpha) {
+            if (entry.flag == TTFlag::UPPERBOUND && entry.value <= alpha) {
                 ctx_.count_tt_cutoff();
-                return {entry->value, true};
+                return {entry.value, true};
             }
         }
-        tt_move = entry->best_move;
+        tt_move = entry.best_move;
     }
 
     // Terminal check: only the last move can have produced a five.
@@ -238,7 +240,8 @@ NodeResult AlphaBetaSearch::alphabeta(Board& board, int depth, int alpha, int be
 
         board.place_stone(move.pos.row, move.pos.col, color);
 
-        NodeResult child = alphabeta(board, depth - 1, -beta, -alpha, opponent(color), stop_flag);
+        NodeResult child = alphabeta(board, depth - 1, -beta, -alpha, opponent(color),
+                                     stop_flag, ply + 1);
 
         board.undo_last_move();
         if (!child.sound) node_sound = false;
@@ -261,8 +264,13 @@ NodeResult AlphaBetaSearch::alphabeta(Board& board, int depth, int alpha, int be
     // A sound node's value is a bound on its subtree even when the search as a
     // whole was cut short, so an aborted search keeps its finished work in the
     // table. What it does not keep is this node's own short-circuited number.
-    if (node_sound && best_score > -100000 && best_score < 100000) {
-        tt_.store(hash, depth, best_score, best_move, flag);
+    //
+    // Mate scores are stored too (design doc 2.4.2): they used to be excluded, so a
+    // proven line was recomputed from scratch on every move that walked back into
+    // it. The window is wide enough to hold +-100000 plus the ply correction and
+    // narrow enough to keep the -INT_MAX nothing-was-searched value out.
+    if (node_sound && best_score > -1000000 && best_score < 1000000) {
+        tt_.store(hash, depth, best_score, best_move, flag, ply);
     }
 
     return {best_score, node_sound};
@@ -323,12 +331,10 @@ Move AlphaBetaSearch::search(const Board& board, int color, const SearchLimits& 
     ctx_.start(limits, *clock_, stop_flag);
     if (has_deadline_) ctx_.set_absolute_deadline(deadline_ms_);
 
-    // Still advanced once per search call: the generation that makes a stale
-    // entry lose a replacement battle belongs to a move, not to a search, and
-    // moving this to the places that play a move is the transposition table's
-    // own change, not part of the interrupt accounting.
-    tt_.new_search();
-
+    // No generation step here, on purpose. Ageing the table at the start of a think
+    // is what let that think's own shallow records evict the deep ones the previous
+    // move had paid for; the owners that commit a stone to a board advance the clock
+    // (GameManager, SelfPlay).
     Move best_move;
     int best_score = 0;
 
@@ -472,7 +478,9 @@ NodeResult AlphaBetaSearch::search_root_layer(Board& board,
 
         board.place_stone(move.pos.row, move.pos.col, color);
 
-        NodeResult child = alphabeta(board, depth - 1, -beta, -alpha, opponent(color), stop_flag);
+        // A root child sits one ply from the root, whatever the layer's depth is.
+        NodeResult child = alphabeta(board, depth - 1, -beta, -alpha, opponent(color),
+                                     stop_flag, 1);
 
         board.undo_last_move();
 

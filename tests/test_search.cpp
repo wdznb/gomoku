@@ -137,8 +137,8 @@ bool read_rss_kb(long long& kb) {
 
 }  // namespace
 
-// The default table is 2^18 entries (~8 MiB); the old 2^20 default cost ~32 MiB
-// per engine, and every session owns an engine. Run before any other table is
+// The default table is 2^18 entries of 28 B (~7.3 MiB); the old 2^20 default cost
+// ~32 MiB per engine, and every session owns an engine. Run before any other table is
 // built so the delta reflects this table alone: 32 MiB would break the upper
 // bound and a shrunk table would break the lower one.
 void test_transposition_default_size() {
@@ -164,81 +164,314 @@ void test_transposition_default_size() {
     }
 }
 
+// A3: the table is four-way set-associative, addressed by the high bits of a mixed
+// hash and verified by a 32-bit tag of the hash's own high half. These hashes carry
+// distinct high halves on purpose: every small integer has the tag 0 and would alias.
 void test_transposition_table() {
     TranspositionTable tt(1024);
     assert(tt.size() == 1024);
 
+    // The memory contract the session budget is written against (transposition.h):
+    // 2^18 of these is ~=7.3 MB, less than the 32-byte entry it replaced.
+    assert(sizeof(TTEntry) == 28);
+
+    const uint64_t hash = 0x1122334455667788ULL;
+    const uint64_t other = 0x99AABBCCDDEEFF00ULL;
     Move m(7, 7, BLACK);
-    tt.store(12345, 3, 500, m, TTFlag::EXACT);
+    tt.store(hash, 3, 500, m, TTFlag::EXACT);
 
-    const TTEntry* entry = tt.lookup(12345);
-    assert(entry != nullptr);
-    assert(entry->hash == 12345);
-    assert(entry->depth == 3);
-    assert(entry->value == 500);
-    assert(entry->flag == TTFlag::EXACT);
+    TTEntry entry;
+    assert(tt.probe(hash, entry));
+    assert(entry.depth == 3);
+    assert(entry.value == 500);
+    assert(entry.flag == TTFlag::EXACT);
+    assert(entry.best_move == m);
+    // A3 lands the field; the search that fills it in is the static-evaluation reuse
+    // step, so until then every record carries the explicit "no evaluation here".
+    assert(entry.static_eval == NO_STATIC_EVAL);
 
-    const TTEntry* miss = tt.lookup(99999);
-    assert(miss == nullptr);
+    TTEntry miss;
+    assert(!tt.probe(other, miss));
 
     std::cout << "test_transposition_table passed" << std::endl;
 }
 
-void test_transposition_aging() {
+// A3: the replacement order was age-first, which is why cross-move reuse failed - a
+// shallow record written by the newest think evicted the deep record the next think
+// would have read. Depth decides, age only breaks a tie.
+void test_tt_depth_first_replacement() {
     TranspositionTable tt(1024);
+    const uint64_t hash = 0x1122334455667788ULL;
 
-    Move m1(7, 7, BLACK);
-    tt.store(100, 2, 300, m1, TTFlag::EXACT);
-    tt.new_search();
+    tt.store(hash, 5, 500, Move(7, 7, BLACK), TTFlag::EXACT);
+    tt.advance_generation();
+    tt.store(hash, 3, 300, Move(7, 8, WHITE), TTFlag::LOWERBOUND);
 
-    Move m2(7, 8, WHITE);
-    tt.store(100, 1, 200, m2, TTFlag::LOWERBOUND);
+    TTEntry entry;
+    assert(tt.probe(hash, entry));
+    // The newer but shallower record lost: same depth 5 and value 500 as when it was
+    // written a generation ago.
+    assert(entry.depth == 5);
+    assert(entry.value == 500);
+    assert(entry.best_move == Move(7, 7, BLACK));
 
-    const TTEntry* entry = tt.lookup(100);
-    assert(entry != nullptr);
-    assert(entry->value == 200);
-    assert(entry->depth == 1);
+    // A deeper record of the same position does replace, whatever its age.
+    tt.store(hash, 6, 700, Move(3, 3, BLACK), TTFlag::EXACT);
+    assert(tt.probe(hash, entry));
+    assert(entry.depth == 6);
+    assert(entry.value == 700);
 
-    std::cout << "test_transposition_aging passed" << std::endl;
+    std::cout << "test_tt_depth_first_replacement passed" << std::endl;
 }
 
-// B8: lookup() no longer requires the stored age to match the current one, so an
-// entry written by an earlier search is still readable after new_search().
+// A3: a think used to age the whole table, which left the deep records of the
+// previous move free game for the shallow ones of this one. The clock now moves when
+// a stone is committed - by either side.
+void test_tt_generation_advances_per_move() {
+    SearchEngine engine;
+    Board board;
+    build_midgame(board);
+    std::atomic<bool> stop(false);
+
+    const uint8_t before_think = engine.transposition_table().generation();
+    const SearchResult result = engine.search(board, WHITE, 4, 1500, stop);
+    assert(result.best_move.pos.is_valid());
+    // One think, no stone played by this caller: the generation did not move.
+    assert(engine.transposition_table().generation() == before_think);
+
+    GameManager game;
+    game.set_player_color(BLACK);
+    game.set_config(500, 1);
+    std::atomic<int> ai_moves{0};
+    game.set_move_callback([&](const Move&, int, int) { ai_moves.fetch_add(1); });
+
+    TranspositionTable& session_tt = game.transposition_table();
+    const uint8_t start = session_tt.generation();
+    assert(game.make_move(7, 7));
+    // Both halves of the wait are needed: move_callback_ fires inside the worker
+    // and ai_thinking_ only goes false once that worker has left the commit block,
+    // and undo() refuses while the flag is still set.
+    for (int i = 0; i < 300 && (ai_moves.load() < 1 || game.is_ai_thinking()); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    assert(ai_moves.load() >= 1);
+    assert(!game.is_ai_thinking());
+    // The human's stone and the AI's stone: two steps, and the think that produced
+    // the second one added none of its own.
+    assert(session_tt.generation() - start == 2);
+
+    // Undo gives the stones back but does not wind the clock: the records of the
+    // position being re-entered are still the newest ones the session wrote.
+    int move_count = 1;
+    GameStatus undo_status = GameStatus::PLAYING;
+    assert(game.undo(move_count, undo_status));
+    assert(session_tt.generation() - start == 2);
+
+    std::cout << "test_tt_generation_advances_per_move passed (generation "
+              << static_cast<int>(session_tt.generation() - start) << " after two stones)"
+              << std::endl;
+}
+
+// A3: a mate score used to be excluded from the table, so a proven line was recomputed
+// from scratch by every move that walked back into it. It is stored now, but only as
+// distance from the think's root, which is the form that stays comparable across
+// iterations - the +-100000 sentinel the resign rule and the replay panel read out of
+// a SearchResult is untouched, because the correction happens inside the table.
+void test_tt_mate_score_normalised_by_ply() {
+    TranspositionTable tt(1024);
+    const uint64_t hash = 0x1122334455667788ULL;
+    TTEntry entry;
+
+    // A win found with 4 of the layer's depth still unused, six plies into the root.
+    tt.store(hash, 4, 100004, Move(7, 6, BLACK), TTFlag::EXACT, 6);
+    assert(tt.probe(hash, entry, 6));
+    assert(entry.value == 100004);
+
+    // The same record seen from the root itself: the mate is 6 plies closer to that
+    // node, so it reads bigger, and a later node reads it smaller. Both stay above
+    // the sentinel either way.
+    assert(tt.probe(hash, entry, 0));
+    assert(entry.value == 100010);
+    assert(tt.probe(hash, entry, 10));
+    assert(entry.value == 100000);
+
+    // And it stays there: the restore is saturating, so a record two plies in that
+    // is met twenty plies deep is still a proven result rather than a 99982.
+    assert(tt.probe(hash, entry, 20));
+    assert(entry.value == 100000);
+    assert(tt.probe(hash, entry, 40));
+    assert(entry.value == 100000);
+
+    // A loss mirrors it: closer to the root is worse, not better.
+    tt.store(hash, 4, -100004, Move(7, 6, WHITE), TTFlag::EXACT, 6);
+    assert(tt.probe(hash, entry, 6));
+    assert(entry.value == -100004);
+    assert(tt.probe(hash, entry, 0));
+    assert(entry.value == -100010);
+    assert(tt.probe(hash, entry, 30));
+    assert(entry.value == -100000);
+
+    // A score inside the ordinary range is untouched by the ply.
+    tt.store(hash, 4, 500, Move(7, 6, BLACK), TTFlag::EXACT, 7);
+    assert(tt.probe(hash, entry, 2));
+    assert(entry.value == 500);
+
+    std::cout << "test_tt_mate_score_normalised_by_ply passed" << std::endl;
+}
+
+// A3: the tag is 32 bits, not the whole hash, so two positions can alias. What must
+// hold is that sharing a bucket does not alias: the tag decides, and the bucket has
+// room for the four positions that collide in the index.
+void test_tt_key_collision_is_a_miss_not_a_wrong_hit() {
+    TranspositionTable tt(1 << 12);
+    // The addressing is part of the layout being tested, so the case recomputes it
+    // rather than trusting an accessor that only exists for tests: 4096 entries over
+    // four ways is 1024 buckets, so the index is the top 10 bits of the mixed product.
+    auto bucket_of = [](uint64_t h) {
+        return static_cast<size_t>((h * 0x9E3779B97F4A7C15ULL) >> (64 - 10));
+    };
+
+    const uint64_t hash = 0x1122334455667788ULL;
+    uint64_t twin = 0;
+    for (uint64_t h = 1; h < 1000000; ++h) {
+        const uint64_t candidate = (h << 32) | 0x0BADF00DU;
+        if (candidate == hash) continue;
+        if (bucket_of(candidate) != bucket_of(hash)) continue;
+        if (candidate >> 32 == hash >> 32) continue;
+        twin = candidate;
+        break;
+    }
+    assert(twin != 0);
+
+    TTEntry entry;
+    tt.store(hash, 4, 500, Move(7, 7, BLACK), TTFlag::EXACT);
+    // Same bucket, different tag: a miss, and the record survives it.
+    assert(!tt.probe(twin, entry));
+    assert(tt.probe(hash, entry));
+    assert(entry.value == 500);
+
+    // Four ways mean the neighbour is kept rather than replacing it.
+    tt.store(twin, 4, 900, Move(8, 8, WHITE), TTFlag::EXACT);
+    assert(tt.probe(twin, entry));
+    assert(entry.value == 900);
+    assert(tt.probe(hash, entry));
+    assert(entry.value == 500);
+    assert(bucket_of(twin) == bucket_of(hash));
+
+    std::cout << "test_tt_key_collision_is_a_miss_not_a_wrong_hit passed (bucket "
+              << bucket_of(hash) << ")" << std::endl;
+}
+
+// A3: a full bucket's victim is the shallowest record, and only a tie on depth is
+// broken by age. The order matters: the retired policy let the newest record push out
+// the deepest one, which is the record the next think would actually have read.
+void test_tt_full_bucket_replaces_shallowest_then_oldest() {
+    TranspositionTable tt(1 << 12);
+    auto bucket_of = [](uint64_t h) {
+        return static_cast<size_t>((h * 0x9E3779B97F4A7C15ULL) >> (64 - 10));
+    };
+    const uint64_t hash = 0x1122334455667788ULL;
+    std::vector<uint64_t> keys{hash};
+    for (uint64_t h = 1; h < 1000000 && keys.size() < 6; ++h) {
+        const uint64_t candidate = (h << 32) | 0x0BADF00DU;
+        if (bucket_of(candidate) != bucket_of(hash)) continue;
+        if (candidate >> 32 == hash >> 32) continue;
+        keys.push_back(candidate);
+    }
+    assert(keys.size() == 6);
+
+    // Four graded records fill the bucket, one generation apart each.
+    tt.store(keys[0], 4, 400, Move(7, 7, BLACK), TTFlag::EXACT);
+    tt.advance_generation();
+    tt.store(keys[1], 5, 500, Move(7, 7, BLACK), TTFlag::EXACT);
+    tt.advance_generation();
+    tt.store(keys[2], 6, 600, Move(7, 7, BLACK), TTFlag::EXACT);
+    tt.advance_generation();
+    tt.store(keys[3], 7, 700, Move(7, 7, BLACK), TTFlag::EXACT);
+    tt.advance_generation();
+
+    TTEntry entry;
+    // The shallowest and the oldest are the same record here, so this first eviction
+    // is the tie case: keys[4] at depth 4 goes where keys[0] at depth 4 and age 0 sits.
+    tt.store(keys[4], 4, 404, Move(8, 8, WHITE), TTFlag::EXACT);
+    assert(!tt.probe(keys[0], entry));
+    assert(tt.probe(keys[4], entry));
+    assert(entry.value == 404);
+    for (size_t i = 1; i <= 3; ++i) assert(tt.probe(keys[i], entry));
+
+    // Now the order is what decides: keys[5] is newer than every record in the bucket
+    // and shallower than three of them, so the depth-4 neighbour is the victim and the
+    // deep ones survive. Under the retired age-first policy this is where the deep
+    // record of a previous move was thrown away.
+    tt.advance_generation();
+    tt.store(keys[5], 3, 303, Move(9, 9, WHITE), TTFlag::EXACT);
+    assert(!tt.probe(keys[4], entry));
+    assert(tt.probe(keys[5], entry));
+    for (size_t i = 1; i <= 3; ++i) assert(tt.probe(keys[i], entry));
+
+    std::cout << "test_tt_full_bucket_replaces_shallowest_then_oldest passed" << std::endl;
+}
+
+// A3: a probe copies the record out. Handing back a pointer into the table would let
+// the store at the end of this very node evict the entry the node is still reading.
+void test_tt_probe_copies_the_record_out() {
+    TranspositionTable tt(1 << 12);
+    const uint64_t hash = 0x1122334455667788ULL;
+
+    tt.store(hash, 4, 500, Move(7, 7, BLACK), TTFlag::EXACT);
+    TTEntry held;
+    assert(tt.probe(hash, held));
+    assert(held.value == 500);
+
+    // Overwrite the position with a deeper record of a different value.
+    tt.store(hash, 6, 777, Move(2, 2, WHITE), TTFlag::LOWERBOUND);
+    // The copy the caller is holding is unchanged, and a fresh probe sees the new one.
+    assert(held.value == 500);
+    TTEntry fresh;
+    assert(tt.probe(hash, fresh));
+    assert(fresh.value == 777);
+    assert(fresh.depth == 6);
+
+    std::cout << "test_tt_probe_copies_the_record_out passed" << std::endl;
+}
+
+// An entry written by an earlier move is still readable: the generation is what the
+// replacement policy reads, never what a probe reads.
 void test_transposition_cross_search_reuse() {
     TranspositionTable tt(1024);
 
     Move m(7, 7, BLACK);
-    tt.store(12345, 3, 500, m, TTFlag::EXACT);
-    assert(tt.lookup(12345) != nullptr);
+    const uint64_t hash = 0x1122334455667788ULL;
+    const uint64_t other = 0x99AABBCCDDEEFF00ULL;
+    TTEntry entry;
+    tt.store(hash, 3, 500, m, TTFlag::EXACT);
+    assert(tt.probe(hash, entry));
 
-    tt.new_search();
-    tt.new_search();
+    tt.advance_generation();
+    tt.advance_generation();
 
-    const TTEntry* reuse = tt.lookup(12345);
-    assert(reuse != nullptr);
-    assert(reuse->hash == 12345);
-    assert(reuse->depth == 3);
-    assert(reuse->value == 500);
-    assert(reuse->flag == TTFlag::EXACT);
-    assert(reuse->best_move == m);
+    assert(tt.probe(hash, entry));
+    assert(entry.depth == 3);
+    assert(entry.value == 500);
+    assert(entry.flag == TTFlag::EXACT);
+    assert(entry.best_move == m);
 
-    // An empty slot is a miss, and a NONE flag stays a miss across searches.
+    // An empty slot is a miss, and a NONE flag stays a miss across generations.
     TranspositionTable blank(1024);
-    assert(blank.lookup(12345) == nullptr);
-    blank.store(12345, 3, 500, m, TTFlag::NONE);
-    assert(blank.lookup(12345) == nullptr);
-    blank.new_search();
-    assert(blank.lookup(12345) == nullptr);
+    assert(!blank.probe(hash, entry));
+    blank.store(hash, 3, 500, m, TTFlag::NONE);
+    assert(!blank.probe(hash, entry));
+    blank.advance_generation();
+    assert(!blank.probe(hash, entry));
 
-    // Same slot, different hash: the full hash is still compared, aging did not
-    // turn the table into a slot-only cache.
-    const TTEntry* collision = tt.lookup(12345 + 1024);
-    assert(collision == nullptr);
+    // Different hash, different tag: the bucket addressing did not turn the table
+    // into a slot-only cache.
+    assert(!tt.probe(other, entry));
 
     std::cout << "test_transposition_cross_search_reuse passed" << std::endl;
 }
 
-// B8: the age filter moved out of lookup() and the value gate stayed in
+// The age filter never lived in the probe and the depth gate still lives in
 // alphabeta: an entry only supplies its value when it is deep enough, otherwise
 // it is a move-ordering hint and the score is recomputed.
 void test_transposition_depth_gate_still_applies() {
@@ -267,7 +500,6 @@ void test_transposition_depth_gate_still_applies() {
         AlphaBetaSearch search(evaluator, tt);
         arm(search);
         tt.store(hash, 4, 123456, Move(7, 6, BLACK), TTFlag::EXACT);
-        tt.new_search();
         Board work = board;
         const NodeResult result = search.alphabeta(work, 4, -INT_MAX, INT_MAX, BLACK, stop);
         assert(result.sound);
@@ -279,10 +511,9 @@ void test_transposition_depth_gate_still_applies() {
         AlphaBetaSearch search(evaluator, tt);
         arm(search);
         tt.store(hash, 3, 123456, Move(7, 6, BLACK), TTFlag::EXACT);
-        tt.new_search();
-        const TTEntry* hint = tt.lookup(hash);
-        assert(hint != nullptr);
-        assert(hint->depth < 4);
+        TTEntry hint;
+        assert(tt.probe(hash, hint));
+        assert(hint.depth < 4);
         Board work = board;
         const NodeResult result = search.alphabeta(work, 4, -INT_MAX, INT_MAX, BLACK, stop);
         assert(result.sound);
@@ -297,7 +528,6 @@ void test_transposition_depth_gate_still_applies() {
         AlphaBetaSearch search(evaluator, tt);
         arm(search);
         tt.store(hash, 6, 300, Move(7, 6, BLACK), TTFlag::LOWERBOUND);
-        tt.new_search();
         Board work = board;
         assert(search.alphabeta(work, 4, 60, 200, BLACK, stop).score == 300);
     }
@@ -307,12 +537,58 @@ void test_transposition_depth_gate_still_applies() {
         AlphaBetaSearch search(evaluator, tt);
         arm(search);
         tt.store(hash, 3, 300, Move(7, 6, BLACK), TTFlag::LOWERBOUND);
-        tt.new_search();
         Board work = board;
         assert(search.alphabeta(work, 4, 60, 200, BLACK, stop).score != 300);
     }
 
     std::cout << "test_transposition_depth_gate_still_applies passed" << std::endl;
+}
+
+// One think's cost, twice: on a cold table and then on the table that think just
+// filled. Both figures are counts rather than timings - no wall-clock limit, no node
+// cap, a fresh table - so only the table can move them. On the pre-A3 layout (direct
+// mapping, age before depth) the cold think spent 276131 nodes and 383 hits; here it
+// spends 225745 and 2833, and both trees agree to the node on the shallower thinks of
+// the same position (2595 at depth 2, 21963 at depth 3, measured side by side) - which
+// is what puts the difference in the table and not in the search.
+void test_tt_cold_think_cost_and_warm_reuse() {
+    Board board;
+    for (int i = 0; i < 4; ++i) {
+        const int r = 1 + i * 3;
+        const int c = 2 + (i % 3);
+        board.place_stone(r, c, BLACK);
+        board.place_stone(r, c + 1, WHITE);
+        board.place_stone(r, c + 2, WHITE);
+        board.place_stone(r, c + 3, WHITE);
+    }
+    assert(board.move_count() == 16);
+
+    Evaluator evaluator;
+    std::atomic<bool> stop(false);
+
+    TranspositionTable tt;
+    AlphaBetaSearch cold(evaluator, tt);
+    cold.set_node_limit(INT_MAX);
+    const Move cold_move = cold.search(board, WHITE, 4, 0, stop);
+    const uint64_t cold_nodes = cold.stats_.nodes;
+    assert(cold.stats_.completed_depth == 4);
+    // A ceiling with a tenth of slack over the measured 225745. The pre-A3 layout
+    // needed 276131 for this same job, so the case is red there.
+    assert(cold_nodes <= 250000);
+
+    AlphaBetaSearch warm(evaluator, tt);
+    warm.set_node_limit(INT_MAX);
+    const Move warm_move = warm.search(board, WHITE, 4, 0, stop);
+    const uint64_t warm_nodes = warm.stats_.nodes;
+    // The same root on the table the cold think just filled is a table read, not a
+    // search: the claim is the ratio (96 against 225745), not a number.
+    assert(warm_nodes * 10 < cold_nodes);
+    assert(warm_move.pos.row == cold_move.pos.row && warm_move.pos.col == cold_move.pos.col);
+    assert(warm.stats_.score == cold.stats_.score);
+
+    std::cout << "test_tt_cold_think_cost_and_warm_reuse passed (cold " << cold_nodes
+              << " nodes, warm repeat " << warm_nodes << ", move (" << cold_move.pos.row
+              << "," << cold_move.pos.col << ") score " << cold.stats_.score << ")" << std::endl;
 }
 
 void test_vcf_immediate_five() {
@@ -2515,7 +2791,8 @@ void test_alphabeta_aborted_search_stores_only_sound_nodes() {
     assert(cut.stopped == StopReason::NODES);
     // The cut landed inside the node that would have written this entry, so its
     // own short-circuit value is not a bound and is not in the table.
-    assert(aborted_tt.lookup(child_hash) == nullptr);
+    TTEntry cut_entry;
+    assert(!aborted_tt.probe(child_hash, cut_entry));
     // A layer did finish, so the move played is that layer's, not a fallback.
     assert(cut.best_move.pos.is_valid());
 
@@ -2530,16 +2807,17 @@ void test_alphabeta_aborted_search_stores_only_sound_nodes() {
     assert(full_info.depth == 2);
     assert(full_info.partial_depth == 0);
     assert(full_info.nodes_searched < node_limit * 10);
-    const TTEntry* entry = full_tt.lookup(child_hash);
-    assert(entry != nullptr);
+    TTEntry entry;
+    const bool control_entry = full_tt.probe(child_hash, entry);
+    assert(control_entry);
 
     std::cout << "test_alphabeta_aborted_search_stores_only_sound_nodes passed ("
               << "layer 1 nodes: " << layer_one_nodes << ", cut: d" << cut.depth
               << "+partial " << cut.partial_depth << " " << cut.root_moves_done << "/"
               << cut.root_moves_total << " " << stop_reason_name(cut.stopped)
               << ", control nodes: " << full_info.nodes_searched
-              << ", control entry value: " << (entry ? entry->value : 0)
-              << ", flag: " << static_cast<int>(entry ? entry->flag : TTFlag::NONE)
+              << ", control entry value: " << entry.value
+              << ", flag: " << static_cast<int>(entry.flag)
               << ", first root: " << first_root.pos.row << "," << first_root.pos.col << ")"
               << std::endl;
 }
@@ -3464,9 +3742,15 @@ int main() {
 
     test_transposition_default_size();
     test_transposition_table();
-    test_transposition_aging();
+    test_tt_depth_first_replacement();
+    test_tt_generation_advances_per_move();
+    test_tt_mate_score_normalised_by_ply();
+    test_tt_key_collision_is_a_miss_not_a_wrong_hit();
+    test_tt_full_bucket_replaces_shallowest_then_oldest();
+    test_tt_probe_copies_the_record_out();
     test_transposition_cross_search_reuse();
     test_transposition_depth_gate_still_applies();
+    test_tt_cold_think_cost_and_warm_reuse();
     test_vcf_immediate_five();
     test_vcf_no_win();
     test_vcf_gap_four_sequence_wins();
