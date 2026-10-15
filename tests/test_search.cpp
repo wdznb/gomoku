@@ -21,6 +21,9 @@
 #include "search/greedy.h"
 #include "search/search_engine.h"
 #include "search/controller.h"
+#include "search/search_limits.h"
+#include "search/search_state.h"
+#include "search/time_manager.h"
 #include "optimization/opening_book.h"
 #include "server/game_manager.h"
 #include <iostream>
@@ -35,6 +38,38 @@ namespace {
 
 // Defined further down, next to the J1/J2 tests that share the shape.
 void build_midgame(Board& board);
+
+// A clock the test steers, so "which layer had the deadline crossed" is an
+// input rather than a race the case hopes to lose.
+//
+// SteadyClock never moves: it isolates the budget checks from the time checks.
+// JumpClock reads once at start and is already past any deadline afterwards.
+// ScriptedClock advances on every reading, which is what pins the deadlines of a
+// search whose start() consulted the clock more than once.
+struct SteadyClock : SearchClock {
+    long long now_ms() const override { return 0; }
+};
+
+struct JumpClock : SearchClock {
+    mutable int readings = 0;
+    long long now_ms() const override {
+        ++readings;
+        return readings == 1 ? 0 : 100000;
+    }
+};
+
+struct ScriptedClock : SearchClock {
+    mutable long long ms = 0;
+    const long long step;
+    explicit ScriptedClock(long long step_ms) : step(step_ms) {}
+    long long now_ms() const override {
+        long long value = ms;
+        ms += step;
+        ++readings;
+        return value;
+    }
+    mutable int readings = 0;
+};
 
 // Resident set size in KiB, for pinning the default table's real footprint.
 bool read_rss_kb(long long& kb) {
@@ -2796,6 +2831,254 @@ void test_engine_greedy_relabel_zeroes_the_alphabeta_count() {
     std::cout << "test_engine_greedy_relabel_zeroes_the_alphabeta_count passed" << std::endl;
 }
 
+// ---------------------------------------------------------------------------
+// A1 scaffolding. SearchLimits / SearchStats / TimeManager / SearchContext do
+// not exist on the base commit, so these cases have no HEAD-negative to run
+// against; they are the construction and default-value sanity of the new
+// vocabulary, and REVIEW_LOG.md records that as a declared exception.
+// ---------------------------------------------------------------------------
+
+void test_search_limits_and_stats_defaults() {
+    SearchLimits limits;
+    assert(limits.max_depth == 8);
+    assert(limits.soft_time_ms == 0 && limits.hard_time_ms == 0);
+    assert(limits.max_nodes == 0);
+    assert(!limits.ponder && !limits.training);
+    assert(!limits.has_hint_score && limits.hint_score == 0);
+    assert(!limits.hint_move.pos.is_valid());
+
+    SearchStats stats;
+    assert(stats.completed_depth == 0 && stats.partial_depth == 0);
+    assert(stats.root_moves_done == 0 && stats.root_moves_total == 0);
+    assert(stats.seldepth == 0 && stats.score == 0 && stats.elapsed_ms == 0);
+    assert(stats.nodes == 0 && stats.qnodes == 0);
+    assert(stats.tt_hits == 0 && stats.tt_cutoffs == 0);
+    assert(stats.pv.empty());
+    assert(!stats.best_move.pos.is_valid());
+    assert(!stats.partial_best_move.pos.is_valid());
+    assert(stats.stopped == StopReason::NONE);
+
+    // These strings leave the process: the client shows them and the replay
+    // stores them, so a rename is a protocol change.
+    assert(std::string(stop_reason_name(StopReason::NONE)) == "none");
+    assert(std::string(stop_reason_name(StopReason::TIME_SOFT)) == "time_soft");
+    assert(std::string(stop_reason_name(StopReason::TIME_HARD)) == "time_hard");
+    assert(std::string(stop_reason_name(StopReason::NODES)) == "nodes");
+    assert(std::string(stop_reason_name(StopReason::USER)) == "user");
+    assert(std::string(stop_reason_name(StopReason::MATE)) == "mate");
+
+    std::cout << "test_search_limits_and_stats_defaults passed" << std::endl;
+}
+
+void test_time_manager_sizes_the_window_to_the_position() {
+    SearchLimits limits;
+    limits.hard_time_ms = 3000;
+
+    // An empty board is both a book stage and a tiny candidate set: either
+    // reason alone halves the soft window.
+    Board opening;
+    MoveBudget opening_budget = TimeManager::allocate(opening, limits, 0);
+    assert(opening_budget.hard_ms == 3000);
+    assert(opening_budget.soft_ms == 1500);
+
+    Board mid;
+    build_midgame(mid);
+    assert(mid.active_empty().size() > 6);
+    MoveBudget mid_budget = TimeManager::allocate(mid, limits, 0);
+    assert(mid_budget.soft_ms == 1950);  // the 65 % default, untouched
+
+    // An explicit soft request is honoured, but never beyond the hard limit.
+    limits.soft_time_ms = 5000;
+    assert(TimeManager::allocate(mid, limits, 0).soft_ms == 3000);
+    limits.soft_time_ms = 900;
+    assert(TimeManager::allocate(mid, limits, 0).soft_ms == 900);
+    limits.soft_time_ms = 0;
+
+    // The previous move spending 80 % of its limit is the boundary: over it
+    // halves the next window, at it does not.
+    assert(TimeManager::allocate(mid, limits, 2400).soft_ms == 1950);
+    assert(TimeManager::allocate(mid, limits, 2401).soft_ms == 1500);
+
+    // An endgame is the opposite of an opening: few stones left to place, long
+    // forcing lines, and it may run past the default share towards the hard
+    // limit. 196 stones leave 29 empties, so the candidate branch stays out of
+    // the way and only the endgame rule moves the number.
+    Board endgame;
+    bool black_to_place = true;
+    for (int row = 0; row < BOARD_SIZE; ++row) {
+        for (int col = 0; col < BOARD_SIZE && endgame.move_count() < 196; ++col) {
+            assert(endgame.place_stone(row, col, black_to_place ? BLACK : WHITE));
+            black_to_place = !black_to_place;
+        }
+    }
+    assert(endgame.move_count() == 196);
+    assert(endgame.active_empty().size() > 6);
+    assert(TimeManager::allocate(endgame, limits, 0).soft_ms == 2437);
+
+    std::cout << "test_time_manager_sizes_the_window_to_the_position passed" << std::endl;
+}
+
+void test_time_manager_node_budget_and_no_deadline() {
+    // Training asks for nodes and gets nothing else: the same move must not cost
+    // a different number of instructions on a loaded machine.
+    SearchLimits training;
+    training.training = true;
+    training.max_nodes = 250000;
+    training.hard_time_ms = 5000;
+    MoveBudget trained = TimeManager::allocate(Board(), training, 0);
+    assert(trained.max_nodes == 250000);
+    assert(trained.hard_ms == 0 && trained.soft_ms == 0);
+
+    // No hard deadline at all: the node budget stands alone, and a soft window
+    // with nothing to be a fraction of is not invented.
+    SearchLimits nodes_only;
+    nodes_only.max_nodes = 1000;
+    MoveBudget open = TimeManager::allocate(Board(), nodes_only, 0);
+    assert(open.hard_ms == 0 && open.soft_ms == 0 && open.max_nodes == 1000);
+
+    // A play request that carries both budgets keeps both.
+    SearchLimits both;
+    both.hard_time_ms = 1000;
+    both.max_nodes = 4096;
+    MoveBudget kept = TimeManager::allocate(Board(), both, 0);
+    assert(kept.hard_ms == 1000 && kept.max_nodes == 4096);
+    assert(kept.soft_ms == 500);
+
+    std::cout << "test_time_manager_node_budget_and_no_deadline passed" << std::endl;
+}
+
+void test_search_context_polls_the_clock_once_per_1024_nodes() {
+    SearchLimits limits;
+    limits.hard_time_ms = 1000;
+    std::atomic<bool> stop_flag{false};
+
+    JumpClock clock;
+    SearchContext ctx;
+    ctx.start(limits, clock, stop_flag);
+    assert(clock.readings == 1);
+
+    // A stop test whose whole purpose is to save time must not cost a clock read
+    // per node: 1023 of them go by without asking, and only the 1024th sees the
+    // deadline that was already crossed.
+    for (int i = 0; i < 1023; ++i) {
+        assert(!ctx.hard_stopped());
+        assert(clock.readings == 1);
+    }
+    assert(ctx.hard_stopped());
+    assert(clock.readings == 2);
+    assert(ctx.stopped_for(StopReason::TIME_HARD));
+    assert(ctx.hard_stopped());
+    assert(clock.readings == 2);  // sticky: the reason is remembered, not re-polled
+
+    // Once the search has stopped, the budget checks still short-circuit before
+    // the clock, so a stopped think costs no further readings however long it
+    // unwinds.
+    for (int i = 0; i < 2048; ++i) assert(ctx.hard_stopped());
+    assert(clock.readings == 2);
+
+    std::cout << "test_search_context_polls_the_clock_once_per_1024_nodes passed" << std::endl;
+}
+
+void test_search_context_reports_why_it_stopped() {
+    std::atomic<bool> stop_flag{false};
+    SteadyClock clock;
+
+    SearchLimits node_budget;
+    node_budget.max_nodes = 4;
+    SearchContext nodes_ctx;
+    nodes_ctx.start(node_budget, clock, stop_flag);
+    for (int i = 0; i < 3; ++i) {
+        nodes_ctx.count_node();
+        assert(!nodes_ctx.hard_stopped());
+    }
+    nodes_ctx.count_node();
+    assert(nodes_ctx.nodes() == 4);
+    assert(nodes_ctx.hard_stopped());
+    assert(nodes_ctx.stopped_for(StopReason::NODES));
+
+    // The player pressed 终止 / 重开 / 接管: the flag is the reason, and it beats
+    // the budget checks in reporting which.
+    std::atomic<bool> user_stop{false};
+    SearchContext user_ctx;
+    user_ctx.start(node_budget, clock, user_stop);
+    user_stop.store(true);
+    assert(user_ctx.hard_stopped());
+    assert(user_ctx.stopped_for(StopReason::USER));
+
+    // A deliberate stop set by the root loop reads back as itself, and a budget
+    // limit of zero means the check is never armed.
+    SearchContext armed;
+    SearchLimits nothing;
+    armed.start(nothing, clock, stop_flag);
+    assert(!armed.hard_stopped());
+    assert(!armed.soft_time_up());
+    armed.set_reason(StopReason::MATE);
+    assert(armed.stopped_for(StopReason::MATE));
+    assert(armed.hard_stopped());
+
+    std::cout << "test_search_context_reports_why_it_stopped passed" << std::endl;
+}
+
+void test_search_context_deadlines_share_one_start_reading() {
+    // An advancing clock is the only way to catch a start() that reads the clock
+    // once per deadline: each extra reading would push the later window further
+    // out and the soft/hard pair would no longer be measured from one instant.
+    ScriptedClock clock(100);
+    SearchLimits limits;
+    limits.hard_time_ms = 1000;
+    limits.soft_time_ms = 400;
+    std::atomic<bool> stop_flag{false};
+
+    SearchContext ctx;
+    ctx.start(limits, clock, stop_flag);
+    assert(clock.readings == 1);
+    assert(ctx.elapsed_ms() == 100);
+    assert(ctx.elapsed_ms() == 200);
+
+    // 300 ms of simulated search has not spent the soft window; the next
+    // reading is exactly 400, which only lands there because the window was
+    // measured from the same reading as the hard deadline.
+    assert(!ctx.soft_time_up());
+    assert(ctx.soft_time_up());
+
+    std::cout << "test_search_context_deadlines_share_one_start_reading passed" << std::endl;
+}
+
+void test_search_context_counters_account_for_the_tree() {
+    SteadyClock clock;
+    std::atomic<bool> stop_flag{false};
+    SearchLimits limits;
+    limits.max_nodes = 100;
+
+    SearchContext ctx;
+    ctx.start(limits, clock, stop_flag);
+    ctx.count_node();
+    ctx.count_quiescence_node();
+    ctx.count_quiescence_node();
+    ctx.count_tt_hit();
+    ctx.count_tt_hit();
+    ctx.count_tt_cutoff();
+    ctx.note_quiescence_depth(3);
+    ctx.note_quiescence_depth(7);
+    ctx.note_quiescence_depth(5);  // a shallower line does not undo the record
+
+    assert(ctx.nodes() == 3);
+    assert(ctx.quiescence_nodes() == 2);
+    assert(ctx.tt_hits() == 2);
+    assert(ctx.tt_cutoffs() == 1);
+    assert(ctx.seldepth() == 7);
+
+    // start() resets the bookkeeping: a second think on the same context must not
+    // inherit the last one's node count or stop reason.
+    ctx.start(limits, clock, stop_flag);
+    assert(ctx.nodes() == 0 && ctx.quiescence_nodes() == 0);
+    assert(ctx.tt_hits() == 0 && ctx.tt_cutoffs() == 0);
+    assert(ctx.seldepth() == 0);
+    assert(ctx.reason() == StopReason::NONE);
+
+    std::cout << "test_search_context_counters_account_for_the_tree passed" << std::endl;
+}
+
 int main() {
     std::cout << "Running search tests..." << std::endl;
 
@@ -2875,6 +3158,14 @@ int main() {
     test_sort_moves_pins_tt_move_already_at_front();
     test_sort_moves_promotes_tt_move_from_tail();
     test_sort_moves_full_order_without_tt_move();
+
+    test_search_limits_and_stats_defaults();
+    test_time_manager_sizes_the_window_to_the_position();
+    test_time_manager_node_budget_and_no_deadline();
+    test_search_context_polls_the_clock_once_per_1024_nodes();
+    test_search_context_reports_why_it_stopped();
+    test_search_context_deadlines_share_one_start_reading();
+    test_search_context_counters_account_for_the_tree();
 
     std::cout << "All search tests passed!" << std::endl;
     return 0;
