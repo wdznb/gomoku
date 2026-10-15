@@ -1979,6 +1979,100 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次121 引擎重构 A5：整盘评估第一次知道棋子站在哪 — engine redesign stage A5
+
+规格 `docs/ENGINE_REDESIGN.md` §2.5.2 / §2.5.4（冻结，不改写）。A5 动的是 P3：评估里从来没有「位置」这件事，中心偏好
+只活在候选排序里，而且量级小到任何一条眠二都能压过去。
+
+### Found
+
+- **`evaluate_board` 只累加 `pattern_score`**：一条子没落的盘，和主力握在中心的盘，读成同一个 0 —— 静默局的叶子值对
+  「子站在哪」毫无反应，无谱可依赖的那一手就顺着 `active_empty()` 的 swap-remove 顺序漂到边角。
+- **量级**。`position_weights_[r][c] = (14 - dist) * position_weight_scale`，默认 `scale = 1` ⇒ 权重区间 [0, 14]，
+  而 `sleepy_two = 10`、`live_two = 50` ⇒ 中心偏好连一条眠二都争不过（文档 §1.3-P3-2）。
+- **形状表看不见边**。18-bit 窗口把界外格与对手子都读成同一个 2，于是贴边活三与被封活三同价（`pattern.cpp:278-318`）。
+  这张表是位棋盘识别器与标量识别器的一致性证明，动它等于动规则层 ⇒ 修正必须落在「候选站在哪」这一侧。
+
+### Fixed
+
+- `evaluate_board` 在 pattern 累加之后、clamp 之前加两项，且**都按颜色差分**：`position_term`（遍历
+  `move_history()` 里该色的子，累加中心权重 × `distance_to_stones`）与 `edge_penalty_term`（站在外两行/两列的子，
+  每子每轴 × `edge_penalty`）。差分 ⇒ `eval(W) == -eval(B)` 仍代数成立，`five - 1` 的天花板照旧兜住总和；成本 O(子数)，
+  遍历的是棋子而不是候选格。
+- `pattern_score` 改签名为 `(pattern, row, col)`：活四 / 活三 / 活二按一张编译期 15×15×4 表 `kBlockedEnds`
+  （该格该方向被棋盘封住的端数，「往外不足两格」即算封）打折，每端一个 `edge_penalty`。形状 LUT 一个字没改。
+- `position_weight_scale` 默认 1 → **8**（在 `params.cpp` 的 [0, 20] 之内）⇒ 单格候选的中心-边角差 **112**，与
+  `live_two`(50) 同阶，落在文档要求的 100–200 窗口。
+- 新增两个系数字段：`distance_to_stones = 1`、`edge_penalty = 100`。它们进可调面是 P1 的活（`EDGE_PENALTY` /
+  `DISTANCE_TO_STONES`），本轮只落到 `ThreatCoefficients` 的默认值。
+- **折扣仍然是折扣**：一格最多 4 方向 × 2 端 = 8 端 ⇒ 至多折 800 分，仍 < `rush_four`(1000)；折价后的活三 400 介于
+  眠三与冲四之间 ⇒ 既不会把贴边的假活三抬成真威胁，也不会把任何形状重新分级。
+
+### 合约过期
+
+被改写的都是**精确聚合值**，不是前提：`pattern_score` 的一项里多了位置、`evaluate_board` 的总和里多了两项。
+
+1. `test_evaluator.cpp` 的 helper `naive_board_total`(:13-22) —— 它按定义就是「把 `evaluate_board` 重算一遍」，同步
+   补上两项位置差；`pattern_score` 调用改 2 参。
+2. `test_evaluate_board_skips_black_forbidden_point` :238/:241/:243 —— 38300→**38700**、7300→**7700**。四子的中心项
+   96+104+96+104 = 400；`black_ps` 仍是 31000、`before - after` 仍是 31000，即禁手门照旧只带走自己那一项。
+3. `test_evaluate_board_double_four_point` :264/:266 —— 99800→**100376**、29800→**30376**（+576 中心项）。
+4. `test_evaluate_board_keeps_white_value_on_forbidden_square` :292/:295/:298 —— 35700→**35924**、4700→**4924**
+   （+400 BLACK 中心项 −176 WHITE 边角项；WHITE 的 500 一分没少）。
+5. `test_evaluate_board_unchanged_without_forbidden` :315 —— 1700→**1708**。
+6. `test_evaluate_board_never_judges_white` :361-363 —— 38300→**38700**、−38300→**−38700**；同一副盘的 WHITE 形状
+   `white_ps` 仍 31000（(7,7) 四端都不缺格子 ⇒ 不打折）。
+7. `test_candidate_value_zeroes_black_forbidden_shape` :385-395 —— 14→**112**、13→**104**、1063→**1154**、
+   1076→**1258**、10014→**10112**、10028→**10224**。形状那一半（0 / 1050 / 10000）一分没动，变的只有格子。
+8. `test_exact_five_outranks_the_forbidden_gate` :486 —— `five + 14`→`five + `**112**。
+9. `test_search.cpp:3356-3389`（同一类数字在搜索套件里的对位）—— 14→112、1063→1154、13→104、1076→1258、
+   10014→10112、10028→10224。
+10. `test_tt_cold_think_cost_and_warm_reuse` 的**注释**里的三个节点数（225745→222885 等）。`<= 250000` 上限与
+    `warm * 10 < cold` 比值断言都没动，两棵树都绿。
+
+### New
+
+`test_evaluate_board_prefers_centre_stones`（同一副三连子整体搬到边角 ⇒ 整盘分严格更低，并逐项点名是谁在起作用）、
+`test_evaluate_board_antisymmetric_with_terms`（三副局面 × 两个座位 ⇒ `black == -white` 且 `black != 0`）、
+`test_edge_penalty_below_rush_four`（贴边活三/活四各少 100、开行活二一分不少、`8 * edge_penalty < rush_four`，
+默认标定 8 与 100 放在最后两行 —— 让行为断言先跑，红点就落在行为上）。
+
+### Verified
+
+HEAD-negative 的改动前树是 `git archive 01c2038` 整树，只把 A5 的**名字**补进去（2 参 `pattern_score`、两个 `return 0`
+的 `*_term`、`position_weight_scale` 留 1、`edge_penalty` 字段留 100），行为退回 A3 收尾时那棵树。构造树的行为中立性是
+自证的：同一个节点数 driver 在构造树打印 `2595 / 21963 / 225745 / 96`，与 pristine `01c2038` 一字不差。
+
+逐用例 driver（`-Dmain=suite_main` + 挑用例的 main，18 条各跑一次）在构造树上的红点：
+`prefers_centre_stones` 红在 `:516`（`position_term(centre) > position_term(corner)`）、`edge_penalty_below_rush_four`
+红在 `:575`（`pattern_score(three, 7, 1)` 读 500 而不是 400）、7 条被改写的聚合值用例红在
+`:238/:264/:292/:315/:361/:385/:486`；`test_evaluate_board_antisymmetric_with_terms` 在两棵树都绿（它要证的是「新项不
+破对称」，本来就该同绿），与 A5 无关的 8 条在两棵树全绿。`test_search` 侧同法两条：`greedy` 用例在构造树红在 `:3359`，
+`test_tt_cold_think_cost_and_warm_reuse` 在两棵树都绿 —— 构造树冷跑 225745、本树 222885，同在 `<= 250000` 之内，
+warm 两次都是 96。`position_term` / `edge_penalty_term` / 2 参 `pattern_score` 是新 API 面 ⇒ 这三样在 pristine 树上
+**无 HEAD-negative（by construction）**，构造树就是它们的替身。
+
+实测数：`prefers_centre_stones` 中心 23212 / 边角 11822；对称三盘 `−1184 / 1184`、`7204 / −7204`、`1708 / −1708`；
+折扣 per end 100、单格最坏 800、`rush_four` 1000。同一副 16 子局面 depth 4 的冷跑从 225745 节点变成 **222885**
+（−1.3%）、`tt_hits` 2833→2965，选点与分值仍是 `(6,6) / 100000`；浅层各多 2 个节点（2595→2597、21963→21965）——
+叶子值里多了两项，剪枝边界跟着挪了一格，这正是「位置项进了评估」的形状。
+
+`ctest` **8/8 / 80.69 s**（`test_search` 51.12 s、`test_server` 12.56 s），
+`node tests/web_frontend_check.js` **103/103**，
+`node tests/readme_anchor_check.js` **113 citations / 0 problems**，README 仍 **658 行**（A5 没动文档，系数默认值在
+README 里没有被枚举过，故无行内改写）。
+
+Valgrind（`build-vg/`，Debug + `-UNDEBUG`，`tools/valgrind_check.sh`）：`test_evaluator` **clean / reports=0 / 2 s**，
+`test_pattern` **clean / reports=0 / 5 s**。`test_position` **ABORTED rc=134 / reports=0 / 779 s** —— 这是本轮新增的
+一条**仪表脆弱**记录，不是 A5 的缺陷，归因用单用例 driver 在两棵树上各跑一次同一用例
+（`test_oversized_flat_run_is_scanned_in_one_pass`）：pristine `01c2038` 与本树逐行相同 ——
+`peak RSS 314 MB`、红在 `tests/test_position.cpp:1127` 的 `assert(after.ru_maxrss < 250LL * 1024)`、rc=134、
+valgrind 报告 **0 条**。那条断言读的是**进程**峰值 RSS，而 memcheck 的影子内存本身就记在它头上（全套跑时更高，425 MB），
+与这条用例测的「一遍扫描 vs 每符号一个容器」的成本级无关；这一用例从头到尾不碰 `Evaluator`。⇒ 它加进 §5 基线里
+`test_training.cpp:2055` / `test_server.cpp:1706` 那一对的同类型记录：**按既存记录、不计为新增**，门禁只看
+「abort 之前零新增 + abort 点未前移」，两处都成立（`reports=0`，且红点在改动前的树上同样红）。
+`test_search` 的全量 memcheck 按 §5 节奏留给 A6 checkpoint（A5 之后它的 222885 节点上限用例仍是同一条线）。
+
 ## 轮次121 引擎重构 A3：置换表按深度替换，代龄跟着落子走 — engine redesign stage A3
 
 规格 `docs/ENGINE_REDESIGN.md` §2.4（冻结，不改写）。A3 动的是 P2：一张直接映射表把「上一手付出来的深层记录」当

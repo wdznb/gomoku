@@ -22,7 +22,20 @@ struct ThreatCoefficients {
     
     int forbidden_penalty = 50000;
     
-    int position_weight_scale = 1;
+    // Centre bias per candidate square: the table below runs from 0 at the corner
+    // to 14 * this at the centre, so a scale of 8 puts centre and corner 112 points
+    // apart - the same order as live_two, which is what makes the preference
+    // observable in a comparison of two otherwise equal shapes.
+    int position_weight_scale = 8;
+    // Multiplier for the stones-on-the-board half of that preference inside
+    // evaluate_board. Kept separate from position_weight_scale so training can move
+    // the whole-board term without re-tuning the candidate ordering.
+    int distance_to_stones = 1;
+    // What one closed line end costs: the shape table cannot tell a board edge from
+    // an opponent stone, so an edge-hugging 活三 is paid as if it were open. The
+    // discount runs over at most four directions times two ends, so keeping this
+    // under rush_four / 8 leaves a discounted shape worth less than a real 冲四.
+    int edge_penalty = 100;
     
     ThreatCoefficients() = default;
 };
@@ -59,7 +72,16 @@ private:
     int position_weights_[BOARD_SIZE][BOARD_SIZE];
     
     void init_position_weights();
-    int pattern_score(const PositionPattern& pattern) const;
+    // `row`/`col` are the candidate the pattern was read at: the shape itself does
+    // not say where on the board it sits, and a line the edge closes has to be
+    // worth less than the same line with room to grow.
+    int pattern_score(const PositionPattern& pattern, int row, int col) const;
+    // Sum of the centre weights over the stones of one colour, and the price of the
+    // ones standing in the outer two rows or columns. Both are read one colour at a
+    // time and subtracted from each other by the caller, so the whole-board value
+    // stays antisymmetric: eval(W) == -eval(B).
+    int position_term(const Board& board, int color) const;
+    int edge_penalty_term(const Board& board, int color) const;
     // A recognised candidate pattern's value for its colour: the mate bonus for
     // a five, otherwise the pattern score plus the square's centre bias - except
     // a shape BLACK may not legally play, which is worth nothing.

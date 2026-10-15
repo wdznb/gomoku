@@ -4,6 +4,51 @@
 
 namespace gomoku {
 
+namespace {
+
+// How many of a direction's two ends the edge of the board closes at one cell.
+// Built at compile time: the answer depends only on the cell, never on the stones.
+// An end with room for fewer than two more cells cannot hold the extension the
+// shape's price assumes, which is the difference between 贴边活三 and 被封活三 that
+// the 18-bit window cannot see (both read the same 2 in the cell beyond the run).
+struct BlockedEnds {
+    signed char v[BOARD_SIZE][BOARD_SIZE][4];
+};
+
+constexpr BlockedEnds build_blocked_ends() {
+    BlockedEnds table{};
+    for (int r = 0; r < BOARD_SIZE; ++r) {
+        for (int c = 0; c < BOARD_SIZE; ++c) {
+            for (int d = 0; d < 4; ++d) {
+                const int dr = DIRECTIONS[d][0];
+                const int dc = DIRECTIONS[d][1];
+                int ends = 0;
+                int forward = 0;
+                for (int k = 1; k < BOARD_SIZE; ++k) {
+                    const int rr = r + dr * k;
+                    const int cc = c + dc * k;
+                    if (rr < 0 || rr >= BOARD_SIZE || cc < 0 || cc >= BOARD_SIZE) break;
+                    ++forward;
+                }
+                int backward = 0;
+                for (int k = 1; k < BOARD_SIZE; ++k) {
+                    const int rr = r - dr * k;
+                    const int cc = c - dc * k;
+                    if (rr < 0 || rr >= BOARD_SIZE || cc < 0 || cc >= BOARD_SIZE) break;
+                    ++backward;
+                }
+                ends = (forward < 2 ? 1 : 0) + (backward < 2 ? 1 : 0);
+                table.v[r][c][d] = static_cast<signed char>(ends);
+            }
+        }
+    }
+    return table;
+}
+
+constexpr BlockedEnds kBlockedEnds = build_blocked_ends();
+
+}
+
 Evaluator::Evaluator() {
     init_position_weights();
 }
@@ -37,7 +82,7 @@ int Evaluator::get_position_weight(int row, int col) const {
     return position_weights_[row][col];
 }
 
-int Evaluator::pattern_score(const PositionPattern& pattern) const {
+int Evaluator::pattern_score(const PositionPattern& pattern, int row, int col) const {
     int score = 0;
 
     // FIVE is only counted here, not via has_live_four / four_count, so
@@ -82,7 +127,21 @@ int Evaluator::pattern_score(const PositionPattern& pattern) const {
     if (pattern.has_three_three) {
         score += coeffs_.double_three;
     }
-    
+
+    // The shape's price assumes room. A live four / live three / live two is worth
+    // what it is because both ends can grow, and the table cannot tell that an end
+    // here is the edge of the board rather than a stone, so the correction has to
+    // come from where the candidate sits (design doc 2.5.4 - the shape table itself
+    // stays untouched, because it is the bitboard/scalar matcher's consistency
+    // proof, not a place to put a preference).
+    for (int d = 0; d < 4; ++d) {
+        const PatternType type = pattern.directions[d].type;
+        if (type == PatternType::LIVE_FOUR || type == PatternType::LIVE_THREE ||
+            type == PatternType::LIVE_TWO) {
+            score -= coeffs_.edge_penalty * kBlockedEnds.v[row][col][d];
+        }
+    }
+
     return score;
 }
 
@@ -115,7 +174,7 @@ int Evaluator::candidate_value(int row, int col, const PositionPattern& pattern,
     // the same rule evaluate_board applies to each side of a candidate square.
     if (color == BLACK && PatternRecognizer::is_forbidden_from_pattern(pattern)) return 0;
 
-    int score = pattern_score(pattern);
+    int score = pattern_score(pattern, row, col);
     score += get_position_weight(row, col);
 
     return score;
@@ -141,6 +200,33 @@ int Evaluator::evaluate_position_both(const Board& board, int row, int col, int 
     return evaluate_position_pair(board, row, col, my_color);
 }
 
+int Evaluator::position_term(const Board& board, int color) const {
+    // One pass over the stones on the board, not over the candidate list: the
+    // preference is about where the army stands, and the candidates are the empty
+    // squares around it. move_history() is kept in step by place_stone and
+    // undo_last_move, so it is exactly the stones that are there now.
+    long long total = 0;
+    for (const Move& move : board.move_history()) {
+        if (move.color != color) continue;
+        total += position_weights_[move.pos.row][move.pos.col];
+    }
+    return static_cast<int>(total * coeffs_.distance_to_stones);
+}
+
+int Evaluator::edge_penalty_term(const Board& board, int color) const {
+    long long total = 0;
+    for (const Move& move : board.move_history()) {
+        if (move.color != color) continue;
+        const int row = move.pos.row;
+        const int col = move.pos.col;
+        int closed = 0;
+        if (row <= 1 || row >= BOARD_SIZE - 2) ++closed;
+        if (col <= 1 || col >= BOARD_SIZE - 2) ++closed;
+        total += closed;
+    }
+    return static_cast<int>(total * coeffs_.edge_penalty);
+}
+
 int Evaluator::evaluate_board(const Board& board, int my_color) const {
     long long my_total = 0;
     long long opp_total = 0;
@@ -160,14 +246,24 @@ int Evaluator::evaluate_board(const Board& board, int my_color) const {
         // move generator refuses to place. Each side is judged on its own pattern:
         // the square may be forbidden for BLACK and a live four for WHITE.
         if (!black_is_mine || !PatternRecognizer::is_forbidden_from_pattern(my_pattern)) {
-            my_total += pattern_score(my_pattern);
+            my_total += pattern_score(my_pattern, pos.row, pos.col);
         }
         if (black_is_mine || !PatternRecognizer::is_forbidden_from_pattern(opp_pattern)) {
-            opp_total += pattern_score(opp_pattern);
+            opp_total += pattern_score(opp_pattern, pos.row, pos.col);
         }
     }
-    
+
     long long diff = my_total - opp_total;
+    // Where the stones stand. The pattern sum only ever speaks about threats a
+    // player could still build, so an otherwise quiet board reads as 0 no matter
+    // whether the army sits on the centre lines or along the rim - which is why a
+    // search with no book move to lean on drifted to the corners. Both terms are
+    // taken as a difference between the two colours, so eval(W) == -eval(B) still
+    // holds with them in, and the cap below still bounds them.
+    diff += position_term(board, my_color);
+    diff -= position_term(board, opponent(my_color));
+    diff -= edge_penalty_term(board, my_color);
+    diff += edge_penalty_term(board, opponent(my_color));
     // Summing pattern scores over hundreds of candidate squares can exceed the
     // mate threshold (100000) that AlphaBeta uses to detect forced wins and
     // terminate iterative deepening. Static evaluation must never reach a mate

@@ -546,11 +546,13 @@ void test_transposition_depth_gate_still_applies() {
 
 // One think's cost, twice: on a cold table and then on the table that think just
 // filled. Both figures are counts rather than timings - no wall-clock limit, no node
-// cap, a fresh table - so only the table can move them. On the pre-A3 layout (direct
-// mapping, age before depth) the cold think spent 276131 nodes and 383 hits; here it
-// spends 225745 and 2833, and both trees agree to the node on the shallower thinks of
-// the same position (2595 at depth 2, 21963 at depth 3, measured side by side) - which
-// is what puts the difference in the table and not in the search.
+// cap, a fresh table - so only the table and the evaluation can move them. On the
+// pre-A3 layout (direct mapping, age before depth) the cold think spent 276131 nodes
+// and 383 hits; the A3 layout brought that to 225745 / 2833, and A5's positional
+// terms to the 222885 / 2965 below. The shallower thinks of the same position move by
+// two nodes across the whole change (2595 / 2597 at depth 2, 21963 / 21965 at depth 3)
+// while the depth-4 cost drops by thousands - which is what puts the difference in
+// the table rather than in the search.
 void test_tt_cold_think_cost_and_warm_reuse() {
     Board board;
     for (int i = 0; i < 4; ++i) {
@@ -572,8 +574,8 @@ void test_tt_cold_think_cost_and_warm_reuse() {
     const Move cold_move = cold.search(board, WHITE, 4, 0, stop);
     const uint64_t cold_nodes = cold.stats_.nodes;
     assert(cold.stats_.completed_depth == 4);
-    // A ceiling with a tenth of slack over the measured 225745. The pre-A3 layout
-    // needed 276131 for this same job, so the case is red there.
+    // A ceiling with more than a tenth of slack over the measured 222885. The
+    // pre-A3 layout needed 276131 for this same job, so the case is red there.
     assert(cold_nodes <= 250000);
 
     AlphaBetaSearch warm(evaluator, tt);
@@ -581,7 +583,7 @@ void test_tt_cold_think_cost_and_warm_reuse() {
     const Move warm_move = warm.search(board, WHITE, 4, 0, stop);
     const uint64_t warm_nodes = warm.stats_.nodes;
     // The same root on the table the cold think just filled is a table read, not a
-    // search: the claim is the ratio (96 against 225745), not a number.
+    // search: the claim is the ratio (96 against 222885), not a number.
     assert(warm_nodes * 10 < cold_nodes);
     assert(warm_move.pos.row == cold_move.pos.row && warm_move.pos.col == cold_move.pos.col);
     assert(warm.stats_.score == cold.stats_.score);
@@ -3350,16 +3352,19 @@ void test_greedy_drops_the_defense_price_of_a_black_forbidden_point() {
         if (candidate.move.pos.row == 7 && candidate.move.pos.col == 8) neighbour = &candidate;
     }
     assert(spot != nullptr);
+    // The centre bias in these four numbers is position_weight_scale 8 (engine
+    // redesign A5), so (7,7) carries 112 and (7,8) carries 104; the shape halves
+    // are the same 0 / 1050 they were at scale 1.
     assert(spot->defense_score == 0);
-    assert(spot->attack_score == 14);
+    assert(spot->attack_score == 112);
     assert(spot->total_score == spot->attack_score + spot->defense_score);
-    assert(spot->total_score == 14);
+    assert(spot->total_score == 112);
     // The square beside it is an ordinary candidate on the same board: BLACK's
     // live four there is still a threat worth blocking.
     assert(neighbour != nullptr);
-    assert(neighbour->defense_score == 1063);
-    assert(neighbour->attack_score == 13);
-    assert(neighbour->total_score == 1076);
+    assert(neighbour->defense_score == 1154);
+    assert(neighbour->attack_score == 104);
+    assert(neighbour->total_score == 1258);
 
     // BLACK's ranked list never carried the forbidden point even before the gate.
     const std::vector<ScoredMove> as_black = greedy.search_ranked(board, BLACK, all);
@@ -3382,8 +3387,8 @@ void test_greedy_drops_the_defense_price_of_a_black_forbidden_point() {
         if (candidate.move.pos.row == 7 && candidate.move.pos.col == 7) legal_spot = &candidate;
     }
     assert(legal_spot != nullptr);
-    assert(legal_spot->defense_score == 10014);
-    assert(legal_spot->total_score == 10028);
+    assert(legal_spot->defense_score == 10112);
+    assert(legal_spot->total_score == 10224);
 
     std::cout << "test_greedy_drops_the_defense_price_of_a_black_forbidden_point passed ("
               << spot->defense_score << " defense at 7,7, control "
