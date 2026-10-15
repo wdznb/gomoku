@@ -2808,7 +2808,16 @@ void test_alphabeta_aborted_search_stores_only_sound_nodes() {
     const SearchInfo full_info = completed.last_search_info();
     assert(full_info.depth == 2);
     assert(full_info.partial_depth == 0);
-    assert(full_info.nodes_searched < node_limit * 10);
+    // Contract change (A4): this layer now runs inside an aspiration window centred
+    // on the score the layer below returned. Here that estimate is far off - 4202
+    // against a real 20584 - so the pass fails high, the end it failed against
+    // opens up, and the layer re-runs: measured 1104 nodes where the same think
+    // with one pass per layer cost 752. What the control still has to prove is that
+    // the whole tree fits (no interrupted layer, entry written: asserted below), so
+    // the ceiling is the ladder's pass count times a single pass, not a guess at
+    // one pass's cost.
+    assert(full_info.nodes_searched > layer_one_nodes);
+    assert(full_info.nodes_searched < 752 * 3);
     TTEntry entry;
     const bool control_entry = full_tt.probe(child_hash, entry);
     assert(control_entry);
@@ -3326,6 +3335,174 @@ void test_sort_moves_full_order_without_tt_move() {
     std::cout << "test_sort_moves_full_order_without_tt_move passed" << std::endl;
 }
 
+// A4, design doc 2.4.3 ①: the root order starts from the move the session's
+// previous think considered best. The pin is observable through the fallback: with
+// the deadline already expired no layer runs, so the answer is literally
+// root_moves[0] - whatever the order puts there. A think that gets to search is
+// free to disagree with the pin, which is why the pin is proved here rather than in
+// a scored think.
+void test_root_ordering_uses_hint_move() {
+    Board board;
+    build_midgame(board);
+    Evaluator evaluator;
+    TranspositionTable tt;
+
+    AlphaBetaSearch ab(evaluator, tt);
+    std::atomic<bool> stop(false);
+    ab.set_deadline(std::chrono::steady_clock::now() - std::chrono::seconds(1));
+
+    // The same order the root builds for itself: this board has no self-symmetry,
+    // so nothing is deduplicated and the heuristic sort is all that decides.
+    std::vector<Move> root = ab.generate_moves(board, WHITE);
+    ab.sort_moves(root, board, WHITE);
+    assert(root.size() > 8);
+    const Move pinned = root.back();
+    assert(pinned.pos != root[0].pos);
+
+    SearchLimits limits;
+    limits.max_depth = 4;
+    limits.hard_time_ms = 5000;
+    limits.hint_move = pinned;
+
+    const Move hinted = ab.search(board, WHITE, limits, stop);
+    const SearchInfo hint_info = ab.last_search_info();
+    assert(hint_info.depth == 0);
+    assert(hinted.pos == pinned.pos);
+
+    // Control 1: no hint (the invalid default) pins nothing, so the fallback is
+    // the heuristic maximum as it always was.
+    limits.hint_move = Move();
+    const Move plain = ab.search(board, WHITE, limits, stop);
+    assert(plain.pos == root[0].pos);
+
+    // Control 2: a hint for a cell the root list does not hold - here a stone is
+    // already on it - is dropped rather than played.
+    limits.hint_move = Move(7, 7, WHITE);
+    assert(!board.is_empty(7, 7));
+    const Move stale = ab.search(board, WHITE, limits, stop);
+    assert(stale.pos == root[0].pos);
+
+    std::cout << "test_root_ordering_uses_hint_move passed (pinned "
+              << pinned.pos.row << "," << pinned.pos.col << ", unhinted "
+              << plain.pos.row << "," << plain.pos.col << ", stale "
+              << stale.pos.row << "," << stale.pos.col << ")" << std::endl;
+}
+
+namespace {
+
+// Spread across the board with no five in sight, so every one of the four layers
+// completes and none of them ends in a mate sentinel: the centre each layer
+// inherits is an ordinary position value, which is what the ladder is for.
+Board quiet_think_board() {
+    Board board;
+    board.place_stone(3, 3, BLACK);
+    board.place_stone(13, 13, BLACK);
+    board.place_stone(3, 13, WHITE);
+    board.place_stone(13, 3, WHITE);
+    board.place_stone(8, 6, WHITE);
+    board.place_stone(10, 10, BLACK);
+    board.place_stone(4, 4, WHITE);
+    return board;
+}
+
+// One depth-limited think on `board` with the aspiration centre the caller asks
+// for, under a budget that cannot run out: no clock and no node ceiling, so the
+// only thing the three arms below can differ in is how many passes each layer
+// needed.
+SearchStats think_with_centre(const Board& board, const Evaluator& evaluator,
+                              std::atomic<bool>& stop, bool has_centre, int centre) {
+    TranspositionTable tt;
+    AlphaBetaSearch search(evaluator, tt);
+    SearchLimits limits;
+    limits.max_depth = 4;
+    limits.has_hint_score = has_centre;
+    limits.hint_score = centre;
+    const Move move = search.search(board, WHITE, limits, stop);
+    SearchStats stats = search.last_stats();
+    stats.best_move = move;
+    return stats;
+}
+
+}  // namespace
+
+// A4, design doc 2.4.3 ③: a layer is searched inside a window centred on the value
+// the layer below reported (seeded from the score the session handed in), and a
+// value outside that window re-searches the layer with the failed side opened up.
+// The rule has to be a work-saving device, never a different move, so every arm has
+// to submit exactly what the whole-window think submits - same cell, same score,
+// same completed depth - while the node count proves the centre was consumed at all
+// (before the fix, handing in a number changed nothing, so all three counts were
+// the same line).
+void test_aspiration_refines_without_changing_result() {
+    const Board board = quiet_think_board();
+    Evaluator evaluator;
+    std::atomic<bool> stop(false);
+
+    const SearchStats none = think_with_centre(board, evaluator, stop, false, 0);
+    assert(none.completed_depth == 4);
+    assert(none.stopped == StopReason::NONE);
+
+    const SearchStats exact = think_with_centre(board, evaluator, stop, true, none.score);
+    const SearchStats negated = think_with_centre(board, evaluator, stop, true, -none.score);
+
+    for (const SearchStats* arm : {&exact, &negated}) {
+        assert(arm->best_move.pos == none.best_move.pos);
+        assert(arm->score == none.score);
+        assert(arm->completed_depth == none.completed_depth);
+        assert(arm->stopped == none.stopped);
+    }
+    // The load-bearing half: a centre the window cannot hold costs re-searches, so
+    // the work is not the whole-window figure. The negated arm is not pinned this
+    // way - its count can land on the full-window one by accident - and it is there
+    // to show a wildly wrong estimate still returns the same move.
+    assert(exact.nodes != none.nodes);
+
+    std::cout << "test_aspiration_refines_without_changing_result passed (best "
+              << none.best_move.pos.row << "," << none.best_move.pos.col << " score "
+              << none.score << " depth " << none.completed_depth << ", nodes: no centre "
+              << none.nodes << ", centre " << exact.nodes << ", negated centre "
+              << negated.nodes << ")" << std::endl;
+}
+
+// A4 through the layer the session actually calls: SearchEngine owns the hint the
+// owner hands it and reads it into the limits it searches under. A centre-only hint
+// (no pinned move) touches nothing but the aspiration windows, so identical output
+// with a different node count is the proof that the number reached the search.
+void test_search_engine_forwards_the_hint_to_the_search() {
+    const Board board = quiet_think_board();
+    std::atomic<bool> stop(false);
+
+    auto think = [&](bool has_centre, int centre) {
+        SearchEngine engine;
+        engine.set_vcf_enabled(false);
+        engine.set_vct_enabled(false);
+        engine.set_book_enabled(false);
+        engine.set_resign_detection(false);
+        engine.clear_hint();
+        if (has_centre) engine.set_hint(Move(), centre);
+        // A budget this think cannot spend: the deadline is ten minutes away and
+        // the node ceiling derived from it clamps to INT_MAX, so the four layers
+        // decide the answer and the node count is a deterministic quantity.
+        return engine.search(board, WHITE, 4, 600000, stop);
+    };
+
+    const SearchResult plain = think(false, 0);
+    assert(plain.method == "alphabeta");
+    assert(plain.depth == 4);
+
+    const SearchResult reuse = think(true, plain.score);
+    assert(reuse.method == plain.method);
+    assert(reuse.best_move.pos == plain.best_move.pos);
+    assert(reuse.score == plain.score);
+    assert(reuse.depth == plain.depth);
+    assert(reuse.nodes_searched != plain.nodes_searched);
+
+    std::cout << "test_search_engine_forwards_the_hint_to_the_search passed ("
+              << plain.best_move.pos.row << "," << plain.best_move.pos.col
+              << " score " << plain.score << ", nodes " << plain.nodes_searched
+              << " -> " << reuse.nodes_searched << ")" << std::endl;
+}
+
 // Round 89, T1: the colour gate reaches the search layer through the two
 // single-colour reads greedy_.search_ranked reports. On the four-four board
 // WHITE paid 70014 to "block" a shape BLACK can never play; that defence price
@@ -3831,6 +4008,9 @@ int main() {
     test_sort_moves_pins_tt_move_already_at_front();
     test_sort_moves_promotes_tt_move_from_tail();
     test_sort_moves_full_order_without_tt_move();
+    test_root_ordering_uses_hint_move();
+    test_aspiration_refines_without_changing_result();
+    test_search_engine_forwards_the_hint_to_the_search();
 
     test_search_limits_and_stats_defaults();
     test_time_manager_sizes_the_window_to_the_position();

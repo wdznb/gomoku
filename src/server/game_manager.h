@@ -171,6 +171,29 @@ private:
     
     int timeout_ms_;
     int max_depth_;
+
+    // What the session's last completed AlphaBeta think concluded, for the next
+    // think of the same colour to reuse as a root candidate and an aspiration
+    // centre (design doc 2.4.3 ①③). `hint_color_` is whose perspective
+    // `hint_score_` speaks from, and it is the gate: a think for the other colour
+    // would read the same number with the sign meaning the opposite. Any path that
+    // replaces the board outright - 悔棋, 摆棋, 重开, a restored record - invalidates
+    // it, because the number no longer describes a position that exists.
+    Move hint_move_;
+    int hint_score_ = 0;
+    int hint_color_ = EMPTY;
+    bool has_hint_ = false;
+
+    // One think's share of the above, read on the thread that spawns the worker.
+    struct Reuse {
+        Move move;
+        int score = 0;
+        bool valid = false;
+    };
+    Reuse take_hint(int for_color) const {
+        if (!has_hint_ || hint_color_ != for_color) return Reuse{};
+        return Reuse{hint_move_, hint_score_, true};
+    }
     
     ProgressCallback progress_callback_;
     MoveCallback move_callback_;
@@ -178,7 +201,10 @@ private:
     GameOverCallback game_over_callback_;
     
     void check_game_over();
-    void ai_thinking_worker(int timeout_ms, int max_depth);
+    // The reuse is what take_hint() handed back on the thread that spawned this
+    // worker: the engine's hint is written by the searching thread and read by no
+    // other, so the worker never touches the session's own members for it.
+    void ai_thinking_worker(int timeout_ms, int max_depth, Reuse reuse);
     // Sets game-over state without joining the search threads, so it is safe to
     // call from ai_thinking_worker itself.
     void resign_now(int color);

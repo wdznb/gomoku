@@ -73,6 +73,7 @@ void GameManager::reset() {
     game_over_reason_.clear();
     analyses_.clear();
     position_pending_ = false;
+    has_hint_ = false;
 }
 
 bool GameManager::set_position(const Board& board) {
@@ -93,6 +94,7 @@ bool GameManager::set_position(const Board& board) {
     game_over_reason_.clear();
     analyses_.clear();
     position_pending_ = true;
+    has_hint_ = false;
     return true;
 }
 
@@ -127,6 +129,7 @@ bool GameManager::restore_game(const GameRestore& restore) {
     winner_ = restore.status == GameStatus::GAME_OVER ? restore.winner : EMPTY;
     game_over_reason_ = restore.status == GameStatus::GAME_OVER ? restore.reason : std::string();
     position_pending_ = restore.position_pending;
+    has_hint_ = false;
     return true;
 }
 
@@ -226,6 +229,9 @@ bool GameManager::undo(int& out_move_count, GameStatus& out_status) {
     for (int i = 0; i < undone && !analyses_.empty(); ++i) {
         analyses_.pop_back();
     }
+    // A hint from the position that was just unpicked no longer describes a
+    // position the session will search.
+    has_hint_ = false;
     
     if (board_.move_count() == 0) {
         status_ = GameStatus::WAITING;
@@ -315,9 +321,20 @@ bool GameManager::request_hint(int timeout_ms, int max_depth) {
     int turn = current_turn();
     Board board_snapshot = board_;
     const int snapshot_move_count = board_snapshot.move_count();
+    // Captured on this thread and copied into the worker: see start_ai_thinking.
+    Reuse reuse;
+    {
+        std::lock_guard<std::mutex> lock(thinking_mutex_);
+        reuse = take_hint(turn);
+    }
 
     hint_thread_ = std::make_unique<std::thread>(
-        [this, board_snapshot, turn, timeout_ms, max_depth, snapshot_move_count]() mutable {
+        [this, board_snapshot, turn, timeout_ms, max_depth, snapshot_move_count, reuse]() mutable {
+            if (reuse.valid) {
+                engine_.set_hint(reuse.move, reuse.score);
+            } else {
+                engine_.clear_hint();
+            }
             SearchResult result = engine_.search(board_snapshot, turn, max_depth, timeout_ms, stop_flag_);
 
             // A user stop_thinking only raises stop_flag_, so delivering on the
@@ -334,6 +351,16 @@ bool GameManager::request_hint(int timeout_ms, int max_depth) {
                 {
                     std::lock_guard<std::mutex> commit_guard(thinking_mutex_);
                     move_count_now = board_.move_count();
+                    // The same test the answer is delivered on: when the board is
+                    // still the position this hint was computed from, the next 求招
+                    // on it is searching exactly what this one just searched, so it
+                    // starts from this conclusion.
+                    if (move_count_now == snapshot_move_count) {
+                        hint_move_ = result.best_move;
+                        hint_score_ = result.score;
+                        hint_color_ = turn;
+                        has_hint_ = (result.method == "alphabeta");
+                    }
                 }
                 if (move_count_now != snapshot_move_count) {
                     hint_callback_(Move(), 0);
@@ -358,6 +385,8 @@ void GameManager::start_ai_thinking(int timeout_ms, int max_depth) {
     if (hint_thread_ && hint_thread_->joinable()) {
         hint_thread_->join();
     }
+    // Both workers are joined above, so any hint one of them wrote is visible here.
+    Reuse reuse;
     
     // If the game is being opened by the AI (human picked WHITE, or an undo
     // emptied the board while ai_color_ == BLACK), status_ is still WAITING.
@@ -369,6 +398,10 @@ void GameManager::start_ai_thinking(int timeout_ms, int max_depth) {
         if (status_ == GameStatus::WAITING) {
             status_ = GameStatus::PLAYING;
         }
+        // Read under the same lock the workers write the hint under, and handed to
+        // the new thread by value: from here on, only that thread talks to the
+        // engine.
+        reuse = take_hint(ai_color_);
     }
 
     stop_flag_.store(false);
@@ -378,7 +411,7 @@ void GameManager::start_ai_thinking(int timeout_ms, int max_depth) {
     max_depth_ = max_depth;
     
     search_thread_ = std::make_unique<std::thread>(
-        &GameManager::ai_thinking_worker, this, timeout_ms, max_depth);
+        &GameManager::ai_thinking_worker, this, timeout_ms, max_depth, reuse);
 }
 
 void GameManager::start_ai_thinking() {
@@ -389,11 +422,17 @@ void GameManager::stop_thinking() {
     stop_flag_.store(true);
 }
 
-void GameManager::ai_thinking_worker(int timeout_ms, int max_depth) {
+void GameManager::ai_thinking_worker(int timeout_ms, int max_depth, Reuse reuse) {
     Board snapshot;
     {
         std::lock_guard<std::mutex> lock(thinking_mutex_);
         snapshot = board_;
+    }
+
+    if (reuse.valid) {
+        engine_.set_hint(reuse.move, reuse.score);
+    } else {
+        engine_.clear_hint();
     }
 
     SearchResult result = engine_.search(snapshot, ai_color_, max_depth, timeout_ms, stop_flag_);
@@ -429,6 +468,14 @@ void GameManager::ai_thinking_worker(int timeout_ms, int max_depth) {
             analyses_.push_back(MoveAnalysis{result.best_move, result.score, result.depth,
                                              result.nodes_searched, result.elapsed_ms,
                                              result.method});
+            // The session remembers this think for the next one of the same colour.
+            // Only AlphaBeta's number is a position value: the tactical and forced
+            // paths report a sentinel, and centring a window on one of those buys
+            // nothing but widened re-searches.
+            hint_move_ = result.best_move;
+            hint_score_ = result.score;
+            hint_color_ = ai_color_;
+            has_hint_ = (result.method == "alphabeta");
             move_callback_(result.best_move, result.score, result.elapsed_ms);
 
             check_game_over();

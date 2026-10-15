@@ -1050,9 +1050,11 @@ void test_resign_survives_interruption() {
         });
 
         // 终止 arrived: stop_flag_ is up when the worker decides, and the
-        // worker is driven directly so the window is deterministic.
+        // worker is driven directly so the window is deterministic. A4 put the
+        // session's reuse record in the worker's arguments; this game has none.
         game.stop_flag_.store(true);
-        std::thread worker(&GameManager::ai_thinking_worker, &game, 2000, 2);
+        std::thread worker(&GameManager::ai_thinking_worker, &game, 2000, 2,
+                           GameManager::Reuse{});
         worker.join();
 
         assert(game.status() == GameStatus::GAME_OVER);
@@ -1077,7 +1079,8 @@ void test_resign_survives_interruption() {
         game.discard_pending_.store(true);
         game.set_game_over_callback([&](int, const std::string&) { ++frames; });
         game.stop_flag_.store(true);
-        std::thread worker(&GameManager::ai_thinking_worker, &game, 2000, 2);
+        std::thread worker(&GameManager::ai_thinking_worker, &game, 2000, 2,
+                           GameManager::Reuse{});
         worker.join();
         assert(game.status() == GameStatus::PLAYING);
         assert(frames == 1);  // unchanged: no second callback

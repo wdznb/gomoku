@@ -1979,6 +1979,94 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次121 引擎重构 A4：上一手的最佳着法，第一次活到下一手 — engine redesign stage A4
+
+规格 `docs/ENGINE_REDESIGN.md` §2.4.3 ①③ + §3 根循环伪码（冻结，不改写）。A4 动的是 P2 剩下的三处：一次思考算出来的
+best_move 与 score 在返回那一刻就被丢掉，下一手从零开始排序、从零开始开窗。
+
+### Found
+
+- **根排序丢掉了提示位**。`sort_moves(root_moves, board, color)` 少传第 4 参 `tt_move`（签名支持），于是深层 PV 头
+  永远抬不到第一手位 —— 而 AB 的剪枝效率几乎全押在根顺序上。
+- **每层都用整窗重搜**。层 2..N 对 `(-INT_MAX, INT_MAX)` 逐手全窗口搜索，而下一手的真值几乎总在上层值 ±几十之内；
+  文档 §2.4.3 ③ 要的 aspiration window 完全没有。
+- **会话级复用无通道**。`GameManager` 拿到 `SearchResult` 后只记 `analyses_`，`SearchEngine` 没有任何入口接收
+  「上一手的着法与分值」，`SearchLimits` 的 `hint_move`/`hint_score` 两个字段自 A1 起一直无人赋值。
+
+### Fixed
+
+- `alphabeta.cpp:384` 根排序补 `sort_moves(root_moves, board, color, limits.hint_move)`；`hint_move` 是被 pin 的
+  那一个（已在候选里则提到最前，不在候选里直接丢弃 —— 落不了的位置不该影响排序）。
+- `search_root_layer` 的窗口改成显式参数 `(alpha, beta)`，并在 `layer_alpha >= beta` 处 break（fail-high 不必再看
+  剩下的候选）；新增 `search_root_with_aspiration`（:492）按文档 ③ 做**单边放宽**：fail-low 就 `lo = -INT_MAX`、
+  fail-high 就 `hi = INT_MAX`，**保留那一趟已经证明的另一端边界**，而不是围绕固定中心重开一个 ±50。中心由
+  `limits.has_hint_score` 起步，此后每完成一层就用该层自己的分值更新（:438-439 `aspiration_centre = best_score;
+  have_centre = true;`）—— 与 §3 伪码 `score = layer_best; have_score = true;` 同形，⇒ 即使没有会话提示，层 2 起
+  也照样有窗口。`kAspirationDelta = 50` / `kAspirationWidenings = 4`（三次放宽即达整窗，第四格是兜底那趟）。
+- **预算中止 vs 窗口失败的判别**：只用粘滞的 `ctx_.reason() != StopReason::NONE` 加上 `!layer.sound`，绝不使用
+  `root_moves_done < total` —— fail-high 的 break 同样留下 `done < total`，用它判别会把一次正常的窗口失败读成超时。
+- `SearchEngine::set_hint(Move, int)` / `clear_hint()`（search_engine.h:78-87）经 `SearchLimits` 透传
+  （search_engine.cpp:278-280）；alphabeta 分支不再走 `set_node_limit` + 四参旧重载，改为构造 `SearchLimits` 调
+  `ab.search(board, color, limits, stop_flag)`。
+- `GameManager` 侧的会话提示：`Reuse{move, score, valid}` + `take_hint(for_color)`（game_manager.h:188-196）——
+  颜色门是必须的，`hint_score_` 站在 `hint_color_` 的视角，白棋那一手的分值喂给黑棋的思考会把窗口开到一个完全错的
+  中心。`request_hint()`（:325-328）与 `start_ai_thinking()`（:389-404）都在 `thinking_mutex_` 内、两个 worker 已
+  join 之后取 `Reuse`，再**按值**交给新线程（此后只有那个线程与引擎对话）。作废点：`reset()` / `set_position()` /
+  `restore_game()` / `undo()` 各一处 `has_hint_ = false`（:76 / :97 / :132 / :234）。
+- **§2.4.3 ②（ponder 预搜）本轮不做**：现架构没有任何把对手着法回灌给一次进行中搜索的通道，`hint_move` 排序 +
+  `hint_score` 窗口已覆盖「复用上一手结果」里可验证的那部分。记入未完成清单。
+
+### 合约过期
+
+1. `test_alphabeta_aborted_search_stores_only_sound_nodes` 控制段的 `assert(full_info.nodes_searched < node_limit * 10)`
+   （:2820）。这一层现在跑在以「下一层返回值」为中心的窗口里，本例那个估计差得远（4202 vs 真值 20584）⇒ fail-high、
+   失败的那一端敞开、该层重跑：实测 1104 节点，而每层只跑一趟时是 752。改写为 `nodes > layer_one_nodes` 与
+   `< 752 * 3`（上限按**趟数 × 单趟**来给，不是按一次估计值猜），其余前提（无中断层、表项照写）一条没动。
+
+### New
+
+- `test_root_ordering_uses_hint_move`（:3344）：借用「deadline 已过期 ⇒ depth 0 ⇒ 兜底就是顺序头」这条既有通路，
+  让根排序变成可断言量 —— `hinted.pos == pinned.pos`，`pinned` 取自 `root.back()`。两个控制：`Move()` 时顺序头是
+  启发式最优的 (9,5)；提示格 `Move(7,7,WHITE)` 已被占用 ⇒ 直接丢弃，不影响排序。
+- `test_aspiration_refines_without_changing_result`（:3436）：7 子静默局（`quiet_think_board()`，:3396）depth 4，
+  三种装配 none / 精确中心 / 取负中心 ⇒ best、score、`completed_depth`、`stopped` 全等，且 `exact.nodes != none.nodes`
+  （窗口确实改变了工作量，而不是恰好相同）。实测 `best 6,4 score 948 depth 4`，节点 218872 / 219866 / 218874。
+  换用静默局是因为 `build_midgame` 那副 12 子盘会在深层撞上有胜负哨兵的一手，加深在层 4 之前就不是「四层都完成」，
+  `completed_depth == 4` 无从断言。
+- `test_search_engine_forwards_the_hint_to_the_search`（:3471）：引擎级贯通（vcf/vct/book/resign 全关）——
+  `set_hint(Move(), plain.score)` ⇒ method / best / score / depth 都不变，节点数变。这里必须传一个足够大的
+  `time_limit_ms`（600000）：`time_limit_ms = 0` 仍会把 `remaining_time` 兜到 100 ms ⇒ 20000 节点预算，而 100 ms 与
+  20000 节点在 valgrind/负载下是一条会翻的界；600000 让节点预算钳到 `INT_MAX`，实测 218872 → 219866。
+
+### Verified
+
+HEAD-negative 的改动前树 = `git archive 066d821` + 可用的 `search_engine.{h,cpp}` 与 `tests/test_search.cpp`，即只把
+A4 的**名字**（`set_hint`/`clear_hint`、`SearchLimits` 的三字段、`Reuse`）补进去、行为退回 A5 收尾那棵树。逐用例 driver
+（`-Dmain=suite_main`）在构造树上的红点正是三条消费断言：
+`test_root_ordering_uses_hint_move` → `Assertion 'hinted.pos == pinned.pos' failed`、
+`test_aspiration_refines_without_changing_result` → `Assertion 'exact.nodes != none.nodes' failed`、
+`test_search_engine_forwards_the_hint_to_the_search` → `Assertion 'reuse.nodes_searched != plain.nodes_searched' failed`；
+控制组 `test_sort_moves_full_order_without_tt_move` 与被改写的 aborted-search 用例在两棵树都绿。`Reuse` 是 worker 的参数，
+两处直接起线程的用例（`test_server.cpp:1055` / `:1080`）补 `GameManager::Reuse{}` —— 那是编译期的调用点同步，语义不变。
+
+**代价（记下来而不是藏起来）**：静默局 depth 4 的冷跑从 pristine 的 176695 节点变成 **218872**（+23.9 %）。原因是根
+fail-low 的重搜很贵（一趟要看完所有候选才发现下界不住），而 fail-high 那一端反而更便宜（同一层的第 3 层从 45052 →
+44054，因为 break 提前收了）。§2.4.3 的窗口是文档要求的，把它做回来的是 **B3 的根 PVS**（zero-window 侦察），
+不是回退窗口。
+
+diff 面：`src/search/alphabeta.cpp` 76/7、`alphabeta.h` 19/6、`search_engine.cpp` 12/5、`search_engine.h` 23/0、
+`src/server/game_manager.cpp` 50/3、`game_manager.h` 27/1、`tests/test_search.cpp` 181/1、`tests/test_server.cpp` 6/3。
+
+`ctest` **8/8 / 144.50 s**（`test_search` **110.88 s** —— 新基线，三条 A4 用例各带一次 depth-4 全窗思考；
+`test_server` 16.44 s、`test_training` 9.50 s），`node tests/web_frontend_check.js` **103/103**，
+`node tests/readme_anchor_check.js` **113 citations / 0 problems**，README 仍 **658 行**（A4 没动文档：`hint_move` /
+`hint_score` 是内部 API，WS 契约要等 A7 才加字段）。
+
+Valgrind：A4 改到的正是表回溯之前的根路径与新的会话状态字段，按 §5 的节奏**并入 A6 的 checkpoint** 一起跑
+`memcheck test_search` 全量（A6 是下一个 checkpoint commit）。本轮另记一条施工瑕疵：中途一次脚本改写把
+`src/search/alphabeta.cpp` 整文件换成了 CRLF（diff 一度 578/509），`tr -d '\r'` 复原后回到 76/7；此后每个改过的文件都用
+`grep -c $'\r'` 查过（仓库没有 `.gitattributes`，行尾只靠人守）。
+
 ## 轮次121 引擎重构 A5：整盘评估第一次知道棋子站在哪 — engine redesign stage A5
 
 规格 `docs/ENGINE_REDESIGN.md` §2.5.2 / §2.5.4（冻结，不改写）。A5 动的是 P3：评估里从来没有「位置」这件事，中心偏好

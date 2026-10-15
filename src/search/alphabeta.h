@@ -121,14 +121,27 @@ private:
     void sort_moves(std::vector<Move>& moves, const Board& board, int color,
                     const Move& tt_move = Move());
 
-    // One layer of the root loop: every root candidate inside one window. The
-    // returned score is the layer's best and its `sound` half says whether any
-    // root child short-circuited; how many candidates were actually searched is
-    // in stats_.root_moves_done, which is what distinguishes "the window crossed
-    // after the last one" from "it crossed in the middle".
+    // One layer of the root loop: every root candidate inside one window, searched
+    // in order until the window's top is reached or the budget is gone. The
+    // returned score is the layer's best and its `sound` half says whether any root
+    // child short-circuited; how many candidates were actually searched is in
+    // stats_.root_moves_done, which is what distinguishes "the window crossed after
+    // the last one" from "it crossed in the middle".
     NodeResult search_root_layer(Board& board, const std::vector<Move>& root_moves,
                                  int depth, int color, Move& best_move,
-                                 std::atomic<bool>& stop_flag);
+                                 int alpha, int beta, std::atomic<bool>& stop_flag);
+
+    // One layer inside an aspiration window centred on `centre` (design doc 2.4.3
+    // ③). A value outside the window says the estimate was wrong, not the
+    // position, so the side that failed opens up and the layer re-runs against the
+    // bound the previous pass actually proved; once both ends are open the layer is
+    // the whole window, which is what a think with no estimate at all runs. A pass
+    // the budget cut short is returned as it stands: a wider window cannot finish a
+    // layer that ran out of nodes.
+    NodeResult search_root_with_aspiration(Board& board,
+                                           const std::vector<Move>& root_moves, int depth,
+                                           int color, Move& best_move, bool use_aspiration,
+                                           int centre, std::atomic<bool>& stop_flag);
 
     // Copy the live counters into the stats so a frame and the final report read
     // the same numbers.

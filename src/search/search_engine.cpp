@@ -268,11 +268,18 @@ SearchResult SearchEngine::search(const Board& board, int color,
         // is computed in 64-bit and clamped: a huge trainer --timeout-ms made
         // remaining_time * 200 overflow int negative, tripping node_limit_ on
         // the very first node and silently falling back to root_moves[0].
-        ab.set_node_limit(static_cast<int>(std::min<long long>(
-            static_cast<long long>(remaining_time) * 200LL, INT_MAX)));
+        const int node_budget = static_cast<int>(std::min<long long>(
+            static_cast<long long>(remaining_time) * 200LL, INT_MAX));
 
-        int depth = (max_depth > 0) ? max_depth : alphabeta_max_depth_;
-        Move ab_move = ab.search(board, color, depth, remaining_time, stop_flag);
+        SearchLimits limits;
+        limits.max_depth = (max_depth > 0) ? max_depth : alphabeta_max_depth_;
+        limits.hard_time_ms = remaining_time;
+        limits.max_nodes = node_budget;
+        limits.hint_move = hint_move_;
+        limits.hint_score = hint_score_;
+        limits.has_hint_score = has_hint_;
+
+        Move ab_move = ab.search(board, color, limits, stop_flag);
 
         // A search that found nothing to search returns an invalid move. The
         // fallback takes the first legal candidate root_moves still holds rather

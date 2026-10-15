@@ -5,6 +5,19 @@
 
 namespace gomoku {
 
+namespace {
+
+// The half-width of the first aspiration window, and how many passes one layer is
+// allowed before it is taken as searched (design doc 2.4.3 ③). Fifty points is the
+// gap between two quiet-position evaluations one ply apart, so a correct estimate
+// usually needs no re-search at all. Each re-search opens only the end the previous
+// pass failed against, so a layer that keeps failing reaches the whole window in
+// three passes, and the fourth slot is the fallback that finishes it.
+constexpr int kAspirationDelta = 50;
+constexpr int kAspirationWidenings = 4;
+
+}
+
 AlphaBetaSearch::AlphaBetaSearch(const Evaluator& evaluator, TranspositionTable& tt)
     : evaluator_(evaluator), tt_(tt), node_limit_(2000000),
       clock_(&system_search_clock()) {}
@@ -368,7 +381,15 @@ Move AlphaBetaSearch::search(const Board& board, int color, const SearchLimits& 
         stats_.root_moves_total = static_cast<int>(root_moves.size());
     }
 
-    sort_moves(root_moves, board, color);
+    sort_moves(root_moves, board, color, limits.hint_move);
+
+    // The value the next layer is expected near (design doc 2.4.3 ③): the score the
+    // previous think of this session handed back, and from the first layer that
+    // finishes onward, this think's own last layer. A wrong estimate is not a
+    // wrong move - it costs a widened re-search - so the caller can hand in a
+    // number that describes a board two plies back.
+    int aspiration_centre = limits.hint_score;
+    bool have_centre = limits.has_hint_score;
 
     for (int depth = 1; depth <= limits.max_depth; ++depth) {
         if (ctx_.layer_boundary_stopped()) {
@@ -396,8 +417,9 @@ Move AlphaBetaSearch::search(const Board& board, int color, const SearchLimits& 
         // change which equal-valued moves get searched first.
         Board mutable_board = board;
         Move layer_move;
-        NodeResult layer = search_root_layer(mutable_board, root_moves, depth, color,
-                                            layer_move, stop_flag);
+        NodeResult layer = search_root_with_aspiration(mutable_board, root_moves, depth,
+                                                       color, layer_move, have_centre,
+                                                       aspiration_centre, stop_flag);
         const bool layer_complete =
             stats_.root_moves_done == static_cast<int>(root_moves.size());
 
@@ -410,6 +432,11 @@ Move AlphaBetaSearch::search(const Board& board, int color, const SearchLimits& 
             // A layer that finished replaces any earlier cut-short record.
             stats_.partial_depth = 0;
             stats_.partial_best_move = Move();
+            // Iterative deepening says this layer's value sits near the one it
+            // replaced, so the layer after it is centred here rather than on the
+            // number the session handed in.
+            aspiration_centre = best_score;
+            have_centre = true;
             emit_progress();
 
             // Feed the shallow iteration's winner back into the root order so
@@ -462,12 +489,48 @@ Move AlphaBetaSearch::search(const Board& board, int color, const SearchLimits& 
     return best_move;
 }
 
+NodeResult AlphaBetaSearch::search_root_with_aspiration(
+    Board& board, const std::vector<Move>& root_moves, int depth, int color,
+    Move& best_move, bool use_aspiration, int centre, std::atomic<bool>& stop_flag) {
+    if (use_aspiration) {
+        int lo = centre - kAspirationDelta;
+        int hi = centre + kAspirationDelta;
+        for (int attempt = 0; attempt < kAspirationWidenings; ++attempt) {
+            NodeResult layer = search_root_layer(board, root_moves, depth, color, best_move,
+                                                 lo, hi, stop_flag);
+            // A pass the budget ran out inside is reported as it stands: widening
+            // its window would re-search the same candidates and stop on the same
+            // node. This is the one test that separates that from a fail-high,
+            // which also ends the pass early but leaves the reason unset.
+            if (!layer.sound || ctx_.reason() != StopReason::NONE) return layer;
+            // A value strictly inside the window is this layer's exact best: a
+            // candidate only becomes the layer's best when its own value was
+            // inside the window it was given, and one that reaches the top ends the
+            // pass as a fail-high instead.
+            if (layer.score > lo && layer.score < hi) return layer;
+            // Only the bound the pass failed against opens up (design doc 2.4.3 ③'s
+            // fail-low / fail-high relaxation). The other end is a bound this pass
+            // proved, so keeping it is what makes the re-search cheaper than running
+            // the whole window again - and a fail-high pass stops at the first
+            // candidate that reaches its top, so a wrong estimate costs a cut, not a
+            // layer.
+            if (layer.score <= lo) lo = -INT_MAX;
+            else hi = INT_MAX;
+        }
+    }
+    // The estimate missed often enough that no window held the value. The last
+    // pass is the one an un-aspirated think would have run, so a wrong hint can
+    // cost work but never a different move.
+    return search_root_layer(board, root_moves, depth, color, best_move,
+                            -INT_MAX, INT_MAX, stop_flag);
+}
+
 NodeResult AlphaBetaSearch::search_root_layer(Board& board,
                                               const std::vector<Move>& root_moves, int depth,
                                               int color, Move& best_move,
+                                              int alpha, int beta,
                                               std::atomic<bool>& stop_flag) {
-    int alpha = -INT_MAX;
-    const int beta = INT_MAX;
+    int layer_alpha = alpha;
     int layer_best_score = -INT_MAX;
     Move layer_best_move;
     bool layer_sound = true;
@@ -479,7 +542,7 @@ NodeResult AlphaBetaSearch::search_root_layer(Board& board,
         board.place_stone(move.pos.row, move.pos.col, color);
 
         // A root child sits one ply from the root, whatever the layer's depth is.
-        NodeResult child = alphabeta(board, depth - 1, -beta, -alpha, opponent(color),
+        NodeResult child = alphabeta(board, depth - 1, -beta, -layer_alpha, opponent(color),
                                      stop_flag, 1);
 
         board.undo_last_move();
@@ -490,7 +553,7 @@ NodeResult AlphaBetaSearch::search_root_layer(Board& board,
             layer_best_score = score;
             layer_best_move = move;
         }
-        if (score > alpha) alpha = score;
+        if (score > layer_alpha) layer_alpha = score;
         // What the interrupted layer would have played, kept as it is built: the
         // player sees it, the returned move never comes from it.
         stats_.partial_best_move = layer_best_move;
@@ -500,6 +563,12 @@ NodeResult AlphaBetaSearch::search_root_layer(Board& board,
         // "how far into the layer the interrupt landed" - which is what the client
         // shows as 第 N 层（12/34）.
         if (child.sound) ++stats_.root_moves_done;
+        // The window's top is reached: every candidate after this one is searched
+        // against a window it cannot raise, so the pass ends here and the caller
+        // decides between widening the window and reporting the layer. With the
+        // whole window this test can never be true, which is why an un-aspirated
+        // think searches every candidate as it always did.
+        if (layer_alpha >= beta) break;
     }
 
     best_move = layer_best_move;

@@ -69,6 +69,23 @@ public:
     const OpeningBook* opening_book() const { return book_; }
     void set_book_enabled(bool v) { book_enabled_ = v; }
 
+    // What the session's previous think concluded (design doc 2.4.3 ①③): the root
+    // order starts from `move` and the aspiration window is centred on `score`.
+    // Both are only hints - a stale one costs a re-search of the layers it misled,
+    // never a different move - so the owner calls clear_hint() as soon as the board
+    // stops being one the number described. Must be called from the thread that
+    // searches, before search().
+    void set_hint(Move move, int score) {
+        hint_move_ = move;
+        hint_score_ = score;
+        has_hint_ = true;
+    }
+    void clear_hint() {
+        hint_move_ = Move();
+        hint_score_ = 0;
+        has_hint_ = false;
+    }
+
     // Proves the position lost by exhausting every reply against the opponent's
     // forced VCF. Returns quickly on the first reply that survives, so the cost
     // only grows in positions that are genuinely lost. Only ever sets
@@ -86,6 +103,12 @@ private:
     // never touched.
     TranspositionTable tt_alphabeta_;
     const OpeningBook* book_ = nullptr;
+
+    // The last hint handed in by the session owner, read once per think into the
+    // SearchLimits it searches under.
+    Move hint_move_;
+    int hint_score_ = 0;
+    bool has_hint_ = false;
 
     bool book_enabled_;
 
