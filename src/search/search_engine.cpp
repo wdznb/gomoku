@@ -282,17 +282,27 @@ SearchResult SearchEngine::search(const Board& board, int color,
         Move ab_move = ab.search(board, color, limits, stop_flag);
 
         // A search that found nothing to search returns an invalid move. The
-        // fallback takes the first legal candidate root_moves still holds rather
-        // than greedy_.search, which reads the same active_empty() window and
-        // hands back the centre point when that window has no legal cell.
+        // fallback answers from the candidate list this method still holds, and it
+        // picks by the same keys the root tie-break uses below the value - nearer
+        // the centre, then the lower cell index - rather than by whichever legal
+        // cell the list happens to state first. The list it states first is
+        // meaningful most of the time, but not here: this branch is reached from a
+        // BLACK player whose whole active window is forbidden, and the points
+        // recovered outside that window come back in row-major order, so the old
+        // rule answered with the top-left of the board.
         if (!ab_move.pos.is_valid() || !board.is_empty(ab_move.pos.row, ab_move.pos.col)) {
             Move fallback;
+            int fallback_dist = 0;
             for (const auto& pos : root_moves) {
                 if (!board.is_empty(pos.row, pos.col)) continue;
                 if (color == BLACK &&
                     PatternRecognizer::is_forbidden(board, pos.row, pos.col, BLACK)) continue;
-                fallback = Move(pos, color);
-                break;
+                const int dist = center_distance(pos);
+                if (!fallback.pos.is_valid() || dist < fallback_dist ||
+                    (dist == fallback_dist && pos.to_index() < fallback.pos.to_index())) {
+                    fallback = Move(pos, color);
+                    fallback_dist = dist;
+                }
             }
             result.best_move = fallback;
             result.method = fallback.pos.is_valid() ? "greedy" : "no_legal_move";

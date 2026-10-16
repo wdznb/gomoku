@@ -16,6 +16,28 @@ namespace {
 constexpr int kAspirationDelta = 50;
 constexpr int kAspirationWidenings = 4;
 
+// The total order every root and ordering decision is made on: value, then being
+// nearer the centre (search_limits.h's center_distance), then the lower cell
+// index. The last key is what makes it a total order - no two cells share an
+// index, so no comparison can come back "equal" and leave the answer to whatever
+// order a container happened to iterate in - and the second is what makes the
+// engine's choice in a tie be the central one instead of an accident of
+// Board::active_empty()'s swap-remove order.
+struct RootScore {
+    int score;
+    int center_dist;
+    int cell_index;
+
+    RootScore(const Move& m, int s)
+        : score(s), center_dist(center_distance(m.pos)), cell_index(m.pos.to_index()) {}
+
+    bool operator>(const RootScore& other) const {
+        if (score != other.score) return score > other.score;
+        if (center_dist != other.center_dist) return center_dist < other.center_dist;
+        return cell_index < other.cell_index;
+    }
+};
+
 }
 
 AlphaBetaSearch::AlphaBetaSearch(const Evaluator& evaluator, TranspositionTable& tt)
@@ -71,8 +93,17 @@ void AlphaBetaSearch::sort_moves(std::vector<Move>& moves, const Board& board, i
         int s = evaluator_.evaluate_position_pair(board, m.pos.row, m.pos.col, color);
         scored.emplace_back(s, static_cast<size_t>(start + i));
     }
-    std::sort(scored.begin(), scored.end(),
-              [](const auto& a, const auto& b) { return a.first > b.first; });
+    // Score alone is not a total order: two candidates of the same value compare
+    // equal, and std::sort then leaves their relative order down to the input
+    // order - which is active_empty()'s swap-remove order, and that order changes
+    // once a board has played and undone stones. Ordering the pairs by the same
+    // triple the root chooses on makes the result a function of the position;
+    // stable_sort is the same belt from the other side, with nothing left to
+    // stabilise.
+    std::stable_sort(scored.begin(), scored.end(), [&](const std::pair<int, size_t>& a,
+                                                        const std::pair<int, size_t>& b) {
+        return RootScore(moves[a.second], a.first) > RootScore(moves[b.second], b.first);
+    });
 
     std::vector<Move> reordered(moves.size());
     for (size_t i = 0; i < static_cast<size_t>(start); ++i) reordered[i] = moves[i];
@@ -138,9 +169,13 @@ NodeResult AlphaBetaSearch::quiescence(Board& board, int alpha, int beta, int co
     if (scored.empty()) return {stand_pat, true};
 
     // Decorate-sort-undecorate: scores are already attached, so the sort does
-    // no pattern recognition.
-    std::sort(scored.begin(), scored.end(),
-              [](const auto& a, const auto& b) { return a.first > b.first; });
+    // no pattern recognition. The triple below the score is what keeps a quiet
+    // subtree's ordering (and so its cut pattern, and so the bounds it hands back)
+    // a function of the position rather than of the candidate list's order.
+    std::stable_sort(scored.begin(), scored.end(),
+                     [](const std::pair<int, Move>& a, const std::pair<int, Move>& b) {
+                         return RootScore(a.second, a.first) > RootScore(b.second, b.first);
+                     });
 
     bool node_sound = true;
     for (const auto& entry : scored) {
@@ -366,8 +401,12 @@ Move AlphaBetaSearch::search(const Board& board, int color, const SearchLimits& 
 
     // Symmetric positions are searched once per mirror otherwise. When the
     // board maps onto itself under a D4 variant, every candidate has twins that
-    // score alike, branch alike and win alike, so keep only the lowest-index
-    // cell of each orbit. Positions with no self-symmetry - almost every
+    // score alike, branch alike and win alike, so keep one cell per orbit.
+    // is_symmetry_representative keeps the lowest-index member, which after A6 is
+    // also the member the triple would pick: a self-symmetry of the board is a
+    // row flip, a column flip or a transpose, and all three preserve
+    // |row-7| + |col-7|, so every member of an orbit ties on the centre key and
+    // the index key decides. Positions with no self-symmetry - almost every
     // midgame - are untouched, which is what keeps the chosen move identical to
     // what the undeduplicated root would have played.
     const std::vector<int> symmetries = self_symmetries(board);
@@ -391,6 +430,15 @@ Move AlphaBetaSearch::search(const Board& board, int color, const SearchLimits& 
     int aspiration_centre = limits.hint_score;
     bool have_centre = limits.has_hint_score;
 
+    // Copied once for the whole think. Every candidate list this board hands back
+    // is now ordered by a total triple, so the order `active_empty()` happens to be
+    // in - which place/undo cycles shuffle, because undo restores by swap-remove -
+    // reaches no decision any more. Re-copying per layer bought a board whose
+    // candidate order was pristine for each depth, and that was the reason it
+    // existed, not the stone layout: place_stone/undo_last_move leave the stones,
+    // the hash, the neighbour counts and the move stack exactly as they were.
+    Board work_board = board;
+
     for (int depth = 1; depth <= limits.max_depth; ++depth) {
         if (ctx_.layer_boundary_stopped()) {
             // The budget was already gone before this layer started: the layer
@@ -409,17 +457,10 @@ Move AlphaBetaSearch::search(const Board& board, int color, const SearchLimits& 
             break;
         }
 
-        // Re-copied per iteration on purpose. undo_last_move() restores the
-        // candidate list by swap-remove, so a board that has already played and
-        // undone this iteration's root moves holds active_empty() in a different
-        // order than a fresh copy, and the score ties in sort_moves break
-        // against that order. Reusing one board across depths would quietly
-        // change which equal-valued moves get searched first.
-        Board mutable_board = board;
         Move layer_move;
-        NodeResult layer = search_root_with_aspiration(mutable_board, root_moves, depth,
-                                                       color, layer_move, have_centre,
-                                                       aspiration_centre, stop_flag);
+        NodeResult layer = search_root_with_aspiration(work_board, root_moves, depth,
+                                                      color, layer_move, have_centre,
+                                                      aspiration_centre, stop_flag);
         const bool layer_complete =
             stats_.root_moves_done == static_cast<int>(root_moves.size());
 
@@ -481,6 +522,10 @@ Move AlphaBetaSearch::search(const Board& board, int color, const SearchLimits& 
     }
 
     if (!best_move.pos.is_valid() && !root_moves.empty()) {
+        // A think that completed no layer still has to answer with a cell, and
+        // index 0 is now a principled first: sort_moves ordered the root by the
+        // same triple this would pick (value, centre, index) and only a hand-in
+        // hint can sit ahead of it.
         best_move = root_moves[0];
     }
 
@@ -548,8 +593,42 @@ NodeResult AlphaBetaSearch::search_root_layer(Board& board,
         board.undo_last_move();
 
         if (!child.sound) layer_sound = false;
-        const int score = -child.score;
-        if (score > layer_best_score) {
+        int score = -child.score;
+
+        // Every candidate after the first is searched against a window whose bottom
+        // is already the best's value, so one that comes back level with it has
+        // proved only "not worse than this score reads as" - an exact tie and a
+        // loss look identical. Where the tie decides nothing, that is fine; where it
+        // decides the move, it is not. A rival that loses the centre-and-index
+        // comparison needs no proof either way: its value is bounded by the best's
+        // exact one, so it cannot overtake it, and equal-or-worse with a worse centre
+        // loses on both readings. A rival that would win the tie on being nearer the
+        // centre has to be asked again before the centre is allowed to choose.
+        //
+        // Asking again means a window whose bottom is one point *below* the tie, and
+        // nothing wider: with the bottom at value-1, a subtree that truly is worth
+        // the tie value no longer fails low, so it returns at least it, while a
+        // strictly worse one returns at most value-1. That single point is what makes
+        // "tied" and "worse" come out as different numbers, and it is why the proof
+        // costs about what the failed pass already cost - a whole-window re-search
+        // measured 954038 nodes for the same quiet depth-4 think that a plain pass
+        // spends 218872 on, because it re-opens every subtree the cut had closed.
+        if (child.sound && layer_best_move.pos.is_valid() && score == layer_best_score &&
+            RootScore(move, score) > RootScore(layer_best_move, layer_best_score)) {
+            const int tie_probe = layer_best_score - 1;
+            board.place_stone(move.pos.row, move.pos.col, color);
+            NodeResult exact = alphabeta(board, depth - 1, -beta, -tie_probe, opponent(color),
+                                          stop_flag, 1);
+            board.undo_last_move();
+            // A re-search the budget ran out inside answers nothing, and this layer
+            // is now a partial record: the caller reports it and plays the last
+            // completed layer's move.
+            if (!exact.sound) layer_sound = false;
+            score = -exact.score;
+        }
+
+        if (!layer_best_move.pos.is_valid() ||
+            RootScore(move, score) > RootScore(layer_best_move, layer_best_score)) {
             layer_best_score = score;
             layer_best_move = move;
         }

@@ -1979,6 +1979,132 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次121 引擎重构 A6：同分的根不再由容器顺序决定 — engine redesign stage A6
+
+规格 `docs/ENGINE_REDESIGN.md` §2.5.3 / §2.6 末段 + 验收 G4（冻结，不改写）。A6 动的是 P3 剩下的一半：A5 让评估知道
+棋子站在哪，但根层在**同分**时仍然没有任何规则 —— 而「同分」在静默局里是常态，不是边角情况。
+
+### Found
+
+- `sort_moves` 用 `std::sort` 按单一分值排序：同分候选的先后 = 传进来的 `active_empty()` 先后，而
+  `undo_last_move()` 用 swap-remove 归还空格 ⇒ 同一副局面走子再悔棋之后，候选顺序真的变了。实测同一局面两副摆法
+  （第二副多走一手再退回来）在 depth 3 上花 **47397 vs 47045** 节点。
+- 根层提交用 `if (score > layer_best_score)` 严格大于 ⇒ 平分时先被搜的那个占住答案，「先被搜」就是上面那个顺序。
+- fail-soft 下的歧义比顺序更根本：除第一个候选外，每个候选的对窗口下界已经等于当前最优，所以回来相等的 rival 只证明了
+  「不比这个读数差」，**精确相等和被剪掉的下界是同一个数**。中心偏好要成立，必须先把这条歧义关掉。
+- 三处兜底全都读顺序：`alphabeta.cpp` 的 `root_moves[0]`、`search_engine.cpp` 里 alphabeta 空返回时取候选表第一个合法格、
+  D4 去重取最低格号。
+
+### Fixed
+
+- `RootScore{score, center_dist, cell_index}` 全序（`alphabeta.cpp` 匿名命名空间）。`sort_moves` 与 `quiescence`
+  的 decorate-sort 都改成按三元组 `std::stable_sort`：第三键使全序成立（两格不可能同号），第二键使平分时的选择
+  是「靠中心」而不是「碰巧排前面」。
+- `center_distance(Position)` 放进 `search_limits.h`，**不用** `Evaluator::get_position_weight`：后者被可调参数
+  `position_weight_scale` 缩放，训练把该基因取 0 就会静默删掉这个键。D4 的三种自同构（行翻、列翻、转置）都保持
+  `|row-7|+|col-7|` ⇒ 去重的「最低格号」代表本来就是三元组的答案，**代码不动**，由一条新用例把这个一致关系钉住。
+- **tie probe**（`search_root_layer`）：只有「回来等于当前最优、且按中心/索引会赢得这次比较」的 rival 才复问一次，
+  复问窗口是 `(best-1, beta)`。下界放在 `best-1` 而不是 `beta` 的整窗，是因为整窗复问实测要 **954038** 节点（同一副
+  静默局 depth 4 的一趟只花 218872）：一分钱就能把「相等」和「更差」分成的两个数，不必重开整棵树。复问自己也被预算
+  切断时，该层记为不完整（`layer_sound = false`），与 A2 的分层记账同形。
+- 每次迭代重新复制 Board 的写法删除，整次思考只拷一次 `work_board`（§2.8.5 第一步）。它存在的唯一理由就是上面那条
+  顺序歧义；三元组之后歧义消失，O(depth) 次 225 格复制随之消失。
+- `search_engine.cpp` 的 alphabeta-空返回兜底改为「最靠中心、再取低格号」。走到这条分支的是**整个活动窗都是禁手的
+  BLACK**，此时补扫找回的空格按行优先回来 ⇒ 旧规则回答的是棋盘左上角那一格。
+
+### 合约过期
+
+1. `test_tt_cold_think_cost_and_warm_reuse` 的 `assert(cold_nodes <= 250000)`（A3 用它区分新旧表布局）。实测链：
+   pristine **276131** → A3 **225745** → A5 **222885** → **A6 267918**。A6 的复问让 HEAD 自己越过了 250000，
+   这条上限不再有区分能力 ⇒ 改为 `<= 300000`，注释写清 A3 的证据从此由表自身的用例
+   （`test_tt_depth_first_replacement` / `test_tt_generation_advances_per_move` / `test_tt_mate_score_normalised_by_ply`）
+   和 cold/warm 比值（267918 对 96）承担，而不是由一个节点数上限承担。
+2. `test_alphabeta_aborted_search_stores_only_sound_nodes` 的单趟代价上限 `< 752 * 3`：上限没动，但**前提变了** ——
+   A6 的排序改变了「一层先看哪个候选」，实测对照段从 1104 变成 **1060**。注释改写为「三 = 趟数上限，单趟 = 752」。
+3. `test_alphabeta_expired_deadline_returns_root_fallback` 的 `assert(result.pos == root[0].pos)`：断言不动，
+   注释改写 —— 重新生成一遍根表能给出同一个头，从此是关于**局面**的命题而不是关于容器状态的命题。
+
+### New
+
+- 文件级 helper：`root_candidate_value(board, evaluator, stop, cand, color, depth, alpha, beta)`（独立复读一个候选，
+  自带一张 fresh 表，直连 `alphabeta()` 但先 `ctx_.start()` 装上下文）、`sweep_optimum(...)`、`triple_best(cells)`。
+  **sweep 的代价是这轮最大的施工返工**：第一版对 123 个候选逐个开整窗，实测 **1873539 节点 / 78.16 s**（这一条用例
+  一个人占了 219 s 套件里的 82.68 s）。改成围绕「当前最优」开一分宽窗口、只在 fail-high 时整窗精读之后是
+  **143013 节点 / 3.86 s**，而答案一字不差。相等判定的三分类（内值=精确 / 下界=严格更差 / 上界=真更好要精读）
+  成立到「同一个中心只可能是精确值或已被证明低于最终最优」，所以一趟就够。五副局面（静默局 d3/d2、双胜点 d1、
+  角上聚集局 d3/d4）与整窗读法逐候选一致，静默局 d3 有 3 次 fail-high 触发精读。
+- `test_root_tiebreak_prefers_centre`：静默中盘 depth 3 ⇒ `completed_depth == 3`、score == 扫出的最优、落子 ==
+  最优集合里三元组最优；双胜点局（黑 (7,3)-(7,6) 两头开、白另有一行三）⇒ 前提被**数出来**（最优格 >1 且中心距不等），
+  思考在第 1 层因 `MATE` 收束，`score == 100000` 保持 README:338 那颗红点读的哨兵，落 (7,7) 而不是 (7,2)。
+- `test_root_choice_reproducible`：同一副子、两种走子顺序（一手 place+undo，(1,1) 而非 (0,0) —— 后者本来就排在最前
+  所以换不出顺序），前提 `direct.active_empty() != detour.active_empty()`；控制段是同一副局面连想两次（两棵树都绿），
+  跨局面段断言 best / score / `completed_depth` / **nodes** 全等。实测 **48268 == 48268**（改动后），
+  改动前 **47397 vs 47045** ⇒ 这就是本用例的红点。
+- `test_d4_dedup_keeps_central_representative`：空盘 36 个代表，每个轨道成员中心距相等且自己是最低格号，
+  过期 deadline 的顺序头 == (7,7)。它是控制组（两棵树都绿），作用是说明去重不需要自己再学一遍三元组。
+
+### Verified
+
+HEAD-negative 树 = `git archive e6bf642` 解到 `/mnt/d/tmp/neg_a6_tree`，加**一处词汇抬升**：`center_distance()` 是 A6
+自己引进的 helper，原样搬进 neg 树的 `search_limits.h` 才能编译当前的测试文件（与 A1 那批新骨架同一类声明）。逐用例
+driver（`-Dmain=suite_main`）跑当前的三条新用例：
+
+| 用例 | 改动前树 | 本树 |
+| --- | --- | --- |
+| `test_root_choice_reproducible` | **红**，`tests/test_search.cpp:3742` `assert(other.nodes == first.nodes)`（整树跑时同一断言在 `:3740`）| 绿，48268 == 48268 |
+| `test_root_tiebreak_prefers_centre` | 绿（控制）：打印与本树**逐字相同**的 `quiet d3: 1 tied optimum 3180, played 6,4; dual-win: 2 tied optima, 1 unequal-centre members, played 7,7 score 100000` | 绿 |
+| `test_d4_dedup_keeps_central_representative` | 绿（控制）：36 representatives, head 7,7 | 绿 |
+
+即本轮唯一的行为差是**确定性**本身：落子与分值两棵树一样，节点数只有本树可复现。A4 那两条消费断言
+（`exact.nodes != none.nodes` / `reuse.nodes_searched != plain.nodes_searched`）是 A6 抬高了它们读的那个节点数，不是
+新用例的红点，不在此列。
+
+**声明的例外**：以 `center_distance` 为键的结构性断言无 HEAD-negative（新词汇的既有例外）；`search_engine.cpp` 那条
+「最靠中心」兜底**无法构造**成用例 —— `AlphaBetaSearch::generate_moves` 不带威胁过滤，要走到远扫补格需要一个
+「活动窗全禁手」的 BLACK 局面，构造不出来；改动仍然保留，因为它比「棋盘左上角」严格更好。
+
+**代价（记下来而不是藏起来）**：复问的节点数用临时计数器测过（测完即删，工作树无残留 —— `grep 'g_probe\|cstdio'` 空）。
+静默局 depth 4：98 次复问 / 31593 节点，218872 → **249892**（+14.2 %）；cold 16 子中盘：11 次 / 48122 节点，
+222885 → **267918**；静默局 depth 3：58 次 / 1837 节点。**全套件里复问改变根答案的次数 = 0**，被预算中止的那次思考
+复问 0 次 —— 它买的是「同分时选中心」这条规则的可证明性，不是棋力。A4 记的那条「窗口改变工作量」仍然成立：
+`no centre 249892 / centre 250886 / negated 249894`。
+
+两组数字相减对不上那个计数器（`249892 − 218872 = 31020` 对 31593，`267918 − 222885 = 45033` 对 48122）是应当的，
+不是测量漏洞：复问本身也是普通的 `alphabeta()` 调用，会把它算干净的节点写进置换表，于是后面的层比不加复问时更省。
+计数器量的是复问自身花掉的，总数字量的是净增 —— 后者才是这条规则真正的代价，所以这里的成本口径用总数字。
+
+diff 面：`src/search/alphabeta.cpp` 98/19、`src/search/search_engine.cpp` 15/5、`src/search/search_limits.h` 11/0、
+`tests/test_search.cpp` 309/12。
+
+**行号位移**：两条受保护前提本轮只是被后面的插入推着走，断言本身一字未改 —— `assert(result.resigned)`
+`2562 → **2563**`（300 ms 那一段），`completed.method == "alphabeta"` `3665 → **3958**`（A6 的三条用例插在它们前面）。
+
+`ctest` **8/8 / 179.76 s**（`test_search` **138.02 s** —— 新基线，A4 的 110.88 s 之上：新增三条用例 11.3 s，其余是复问
+加在既有 depth-4 思考上的工作量；`test_server` 23.99 s、`test_training` 9.99 s），
+`node tests/web_frontend_check.js` **103/103**，`node tests/readme_anchor_check.js` **114 citations / 0 problems**
+（113 → 114：新用例的注释引了 README:338），README 仍 **658 行**。测单用例耗时的手法：把套件 stdout 逐行盖上
+`date +%s.%N` 再取差（`/mnt/d/tmp/a6_case_time.sh`），不动源码。
+
+Valgrind（§5 的 checkpoint，`build-vg/` Debug + `-UNDEBUG`，计数口径 `grep -c '^==[0-9]*=='`，门禁是「相对干净基线零新增」）：
+
+- **子集驱动 13 条**（A6 改到的根层：三条 `sort_moves`、`root_ordering_uses_hint_move`、过期期限兜底、
+  `stores_only_sound_nodes`、`stop_reason_time_hard`、quiescence 记账、A6 新增三条、`tt_cold_think_cost`、
+  `reports_the_interrupted_layer`）：**12 条通过，零报告**。第 13 条
+  `test_engine_reports_the_interrupted_alphabeta_layer` 在减速下 SIGABRT 于 `tests/test_search.cpp:3945`
+  `interrupted.partial_depth == 1`（rc=134，**reports=0**）。两棵树同一断言对照（同一 Debug 形状、同一套 memcheck
+  参数、串行跑以免抢 CPU）：本树 control `d0+partial 1/n2495`，`e6bf642` 树 control `d0+partial 1/n2506`，两边
+  都打印 `interrupted: alphabeta d0+partial 0/n0 time_hard` —— 那条用例的判别臂只有 10 ms、对照臂 20 s，
+  memcheck 的 ~80× 减速下连一层都跑不完，所以这是**既存墙钟脆弱、中止点未前移**，与 A2 记的
+  `test_engine_progress_callback_reports_each_layer` 同类；D1 打通 `max_nodes` 后两条一起改成节点预算。
+- **全量**：整套 `test_search` 在 memcheck 下 **1466 s / reports=0**，中止于 `main():4251` 的
+  `test_engine_progress_callback_reports_each_layer`，套件 stdout 的最后一行是 `main():4250`
+  `test_search_engine_layered passed` —— 中止点与 A2 记的**同一条、同一处**。按 `main()` 顺序，它之前的每一条
+  都被 memcheck 覆盖；它之后的（含 A6 三条）由上面的子集驱动覆盖。
+- A4 的条目把自己的 memcheck 并入本轮 checkpoint。A4 的三条里 `test_root_ordering_uses_hint_move` 在子集内并已
+  通过；另两条 `test_aspiration_refines_without_changing_result` / `test_search_engine_forwards_the_hint_to_the_search`
+  在 `main():4305-4306`（全量中止点之后），只能用子集驱动单独跑，一轮约一小时：本轮提交时它们仍在跑，**数字记在
+  下一条 A7 条目的 Valgrind 段**，本轮不写未测到的结论。
+
 ## 轮次121 引擎重构 A4：上一手的最佳着法，第一次活到下一手 — engine redesign stage A4
 
 规格 `docs/ENGINE_REDESIGN.md` §2.4.3 ①③ + §3 根循环伪码（冻结，不改写）。A4 动的是 P2 剩下的三处：一次思考算出来的

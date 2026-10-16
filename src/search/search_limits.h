@@ -3,6 +3,7 @@
 
 #include "../core/types.h"
 #include <cstdint>
+#include <cstdlib>
 #include <vector>
 
 namespace gomoku {
@@ -20,6 +21,16 @@ enum class StopReason {
 };
 
 const char* stop_reason_name(StopReason reason);
+
+// How far a cell stands from the centre, in the metric the root tie-break orders
+// on. Read from the board geometry rather than from
+// Evaluator::get_position_weight on purpose: that table is scaled by the tunable
+// position_weight_scale, and a coefficient of 0 would silently delete the
+// tie-break this is a key of. Every D4 symmetry of the board preserves it.
+inline int center_distance(Position pos) {
+    const int center = BOARD_SIZE / 2;
+    return std::abs(pos.row - center) + std::abs(pos.col - center);
+}
 
 // How one think is allowed to spend its budget.
 struct SearchLimits {
