@@ -960,10 +960,12 @@ void test_hill_climbing() {
     assert(grown[0] == 16000);
     for (size_t i = 1; i < genes.size(); ++i) assert(grown[i] == genes[i]);
 
-    // Scaling the smallest threat down cannot go to zero or below its bound.
-    const std::vector<int> shrunk =
-        HillClimbingOptimizer::neighbor(genes, static_cast<size_t>(TUNABLE_COUNT) - 2, 0.001);
-    assert(shrunk[static_cast<size_t>(TUNABLE_COUNT) - 2] >= 1);
+    // Scaling the smallest threat down cannot go to zero or below its bound. Named
+    // by gene rather than by offset from the end: the surface grew, and the last
+    // two coordinates are candidate widths now, not threats.
+    const std::vector<int> shrunk = HillClimbingOptimizer::neighbor(
+        genes, static_cast<size_t>(TunableParam::SLEEPY_TWO), 0.001);
+    assert(shrunk[static_cast<size_t>(TunableParam::SLEEPY_TWO)] >= 1);
     // An out-of-range coordinate is left alone instead of reading past the end.
     assert(HillClimbingOptimizer::neighbor(genes, genes.size(), 2.0) == genes);
 
@@ -1067,11 +1069,20 @@ void test_genetic_seed_covers_the_whole_box() {
     // exactly what seed_population() wrote.
     settings.max_generations = 0;
 
-    // Seeds chosen after a sweep of candidates: the draw is deterministic per
-    // seed, and gene 9 (span 20) truncates to its min about 5% of the time, so
-    // these two are picked where that coincidence does not occur.
     const std::vector<uint64_t> seeds = {202, 505};
-    bool upper_half_seen = false;
+    // Both halves of every gene's box, visited by the reseeded half of the
+    // population across both seeds. The version this replaced asked the question
+    // about double_four only - the one gene the R87 bug pinned to its lower half -
+    // and paired it with "no draw may land exactly on min", a truncation
+    // coincidence the two seeds were swept to avoid. That pairing stopped being
+    // neutral once the surface grew a bound four values wide: a quarter of that
+    // gene's draws hit min by arithmetic, and hitting min is not a failure to
+    // reach the end of the box. Half-coverage is the property, and it is now
+    // checked for every gene - which still guards R87, because the formula that
+    // round deleted left every gene inside its own lower half, not double_four
+    // alone.
+    bool low_seen[TUNABLE_COUNT] = {};
+    bool high_seen[TUNABLE_COUNT] = {};
 
     // The most one inner step can add to a gene is span / 8 (noise is bounded
     // by 0.5 and then the 0.25 factor halves it again), and a nudge member
@@ -1108,10 +1119,11 @@ void test_genetic_seed_covers_the_whole_box() {
                 for (int g = 0; g < TUNABLE_COUNT; ++g) {
                     const ParamBound bound =
                         CoefficientVector::bound_for(static_cast<TunableParam>(g));
-                    assert(genes[g] != bound.min_value);
-                }
-                if (genes[static_cast<size_t>(TunableParam::DOUBLE_FOUR)] > 50000) {
-                    upper_half_seen = true;
+                    assert(genes[g] >= bound.min_value && genes[g] <= bound.max_value);
+                    const int middle =
+                        bound.min_value + (bound.max_value - bound.min_value) / 2;
+                    if (genes[g] < middle) low_seen[g] = true;
+                    if (genes[g] > middle) high_seen[g] = true;
                 }
             } else {
                 for (int g = 0; g < TUNABLE_COUNT; ++g) {
@@ -1120,9 +1132,14 @@ void test_genetic_seed_covers_the_whole_box() {
             }
         }
     }
-    // 50000 - 1 is the old draw's ceiling for double_four, so a member above
-    // the midpoint of that box proves the whole box is reachable now.
-    assert(upper_half_seen);
+    for (int g = 0; g < TUNABLE_COUNT; ++g) {
+        if (!low_seen[g] || !high_seen[g]) {
+            std::cout << "[r87r] gene " << g << " missed low=" << low_seen[g]
+                      << " high=" << high_seen[g] << std::endl;
+        }
+        assert(low_seen[g]);
+        assert(high_seen[g]);
+    }
 
     std::cout << "test_genetic_seed_covers_the_whole_box passed" << std::endl;
 }
@@ -2679,6 +2696,8 @@ void test_params_rejects_out_of_range_tunables() {
         {R"({"coefficients":{"rush_four":99999}})", "rush_four", "[300, 15000]"},
         {R"({"position_weight_scale":-50})", "position_weight_scale", "[0, 20]"},
         {R"({"coefficients":{"sleepy_two":0}})", "sleepy_two", "[1, 500]"},
+        {R"({"edge_penalty":200})", "edge_penalty", "[0, 150]"},
+        {R"({"coefficients":{"cand_width_deep":100}})", "cand_width_deep", "[2, 32]"},
     };
     for (const auto& c : cases) {
         error.clear();
@@ -2903,6 +2922,155 @@ void test_params_rejects_cross_key_rewrites() {
                CoefficientVector::from_vector(CoefficientVector::to_vector(legal))) == legal_text);
 
     std::cout << "test_params_rejects_cross_key_rewrites passed" << std::endl;
+}
+
+// 设计文档 2.5.1 / 2.5.2 的参数面：edge_penalty 与 distance_to_stones 是 A5 就
+// 存在的两个字段，但它们既不在枚举里也不在键表里，所以 trained 值出不了
+// params.save 这一步；两枚宽度是阶段 B1 的候选分层要读的。四条新键都是可选的，
+// 老文件照旧加载。
+void test_params_legacy_12_key_file_still_loads() {
+    static const char* legacy =
+        R"({"coefficients":{"five":100000,"live_four":10000,"rush_four":1000,)"
+        R"("live_three":500,"sleepy_three":100,"live_two":50,"sleepy_two":10,)"
+        R"("double_four":50000,"double_three":30000,"four_three":20000,)"
+        R"("forbidden_penalty":50000,"position_weight_scale":8}})";
+    ThreatCoefficients parsed;
+    std::string error;
+    assert(CoefficientVector::from_json_string(legacy, parsed, error));
+    assert(error.empty());
+    const ThreatCoefficients defaults;
+    assert(parsed.live_four == 10000);
+    assert(parsed.position_weight_scale == 8);
+    assert(parsed.edge_penalty == defaults.edge_penalty);
+    assert(parsed.distance_to_stones == defaults.distance_to_stones);
+    assert(parsed.cand_width_root == defaults.cand_width_root);
+    assert(parsed.cand_width_deep == defaults.cand_width_deep);
+
+    // And the writer still names every one of the old twelve, so a reader that is
+    // not this one keeps finding them.
+    const std::string written = CoefficientVector::to_json_string(defaults);
+    for (const char* key : {"five", "live_four", "rush_four", "live_three", "sleepy_three",
+                            "live_two", "sleepy_two", "double_four", "double_three",
+                            "four_three", "forbidden_penalty", "position_weight_scale"}) {
+        assert(written.find(key) != std::string::npos);
+    }
+
+    std::cout << "test_params_legacy_12_key_file_still_loads passed" << std::endl;
+}
+
+// The four genes survive the writer, the reader and the vector view. On the tree
+// before this change the file is refused outright ("unknown coefficient key:
+// edge_penalty"), and a params.save of trained position terms silently wrote
+// nothing about them, so the next load restored the compiled-in 100 / 1.
+void test_params_position_and_width_genes_round_trip() {
+    ThreatCoefficients trained;
+    trained.edge_penalty = 150;  // the top of its bound
+    trained.distance_to_stones = 4;
+    trained.cand_width_root = 40;
+    trained.cand_width_deep = 16;
+
+    std::string error;
+    const std::string text = CoefficientVector::to_json_string(trained);
+    ThreatCoefficients parsed;
+    assert(CoefficientVector::from_json_string(text, parsed, error));
+    assert(parsed.edge_penalty == 150);
+    assert(parsed.distance_to_stones == 4);
+    assert(parsed.cand_width_root == 40);
+    assert(parsed.cand_width_deep == 16);
+
+    const std::vector<int> genes = CoefficientVector::to_vector(trained);
+    assert(genes.size() == static_cast<size_t>(TUNABLE_COUNT));
+    assert(genes[static_cast<int>(TunableParam::EDGE_PENALTY)] == 150);
+    assert(genes[static_cast<int>(TunableParam::DISTANCE_TO_STONES)] == 4);
+    assert(genes[static_cast<int>(TunableParam::CAND_WIDTH_ROOT)] == 40);
+    assert(genes[static_cast<int>(TunableParam::CAND_WIDTH_DEEP)] == 16);
+    const ThreatCoefficients back = CoefficientVector::from_vector(genes);
+    assert(back.edge_penalty == 150);
+    assert(back.distance_to_stones == 4);
+    assert(back.cand_width_root == 40);
+    assert(back.cand_width_deep == 16);
+
+    // Neither new pair joins the strength ladder: a discount or a width is not a
+    // threat value, and capping it against live_four would delete it.
+    ThreatCoefficients ladder;
+    ladder.edge_penalty = 120;
+    ladder.distance_to_stones = 3;
+    ladder.cand_width_root = 12;
+    ladder.cand_width_deep = 5;
+    ladder.live_two = 1000;  // past its own neighbour, so the ladder does fire
+    CoefficientVector::sanitize(ladder);
+    assert(ladder.edge_penalty == 120);
+    assert(ladder.distance_to_stones == 3);
+    assert(ladder.cand_width_root == 12);
+    assert(ladder.cand_width_deep == 5);
+    assert(ladder.live_two == ladder.sleepy_three);
+
+    // The bound is set by a structural promise, not by the factor-of-four rule of
+    // thumb: eight closed ends (four directions, two ends each) at the largest
+    // legal discount still cost less than the cheapest legal 活四. Against 冲四 the
+    // promise only holds at the calibrated defaults (test_evaluator.cpp's
+    // 8 * edge_penalty < rush_four), because a file may train rush_four down to
+    // 300 - and a discount that outprices the smallest legal 冲四 is a parameter
+    // set worth reporting, not one the bound can silently absorb.
+    const ParamBound edge = CoefficientVector::bound_for(TunableParam::EDGE_PENALTY);
+    const ParamBound live_four = CoefficientVector::bound_for(TunableParam::LIVE_FOUR);
+    assert(8 * edge.max_value < live_four.min_value);
+
+    // sanitize caps a deep width that out-widens the root; the root is the one
+    // layer that pays for the neighbourhood only once.
+    ThreatCoefficients wide;
+    wide.cand_width_root = 4;
+    wide.cand_width_deep = 32;
+    CoefficientVector::sanitize(wide);
+    assert(wide.cand_width_deep == 4);
+
+    std::cout << "test_params_position_and_width_genes_round_trip passed" << std::endl;
+}
+
+// The width relation follows the rule the ladder already obeys: refuse when the
+// repair would overwrite a value the file stated, repair in place when the other
+// end is an inherited default.
+void test_params_refuses_only_stated_width_conflicts() {
+    ThreatCoefficients parsed;
+    std::string error;
+
+    // A. Both ends stated and the deeper one is wider: refused, both names in it.
+    error.clear();
+    assert(!CoefficientVector::from_json_string(
+        R"({"cand_width_root":10,"cand_width_deep":20})", parsed, error));
+    assert(error.find("cand_width_deep") != std::string::npos);
+    assert(error.find("cand_width_root") != std::string::npos);
+    std::cout << "  refused both-stated -> " << error << std::endl;
+
+    // B. Only the end sanitize would cap is stated: refused as well, because the
+    // default root would silently rewrite what the file wrote.
+    error.clear();
+    assert(!CoefficientVector::from_json_string(R"({"cand_width_deep":30})", parsed, error));
+    assert(error.find("cand_width_deep") != std::string::npos);
+    assert(error.find("（对端是默认值）") != std::string::npos);
+
+    // C. Only the root is stated, and it is the narrow end: the default deep is
+    // what gets capped, and a file that said nothing about deep is not
+    // over-reaching. The inherited value is repaired, not refused.
+    error.clear();
+    assert(CoefficientVector::from_json_string(R"({"cand_width_root":6})", parsed, error));
+    assert(parsed.cand_width_root == 6);
+    assert(parsed.cand_width_deep == 6);  // default 8, capped to the stated root
+
+    // D. Equal widths are inside the relation, not outside it.
+    error.clear();
+    assert(CoefficientVector::from_json_string(
+        R"({"cand_width_root":32,"cand_width_deep":32})", parsed, error));
+    assert(parsed.cand_width_deep == 32);
+
+    // E. Out of range is its own refusal, with the range named (control: the two
+    // widths have bounds, so a file asking for 100000 is not silently clamped).
+    error.clear();
+    assert(!CoefficientVector::from_json_string(R"({"cand_width_root":100})", parsed, error));
+    assert(error.find("cand_width_root") != std::string::npos);
+    assert(error.find("[2, 64]") != std::string::npos);
+
+    std::cout << "test_params_refuses_only_stated_width_conflicts passed" << std::endl;
 }
 
 // R77 L2: stod() parses "nan"/"inf" with used == text.size(), and a NaN then
@@ -3858,6 +4026,9 @@ int main() {
     test_trainer_refuses_one_file_written_two_ways_for_out_and_checkpoint();
     test_trainer_accepts_a_resume_and_checkpoint_that_differ_only_by_a_dot_segment();
     test_data_game_ids_do_not_repeat_across_rounds();
+    test_params_legacy_12_key_file_still_loads();
+    test_params_position_and_width_genes_round_trip();
+    test_params_refuses_only_stated_width_conflicts();
 
     std::cout << "All training tests passed" << std::endl;
     return 0;

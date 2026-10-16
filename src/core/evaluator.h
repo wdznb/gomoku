@@ -33,9 +33,20 @@ struct ThreatCoefficients {
     int distance_to_stones = 1;
     // What one closed line end costs: the shape table cannot tell a board edge from
     // an opponent stone, so an edge-hugging 活三 is paid as if it were open. The
-    // discount runs over at most four directions times two ends, so keeping this
-    // under rush_four / 8 leaves a discounted shape worth less than a real 冲四.
+    // discount runs over at most four directions times two ends, so the bound that
+    // params.h puts on it (0..150) keeps eight closed ends cheaper than the
+    // cheapest legal 活四. Against a 冲四 the tighter promise
+    // 8 * edge_penalty < rush_four holds at the hand-tuned 100, not for every legal
+    // file - a file that trains 冲四 down and the discount up is a parameter set to
+    // judge by its games, not one this field can silently absorb.
     int edge_penalty = 100;
+    // How many of the "near a stone but no threat there" candidates each layer
+    // keeps - the width limit design doc 2.5.1 asks for. Root layer uses
+    // cand_width_root, deeper layers cand_width_deep (never more than the root's,
+    // which sanitize() enforces); nothing reads them until stage B1's candidate
+    // tiers, which is why they are declared here rather than hard-coded there.
+    int cand_width_root = 24;
+    int cand_width_deep = 8;
     
     ThreatCoefficients() = default;
 };

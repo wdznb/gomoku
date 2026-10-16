@@ -1979,6 +1979,92 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次121 引擎重构 P1：参数面从十枚基因长到十四枚 — engine redesign stage P1
+
+规格 `docs/ENGINE_REDESIGN.md` §2.5.1、§2.5.2 与 §7 前置事实 P1（冻结，不改写）。P1 是 B1 的硬前置：宽度帽必须是
+**可读的参数**，而 A5 留在 `ThreatCoefficients` 里的两枚字段必须先出得了 `params.save` 那一步。
+
+### Found
+
+- **真 bug，不是新能力**：`edge_penalty`（`src/core/evaluator.h:42`）与 `distance_to_stones`（`:33`）从 A5 起就被
+  评估读着，却既不在 `TunableParam` 枚举里、也不在文件键表里 ⇒ `CoefficientVector::save` 根本不写它们，`load`
+  之后训练值回到编译期的 100 / 1。反证探针（只调用两棵树都有的 API，`/mnt/d/tmp/p1_probe.cpp`）在改动前树
+  `87ee891` 上：写出的 JSON 只有 12 个键、`edge_penalty=100 distance_to_stones=1`、**`RUN_HEAD_RC=1`**，而手写
+  `{"coefficients":{"edge_penalty":37}}` 整份被拒（`no known coefficient key found in the file`）；同一份探针在本树
+  写出 16 个键、`37 / 3` 原样读回、**`RUN_FIXED_RC=0`**。
+- §7 P1 记的那条前置事实仍然成立：`field_of` 的 `default:` 会把一个「进了枚举却没进 switch」的基因静默别名到
+  `position_weight_scale` 上——训练得动、存成别人的名字、再读不回来。所以这一轮**没有加第五处 switch**，而是把五处
+  平行表面（writer 的键表、reader 的 `names[]`/`fields[]`/`present[]`、bound switch、field_of switch、报错用的名字表）
+  合并成一张 `kParams` 表：键名、成员指针、基因、取值域四件事只写一遍，并由
+  `static_assert(tunable_table_complete(), "every TunableParam needs exactly one row in kParams")` 钉住「每枚基因恰
+  有一行」。`to_vector` 也不再整份拷贝系数对象，逐基因只取自己那一格。
+- 两枚宽度 `cand_width_root = 24` / `cand_width_deep = 8` 声明在 `ThreatCoefficients` 上，本轮没有任何代码读它们
+  （B1 的分层裁剪才是消费者）⇒ 纯新增结构，按 §5 的规矩**声明为无 HEAD 反证**；能反证的只有「老树不认这两个键」，
+  即上面那条探针的第二半。
+- 文档 §2.5.1 的 K 是**三档**（根 24 / ply 1–2 16 / ply ≥ 3 8），而计划给 P1 的是**两枚**宽度基因。本轮按计划做两枚，
+  中间档留给 B1（计划 103 行的「Tier2 按 §2.5.1 表取 K」届时要么在两档之间插值，要么加第三枚基因）——那是 B1 的决定，
+  不在参数面这一轮预先猜。
+
+### Fixed
+
+- `src/core/evaluator.h`：两枚宽度字段 + 说明「为什么声明在这里而不是硬编码在 B1」。
+- `src/training/params.h`：枚举加 `EDGE_PENALTY`、`DISTANCE_TO_STONES`、`CAND_WIDTH_ROOT`、`CAND_WIDTH_DEEP`
+  （`TUNABLE_COUNT` 10 → 14，文件键面 12 → 16）。
+- `src/training/params.cpp`：表驱动重写；取值域 `edge_penalty [0, 150]`、`distance_to_stones [0, 4]`、
+  `cand_width_root [2, 64]`、`cand_width_deep [2, 32]`；跨键规则加第九条 `cand_width_deep ≤ cand_width_root`；
+  `sanitize` 加 `cand_width_deep = min(cand_width_deep, cand_width_root)`。
+- **第九条跨键规则与计划措辞的偏差**（计划 97 行写「仅当两端都被文件显式声明才拒绝」）：实现按仓内既有八条同一个
+  `stated()` 判据，也就是 loader 规则本来的说法——**只要 `sanitize` 会被改掉的那一端是文件亲手写的就拒绝**，另一端是
+  继承默认时把这件事写进消息（「（对端是默认值）」）。于是 `{"cand_width_deep":30}` 被拒（默认 root=24 会把它压回
+  24，改掉的正是文件写的值），而 `{"cand_width_root":6}` 通过并把继承来的 deep=8 修成 6。计划那句照字面实现的话，
+  第一条反而会被静默改写——与轮次90 定下的判据相反，故取仓内规则、弃计划措辞。
+- 新键全部**可选**：老 12 键文件照旧加载，四枚新字段停在编译期默认值上，writer 仍然把老 12 个键一个不漏地写出来。
+- README 两处行内改写（行数仍 658，`:529-531` 未动）：`:155` 的加载失败清单补「可调项越界或跨项冲突如
+  `cand_width_deep` 大于 `cand_width_root`」；`:607` 的训练对象一句补「外加 2.5.1 的候选宽度与 2.5.2 的位置/贴边权重」。
+- `tests/test_training.cpp`：三条新用例 + 两处既有改写。`test_params_legacy_12_key_file_still_loads` 是对照（老 12 键
+  文本照旧加载、四枚新字段停在默认、writer 一个不漏地仍写老 12 键）；
+  `test_params_position_and_width_genes_round_trip` 让 `150 / 4 / 40 / 16` 走 JSON 与向量两条视图，并用「阶梯确实在动」
+  （同一份系数里 `live_two` 被压到 `sleepy_three`）证明这四枚没被阶梯顺手改掉，另带 `8 * edge.max_value <
+  live_four.min_value` 这条取值域结构前提和 `sanitize` 把 deep 32 压到 root 4；
+  `test_params_refuses_only_stated_width_conflicts` 五个臂——两端都写→拒且两个键名都在消息里、只写会被压的那端→拒并带
+  「（对端是默认值）」、只写 root=6→接受并把继承来的 deep 修成 6、同宽合法、`cand_width_root:100` 报 "[2, 64]"。
+  `test_params_rejects_out_of_range_tunables` 加两行越界拒绝；爬山那处 `TUNABLE_COUNT - 2` 的偏移改成按基因名点名
+  （`SLEEPY_TWO`），以后加参数不再挪测试。
+
+### 合约过期
+
+- `test_genetic_seed_covers_the_whole_box` 的 `assert(genes[g] != bound.min_value)`：`distance_to_stones` 的取值域只有
+  4 个整数，播种落在下界是**算术**（每枚约 1/4 的概率），不是缺陷，换种子也只是把硬币换成另一枚。前提改成「每枚基因在
+  两个种子的样本里都出现过盒子的上半和下半」，同时保留「落点必须在自己取值域内」这条原有断言。实测两个种子 × 6 个重播
+  席位下，`double_four`（下标 6）取到 62465 / 89374 / 80617 / 67789 等上半格值，14 枚基因的 `low_seen`、`high_seen`
+  全部成立；R87 那个缺陷仍被同一条断言抓住——被删掉的那半公式让**每一枚**基因都困在自己的下半格，而不只是
+  `double_four`。计划 97 行「宽度取 `{2,64}`/`{2,32}` 使 `genes[g] != bound.min_value` 保持现有成立性」只算到了两枚
+  宽度（它们确实躲得开下界），漏掉同一轮加进来的 `distance_to_stones` 是 4 个整数的取值域。
+
+### 反证与 Valgrind
+
+- 反证探针只调用两棵树都有的 API（`edge_penalty` / `distance_to_stones` 与 `to_json_string` / `from_json_string`），
+  所以它在老树上**编得过、跑不过**：`/mnt/d/tmp/p1_probe.cpp` 配 `git archive HEAD src/core src/training` 解出的阴影头
+  （`-I` 把存档目录排在前面）→ `BUILD_HEAD_RC=0`、**`RUN_HEAD_RC=1`**，打印的 JSON 只有 12 个键、
+  `edge_penalty=100 distance_to_stones=1`；同一份源文件对本树 → **`RUN_FIXED_RC=0`**，JSON 16 个键、`37 / 3` 原样读回。
+  两枚宽度本身是纯新增字段，能反证的只有「老树把只写它们的那份文件整份拒了」这一条
+  （`no known coefficient key found in the file`）。
+- 子集驱动 `/mnt/d/tmp/p1_subset_main.cpp`（同 `-Dmain=suite_main` 手法，挑五条：改写后的播种覆盖、加了两条新行的越界
+  拒绝、老 12 键对照、四枚新基因往返、只拒已声明的宽度冲突）：Debug 形状直跑 **`PLAIN_RC=0`**，memcheck
+  **`MEMCHECK_RC=0`、报告 0 行**；这五条排在 `test_training.cpp:2055` 那条既存墙钟脆弱断言之后，全量跑不到 ⇒ 由子集覆盖。
+- 全量（`tools/valgrind_check.sh memcheck test_board test_pattern test_evaluator test_training`，`/mnt/d/tmp/p1_vgfull.out`）：
+  **四条全 `clean`、`reports=0`**，1406 s / 5 s / 2 s / **179 s**（`test_training` 直跑 10.18 s ⇒ 约 18× 减速），
+  `FULL_RC=0`。**这一轮 `:2055` 那条既存墙钟脆弱断言没有触发**，整套跑到 `main()` 末尾，所以五条新/改用例既被子集覆盖、
+  也被全量覆盖；上一条子集驱动留着是因为它按 §5 的口径证明了「就算它触发，这五条也已单独 memcheck 干净」。两段
+  memcheck 都跑在那两处注释改写之前（其后只有 README/注释动过，行为不变），最终树的门禁与探针数字见下面的 Gate。
+
+**Gate**（空闲树，跑门禁时不与构建或 memcheck 并发）：改动后树先量到 ctest **8/8 / 174.91 s**，两处注释改写后再在**将要
+提交的那棵树**上复测为 ctest **8/8 / 168.21 s**（`test_search` 139.13 s、`test_server` 11.43 s、`test_position` 7.46 s、
+`test_training` 9.92 s、`test_evaluator` 与 `test_board` 0.0x s），web **105/105**，anchor **118 引用 / 0 problems**，
+README 仍 **658 行**（`:529-531` 未动）。两条受保护的预算前提复测仍在原位：`tests/test_search.cpp:2563`
+`assert(result.resigned)`、`:3958` `assert(completed.method == "alphabeta")`。反证探针在同一棵树上重跑，
+`RUN_FIXED_RC=0` / `RUN_HEAD_RC=1` 不变。
+
 ## 轮次121 引擎重构 A8：候选分层的两只门打开了 — engine redesign stage A8
 
 规格 `docs/ENGINE_REDESIGN.md` §2.5.1 + §6 文件清单的 `src/core/board.h/.cpp` 行（冻结，不改写）。A8 是给 B1 前置的

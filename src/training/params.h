@@ -25,6 +25,16 @@ enum class TunableParam {
     DOUBLE_THREE,
     FOUR_THREE,
     POSITION_WEIGHT_SCALE,
+    // Design doc 2.5.2: the centre preference and the edge discount should be a
+    // learned preference, not a hard-coded one. Both scale a term of
+    // evaluate_board / pattern_score, and neither is a threat value, so neither
+    // joins the strength ladder sanitize() repairs.
+    EDGE_PENALTY,
+    DISTANCE_TO_STONES,
+    // Design doc 2.5.1: the candidate width limit is a playing-strength knob too -
+    // how much of the near-a-stone neighbourhood each layer is allowed to search.
+    CAND_WIDTH_ROOT,
+    CAND_WIDTH_DEEP,
     COUNT
 };
 
