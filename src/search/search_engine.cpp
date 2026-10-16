@@ -255,8 +255,9 @@ SearchResult SearchEngine::search(const Board& board, int color,
         const ProgressCallback progress_cb = progress_callback_;
         if (progress_cb) {
             ab.set_progress_callback([progress_cb, elapsed_since_start](const SearchStats& stats) {
-                progress_cb(stats.completed_depth, static_cast<int>(stats.nodes),
-                            elapsed_since_start());
+                SearchStats frame = stats;
+                frame.elapsed_ms = elapsed_since_start();
+                progress_cb(frame);
             });
         }
 
@@ -274,7 +275,14 @@ SearchResult SearchEngine::search(const Board& board, int color,
         SearchLimits limits;
         limits.max_depth = (max_depth > 0) ? max_depth : alphabeta_max_depth_;
         limits.hard_time_ms = remaining_time;
-        limits.max_nodes = node_budget;
+        // Zero means the client named nothing, which keeps the behavior this engine
+        // had before: no soft window at all (the whole hard deadline is usable) and
+        // the time-derived node ceiling. A named node budget replaces that ceiling
+        // outright - the only way a think can cost the same twice on a loaded machine
+        // - and a named soft deadline stops the search from starting another layer
+        // once it is past, at a layer boundary where the check costs nothing.
+        limits.soft_time_ms = soft_time_ms_;
+        limits.max_nodes = max_nodes_ > 0 ? max_nodes_ : node_budget;
         limits.hint_move = hint_move_;
         limits.hint_score = hint_score_;
         limits.has_hint_score = has_hint_;
@@ -374,8 +382,14 @@ SearchResult SearchEngine::search(const Board& board, int color,
 
         const int whole_elapsed_ms = elapsed_since_start();
         result.elapsed_ms = whole_elapsed_ms;
+        // The closing frame is the whole think, not the last layer: it repeats the
+        // accounting each layer frame repeated, and its clock is stamped after the
+        // resign probe so the elapsed the client sees covers the probe's share of
+        // the budget too. depth/nodes keep their old meanings.
         if (progress_callback_) {
-            progress_callback_(info.depth, info.nodes_searched, whole_elapsed_ms);
+            SearchStats final_frame = ab.last_stats();
+            final_frame.elapsed_ms = whole_elapsed_ms;
+            progress_callback_(final_frame);
         }
 
         return result;

@@ -22,6 +22,10 @@ enum class GameStatus {
 
 // One ply of the session's own game, kept so the client can replay it with the
 // engine's numbers. Human stones carry method "human" and no search data.
+// The last five fields are AlphaBeta's layered accounting (search_engine.h
+// SearchResult); they travel with the move so a replay can say which layer an
+// interrupted think was in, and a record written before they existed reads as a
+// think that finished.
 struct MoveAnalysis {
     Move move;
     int score = 0;
@@ -29,6 +33,11 @@ struct MoveAnalysis {
     int nodes = 0;
     int elapsed_ms = 0;
     std::string method;
+    int partial_depth = 0;
+    int root_moves_done = 0;
+    int root_moves_total = 0;
+    int seldepth = 0;
+    std::string stopped = "none";
 };
 
 // Everything the replay view needs, captured in one lock so the move list and
@@ -66,7 +75,9 @@ struct GameRestore {
 
 class GameManager {
 public:
-    using ProgressCallback = std::function<void(int depth, int nodes, int elapsed_ms)>;
+    // The engine's per-layer accounting, handed on unchanged so the frame writer
+    // decides what the client sees.
+    using ProgressCallback = std::function<void(const SearchStats&)>;
     using MoveCallback = std::function<void(const Move& move, int score, int thinking_time_ms)>;
     using HintCallback = std::function<void(const Move& move, int score)>;
     using GameOverCallback = std::function<void(int winner, const std::string& reason)>;
@@ -135,9 +146,15 @@ public:
     ReplaySnapshot replay_snapshot();
     
     void set_coefficients(const ThreatCoefficients& coeffs);
-    void set_config(int timeout_ms, int max_depth);
+    // soft_time_ms / max_nodes are optional overrides: a negative value means
+    // "whatever this session already has", so the two older callers and a client
+    // that names only the timeout keep the engine's own budget (0 = no soft window
+    // and the time-derived node ceiling).
+    void set_config(int timeout_ms, int max_depth, int soft_time_ms = -1, int max_nodes = -1);
     int timeout_ms() const { return timeout_ms_; }
     int max_depth() const { return max_depth_; }
+    int soft_time_ms() const { return soft_time_ms_; }
+    int max_nodes() const { return max_nodes_; }
     void set_opening_book(const OpeningBook* book);
     
 private:
@@ -171,6 +188,12 @@ private:
     
     int timeout_ms_;
     int max_depth_;
+    // Named by set_config when a client wants a think to stop before the hard
+    // deadline or to cost a fixed number of nodes; 0 on either is what every
+    // session had before this existed - no soft window, and the node ceiling the
+    // remaining time derives.
+    int soft_time_ms_ = 0;
+    int max_nodes_ = 0;
 
     // What the session's last completed AlphaBeta think concluded, for the next
     // think of the same colour to reuse as a root candidate and an aspiration
@@ -194,6 +217,16 @@ private:
         if (!has_hint_ || hint_color_ != for_color) return Reuse{};
         return Reuse{hint_move_, hint_score_, true};
     }
+
+    // One think's share of the budget config, read on the spawning thread for the
+    // same reason as the reuse above: engine_ state is written by the searching
+    // thread only, and set_config runs on the io thread while a worker is inside
+    // engine_.search.
+    struct Budget {
+        int soft_time_ms = 0;
+        int max_nodes = 0;
+    };
+    Budget take_budget() const { return Budget{soft_time_ms_, max_nodes_}; }
     
     ProgressCallback progress_callback_;
     MoveCallback move_callback_;
@@ -204,7 +237,7 @@ private:
     // The reuse is what take_hint() handed back on the thread that spawned this
     // worker: the engine's hint is written by the searching thread and read by no
     // other, so the worker never touches the session's own members for it.
-    void ai_thinking_worker(int timeout_ms, int max_depth, Reuse reuse);
+    void ai_thinking_worker(int timeout_ms, int max_depth, Reuse reuse, Budget budget);
     // Sets game-over state without joining the search threads, so it is safe to
     // call from ai_thinking_worker itself.
     void resign_now(int color);

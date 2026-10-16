@@ -696,7 +696,14 @@ class GomokuGame {
             depth: m.depth || 0,
             nodes: m.nodes || 0,
             elapsed_ms: m.elapsed_ms || 0,
-            method: m.method || ''
+            method: m.method || '',
+            partial_depth: m.partial_depth || 0,
+            root_moves_done: m.root_moves_done || 0,
+            root_moves_total: m.root_moves_total || 0,
+            seldepth: m.seldepth || 0,
+            // Absent on a record written before the frame carried it, and "none" is
+            // what such a think looks like: a list of depths that all finished.
+            stopped: typeof m.stopped === 'string' ? m.stopped : 'none'
         }));
         this.board = emptyMatrix();
         // The stones the move list did not play: a game resumed or replayed from a
@@ -885,6 +892,7 @@ class GomokuGame {
         let text = `第 ${this.replayIndex + 1}/${this.moveHistory.length} 手 · ${colorName} ${this.coordName(m.row, m.col)}`;
         if (a) {
             text += ` · ${this.formatAnalysis(a, false)}`;
+            text += this.interruptedLayerNote(a);
         } else {
             text += ' · 尚未载入分析';
         }
@@ -1957,6 +1965,26 @@ class GomokuGame {
             document.getElementById('btn-hint').disabled = true;
             this.refreshReplayControls();
         }
+        this.showInterruptedLayer(msg);
+    }
+
+    // The same one-line account of a cut think, from either a live progress frame
+    // or the recorded fields a replay carries. A think that stopped for no reason
+    // (stopped "none", or an older server that sends no key) has nothing to say, so
+    // an ordinary think never reads as an interrupted one.
+    interruptedLayerNote(source) {
+        if (typeof source.stopped !== 'string' || source.stopped === 'none') return '';
+        const layer = source.partial_depth > 0 ? source.partial_depth : (source.depth || 0);
+        const done = Number.isInteger(source.root_moves_done) ? source.root_moves_done : 0;
+        const total = Number.isInteger(source.root_moves_total) ? source.root_moves_total : 0;
+        return ` · 第 ${layer} 层中断（${done}/${total}）`;
+    }
+
+    showInterruptedLayer(msg) {
+        if (this.gameStatus !== 'playing') return;
+        const note = this.interruptedLayerNote(msg);
+        if (!note) return;
+        this.updateTurnInfo(undefined, note);
     }
     
     handleGameOver(msg) {
@@ -2190,17 +2218,17 @@ class GomokuGame {
         el.className = `status ${kind}`;
     }
     
-    updateTurnInfo(text) {
-        if (text === undefined) {
-            if (this.gameStatus === 'playing') {
-                const turnColor = this.currentTurn === BLACK ? '黑棋' : '白棋';
-                const who = this.currentTurn === this.playerColor ? '你的回合' : 'AI 思考中';
-                text = `轮到${turnColor} · ${who}`;
-            } else {
-                text = '';
-            }
-        }
-        document.getElementById('turn-info').textContent = text;
+    // The narration line by itself, for whoever wants to append to it.
+    defaultTurnInfo() {
+        if (this.gameStatus !== 'playing') return '';
+        const turnColor = this.currentTurn === BLACK ? '黑棋' : '白棋';
+        const who = this.currentTurn === this.playerColor ? '你的回合' : 'AI 思考中';
+        return `轮到${turnColor} · ${who}`;
+    }
+
+    updateTurnInfo(text, note = '') {
+        const line = (text === undefined ? this.defaultTurnInfo() : text) + note;
+        document.getElementById('turn-info').textContent = line;
     }
     
     updateMoveList() {

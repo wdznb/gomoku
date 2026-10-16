@@ -35,7 +35,7 @@ inline int center_distance(Position pos) {
 // How one think is allowed to spend its budget.
 struct SearchLimits {
     int max_depth = 8;
-    int soft_time_ms = 0;   // 0 = derive from the hard deadline
+    int soft_time_ms = 0;   // 0 = no soft window; the whole hard deadline is usable
     int hard_time_ms = 0;   // 0 = no wall-clock limit at all
     int max_nodes = 0;      // 0 = no node limit; this is what training runs on
     bool ponder = false;

@@ -1979,6 +1979,127 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次121 引擎重构 A7：一层中断是一个帧，不是一次沉默 — engine redesign stage A7
+
+规格 `docs/ENGINE_REDESIGN.md` §2.3.3 末段 + 验收 G2（冻结，不改写）。A1–A6 把分层记账做进了引擎，但它出不了
+`alphabeta.cpp`：协议上仍然只有三个整数，`SearchResult` 里那五个字段在会话与存档的边界上被丢掉。G2 要的是
+「玩家看得见思考到哪一层」，所以本轮动的全是**边界**，不是搜索。
+
+### Found
+
+- 两级 `ProgressCallback` 都是 `void(int depth, int nodes, int elapsed_ms)`。A2 删掉 `depth == 0 → "greedy"`
+  的改写之后，「第 6 层搜到一半被掐断」与「这个局面没东西可搜」在帧上**变成同一个读数** —— 歧义没消失，只是从
+  method 标签搬到了 `depth`。
+- `SearchResult` 自 A2 起就带 `partial_depth` / `root_moves_done` / `root_moves_total` / `seldepth` / `stopped`，
+  但 `MoveAnalysis`（会话自己的回放表）与 `MoveRecord`（落盘存档）都只留六项，回放里被截断的那一手和搜完的那一手
+  长得一样。
+- `set_config` 没有任何入口点名软时限或节点预算：`SearchLimits` 的这两个字段自 A1 起只被 `test_search` 写过，
+  线上走不到 ⇒ §2.3.1 的「客户端可选」半条是空的。
+- 收尾帧读的是 `info.depth` / `info.nodes_searched`，即每次思考的**最后一帧也只报老三个数**；每层帧更不必说。
+
+### Fixed
+
+- 三个签名一起改为携带记账：`SearchEngine::ProgressCallback`、`GameManager::ProgressCallback` 收
+  `const SearchStats&`，由帧写入者（`server.cpp`）决定客户端看见什么。`depth` / `nodes` / `elapsed_ms` 三个键的
+  含义一字未动（`nodes` 仍是 `static_cast<int>(stats.nodes)`），新增五个键；`stopped` 走 `stop_reason_name`。
+- 收尾帧改为 `ab.last_stats()` 拷出后盖一次整手时钟（沿用 A2 那条口径：帧的时间从走子时钟现读，不把各阶段的截断值
+  相加），并把 `elapsed_ms` 取在认输探针之后 ⇒ 客户端看到的耗时包含探针花掉的那部分预算。
+- 五个字段逐跳传到底：`record_of` / `analysis_of` / `handle_request_replay` / `SelfPlay::run` 各拷一份，
+  `GameRecord::to_json` 照写；`from_json` 用 `read_int(key, 0)`、`stopped` 用「是字符串才取，否则 `none`」⇒
+  早于它们的存档读成「每一层都搜完了」，不报错也不判坏（分层记账是元数据，不像 `winner`/`reason` 那样缺一即坏）。
+- `set_config` 增 `soft_time_ms` / `max_nodes` 两枚**可选**键；`GameManager::set_config` 用**负数**表示「本会话
+  已有的就保留」，`clamp_soft_time_ms` 把软时限夹进硬时限之内（0 保持 0 = 不设软窗，而不是一个长度为零的时限），
+  `clamp_max_nodes` 只把非正数归零。预算由 spawn 侧按值 `Budget` 拷出、搜索线程进去以后自己
+  `engine_.set_soft_time_ms` / `set_max_nodes` —— 与 A4 的 `Reuse` 是同一条线程约定：`set_config` 跑在 io 线程上，
+  此时 worker 正在 `engine_.search` 里面，引擎配置只有搜索线程写。
+- `SearchEngine` 第一次把这两个预算接到 `SearchLimits`：`limits.max_nodes = max_nodes_ > 0 ? max_nodes_ :
+  node_budget`。默认 0/0 ⇒ 逐字等于本轮之前的行为（不设软窗、节点上限由剩余时间换算）。顺带改正四处**过期注释**
+  （`search_limits.h:38`、`search_engine.h`、`server.cpp:1141`、`game_manager.h`）：它们都写着「0 = 由硬时限推出」，
+  而 `SearchContext::start()` 做的是 `has_soft_ = soft_time_ms > 0`，即 0 表示**没有软窗**。
+- `web/app.js`：`interruptedLayerNote()` 一份文案两个入口 —— 实时 `thinking_progress`（`showInterruptedLayer`，
+  带 `gameStatus` 守卫）与 `replay` 的逐手行；只在 `stopped` 是字符串且不为 `none` 时产出，否则返回空串。
+  `updateTurnInfo(text)` 拆成 `defaultTurnInfo()` + `updateTurnInfo(text, note)`，副行是**追加**不是替换。
+  `handleReplay` 的五个新键按 `|| 0` 读、`stopped` 按类型读。
+
+### 合约过期
+
+1. `tests/test_search.cpp` 三处回调形参（`:914` / `:1139` / `:3907`）从 `[&](int depth, int nodes, int)` 改为
+   `[&](const SearchStats& stats)`。**断言一行未改**，只是形参跟着签名走。这是 A2 计划里「`ProgressCallback`
+   签名扩为携带 `SearchStats`」一条的真正落地点：之前没有任何上层要求 `GameManager` 收整份记账，签名便留在 A7。
+
+### Docs
+
+README 五处**行内改单元格**（没有任何插入，`:431` 之前的行号一个没动）：`:345`（`set_config` 的两枚新键与其缺省）、
+`:499`（示例帧补 `elapsed_ms` 与五个新键）、`:508`（`replay` 一手补五键）、`:521`（分层记账的语义）、`:531`
+（「存档缺键按搜完算」）。README 仍 **658 行**，`:529-531` 仍恰好三行 ⇒ `readme_anchor_check.js` 硬取的
+`slice(528,531)` 未受影响；引用数 114 → 118 全部来自新用例注释里新增的 README 行号。
+
+### New
+
+- `test_thinking_progress_carries_partial_fields`：直接喂 `h.entry->game->progress_callback_(stats)` 再 `drain_frames`
+  读回 —— 九个键逐个断言（`TIME_HARD` 的截断层报成 `partial_depth 6 / 12 of 34 / seldepth 7`）；控制臂喂一个在层边界
+  收束的 `TIME_SOFT`，断言新键**不缺席而是取 0**；再循环六种 `StopReason` 逐一断言名字到达客户端，且「除了 `stopped`
+  什么都没说」的那一帧里老三个键仍在场、取 0。
+- `test_replay_roundtrip_keeps_new_fields`：同一手（ply 2）四跳逐读 —— `request_replay` 帧 → `flush_entry` 落盘 →
+  把五个键从文件里 `erase` 之后再 `open_session` 重建（token 换成 `a7000000000000f7`）→ 冷存 + `resume` + 再
+  `request_replay`。人落子那一手（ply 1）在两棵树都读 `0` / `none`。
+- `test_set_config_keeps_the_two_optional_budgets`：先 `restore_game(playing_restore(2))` 让会话文件真实存在，再断
+  谁也没点名 ⇒ `0/0`；两个都点名 ⇒ `3000/50000`；`soft 20000` 配 `timeout 8000` ⇒ 夹到 `8000`；只点名一枚 ⇒ 另一枚
+  保留（`8000/1234`）；`0` ⇒ 回到派生预算；负数 ⇒ `0`；最后 `flush` 后确认**会话文件里两个键都不在**（预算是客户端
+  每次连上重新声明的东西，不是对局事实），而同一帧里的 `timeout_ms 9000` / `max_depth 7` 照旧持久化。
+- `tests/web_frontend_check.js` 两条：`ENG-A7 一条 time_hard 的 thinking_progress 把中断层报进副行`（副行含
+  「第 6 层中断（12/34）」且**接在**「轮到…」之后）；`ENG-A7 搜完了的思考与不带这几个键的老服务器都不写中断文案`
+  （`stopped:"none"` 一臂 + 整帧无键一臂，都断 `#turn-info` 是空串）。命名从 `A7 …` 改成 `ENG-A7 …` 是因为既有
+  用例里已经有一条 `A7 replay cluster guarded during setup`。
+
+### Verified
+
+- **web HEAD-negative**：`git archive 87ee891` 解到 `/mnt/d/tmp/neg121_web` + 当前 `tests/` ⇒ **104/105**，红的只有
+  第一条（副行没写），第二条与既有 103 条在两棵树都绿。
+- **C++ 三条无 HEAD-negative，以编译可能性为限的声明**：`87ee891` 上 `GameManager::Budget` 不是成员
+  （`tests/test_server.cpp:1058/:1084` 直接编译失败），`progress_callback_` 收三个 int ⇒ 当前测试 TU 在改动前树上
+  根本无法编译，与 A1 的新骨架同类。替代证据是一条只在 HEAD 树上编译的探针 `probe_a7_frame_shape_on_head()`
+  （`/mnt/d/tmp/neg121_a7b.sh`：把三个新用例从 HEAD 副本里删掉、把探针插进 `main()`），它用 HEAD 自己的帧写入者打印
+  「改动前这条线长什么样」：
+  - `thinking_progress`：`{"depth":6,"elapsed_ms":4800,"nodes":123456,"type":"thinking_progress"}` —— 三个键，
+    五个新键**不存在**（不是 0，是没有）。
+  - `replay` 的一手：`{"col":7,"color":"black","depth":0,"elapsed_ms":0,"method":"human","nodes":0,"row":7,
+    "score":0}`。
+  - 只点 `soft_time_ms` / `max_nodes` 的 `set_config` 帧在 HEAD 上 `timeout before/after = 8000/8000`：HEAD 既认不下
+    这两个键、也不受影响 ⇒ 老客户端不发它们时行为逐字不变。
+  同一棵 HEAD 树的 `test_server` 全套打印 **All server tests passed!**（`main()` 里那 34 条既有用例一字未改地全绿，
+  是「纯加字段」的机械证明；本树是 37 条）。
+- **两条受保护前提未移动**：`assert(result.resigned)` 仍在 `tests/test_search.cpp:2563`，
+  `completed.method == "alphabeta"` 仍在 `:3958`；本轮对 `test_search.cpp` 只有 8/8 的原地替换，没有插入。
+- diff 面：`src/server/server.cpp` 36/5、`src/server/game_manager.{h,cpp}` 79/10、`src/search/search_engine.{h,cpp}`
+  37/5、`src/training/game_record.{h,cpp}` 24/0、`src/training/self_play.cpp` 5/0、`src/search/search_limits.h` 1/1、
+  `web/app.js` 40/12、`README.md` 6/6、`tests/test_server.cpp` 288/3、`tests/web_frontend_check.js` 43/0、
+  `tests/test_search.cpp` 8/8。
+- 门禁数字见下方 Valgrind 段之后的 **Gate**。
+
+Valgrind（§5 的口径：`build-vg/` Debug + `-UNDEBUG`，计数 `grep -c '^==[0-9]*=='`，门禁是「相对干净基线零新增」）：
+
+- **A7 自己的三条**排在 `test_server.cpp` 的 `main()` 末尾，即既存全量中止点 `:1706`（轮次111 记的墙钟脆弱）之后，
+  全量跑不到 ⇒ 子集驱动 `/mnt/d/tmp/a7_vg_main.cpp`（同 `-Dmain=suite_main` 手法）：**`MEMCHECK_RC=0`、报告 0 行、
+  3 条全过**，并打印出上面那三份帧与回放的实测 JSON。
+- **A6 欠下的 A4 两条**（`test_aspiration_refines_without_changing_result` /
+  `test_search_engine_forwards_the_hint_to_the_search`）本树：**`MEMCHECK_RC=134`、报告 0 行**，第一条通过并打印
+  `no centre 249892 / centre 250886 / negated centre 249894` —— 与 A6 记的数字**逐字相同**，即减速没有改变「窗口
+  决定工作量」这条结论；第二条 SIGABRT 于 `tests/test_search.cpp:3497` `assert(plain.depth == 4)`。该用例把时限设成
+  600000 ms 并声称「这笔预算花不完」，但 memcheck 的减速下 depth 4 的一趟就能越过 600 s 的墙 ⇒ 这是一条**墙钟前提**，
+  与 A2/A6 记的 `test_engine_progress_callback_reports_each_layer`、`test_training.cpp:2055`、`test_server.cpp:1706`
+  同类。按「减速下死掉的门禁用例要在改动前树上重测，而不是删掉」的规矩，改动前树（`87ee891`，同一 Debug 形状、同一
+  套 memcheck 参数、串行独跑）的对照结果是：**`MEMCHECK_RC=134`、报告 0 行、4897 s**，第一条通过并打印
+  `no centre 249892 / centre 250886 / negated centre 249894` —— 与本树**逐字相同**的三个节点数，第二条 SIGABRT 于
+  **同一行** `tests/test_search.cpp:3497` `assert(plain.depth == 4)`。⇒ 中止点没有前移（既存墙钟脆弱，非本轮引入），
+  且 A7 对搜索可观测地为惰性：协议层改了九个键，节点数一位没变。这比原计划要的「对照只证明同类失败」更强，
+  因为它同时是本树与 `87ee891` 的**逐字节搜索结果一致性**证明。
+- 全量 `test_server` 本轮未跑：A7 没动任何搜索代码，三条新用例已由上面的子集覆盖，而全量套件仍会中止在 `:1706`。
+
+**Gate**（空闲树上复测，跑门禁时不与 memcheck 并发）：ctest **8/8 / 165.51 s**（`test_search` 138.52 s、
+`test_server` 9.38 s、`test_board` 0.03 s），web **105/105**，anchor **118 引用 / 0 problems**，README 仍 **658 行**。
+此前记的 203.14 s / 44.50 s 是与 memcheck 并发时的读数，本轮空闲复测取代它们；A7 的三条用例本身计时 0.00 s。
+
 ## 轮次121 引擎重构 A6：同分的根不再由容器顺序决定 — engine redesign stage A6
 
 规格 `docs/ENGINE_REDESIGN.md` §2.5.3 / §2.6 末段 + 验收 G4（冻结，不改写）。A6 动的是 P3 剩下的一半：A5 让评估知道

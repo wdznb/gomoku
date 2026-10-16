@@ -1051,10 +1051,11 @@ void test_resign_survives_interruption() {
 
         // 终止 arrived: stop_flag_ is up when the worker decides, and the
         // worker is driven directly so the window is deterministic. A4 put the
-        // session's reuse record in the worker's arguments; this game has none.
+        // session's reuse record in the worker's arguments and A7 the budget with
+        // it; this game has neither, so both stay at the engine's own defaults.
         game.stop_flag_.store(true);
         std::thread worker(&GameManager::ai_thinking_worker, &game, 2000, 2,
-                           GameManager::Reuse{});
+                           GameManager::Reuse{}, GameManager::Budget{});
         worker.join();
 
         assert(game.status() == GameStatus::GAME_OVER);
@@ -1080,7 +1081,7 @@ void test_resign_survives_interruption() {
         game.set_game_over_callback([&](int, const std::string&) { ++frames; });
         game.stop_flag_.store(true);
         std::thread worker(&GameManager::ai_thinking_worker, &game, 2000, 2,
-                           GameManager::Reuse{});
+                           GameManager::Reuse{}, GameManager::Budget{});
         worker.join();
         assert(game.status() == GameStatus::PLAYING);
         assert(frames == 1);  // unchanged: no second callback
@@ -2559,6 +2560,287 @@ void test_a_half_written_encoding_does_not_veto_a_bitboard_upload() {
               << std::endl;
 }
 
+// A7 (design doc 2.3.3, G2): the progress frame has to say which layer broke and how
+// far into it the think got, because `depth` alone cannot tell "ran out of budget
+// inside layer 6" from "had nothing to search". The accounting itself is proved in
+// test_search against an injected clock; what is proved here is the wire - the five
+// new keys, each `stopped` reason reaching the client by name, and the old three
+// keeping the meanings they had when the frame carried only those.
+void test_thinking_progress_carries_partial_fields() {
+    const auto dir = scratch("progress_a7_sessions");
+    {
+        Harness h(dir, std::filesystem::path());
+        size_t seen = 0;
+
+        SearchStats cut;
+        cut.completed_depth = 5;
+        cut.partial_depth = 6;
+        cut.root_moves_done = 12;
+        cut.root_moves_total = 34;
+        cut.seldepth = 7;
+        cut.nodes = 123456;
+        cut.elapsed_ms = 4800;
+        cut.stopped = StopReason::TIME_HARD;
+        h.entry->game->progress_callback_(cut);
+        std::vector<std::string> frames = drain_frames(h.server, h.socket, seen);
+        assert(frames.size() == 1);
+        const json hard = json::parse(frames[0]);
+        std::cout << "  [r121a7] progress frame: " << hard.dump() << std::endl;
+        assert(hard["type"] == "thinking_progress");
+        assert(hard["depth"] == 5);
+        assert(hard["nodes"] == 123456);
+        assert(hard["elapsed_ms"] == 4800);
+        assert(hard["partial_depth"] == 6);
+        assert(hard["root_moves_done"] == 12);
+        assert(hard["root_moves_total"] == 34);
+        assert(hard["seldepth"] == 7);
+        assert(hard["stopped"] == "time_hard");
+
+        // Control: a think stopped at a layer boundary interrupted nothing, so the
+        // same keys answer 0 rather than going missing on the client.
+        SearchStats at_boundary;
+        at_boundary.completed_depth = 8;
+        at_boundary.nodes = 987654;
+        at_boundary.elapsed_ms = 1200;
+        at_boundary.seldepth = 9;
+        at_boundary.stopped = StopReason::TIME_SOFT;
+        h.entry->game->progress_callback_(at_boundary);
+        frames = drain_frames(h.server, h.socket, seen);
+        assert(frames.size() == 1);
+        const json soft = json::parse(frames[0]);
+        assert(soft["depth"] == 8);
+        assert(soft["partial_depth"] == 0);
+        assert(soft["root_moves_done"] == 0);
+        assert(soft["root_moves_total"] == 0);
+        assert(soft["seldepth"] == 9);
+        assert(soft["stopped"] == "time_soft");
+
+        // Every reason arrives as a name, and "none" is the only one the page stays
+        // silent on. The three the page cannot produce by itself (a user 终止, a
+        // proven mate, an exhausted node budget) are named like the rest.
+        const StopReason reasons[] = {StopReason::NONE, StopReason::TIME_SOFT,
+                                      StopReason::TIME_HARD, StopReason::NODES,
+                                      StopReason::USER, StopReason::MATE};
+        const char* const names[] = {"none", "time_soft", "time_hard", "nodes",
+                                     "user", "mate"};
+        for (size_t i = 0; i < sizeof(reasons) / sizeof(reasons[0]); ++i) {
+            SearchStats stats;
+            stats.stopped = reasons[i];
+            h.entry->game->progress_callback_(stats);
+            frames = drain_frames(h.server, h.socket, seen);
+            assert(frames.size() == 1);
+            const json answer = json::parse(frames[0]);
+            std::cout << "  [r121a7] stopped " << names[i] << " => "
+                      << answer.value("stopped", std::string()) << std::endl;
+            assert(answer["stopped"] == names[i]);
+            // A frame that says nothing else must still be a whole frame: the old
+            // three keys are always present, at zero, never absent.
+            assert(answer["depth"] == 0);
+            assert(answer["nodes"] == 0);
+            assert(answer["elapsed_ms"] == 0);
+        }
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    std::cout << "test_thinking_progress_carries_partial_fields passed" << std::endl;
+}
+
+// A7: the accounting is only worth having if it survives the three hops it is used
+// for - into the `replay` frame 回放 reads, into the session file and back out of
+// it, and out of a file written before the keys existed, which reads as "every layer
+// finished" (README:531).
+void test_replay_roundtrip_keeps_new_fields() {
+    const auto dir = scratch("replay_a7_sessions");
+    const auto records = scratch("replay_a7_records.jsonl");
+    const auto wall_ms = [] {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::system_clock::now().time_since_epoch()).count();
+    };
+    {
+        Harness h(dir, records);
+        GameRestore restore = playing_restore(2);
+        MoveAnalysis& broken = restore.moves[1];
+        broken.method = "alphabeta";
+        broken.score = 500;
+        broken.depth = 5;
+        broken.nodes = 123456;
+        broken.elapsed_ms = 4800;
+        broken.partial_depth = 6;
+        broken.root_moves_done = 12;
+        broken.root_moves_total = 34;
+        broken.seldepth = 7;
+        broken.stopped = "time_hard";
+        assert(h.entry->game->restore_game(restore));
+        const std::string token = h.entry->token;
+
+        // 1. The frame the client reads.
+        size_t seen = 0;
+        h.server.handle_request_replay(h.socket);
+        std::vector<std::string> frames = drain_frames(h.server, h.socket, seen);
+        assert(frames.size() == 1);
+        json replay = json::parse(frames[0]);
+        assert(replay["type"] == "replay");
+        assert(replay["moves"].size() == 2);
+        std::cout << "  [r121a7] replay ply 2: " << replay["moves"][1].dump() << std::endl;
+        assert(replay["moves"][1]["partial_depth"] == 6);
+        assert(replay["moves"][1]["root_moves_done"] == 12);
+        assert(replay["moves"][1]["root_moves_total"] == 34);
+        assert(replay["moves"][1]["seldepth"] == 7);
+        assert(replay["moves"][1]["stopped"] == "time_hard");
+        // Control: the neighbour ply was never cut and does not borrow the answer.
+        assert(replay["moves"][0]["partial_depth"] == 0);
+        assert(replay["moves"][0]["stopped"] == "none");
+
+        // 2. The file on disk, written by the session's own writer.
+        h.server.flush_entry(h.entry);
+        SessionSnapshot on_disk;
+        std::string error;
+        assert(load_session(dir.string(), token, on_disk, error));
+        assert(on_disk.record.moves.size() == 2);
+        assert(on_disk.record.moves[1].partial_depth == 6);
+        assert(on_disk.record.moves[1].root_moves_done == 12);
+        assert(on_disk.record.moves[1].root_moves_total == 34);
+        assert(on_disk.record.moves[1].seldepth == 7);
+        assert(on_disk.record.moves[1].stopped == "time_hard");
+
+        // 3. The same file with the five keys erased - what a pre-A7 session looks
+        // like. It is a readable record with no answer to "which layer broke", not a
+        // broken one, so the reader's job is to say 0 / "none" and still build.
+        json legacy = json::parse(read_text(h.session_file()));
+        legacy["token"] = "a7000000000000f7";
+        for (json& entry : legacy["record"]["moves"]) {
+            for (const char* key : {"partial_depth", "root_moves_done",
+                                    "root_moves_total", "seldepth", "stopped"}) {
+                entry.erase(key);
+            }
+        }
+        const std::string legacy_text = legacy.dump();
+        assert(legacy_text.find("partial_depth") == std::string::npos);
+        SessionSnapshot old_format;
+        assert(session_from_json(legacy_text, old_format, error));
+        assert(old_format.record.moves[1].partial_depth == 0);
+        assert(old_format.record.moves[1].root_moves_done == 0);
+        assert(old_format.record.moves[1].seldepth == 0);
+        assert(old_format.record.moves[1].stopped == "none");
+        const std::shared_ptr<GameServer::TrackedGame> rebuilt =
+            h.server.open_session(&old_format);
+        assert(rebuilt->rebuilt);
+        const ReplaySnapshot rebuilt_replay = rebuilt->game->replay_snapshot();
+        assert(rebuilt_replay.moves.size() == 2);
+        assert(rebuilt_replay.moves[1].depth == 5);
+        assert(rebuilt_replay.moves[1].stopped == "none");
+        assert(rebuilt_replay.moves[1].partial_depth == 0);
+
+        // 4. The whole takeover path: shelved past the reattach window, rebuilt from
+        // disk by the second socket, and the frame it is handed still names layer 6.
+        h.server.detach_socket(h.socket.get());
+        h.entry->detached_ms = wall_ms() - 30LL * 60LL * 1000LL - 10;
+        h.server.on_flush_tick();
+        assert(h.server.cold_sessions_.count(token) == 1);
+
+        auto second = std::make_shared<WebSocketSession>(tcp::socket(h.server.ioc_), std::string());
+        size_t second_seen = 0;
+        h.server.handle_resume(second, json{{"token", token}});
+        h.server.handle_request_replay(second);
+        for (const std::string& text : drain_frames(h.server, second, second_seen)) {
+            const json parsed = json::parse(text, nullptr, false);
+            if (!parsed.is_discarded() && parsed.value("type", "") == "replay") {
+                replay = parsed;
+            }
+        }
+        std::cout << "  [r121a7] resumed replay ply 2: " << replay["moves"][1].dump()
+                  << std::endl;
+        assert(replay["moves"][1]["partial_depth"] == 6);
+        assert(replay["moves"][1]["root_moves_done"] == 12);
+        assert(replay["moves"][1]["root_moves_total"] == 34);
+        assert(replay["moves"][1]["seldepth"] == 7);
+        assert(replay["moves"][1]["stopped"] == "time_hard");
+        assert(replay["moves"][0]["stopped"] == "none");
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    std::filesystem::remove(records, ec);
+    std::cout << "test_replay_roundtrip_keeps_new_fields passed" << std::endl;
+}
+
+// A7's other half: the two budgets a client may name. README:345 fixes the three
+// rules - a frame that names a key only changes that key, `soft_time_ms` is kept
+// inside the hard deadline it is meant to cut short, and 0 asks for the pre-A7
+// behavior (no soft window, node ceiling derived from the time). Neither is
+// persisted, so a resume hands back the defaults.
+void test_set_config_keeps_the_two_optional_budgets() {
+    const auto dir = scratch("budget_a7_sessions");
+    {
+        Harness h(dir, std::filesystem::path());
+        // Two stones, so the session below has something to write: a zero-stone
+        // game takes flush_entry's delete-the-residue branch instead.
+        assert(h.entry->game->restore_game(playing_restore(2)));
+        auto apply = [&](const json& frame, int& soft, int& nodes) {
+            h.server.handle_set_config(h.socket, frame);
+            soft = h.entry->game->soft_time_ms();
+            nodes = h.entry->game->max_nodes();
+        };
+        int soft = -1;
+        int nodes = -1;
+
+        apply(json{{"timeout_ms", 8000}, {"max_depth", 6}}, soft, nodes);
+        std::cout << "  [r121a7] no budget named => " << soft << "/" << nodes << std::endl;
+        assert(soft == 0);
+        assert(nodes == 0);
+
+        // Both named, inside the window: both taken.
+        apply(json{{"soft_time_ms", 3000}, {"max_nodes", 50000}}, soft, nodes);
+        assert(soft == 3000);
+        assert(nodes == 50000);
+
+        // A soft deadline past the hard one asks for nothing the hard one does not
+        // already give, so it lands on the deadline instead of beyond it.
+        apply(json{{"timeout_ms", 8000}, {"soft_time_ms", 20000}}, soft, nodes);
+        std::cout << "  [r121a7] soft 20000 over hard 8000 => " << soft << std::endl;
+        assert(soft == 8000);
+
+        // Control: naming one key still leaves the other alone - the same per-key
+        // rule the round-88 config halves are held to.
+        apply(json{{"max_nodes", 1234}}, soft, nodes);
+        assert(soft == 8000);
+        assert(nodes == 1234);
+
+        // 0 on either is a request for the derived budget, not a budget of nothing.
+        apply(json{{"soft_time_ms", 0}, {"max_nodes", 0}}, soft, nodes);
+        assert(soft == 0);
+        assert(nodes == 0);
+
+        // A non-positive node count below zero is not a budget either.
+        apply(json{{"max_nodes", -5}}, soft, nodes);
+        assert(nodes == 0);
+
+        // The two budgets are not part of the session file, unlike the timeout and
+        // the depth (README:345): the file says what the game is, not what a client
+        // last asked a single think to cost.
+        apply(json{{"timeout_ms", 9000}, {"max_depth", 7},
+                   {"soft_time_ms", 3000}, {"max_nodes", 50000}},
+              soft, nodes);
+        assert(soft == 3000);
+        assert(nodes == 50000);
+        h.server.flush_entry(h.entry);
+        const std::string file_text = read_text(h.session_file());
+        std::cout << "  [r121a7] session file names soft_time_ms="
+                  << (file_text.find("soft_time_ms") != std::string::npos)
+                  << ", max_nodes=" << (file_text.find("max_nodes") != std::string::npos)
+                  << std::endl;
+        assert(file_text.find("soft_time_ms") == std::string::npos);
+        assert(file_text.find("max_nodes") == std::string::npos);
+        SessionSnapshot on_disk;
+        std::string error;
+        assert(load_session(dir.string(), h.entry->token, on_disk, error));
+        assert(on_disk.timeout_ms == 9000);
+        assert(on_disk.max_depth == 7);
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    std::cout << "test_set_config_keeps_the_two_optional_budgets passed" << std::endl;
+}
+
 int main() {
     std::cout << "Running server tests..." << std::endl;
 
@@ -2598,6 +2880,9 @@ int main() {
     test_a_shelved_contentless_session_does_not_keep_its_token();
     test_a_shelved_played_session_keeps_its_token();
     test_a_half_written_encoding_does_not_veto_a_bitboard_upload();
+    test_thinking_progress_carries_partial_fields();
+    test_replay_roundtrip_keeps_new_fields();
+    test_set_config_keeps_the_two_optional_budgets();
 
     std::cout << "All server tests passed!" << std::endl;
     return 0;

@@ -342,7 +342,7 @@ AI 不会自动落子。玩家随后选择执子颜色或直接落子，这局�
 
 - **超时秒**: AI 思考的最大时间（**秒**）。搜索越深需要越长的截止时间，所以这个框的取值范围由深度决定：
   最小 `深度 × 2`、最大 `深度 × 4`，改深度时自动回到该区间的最小值（默认即是），手填越界会被夹回来。
-  下发服务器时换算成毫秒，服务器限制在 100–120000
+  下发服务器时换算成毫秒，服务器限制在 100–120000。`set_config` 另有两键 `soft_time_ms` / `max_nodes`：网页不发，缺省即上面的行为（不设软时限、节点预算由剩余时间换算），别的客户端可以用它们把一手棋限定到某个思考时间或某个节点数；`soft_time_ms` 会被夹到 `timeout_ms` 以内，非正数的 `max_nodes` 按缺省处理
 - **深度**: AI 搜索的最大深度（2–20）。输入框的范围只是网页规则，服务器对 `set_config` 与
   `request_hint` 送来的 `max_depth` 一律夹到 1–20，回读到的即是夹取后的值
 - 两项改动会通过 `set_config` 立即下发，对本局后续的 AI 落子生效；恢复会话时按会话保存的值回填
@@ -496,7 +496,7 @@ ctest --output-on-failure
 {"type": "ai_move", "row": 7, "col": 8, "color": "white", "score": 1234, "thinking_time_ms": 5000}
 {"type": "undo_success", "move_count": 4, "game_status": "playing"}
 {"type": "hint_result", "row": 8, "col": 8, "score": 1234}
-{"type": "thinking_progress", "depth": 4, "nodes": 50000}
+{"type": "thinking_progress", "depth": 4, "nodes": 50000, "elapsed_ms": 480, "partial_depth": 0, "root_moves_done": 34, "root_moves_total": 34, "seldepth": 7, "stopped": "none"}
 {"type": "game_over", "winner": "black", "reason": "five"}
 {"type": "game_restarted", "game_status": "waiting"}
 {"type": "session", "token": "9af83343549460e1", "resumed": true, "player_color": "black",
@@ -504,8 +504,8 @@ ctest --output-on-failure
  "winner": "", "reason": "", "timeout_ms": 5000, "max_depth": 8, "board": [[...]]}
 {"type": "session_taken_over", "token": "9af83343549460e1"}
 {"type": "replay", "game_over": true, "winner": "white", "reason": "resign",
- "moves": [{"row": 7, "col": 7, "color": "black", "method": "human",
-            "score": 0, "depth": 0, "nodes": 0, "elapsed_ms": 0}],
+ "moves": [{"row": 7, "col": 7, "color": "black", "method": "human", "score": 0, "depth": 0, "nodes": 0,
+            "elapsed_ms": 0, "partial_depth": 0, "root_moves_done": 0, "root_moves_total": 0, "seldepth": 0, "stopped": "none"}],
  "base": [{"row": 8, "col": 8, "color": "white"}]}
 {"type": "error", "message": "Invalid move"}
 {"type": "position_preview", "ok": true, "black_count": 3, "white_count": 2, "side_to_move": "white",
@@ -518,7 +518,7 @@ ctest --output-on-failure
 
 `state_sync`（`choose_side` 的回应）与 `session`（`resume` 的回应、服务器开局新会话时的主动播报）
 携带**服务器权威棋盘**：前端必须照它们重画棋盘并采用其中的 `current_turn`，否则页面上可能显示服务器
-并没有的子。`thinking_progress` 的 `elapsed_ms` 与 `depth` 随迭代加深推进，`ai_move` 是这一次思考的
+并没有的子。`thinking_progress` 的 `elapsed_ms` 与 `depth` 随迭代加深推进，并带上这次思考的分层记账：`partial_depth` 是被截断的那一层（`0` = 没有）、`root_moves_done` / `root_moves_total` 是这一层搜到第几个候选、`seldepth` 是静态搜索到达的最深 ply、`stopped` 说明它为什么没继续（`none` / `time_soft` / `time_hard` / `nodes` / `user` / `mate`）；「没时间了」与「没什么可搜」由此是两个不同的帧。网页只在 `stopped` 不为 `none` 时把这段显示成「第 N 层中断（x/y）」，`ai_move` 是这一次思考的
 终点。终结全局的那一手先回落子帧再结算：玩家一子先 `move_made`、AI 一子先 `ai_move`，其后才是 `game_over`。
 
 `session_taken_over` 只在同一个 token 被另一个标签页 `resume` 接管时出现：服务器把它发给被替掉的
@@ -528,7 +528,7 @@ ctest --output-on-failure
 
 `replay` 是本会话对局的逐手分析：`method` 为 `human` 表示玩家落子（无搜索数据），其余为引擎返回路径
 （`book` / `vcf` / `vct` / `alphabeta` / `greedy` / `forced` / `greedy_five` / `must_block`），后三条是搜索前的
-快速路径（只剩一个候选点、自己一手成五、对方一手成五不得不挡），它们照样落子、照样进分析；`score` 是**刚落子一方**视角的分值，非 AlphaBeta 路径不填 `depth` / `nodes`，这三条也一样。`must_block` 的 99000 只是防守标记分：它低于前端判定已证胜负的阈值（`|score| >= 99999`），既不会显示成「胜/负」，也不会在评估曲线上画红点，只是被 ±2000 截断后贴在曲线边缘的一个大分。`base` 是摆棋摆上去、
+快速路径（只剩一个候选点、自己一手成五、对方一手成五不得不挡），它们照样落子、照样进分析；`score` 是**刚落子一方**视角的分值，非 AlphaBeta 路径不填 `depth` / `nodes`，这三条也一样。每手另带 `partial_depth` / `root_moves_done` / `root_moves_total` / `seldepth` / `stopped`，即 `thinking_progress` 那份分层记账，回放里被截断的那一手显示成「第 N 层中断（x/y）」；早于它们的存档没有这几个键，读回来按「每层都搜完了」（`0` 与 `"none"`）算。`must_block` 的 99000 只是防守标记分：它低于前端判定已证胜负的阈值（`|score| >= 99999`），既不会显示成「胜/负」，也不会在评估曲线上画红点，只是被 ±2000 截断后贴在曲线边缘的一个大分。`base` 是摆棋摆上去、
 `moves` 里没有的那些子：只有 `moves` 读不出摆棋对局的棋盘，前端重画时先铺 `base` 再按顺序落 `moves`，
 轮次也按两者之和取。
 

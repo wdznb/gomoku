@@ -111,6 +111,11 @@ GameRecord SelfPlay::run(const std::vector<Move>& prefix,
         entry.nodes = result.nodes_searched;
         entry.elapsed_ms = result.elapsed_ms;
         entry.method = result.method;
+        entry.partial_depth = result.partial_depth;
+        entry.root_moves_done = result.root_moves_done;
+        entry.root_moves_total = result.root_moves_total;
+        entry.seldepth = result.seldepth;
+        entry.stopped = result.stopped;
         record.moves.push_back(entry);
 
         record.total_nodes += result.nodes_searched;

@@ -40,7 +40,13 @@ struct SearchResult {
     std::string stopped = "none";
 };
 
-using ProgressCallback = std::function<void(int depth, int nodes, int elapsed_ms)>;
+// One frame per AlphaBeta layer, so a long think does not go silent between the
+// start and the answer. The frame used to carry three ints and could not tell
+// "ran out of budget inside layer 6" from "had nothing to search", which is the
+// whole difference the layered accounting exists to show; it now carries that
+// accounting and each caller picks what its consumer displays. elapsed_ms is the
+// move clock read once per frame by SearchEngine, never a sum of phase slices.
+using ProgressCallback = std::function<void(const SearchStats&)>;
 
 class SearchEngine {
 public:
@@ -60,6 +66,16 @@ public:
     void set_vcf_depth(int d) { vcf_max_depth_ = d; }
     void set_vct_depth(int d) { vct_max_depth_ = d; }
     void set_alphabeta_depth(int d) { alphabeta_max_depth_ = d; }
+
+    // The two budgets the client may name besides the hard wall clock (design doc
+    // 2.3.1): a soft deadline that only decides whether another layer starts, and a
+    // node ceiling that replaces the time-derived budget outright. Zero on the node
+    // ceiling keeps the budget the remaining time derives; zero on the soft deadline
+    // means no soft window at all, which is what every caller that never named one
+    // had before. A node ceiling is what makes a training think cost the same twice,
+    // which a millisecond budget cannot promise on a loaded machine.
+    void set_soft_time_ms(int ms) { soft_time_ms_ = ms > 0 ? ms : 0; }
+    void set_max_nodes(int nodes) { max_nodes_ = nodes > 0 ? nodes : 0; }
 
     void set_coefficients(const ThreatCoefficients& coeffs);
 
@@ -119,6 +135,8 @@ private:
     int vcf_max_depth_;
     int vct_max_depth_;
     int alphabeta_max_depth_;
+    int soft_time_ms_ = 0;
+    int max_nodes_ = 0;
 
     bool resign_detection_;
     int resign_node_limit_;

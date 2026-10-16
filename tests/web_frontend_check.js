@@ -3723,6 +3723,49 @@ check('VV3b control: the drop on the label itself still reads the file', () => {
     assert(game.setup.preview === null, 'a fresh file drops the old recognition');
 });
 
+// A7 (design doc 2.3.3, G2): the frame that reports a think now names the layer it
+// broke in and how far into that layer it got, which is the one thing about a cut
+// think the player could not see. README:521 keeps the display to the case where
+// `stopped` says something was interrupted.
+check('ENG-A7 一条 time_hard 的 thinking_progress 把中断层报进副行', () => {
+    const game = adviceGame();
+    game.currentTurn = WHITE;  // the AI's turn, so the frame is a live think
+    // #turn-info is shared element state and the case before this one may have
+    // written it; start from empty so the line below is this frame's doing.
+    el('turn-info').textContent = '';
+    game.handleServerMessage({
+        type: 'thinking_progress', depth: 5, nodes: 123456, elapsed_ms: 4800,
+        partial_depth: 6, root_moves_done: 12, root_moves_total: 34,
+        seldepth: 7, stopped: 'time_hard',
+    });
+    const line = el('turn-info').textContent;
+    assert(line.indexOf('第 6 层中断（12/34）') >= 0,
+           'the cut layer and its progress are named, got: ' + line);
+    assert(line.indexOf('轮到') === 0,
+           'and it is appended to the turn line the page already showed, got: ' + line);
+});
+
+check('ENG-A7 搜完了的思考与不带这几个键的老服务器都不写中断文案', () => {
+    const game = adviceGame();
+    game.currentTurn = WHITE;
+    el('turn-info').textContent = '';
+    game.handleServerMessage({
+        type: 'thinking_progress', depth: 8, nodes: 987654, elapsed_ms: 1200,
+        partial_depth: 0, root_moves_done: 0, root_moves_total: 0,
+        seldepth: 9, stopped: 'none',
+    });
+    assert(el('turn-info').textContent === '',
+           'stopped "none" has nothing to report, got: ' + el('turn-info').textContent);
+
+    // The absent-key half is what an old server sends; the frame must read the same.
+    const old = adviceGame();
+    old.currentTurn = WHITE;
+    old.handleServerMessage({ type: 'thinking_progress', depth: 4, nodes: 1200 });
+    assert(el('turn-info').textContent === '',
+           'and a frame with no accounting at all stays silent too, got: '
+           + el('turn-info').textContent);
+});
+
 let failed = 0;
 for (const result of results) {
     console.log(`${result.ok ? 'PASS' : 'FAIL'} ${result.label}` +

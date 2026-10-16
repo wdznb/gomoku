@@ -26,6 +26,23 @@ int clamp_max_depth(int max_depth) {
     if (max_depth > 20) return 20;
     return max_depth;
 }
+
+// The soft deadline is the point a think stops starting another layer, so a value
+// at or above the hard one asks for nothing the hard one does not already give:
+// keep it inside the window it is meant to cut short. Zero stays zero, which is
+// the engine's "no soft window" answer rather than a deadline of no length.
+int clamp_soft_time_ms(int soft_time_ms, int hard_time_ms) {
+    if (soft_time_ms <= 0) return 0;
+    if (soft_time_ms > hard_time_ms) return hard_time_ms;
+    return soft_time_ms;
+}
+
+// A node budget is what makes a think cost the same twice, and unlike the timeout
+// it cannot be turned into unbounded work by a big value: the hard deadline still
+// applies. Zero means the time-derived ceiling this engine has always used.
+int clamp_max_nodes(int max_nodes) {
+    return max_nodes > 0 ? max_nodes : 0;
+}
 }
 
 GameManager::GameManager() 
@@ -37,9 +54,9 @@ GameManager::GameManager()
     // The engine only fires its own progress hook; forward it to whichever
     // consumer installed a GameManager progress_callback_ so the client's
     // "thinking_progress" messages actually flow.
-    engine_.set_progress_callback([this](int depth, int nodes, int elapsed_ms) {
+    engine_.set_progress_callback([this](const SearchStats& stats) {
         if (progress_callback_) {
-            progress_callback_(depth, nodes, elapsed_ms);
+            progress_callback_(stats);
         }
     });
 }
@@ -328,8 +345,16 @@ bool GameManager::request_hint(int timeout_ms, int max_depth) {
         reuse = take_hint(turn);
     }
 
+    // The budget is the session's, but 求招 carries its own timeout and that is the
+    // hard deadline the soft window has to fit inside.
+    Budget budget = take_budget();
+    budget.soft_time_ms = clamp_soft_time_ms(budget.soft_time_ms, timeout_ms);
+
     hint_thread_ = std::make_unique<std::thread>(
-        [this, board_snapshot, turn, timeout_ms, max_depth, snapshot_move_count, reuse]() mutable {
+        [this, board_snapshot, turn, timeout_ms, max_depth, snapshot_move_count, reuse,
+         budget]() mutable {
+            engine_.set_soft_time_ms(budget.soft_time_ms);
+            engine_.set_max_nodes(budget.max_nodes);
             if (reuse.valid) {
                 engine_.set_hint(reuse.move, reuse.score);
             } else {
@@ -411,7 +436,8 @@ void GameManager::start_ai_thinking(int timeout_ms, int max_depth) {
     max_depth_ = max_depth;
     
     search_thread_ = std::make_unique<std::thread>(
-        &GameManager::ai_thinking_worker, this, timeout_ms, max_depth, reuse);
+        &GameManager::ai_thinking_worker, this, timeout_ms, max_depth, reuse,
+        take_budget());
 }
 
 void GameManager::start_ai_thinking() {
@@ -422,13 +448,16 @@ void GameManager::stop_thinking() {
     stop_flag_.store(true);
 }
 
-void GameManager::ai_thinking_worker(int timeout_ms, int max_depth, Reuse reuse) {
+void GameManager::ai_thinking_worker(int timeout_ms, int max_depth, Reuse reuse,
+                                     Budget budget) {
     Board snapshot;
     {
         std::lock_guard<std::mutex> lock(thinking_mutex_);
         snapshot = board_;
     }
 
+    engine_.set_soft_time_ms(budget.soft_time_ms);
+    engine_.set_max_nodes(budget.max_nodes);
     if (reuse.valid) {
         engine_.set_hint(reuse.move, reuse.score);
     } else {
@@ -467,7 +496,9 @@ void GameManager::ai_thinking_worker(int timeout_ms, int max_depth, Reuse reuse)
             engine_.transposition_table().advance_generation();
             analyses_.push_back(MoveAnalysis{result.best_move, result.score, result.depth,
                                              result.nodes_searched, result.elapsed_ms,
-                                             result.method});
+                                             result.method, result.partial_depth,
+                                             result.root_moves_done, result.root_moves_total,
+                                             result.seldepth, result.stopped});
             // The session remembers this think for the next one of the same colour.
             // Only AlphaBeta's number is a position value: the tactical and forced
             // paths report a sentinel, and centring a window on one of those buys
@@ -518,9 +549,14 @@ void GameManager::set_opening_book(const OpeningBook* book) {
     engine_.set_opening_book(book);
 }
 
-void GameManager::set_config(int timeout_ms, int max_depth) {
+void GameManager::set_config(int timeout_ms, int max_depth,
+                             int soft_time_ms, int max_nodes) {
     timeout_ms_ = clamp_timeout_ms(timeout_ms);
     max_depth_ = clamp_max_depth(max_depth);
+    // An unnamed override keeps what the session already had: the same rule the
+    // frame reader applies, so set_config is the one place that decides a budget.
+    if (soft_time_ms >= 0) soft_time_ms_ = clamp_soft_time_ms(soft_time_ms, timeout_ms_);
+    if (max_nodes >= 0) max_nodes_ = clamp_max_nodes(max_nodes);
 }
 
 }

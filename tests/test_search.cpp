@@ -914,9 +914,9 @@ void test_engine_progress_callback_reports_each_layer() {
     std::vector<int> depths;
     bool search_returned = false;
     bool any_after_return = false;
-    engine.set_progress_callback([&](int depth, int, int) {
+    engine.set_progress_callback([&](const SearchStats& stats) {
         if (search_returned) any_after_return = true;
-        depths.push_back(depth);
+        depths.push_back(stats.completed_depth);
     });
 
     std::atomic<bool> stop(false);
@@ -1139,10 +1139,10 @@ void test_engine_progress_frames_share_the_search_clock() {
     std::vector<int> elapsed;
     bool returned = false;
     bool after_return = false;
-    engine.set_progress_callback([&](int depth, int, int elapsed_ms) {
+    engine.set_progress_callback([&](const SearchStats& stats) {
         if (returned) after_return = true;
-        depths.push_back(depth);
-        elapsed.push_back(elapsed_ms);
+        depths.push_back(stats.completed_depth);
+        elapsed.push_back(stats.elapsed_ms);
     });
 
     const auto t0 = std::chrono::steady_clock::now();
@@ -3907,9 +3907,9 @@ void test_engine_reports_the_interrupted_alphabeta_layer() {
     int frame_depth = -1;
     int frame_nodes = -1;
     engine.set_progress_callback(
-        [&](int depth, int nodes, int) {
-            frame_depth = depth;
-            frame_nodes = nodes;
+        [&](const SearchStats& stats) {
+            frame_depth = stats.completed_depth;
+            frame_nodes = static_cast<int>(stats.nodes);
         });
 
     const SearchResult interrupted = engine.search(board, WHITE, 4, 10, stop);

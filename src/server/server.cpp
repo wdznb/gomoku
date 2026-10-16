@@ -194,6 +194,11 @@ MoveRecord record_of(const MoveAnalysis& analysis) {
     entry.nodes = analysis.nodes;
     entry.elapsed_ms = analysis.elapsed_ms;
     entry.method = analysis.method;
+    entry.partial_depth = analysis.partial_depth;
+    entry.root_moves_done = analysis.root_moves_done;
+    entry.root_moves_total = analysis.root_moves_total;
+    entry.seldepth = analysis.seldepth;
+    entry.stopped = analysis.stopped;
     return entry;
 }
 
@@ -205,6 +210,11 @@ MoveAnalysis analysis_of(const MoveRecord& entry) {
     analysis.nodes = entry.nodes;
     analysis.elapsed_ms = entry.elapsed_ms;
     analysis.method = entry.method;
+    analysis.partial_depth = entry.partial_depth;
+    analysis.root_moves_done = entry.root_moves_done;
+    analysis.root_moves_total = entry.root_moves_total;
+    analysis.seldepth = entry.seldepth;
+    analysis.stopped = entry.stopped;
     return analysis;
 }
 
@@ -1043,6 +1053,11 @@ void GameServer::handle_request_replay(std::shared_ptr<WebSocketSession> session
         entry["nodes"] = analysis.nodes;
         entry["elapsed_ms"] = analysis.elapsed_ms;
         entry["method"] = analysis.method;
+        entry["partial_depth"] = analysis.partial_depth;
+        entry["root_moves_done"] = analysis.root_moves_done;
+        entry["root_moves_total"] = analysis.root_moves_total;
+        entry["seldepth"] = analysis.seldepth;
+        entry["stopped"] = analysis.stopped;
         moves_json.push_back(entry);
     }
     // The stones a hand-set position laid down. Without them the move list is not
@@ -1123,7 +1138,12 @@ void GameServer::handle_set_config(std::shared_ptr<WebSocketSession> session, co
     auto& game = it->second;
     const int timeout_ms = get_int_or(msg, "timeout_ms", game->timeout_ms());
     const int max_depth = get_int_or(msg, "max_depth", game->max_depth());
-    game->set_config(timeout_ms, max_depth);
+    // Optional since A7: a frame that names neither keeps the session's budget, and
+    // a 0 asks the engine for the behavior every session had before - the node
+    // ceiling derived from the remaining time, and no soft window at all.
+    const int soft_time_ms = get_int_or(msg, "soft_time_ms", game->soft_time_ms());
+    const int max_nodes = get_int_or(msg, "max_nodes", game->max_nodes());
+    game->set_config(timeout_ms, max_depth, soft_time_ms, max_nodes);
 }
 
 void GameServer::handle_restart(std::shared_ptr<WebSocketSession> session) {
@@ -1636,12 +1656,23 @@ void GameServer::clear_game_callbacks(GameManager& game) {
 }
 
 void GameServer::setup_game_callbacks(std::shared_ptr<WebSocketSession> session, GameManager& game) {
-    game.set_progress_callback([this, session](int depth, int nodes, int elapsed_ms) {
+    // depth / nodes / elapsed_ms keep the meanings they had when the frame carried
+    // only these three. The rest says how far the think got: partial_depth is the
+    // layer that was cut (0 = none), the two root counts are how far into it it got,
+    // seldepth the deepest quiescence reach, and stopped why it ended - so "ran out
+    // of budget inside layer 6" and "had nothing to search" are different frames
+    // (design doc 2.3.3, G2).
+    game.set_progress_callback([this, session](const SearchStats& stats) {
         json msg;
         msg["type"] = "thinking_progress";
-        msg["depth"] = depth;
-        msg["nodes"] = nodes;
-        msg["elapsed_ms"] = elapsed_ms;
+        msg["depth"] = stats.completed_depth;
+        msg["nodes"] = static_cast<int>(stats.nodes);
+        msg["elapsed_ms"] = stats.elapsed_ms;
+        msg["partial_depth"] = stats.partial_depth;
+        msg["root_moves_done"] = stats.root_moves_done;
+        msg["root_moves_total"] = stats.root_moves_total;
+        msg["seldepth"] = stats.seldepth;
+        msg["stopped"] = stop_reason_name(stats.stopped);
         send_message(session, msg);
     });
     
