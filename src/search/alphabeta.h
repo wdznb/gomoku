@@ -5,6 +5,7 @@
 #include "../core/evaluator.h"
 #include "../core/pattern.h"
 #include "../optimization/transposition.h"
+#include "move_generator.h"
 #include "search_limits.h"
 #include "search_state.h"
 #include <atomic>
@@ -94,6 +95,10 @@ public:
 private:
     const Evaluator& evaluator_;
     TranspositionTable& tt_;
+    // The tiered candidate source (design doc 2.5.1): which squares a layer is
+    // allowed to search is its decision, the search only orders and iterates the
+    // result.
+    MoveGenerator move_gen_;
     int node_limit_;
     // Only the layered accounting left in the object: the counters and the three
     // ways a think can end live in the context, so the stop test is one function
@@ -117,7 +122,11 @@ private:
     NodeResult quiescence(Board& board, int alpha, int beta, int color,
                           std::atomic<bool>& stop_flag, int qdepth);
 
-    std::vector<Move> generate_moves(const Board& board, int color);
+    // The tiered candidates this layer may search, in the order the generator put
+    // them: Tier0/Tier1 whole, Tier2 down to the layer's width, Tier3 only in a
+    // position with no threat. `ply` selects the width (design doc 2.5.1's table),
+    // so the root asks for ply 0.
+    std::vector<Move> generate_moves(const Board& board, int color, int ply = 0);
     void sort_moves(std::vector<Move>& moves, const Board& board, int color,
                     const Move& tt_move = Move());
 

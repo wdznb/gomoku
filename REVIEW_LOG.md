@@ -1979,6 +1979,119 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次121 引擎重构 B1：一层能搜的格子终于有了上限 — engine redesign stage B1
+
+规格 `docs/ENGINE_REDESIGN.md` §2.5.1（候选分层与宽度限制）、§3.2（候选生成伪码）、§2.7 的「双威胁前置识别」一行与
+§6 文件清单的 `src/search/move_generator.h/.cpp` 行（冻结，不改写）。B1 是 P1 交出来的两枚宽度基因的**第一个读者**：
+`cand_width_root` / `cand_width_deep` 从这一轮起不再只是存得进 `params.save` 的数。
+
+### Found
+
+- 中盘分支因子的来源第一次被量化：`build_midgame` 那 12 子的局面 `active_empty()` 有 **133** 格，A 阶段的
+  `generate_moves` 把 133 格整个交给根，深度 6 的一层就是 133 路分支。分层以后根只剩 **33**（Tier1 的 9 个威胁点 +
+  Tier2 的 24 个邻域点），一次无预算的 d6 思考 **2080 → 533** 个节点，`test_search` 的套件墙钟从 P1 Gate 的
+  **138.02 s 降到 36.85 s**。§5 B 行「节点数较 A 阶段下降 ≥ 50%」这条验收在 `quiet`（无威胁、原来 40 格全搜）上实测
+  **1525277 → 230474，−84.9 %**。
+- 规格有两处自相矛盾，两处都落在裁剪面上，B1 必须择其一并在日志里留下选了哪一档：
+  1. **Tier0 的第二半**。§2.5.1:335 的注释写 Tier0 是「己方成五 / **对方成五的挡点** / VCF-VCT 强制着法」，§3.2:518 的
+     伪码却只测 `is_forced(mine)`。实现取**并集** `makes_five(mine) || makes_five(theirs)`（`move_generator.cpp:129`）：
+     一个只挡住对方成五的点若落进会被截断的 Tier2，那一层就能在预算内把唯一的应着裁掉。`white_open_four`（白 7,5–7,8
+     活四、黑先）实测 `forced = 2`，而且**任何 ply、任何宽度**（含 2/2 的曲面下限）都不变，(7,4) 与 (7,9) 都在
+     `flatten()` 里。
+  2. **Tier3 的准入**。§3.2:525 写 `threats.empty() && vicinity.empty() ? 8 : 0`，§2.5.1:346 的表只写「8（仅无威胁）」，
+     表的条件宽一档。实现按**表**：无威胁且 ply 0 就取 M，无威胁且 Tier2 落空也取 M。`scattered`（四颗孤子、96 格活跃）
+     实测根上 `remote = 8/72`，ply ≥ 1 归 0。
+- §2.5.1:351 的「无威胁剪枝」与 §3.2:523 的注释「无威胁时**放宽**」方向相反。实现按 :523 的字面（`width_for(ply,
+  threats.empty())`）：无威胁时 Tier2 在**每一层**都保持根宽——那一层没有应着要下，它是在选往哪里铺，收窄它会把开局型
+  搜成一条线。实测 `quiet` 与 `scattered` 在 ply 1 / ply 3 都是 `vicinity = 24`，而同 ply 的 `midgame` 是 16 与 8。
+  :351 那半句「允许提前返回静态分（futility pruning）」**本轮没做**，它与 §2.7 的空着剪枝同类，进未完成清单。
+- **三档 K 对两枚基因**：表给 24 / 16 / 8，P1 只交两枚（`cand_width_root=24`、`cand_width_deep=8`）。ply 1–2 取两者
+  均值 ⇒ 默认值下正好 16，等于表的数。这是 P1 日志预告过、留给 B1 的决定：取均值，不加第三枚基因——加一枚要动
+  `kParams` 表、取值域、跨键规则与训练盒体积，为只有两层使用的中间档不值。测例用 **30/10** 这对不对称值把「是均值」
+  与「是常数」分开：ply 1 的宽度是 **20**，既不是 30 也不是 10。
+- `struct ScoredMove` 这个名字已被 `src/search/greedy.h:11` 占着（贪心层的攻守对），照抄 §3.2 会撞名；分层记录改名
+  `Candidate`，头注释里写明这处偏离。
+- 分层是**成员资格**的决定，不是**搜索顺序**的决定：`sort_moves` 仍然按同一个三元组重排存活下来的整张表，所以 A4 的根
+  复用、A6 的根选择、A7 的分层记账与 `root[0]` 兜底那些测例，描述的仍是引擎真正走的那条路，本轮**一条都不用改写**。
+  三段式启发排序（TT / killer / history）本来就是 B2 的活。
+- **一个写进测例而不是绕过去的实测发现**：`double_three` 上黑棋的三三点 (7,7) 对黑是禁手、对白合法，而它在**默认根宽**
+  下对白也进不了 Tier2——`candidate_pair_value` 把它排在 45 格 Tier2 的**第 28 位**，24 的帽正好把它切掉。若照最初的
+  设想「同一个格子对白应该在层里」写断言，那条断言会红在**宽度**上而不是红在**颜色规则**上。测例因此把镜像臂放在曲面
+  最大值（64/32）下跑（`vicinity[28]`、score 112），并另起一条把「默认宽下它确实被切」这件事本身钉住。
+
+### Fixed
+
+- 新增 `src/search/move_generator.h`（87 行）与 `src/search/move_generator.cpp`（177 行）：`Candidate`、
+  `CandidateSet{forced, threats, vicinity, remote}` + `flatten()`、`MoveGenerator::generate(board, color, ply,
+  in_quiescence, out)`。每个活跃空格一次 `recognize_position_both`，分层判据与分值读同一次识别，BLACK 的禁手用
+  `is_forbidden_from_pattern(mine)`——不再跑第二次四方向扫描（那正是 P3.1 记下的重复代价）。
+- `src/search/search_limits.h:47`：`RootScore` 从 `alphabeta.cpp` 的匿名 namespace **原样搬来**，搜索与生成器现在排在
+  同一个全序上，于是「宽度留下了哪几格」只是局面的函数。
+- `src/core/evaluator.h:81` + `src/core/evaluator.cpp:192`：新公开方法 `candidate_pair_value(mine, theirs, row, col,
+  color)`；`evaluate_position_pair` 改为识别后转调它（`:189`，数值不变）。
+- `src/search/alphabeta.h:101` 挂 `MoveGenerator move_gen_`，`:129` 的 `generate_moves(board, color, ply = 0)` 变成
+  转调；`.cpp` +29/−78，`quiescence()` 那段内联过滤器换成 `move_gen_.generate(..., in_quiescence=true, &forcing)`
+  （`:127-128`）——成员资格、计价口径（只算行棋方）、排序三元组、空表提前返回四件事都按构造保持不变。
+- `CMakeLists.txt`：`src/search/move_generator.cpp` 进 `GOMOKU_CORE_SOURCES`。
+
+### 合约过期
+
+- `test_engine_keeps_alphabeta_time_after_tactics` 尾部那条 `assert(quick.method != "alphabeta" || quick.stopped !=
+  "none")`（现 `tests/test_search.cpp:1003`）把「这盘 120 ms 的思考到不了请求深度」这件**墙钟事实**编码成了「说不出中断
+  原因就是错」。B1 之后前提不成立：`/mnt/d/tmp/r121_b1t_r989.cpp` 在同一块板上跑四臂——pre-B1 -O0 depth 3 /
+  `time_hard` / 3944 节点 / root 0-133；pre-B1 -O2 depth 3 / `time_hard` / 18860 / 1-133；B1 -O0 depth 6 / `time_hard`
+  / 2732 / 0-26；**B1 -O2 用 208 节点、0 ms 把八层全跑完**（root 26-26，`stopped == "none"`）。于是「没有中断原因」
+  成了**跑完了的正确回答**。断言改写为 `... || quick.depth >= 8`，并把「跑完了」补成三条硬账：`depth >= 8`、
+  `partial_depth == 0`、`root_moves_done == root_moves_total`。这不是放宽——它要抓的那个形状（标着 alphabeta、说不出
+  原因、层没跑完）在四臂里依旧全红，`31ad693` 上也依旧绿（它 `stopped == time_hard`）。
+- 两条受保护的预算前提**一字未动**，只因上面这次改写整体下移：`assert(result.resigned)` 从 `:2563` 到 **`:2585`**，
+  `assert(completed.method == "alphabeta")` 从 `:3958` 到 **`:3980`**。后续按新行号引用。
+
+### 反证与 Valgrind
+
+- 七条新用例（`tests/test_search.cpp:4445` 起，注册在 `main()` 末尾 `:5150-5156`）里只有 **B1-4
+  `test_move_generator_width_lowers_nodes_and_root_size`** 能反证：它只用两棵树都有的公开 API（`AlphaBetaSearch` /
+  `SearchLimits` / `last_stats()`）。`/mnt/d/tmp/r121_b1t_case4.sh` 把同一份源文件对两棵树各编一次：本树
+  **`RUN_RC=0`**，打印 `color=1 tight=160/11 narrow=533/33 wide=1114/73`、`color=2 tight=97/6 narrow=461/28
+  wide=937/68`；`git archive 31ad693` 的阴影树 **`RUN_RC=134`，红在 `r121_b1t_case4.cpp:97` 的 `tight.nodes <
+  narrow.nodes`**，三臂全打印 `2080/133`（黑）与 `1633/133`（白）——老树不读这两枚旋钮，三个臂就是同一次搜索。四条严格
+  不等号在老树**每一个都红**，而且它们把「变小」排成旋钮的单调函数，不是「比我自己挑的一个数小」。三臂同时打印同一个
+  已证胜着（黑 7,6 / 白 9,5、`score 100000`、`completed_depth 2`、`reason=mate`），说明 2 格宽的下限没有吃掉战术。
+- 其余六条点名了只有本树才有的符号（`MoveGenerator` / `CandidateSet` / `candidate_pair_value`），在 `31ad693` 上
+  **编不过** ⇒ 词汇限制，按 A6/A7 的写法申报而不隐藏。其中 **B1-6
+  `test_quiescence_row_is_the_forcing_filter`** 是**控制**：它把老内联过滤器按老写法重抄一遍（逐格
+  `recognize_position`、留 成五/活四/冲四/活三、跳过黑的禁手、用已识别的 pattern 计价、按 值→中心→格号 排），再与生成器
+  quiescence 那一行在 7 个臂上 **60 个候选逐格逐分**对齐，并要求另三层为空（§2.5.1 的「仅强制着法」行）。两棵树都绿是
+  它的定义，不是它的失败。
+- memcheck 子集驱动 `/mnt/d/tmp/r121_b1t_subset_main.cpp`（`-Dmain=suite_main_b1`，只挂七条；`build-vg` 是 Debug +
+  `-UNDEBUG`）：直跑 **`PLAIN_RC=0`**，memcheck **`MEMCHECK_RC=0`、报告 0 行、51 s**、`subset cases completed: 7`。
+  七条全注册在 `main()` 末尾，位置在下面全量中止点之后 ⇒ 由子集覆盖。
+- **全量·便宜三套**（`tools/valgrind_check.sh memcheck test_board test_pattern test_evaluator`）：
+  **三条全 `clean`、`reports=0`**，**1817 s / 5 s / 2 s**，`FULL_RC=0`。B1 只经由 `candidate_pair_value` 碰了评估器，
+  但生成器读的是同一份 pattern 识别，所以这三套照常跑；P1 在同一条 `test_board` 线上记的是 1406 s，本轮 1817 s
+  是同一形状的抖动（`test_pattern`/`test_evaluator` 的 5 s / 2 s 与 P1 一字不差）。
+- **全量·`test_search`**（同一工具、同一 `build-vg`）：**`ABORTED rc=134`、`reports=0`、350 s**。套件 stdout 的
+  最后一行是 `main():5086` 那条用例自己打印的 `measured (interrupted: alphabeta d0+partial 0/n0 time_hard, control:
+  alphabeta d0+partial 1/n2494 time_hard)`；紧跟着的第一条**会红**的断言是
+  `tests/test_search.cpp:3967` `assert(interrupted.partial_depth == 1)` —— 判别臂只有 10 ms，memcheck 的减速下它连一层
+  的**第一个根候选**都没开始，于是 `partial_depth` 是打印出来的 0 而不是 1。这正是 A6 那条记录预告的中止形状
+  （「连一层都跑不完……既存墙钟脆弱」），也是它**不是**两条受保护前提之一：`:3980`
+  `assert(completed.method == "alphabeta")` 在同一函数再往下 13 行，本轮根本没走到它，而它读的对照臂打印的是
+  `alphabeta d0+partial 1/n2494 time_hard`（绿的形状）。反过来，`main():5081` 的
+  `test_engine_progress_callback_reports_each_layer`（A2 与 A6 记过的同一处中止点）这次**过去了**：A6 量到的是 1466 s
+  停在 :5081 之前，本轮 350 s 走到了 :5086，按 `main()` 顺序它之前的每一条都被 memcheck 覆盖。
+  一句施工瑕疵：这一次前约 2 分钟有一个我自己重复启动的同套 memcheck 在抢 CPU（发现后按 PID 杀掉了重复的那棵），
+  350 s 因此偏慢而不偏快。
+- 同一条 `build-vg` 树**不带 valgrind 直跑整套 `./test_search`**：**`NATIVE_RC=0`**、最后一行 `All search tests
+  passed!`，末尾七条（含 `test_quiescence_row_is_the_forcing_filter` 的 7 臂 60 格对齐、
+  `test_tier_choice_reproducible_across_undo_cycles` 的 135 条分层）全绿 ⇒ 上面那次 abort 只属于既存墙钟脆弱，
+  不是本树的行为差异；D1 打通 `max_nodes` 后按 A6 的记账把它改成节点预算。
+
+**Gate**（空闲树，跑门禁时不与构建或 memcheck 并发）：`ctest` **8/8 / 63.97 s**（`test_search` **36.85 s**、
+`test_server` 10.59 s、`test_training` 8.91 s、`test_position` 7.35 s、`test_pattern` 0.07 s、`test_board` 0.03 s、
+`test_evaluator` 0.02 s、`test_session` 0.03 s），web **105/105**，anchor **118 引用 / 0 problems**，README 仍
+**658 行**（`:529-531` 未动）。以上每一条都是我在测例落树后自己复跑的，不是转述。
+
 ## 轮次121 引擎重构 P1：参数面从十枚基因长到十四枚 — engine redesign stage P1
 
 规格 `docs/ENGINE_REDESIGN.md` §2.5.1、§2.5.2 与 §7 前置事实 P1（冻结，不改写）。P1 是 B1 的硬前置：宽度帽必须是

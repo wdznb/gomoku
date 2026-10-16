@@ -32,6 +32,33 @@ inline int center_distance(Position pos) {
     return std::abs(pos.row - center) + std::abs(pos.col - center);
 }
 
+// The total order every candidate decision is made on: value, then being nearer
+// the centre (center_distance above), then the lower cell index. The last key is
+// what makes it a total order - no two cells share an index, so no comparison can
+// come back "equal" and leave the answer to whatever order a container happened to
+// iterate in - and the second is what makes the engine's choice in a tie be the
+// central one instead of an accident of Board::active_empty()'s swap-remove order.
+//
+// It lives here, next to the distance it reads, because both the search (which
+// picks the root answer) and the candidate generator (which decides which
+// candidates the width limit keeps) order on it: one definition is what keeps
+// "the tier that survived truncation" and "the layer that won" saying the same
+// thing about which candidate is better.
+struct RootScore {
+    int score;
+    int center_dist;
+    int cell_index;
+
+    RootScore(const Move& m, int s)
+        : score(s), center_dist(center_distance(m.pos)), cell_index(m.pos.to_index()) {}
+
+    bool operator>(const RootScore& other) const {
+        if (score != other.score) return score > other.score;
+        if (center_dist != other.center_dist) return center_dist < other.center_dist;
+        return cell_index < other.cell_index;
+    }
+};
+
 // How one think is allowed to spend its budget.
 struct SearchLimits {
     int max_depth = 8;

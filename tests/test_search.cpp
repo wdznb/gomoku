@@ -6,6 +6,8 @@
 #include <atomic>
 #include <chrono>
 #include <climits>
+#include <array>
+#include <cstdint>
 #include <vector>
 #include <algorithm>
 // J2 drives sort_moves and generate_moves directly, and both are private; the
@@ -19,6 +21,7 @@
 #include "search/vct.h"
 #undef private
 #include "search/greedy.h"
+#include "search/move_generator.h"
 #include "search/search_engine.h"
 #include "search/controller.h"
 #include "search/search_limits.h"
@@ -981,9 +984,28 @@ void test_engine_keeps_alphabeta_time_after_tactics() {
     // relabel the think "greedy"; now the alphabeta label survives and the reason
     // has to come with it, so a depth-0 answer either came from a fast path or
     // names why the search stopped.
+    //
+    // 合约过期（轮次121 B1）: that paragraph used to *imply* "a 120 ms think on this
+    // board cannot reach the requested depth", and the bare `stopped != "none"` below
+    // encoded that wall-clock fact. B1's width cap makes the implication false. Measured
+    // on this exact board by /mnt/d/tmp/r121_b1t_r989.cpp + .sh, which runs both budgets
+    // on both trees at both -O0 and -O2: pre-B1 -O0 depth 3 / time_hard / 3944 nodes /
+    // root 0-133, pre-B1 -O2 depth 3 / time_hard / 18860 nodes / root 1-133, B1 -O0 depth
+    // 6 / time_hard / 2732 nodes / root 0-26, and B1 -O2 finishes all eight layers in
+    // 208 nodes / 0 ms / root 26-26 with stopped == "none". Reporting no reason is then
+    // the *correct* answer for a think that really completed, so the premise moves to the
+    // rule the comment states: an alphabeta result whose deepening was cut has to name
+    // the cut, and one that names no cut has to show a finished deepening - every layer,
+    // no partial layer, every root candidate walked. The pre-A2 shape this case exists
+    // for (labelled alphabeta, no reason, unfinished layers) stays red on every arm.
     SearchResult quick = engine.search(board, WHITE, 8, 120, stop);
     assert(quick.best_move.pos.is_valid());
-    assert(quick.method != "alphabeta" || quick.stopped != "none");
+    assert(quick.method != "alphabeta" || quick.stopped != "none" || quick.depth >= 8);
+    if (quick.method == "alphabeta" && quick.stopped == "none") {
+        assert(quick.depth >= 8);
+        assert(quick.partial_depth == 0);
+        assert(quick.root_moves_done == quick.root_moves_total);
+    }
     std::cout << "  short budget: method " << quick.method << ", depth " << quick.depth
               << ", stopped " << quick.stopped << ", partial " << quick.partial_depth
               << ", best (" << quick.best_move.pos.row << "," << quick.best_move.pos.col
@@ -4210,6 +4232,814 @@ void test_search_context_counters_account_for_the_tree() {
     std::cout << "test_search_context_counters_account_for_the_tree passed" << std::endl;
 }
 
+// ---------------------------------------------------------------------------
+// Stage B1 (design doc 2.5.1 候选分层与宽度限制 + 3.2 候选生成伪码).
+//
+// The fixtures below are placed in exactly one order per pose: `near_last_move`
+// reads board.last_move(), so the pose is only the same pose when the stone that
+// lands last is the same stone. Do not reorder these lists.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+using B1Stones = std::vector<std::array<int, 3>>;
+
+Board b1_board(const B1Stones& stones) {
+    Board board;
+    for (const auto& s : stones) assert(board.place_stone(s[0], s[1], s[2]));
+    return board;
+}
+
+// crowded: midgame plus a second cluster. One BLACK square, (4,5), is 禁手.
+Board b1_crowded() {
+    return b1_board({
+        {7, 7, BLACK}, {7, 8, BLACK}, {7, 9, BLACK},
+        {9, 6, WHITE}, {9, 7, WHITE}, {9, 8, WHITE},
+        {5, 5, BLACK}, {10, 4, BLACK}, {11, 11, BLACK},
+        {4, 9, WHITE}, {3, 11, WHITE}, {2, 2, WHITE},
+        {6, 7, BLACK}, {8, 6, WHITE}, {10, 10, BLACK}, {5, 10, WHITE},
+        {12, 3, BLACK}, {4, 4, WHITE}, {6, 12, BLACK}, {12, 8, WHITE},
+        {13, 13, BLACK}, {1, 6, WHITE}, {3, 5, BLACK}, {11, 6, WHITE},
+    });
+}
+
+// quiet: four stones, no threat for either side - the 「无威胁时放宽」 pose.
+Board b1_quiet() {
+    return b1_board({{7, 7, BLACK}, {7, 8, WHITE}, {8, 8, BLACK}, {6, 6, WHITE}});
+}
+
+// scattered: four isolated corner stones, so Tier2 and Tier3 both have a real
+// population to be cut from.
+Board b1_scattered() {
+    return b1_board({{2, 2, BLACK}, {12, 12, WHITE}, {2, 12, BLACK}, {12, 2, WHITE}});
+}
+
+// WHITE owns an open four on row 7; BLACK to move has exactly two answers, and
+// neither of them makes a threat of its own.
+Board b1_white_open_four() {
+    return b1_board({
+        {7, 5, WHITE}, {7, 6, WHITE}, {7, 7, WHITE}, {7, 8, WHITE},
+        {10, 10, BLACK}, {10, 11, BLACK}, {3, 3, BLACK},
+    });
+}
+
+// BLACK owns the same shape; here Tier0's *own*-five half is what has to survive.
+Board b1_black_makes_five() {
+    return b1_board({
+        {7, 4, BLACK}, {7, 5, BLACK}, {7, 6, BLACK}, {7, 7, BLACK},
+        {10, 10, WHITE}, {10, 11, WHITE}, {3, 3, WHITE},
+    });
+}
+
+// BLACK 3+3 around (7,7): 6,7 / 8,7 vertical and 7,6 / 7,8 horizontal, so (7,7)
+// itself is the 三三 point and must never reach a tier for BLACK.
+Board b1_double_three() {
+    return b1_board({
+        {7, 6, BLACK}, {7, 8, BLACK}, {6, 7, BLACK}, {8, 7, BLACK},
+        {2, 2, WHITE}, {2, 3, WHITE}, {2, 4, WHITE},
+    });
+}
+
+Evaluator b1_evaluator(int root, int deep) {
+    ThreatCoefficients coeffs = Evaluator().coefficients();
+    coeffs.cand_width_root = root;
+    coeffs.cand_width_deep = deep;
+    return Evaluator(coeffs);
+}
+
+// A generator holds its evaluator by reference (move_generator.h:82), so the two
+// have to be owned together. Writing `MoveGenerator gen(b1_evaluator(24, 8))` binds
+// the generator to a temporary that dies at the end of that statement, and the
+// generator then reads a width off freed stack - which is how this file's own case 3
+// first came back reporting a Tier2 width of 0 at the root and 4 at ply 1. Every
+// generator in these cases comes from here.
+struct B1Rig {
+    explicit B1Rig(int root, int deep)
+        : evaluator(b1_evaluator(root, deep)), generator(evaluator) {}
+    const Evaluator evaluator;
+    const MoveGenerator generator;
+};
+
+bool b1_in_tier(const std::vector<Candidate>& tier, int row, int col) {
+    for (const Candidate& c : tier)
+        if (c.move.pos.row == row && c.move.pos.col == col) return true;
+    return false;
+}
+
+bool b1_in_any_tier(const CandidateSet& set, int row, int col) {
+    return b1_in_tier(set.forced, row, col) || b1_in_tier(set.threats, row, col) ||
+           b1_in_tier(set.vicinity, row, col) || b1_in_tier(set.remote, row, col);
+}
+
+bool b1_in_flat(const std::vector<Move>& flat, int row, int col) {
+    for (const Move& m : flat)
+        if (m.pos.row == row && m.pos.col == col) return true;
+    return false;
+}
+
+// The tier each active empty square belongs to *before* any width is applied.
+// Written from design doc 3.2's pseudo-code rather than by calling the generator,
+// so an assert about "the width kept 24 of them" is measured against the actual
+// population and not against a second copy of the thing under test.
+struct B1Populations {
+    size_t active = 0;
+    size_t forced = 0;
+    size_t threats = 0;
+    size_t vicinity = 0;
+    size_t remote = 0;
+    size_t forbidden = 0;
+};
+
+bool b1_doc_makes_five(const PositionPattern& p) {
+    for (int d = 0; d < 4; ++d)
+        if (p.directions[d].type == PatternType::FIVE) return true;
+    return false;
+}
+
+bool b1_doc_makes_forcing_threat(const PositionPattern& p) {
+    for (int d = 0; d < 4; ++d) {
+        const PatternType t = p.directions[d].type;
+        if (t == PatternType::FIVE || t == PatternType::LIVE_FOUR ||
+            t == PatternType::RUSH_FOUR || t == PatternType::LIVE_THREE)
+            return true;
+    }
+    return false;
+}
+
+bool b1_doc_makes_double_threat(const PositionPattern& p) {
+    return p.has_four_four || p.has_four_three || p.has_three_three;
+}
+
+bool b1_doc_near_last_move(const Board& board, Position pos, int radius) {
+    if (!board.has_last_move()) return false;
+    const Position& last = board.last_move().pos;
+    return std::abs(pos.row - last.row) <= radius && std::abs(pos.col - last.col) <= radius;
+}
+
+B1Populations b1_populations(const Board& board, int color) {
+    B1Populations pop;
+    for (const Position& pos : board.active_empty()) {
+        if (!board.is_empty(pos)) continue;
+        ++pop.active;
+        PositionPattern mine, theirs;
+        PatternRecognizer::recognize_position_both(board, pos.row, pos.col, color, mine, theirs);
+        if (color == BLACK && PatternRecognizer::is_forbidden_from_pattern(mine)) {
+            ++pop.forbidden;
+            continue;
+        }
+        if (b1_doc_makes_five(mine) || b1_doc_makes_five(theirs)) ++pop.forced;
+        else if (b1_doc_makes_forcing_threat(mine) || b1_doc_makes_double_threat(mine)) ++pop.threats;
+        else if (b1_doc_near_last_move(board, pos, 2) || board.neighbor_count_at(pos) >= 2)
+            ++pop.vicinity;
+        else
+            ++pop.remote;
+    }
+    return pop;
+}
+
+struct B1Think {
+    uint64_t nodes = 0;
+    int root_total = 0;
+    int completed_depth = 0;
+    int score = 0;
+    Move best;
+    StopReason stopped = StopReason::NONE;
+};
+
+// One think with no clock and no node ceiling, so `nodes` is the size of the tree
+// the width left behind rather than a meter of how busy the box was. Public API
+// only - which is what lets the same body run on the tree before B1.
+B1Think b1_think(const Board& board, int color, int depth, int root, int deep) {
+    const Evaluator evaluator = b1_evaluator(root, deep);
+    TranspositionTable tt;  // fresh table per arm: no warm TT may rescue an arm
+    AlphaBetaSearch search(evaluator, tt);
+    std::atomic<bool> stop(false);
+
+    SearchLimits limits;
+    limits.max_depth = depth;
+    limits.hard_time_ms = 0;
+    limits.soft_time_ms = 0;
+    limits.max_nodes = 0;
+
+    B1Think out;
+    out.best = search.search(board, color, limits, stop);
+    const SearchStats& stats = search.last_stats();
+    out.nodes = stats.nodes;
+    out.root_total = stats.root_moves_total;
+    out.completed_depth = stats.completed_depth;
+    out.score = stats.score;
+    out.stopped = stats.stopped;
+    return out;
+}
+
+}  // namespace
+
+// B1-1: 宽度吃不掉挡点 (design doc 2.5.1's 「强制着法永不截断」 row).
+//
+// Tier0 has two halves and this stage makes both of them real: the square that
+// completes a five for the side to play (§3.2's `is_forced(mine)` shorthand) and
+// the square where the *opponent* would complete one, which is the only answer to
+// that threat and is what 2.5.1's struct comment asks for. Half one runs at the
+// narrowest widths the trained surface allows, so a tier that could be cut is
+// provably cut and the forced points still come back.
+void test_move_generator_tiers_never_drop_forced() {
+    const Evaluator tight_eval = b1_evaluator(2, 2);  // the surface minimums
+    const MoveGenerator tight(tight_eval);
+
+    // Half one: WHITE's open four, BLACK to block.
+    const Board blocking = b1_white_open_four();
+    const B1Populations block_pop = b1_populations(blocking, BLACK);
+    assert(block_pop.forced == 2);
+    assert(block_pop.vicinity == 60);  // the population Tier2 is cut out of
+    for (const int ply : {0, 1, 3, 6}) {
+        CandidateSet set;
+        tight.generate(blocking, BLACK, ply, false, &set);
+        assert(set.forced.size() == 2);
+        assert(b1_in_tier(set.forced, 7, 4) && b1_in_tier(set.forced, 7, 9));
+        assert(set.vicinity.size() == 2);  // the width really is at its floor
+        const std::vector<Move> flat = tight.generate_moves(blocking, BLACK, ply, false);
+        assert(b1_in_flat(flat, 7, 4) && b1_in_flat(flat, 7, 9));
+        // 2 forced + 4 threats + 2 of the 60 vicinity cells; nothing else survives.
+        assert(flat.size() == 8);
+        assert(set.remote.empty());
+    }
+
+    // Half two, the mirror: the squares that complete BLACK's OWN five. They are
+    // Tier0 in normal mode and they do not appear in Tier1 there at all - while
+    // quiescence, which has no Tier0, keeps them because 成五 passes its filter.
+    const Board own = b1_black_makes_five();
+    const B1Populations own_pop = b1_populations(own, BLACK);
+    assert(own_pop.forced == 2);
+    assert(own_pop.threats == 0);
+    for (const int ply : {0, 1, 3}) {
+        CandidateSet set;
+        tight.generate(own, BLACK, ply, false, &set);
+        assert(set.forced.size() == 2);
+        assert(b1_in_tier(set.forced, 7, 3) && b1_in_tier(set.forced, 7, 8));
+        assert(set.threats.empty());
+        assert(!b1_in_tier(set.threats, 7, 3) && !b1_in_tier(set.threats, 7, 8));
+    }
+
+    // And at the defaults, where the widths are not trying to starve anyone.
+    const B1Rig at_default_rig(24, 8);
+    const MoveGenerator& at_default = at_default_rig.generator;
+    CandidateSet defaults;
+    at_default.generate(own, BLACK, 3, false, &defaults);
+    assert(defaults.forced.size() == 2 && defaults.threats.empty());
+    assert(defaults.vicinity.size() == 8 && defaults.remote.empty());
+
+    // The quiescence half of the same claim: no Tier0 exists there, so 成五 is only
+    // reachable through the forcing filter - and both squares come back.
+    CandidateSet quiet;
+    at_default.generate(own, BLACK, 0, true, &quiet);
+    assert(quiet.threats.size() == 2);
+    assert(b1_in_tier(quiet.threats, 7, 3) && b1_in_tier(quiet.threats, 7, 8));
+
+    // The converse, stated so the two halves are not confused: a square that only
+    // stops the *opponent's* five is Tier0 in normal mode and is NOT a quiescence
+    // threat, because quiescence filters on the mover's own shapes.
+    CandidateSet quiet_block;
+    at_default.generate(blocking, BLACK, 0, true, &quiet_block);
+    assert(!b1_in_tier(quiet_block.threats, 7, 4) && !b1_in_tier(quiet_block.threats, 7, 9));
+
+    std::cout << "test_move_generator_tiers_never_drop_forced passed (block "
+              << "(7,4)+(7,9) and own-five (7,3)+(7,8) both survive a width of 2 at "
+              "every ply; 8 candidates kept out of " << block_pop.active << ")"
+              << std::endl;
+}
+
+// B1-2: Tier2 服从本层宽度 (design doc 2.5.1's K column).
+//
+// Three things have to be pinned separately or the ladder is just a constant that
+// happens to look like a ladder: the kept count against the *population* it was
+// drawn from, the kept count against each knob, and the middle row against the
+// mean of the two knobs rather than against either one.
+void test_move_generator_vicinity_obeys_the_layer_width() {
+    Board board;
+    build_midgame(board);  // the suite's own 12-stone midgame
+    const B1Populations pop = b1_populations(board, BLACK);
+    assert(pop.forced == 0 && pop.threats == 9);
+    assert(pop.vicinity == 67);  // the pre-cut Tier2 population
+
+    const B1Rig at_default_rig(24, 8);
+    const MoveGenerator& at_default = at_default_rig.generator;
+
+    // The K ladder: 24 at the root, 16 at ply 1-2, 8 from ply 3 on.
+    const size_t expected[5] = {24, 16, 16, 8, 8};
+    const int plies[5] = {0, 1, 2, 3, 6};
+    size_t kept[5] = {0, 0, 0, 0, 0};
+    for (int i = 0; i < 5; ++i) {
+        CandidateSet set;
+        at_default.generate(board, BLACK, plies[i], false, &set);
+        assert(set.vicinity.size() == expected[i]);
+        assert(set.forced.empty() && set.threats.size() == 9);
+        assert(set.remote.empty());
+        // strictly below the population it was cut from, at every ply
+        assert(set.vicinity.size() < pop.vicinity);
+        kept[i] = set.flatten().size();
+    }
+    assert(kept[0] == 33 && kept[1] == 25 && kept[2] == 25 && kept[3] == 17);
+    assert(kept[3] == kept[4]);  // ply 3 and ply 6 are the same layer width
+
+    // It is a knob, not a constant: the surface minimum keeps exactly 2 of the 67.
+    CandidateSet min_set;
+    {
+        const B1Rig min_rig(2, 2);
+        const MoveGenerator& min_gen = min_rig.generator;
+        min_gen.generate(board, BLACK, 0, false, &min_set);
+        assert(min_set.vicinity.size() == 2);
+        assert(min_set.flatten().size() == 11);  // 9 threats + 2 vicinity, both never-cut
+                                                 // tiers at their measured size
+        assert(min_set.threats.size() == 9);
+    }
+
+    // ...and the surface maximum keeps 64 of them at the root, 32 from ply 3 on.
+    {
+        const B1Rig max_rig(64, 32);
+        const MoveGenerator& max_gen = max_rig.generator;
+        CandidateSet max_root, max_deep;
+        max_gen.generate(board, BLACK, 0, false, &max_root);
+        max_gen.generate(board, BLACK, 3, false, &max_deep);
+        assert(max_root.vicinity.size() == 64 && max_root.flatten().size() == 73);
+        assert(max_deep.vicinity.size() == 32 && max_deep.flatten().size() == 41);
+    }
+
+    // The middle row is the MEAN of the two knobs and not a copy of either: with
+    // 30 / 10 the ply-1 width is 20, which is neither 30 nor 10. (At the defaults
+    // 16 happens to be (24+8)/2, which alone cannot tell a mean from a constant.)
+    {
+        const B1Rig asym_rig(30, 10);
+        const MoveGenerator& asym_gen = asym_rig.generator;
+        const size_t want[4] = {30, 20, 20, 10};
+        for (int ply = 0; ply < 4; ++ply) {
+            CandidateSet set;
+            asym_gen.generate(board, BLACK, ply, false, &set);
+            assert(set.vicinity.size() == want[ply]);
+            assert(set.vicinity.size() < pop.vicinity);
+        }
+        assert(asym_rig.evaluator.coefficients().cand_width_root != 20 &&
+               asym_rig.evaluator.coefficients().cand_width_deep != 20);
+    }
+
+    std::cout << "test_move_generator_vicinity_obeys_the_layer_width passed (Tier2 "
+              << "population " << pop.vicinity << " kept as 24/16/8 by ply, 2 at the "
+              "surface minimum, 64/32 at the maximum, and 20 at ply 1 for the 30/10 "
+              "pair - a mean, not a copy)"
+              << std::endl;
+}
+
+// B1-3: 无威胁时放宽 + Tier3 的 M (design doc 2.5.1's 「无威胁」 row and its M column).
+//
+// The doc's rows, not the measured numbers: Tier2 keeps the ROOT width on a board
+// with no threat at all (instead of falling through the ply ladder), Tier3's cap is
+// `cand_width_deep` (a cap - a population below it is kept whole, not padded), and
+// Tier3 is empty whenever Tier1 is not.
+void test_move_generator_tier3_and_the_no_threat_widening() {
+    const B1Rig at_default_rig(24, 8);
+    const MoveGenerator& at_default = at_default_rig.generator;
+
+    struct NoThreatPose {
+        const char* name;
+        Board board;
+        size_t pop_vicinity;
+        size_t pop_remote;
+        size_t remote_at_root;
+    };
+    const B1Populations quiet_pop = b1_populations(b1_quiet(), BLACK);
+    const B1Populations scat_pop = b1_populations(b1_scattered(), BLACK);
+    std::vector<NoThreatPose> poses = {
+        {"quiet", b1_quiet(), quiet_pop.vicinity, quiet_pop.remote, 7},
+        {"scattered", b1_scattered(), scat_pop.vicinity, scat_pop.remote, 8},
+    };
+    // 7 is below the cap of 8 (so the cap is a cap) and 8 is exactly it (so the cap
+    // is cand_width_deep and not a smaller number). Both have to be true.
+    assert(quiet_pop.remote == 7 && quiet_pop.remote < 8);
+    assert(scat_pop.remote == 72 && scat_pop.remote > 8);
+
+    for (const NoThreatPose& pose : poses) {
+        const B1Populations pop = b1_populations(pose.board, BLACK);
+        assert(pop.forced == 0 && pop.threats == 0);  // the premise of the row
+
+        for (const int ply : {0, 1, 2, 3, 6}) {
+            CandidateSet set;
+            at_default.generate(pose.board, BLACK, ply, false, &set);
+            assert(set.forced.empty() && set.threats.empty());
+            // 「无威胁时放宽」: the ROOT width at every ply, where the threat poses
+            // fall 24 -> 16 -> 8.
+            assert(set.vicinity.size() == std::min(pop.vicinity, size_t(24)));
+            // Tier3 lives at the root only: it is dropped as soon as Tier2 kept
+            // something, which is the doc's 「仅当 Tier2 落空」 half.
+            if (ply == 0) {
+                assert(set.remote.size() == pose.remote_at_root);
+                assert(set.remote.size() == std::min(pop.remote, size_t(8)));
+            } else {
+                assert(set.remote.empty());
+                assert(set.vicinity.size() > 0);
+            }
+        }
+    }
+
+    // The contrast that makes the widening an actual rule and not a coincidence of
+    // the default root width: a threat pose at the same ply keeps less.
+    Board mid;
+    build_midgame(mid);
+    CandidateSet threat_at_ply3;
+    at_default.generate(mid, BLACK, 3, false, &threat_at_ply3);
+    assert(threat_at_ply3.threats.size() == 9);
+    assert(threat_at_ply3.vicinity.size() == 8);
+    for (const NoThreatPose& pose : poses) {
+        CandidateSet set;
+        at_default.generate(pose.board, BLACK, 3, false, &set);
+        assert(set.threats.empty());
+        // three times what the threat pose keeps at the very same ply
+        assert(set.vicinity.size() == 24 && set.vicinity.size() > threat_at_ply3.vicinity.size());
+    }
+
+    // M is `cand_width_deep`, and it is a ceiling: at root=64 the no-threat poses
+    // keep their whole Tier2 (33 and 24 of them, both under 64) while Tier3 tracks
+    // deep = 2 / 8 / 32, stopping short of its own population when it is smaller.
+    for (const int deep : {2, 8, 32}) {
+        const B1Rig wide_rig(64, deep);
+        const MoveGenerator& wide = wide_rig.generator;
+        CandidateSet q, s;
+        wide.generate(b1_quiet(), BLACK, 0, false, &q);
+        wide.generate(b1_scattered(), BLACK, 0, false, &s);
+        assert(q.vicinity.size() == 33 && s.vicinity.size() == 24);
+        assert(q.remote.size() == std::min(size_t(7), size_t(deep)));
+        assert(s.remote.size() == std::min(size_t(72), size_t(deep)));
+        assert(q.remote.size() <= static_cast<size_t>(deep));
+    }
+
+    // 「remote 只在完全无威胁时保留」 stated the other way round: on every pose that
+    // does have a threat, Tier3 is empty even at the root and even with M wide open.
+    {
+        const B1Rig max_rig(64, 32);
+        const MoveGenerator& max_gen = max_rig.generator;
+        const std::vector<std::pair<const char*, Board>> threat_poses = {
+            {"midgame", [&] { Board b; build_midgame(b); return b; }()},
+            {"crowded", b1_crowded()},
+            {"white_open_four", b1_white_open_four()},
+            {"black_makes_five", b1_black_makes_five()},
+            {"double_three", b1_double_three()},
+        };
+        for (const auto& threat : threat_poses) {
+            for (const int color : {BLACK, WHITE}) {
+                CandidateSet set;
+                max_gen.generate(threat.second, color, 0, false, &set);
+                assert(!set.threats.empty() || !set.forced.empty());
+                if (!set.threats.empty()) assert(set.remote.empty());
+            }
+        }
+    }
+
+    std::cout << "test_move_generator_tier3_and_the_no_threat_widening passed (quiet "
+              << quiet_pop.vicinity << "+" << quiet_pop.remote << " and scattered "
+              << scat_pop.vicinity << "+" << scat_pop.remote << " populations keep the "
+              "root width at every ply, Tier3 = min(pop, cand_width_deep) at the root "
+              "only, and is empty wherever Tier1 is not)"
+              << std::endl;
+}
+
+// B1-4: 一层能搜的格子终于有了上限 - the cost side, and the HEAD-negative arm.
+//
+// Public API only, so this very body compiles on the tree before B1 (which reads
+// neither width knob and so answers all three arms with the identical 133-candidate
+// search): every one of the four strict inequalities is red there. The pairs are
+// ordered by the knob rather than being a single lucky comparison, which is what
+// makes it a width limit and not a different position.
+void test_move_generator_width_lowers_nodes_and_root_size() {
+    Board midgame;
+    build_midgame(midgame);
+
+    for (const int color : {BLACK, WHITE}) {
+        const B1Think tight = b1_think(midgame, color, 6, 2, 2);
+        const B1Think narrow = b1_think(midgame, color, 6, 24, 8);
+        const B1Think wide = b1_think(midgame, color, 6, 64, 32);
+
+        assert(tight.nodes < narrow.nodes);
+        assert(narrow.nodes < wide.nodes);
+        assert(tight.root_total < narrow.root_total);
+        assert(narrow.root_total < wide.root_total);
+
+        // The measured ladder, so "smaller" is not just "smaller than a number I
+        // picked". 3.9x between the extremes on the node count, 6.6x/11x on the
+        // root width.
+        if (color == BLACK) {
+            assert(tight.nodes == 160 && narrow.nodes == 533 && wide.nodes == 1114);
+            assert(tight.root_total == 11 && narrow.root_total == 33 && wide.root_total == 73);
+        } else {
+            assert(tight.nodes == 97 && narrow.nodes == 461 && wide.nodes == 937);
+            assert(tight.root_total == 6 && narrow.root_total == 28 && wide.root_total == 68);
+        }
+
+        // A two-wide root still finds the same win the full-width root found: same
+        // tactic, same proven score, same completed layer, same reason.
+        assert(tight.score == 100000 && narrow.score == 100000 && wide.score == 100000);
+        assert(tight.completed_depth == 2 && narrow.completed_depth == 2 &&
+               wide.completed_depth == 2);
+        assert(tight.stopped == StopReason::MATE && narrow.stopped == StopReason::MATE &&
+               wide.stopped == StopReason::MATE);
+        const int want_row = color == BLACK ? 7 : 9;
+        const int want_col = color == BLACK ? 6 : 5;
+        assert(tight.best.pos.row == want_row && tight.best.pos.col == want_col);
+        assert(narrow.best.pos == tight.best.pos);
+        assert(wide.best.pos == tight.best.pos);
+        // NOT asserted, on purpose: completed_depth as a monotone function of the
+        // width. A cut root can finish deeper, and pinning that would be pinning
+        // an accident.
+    }
+
+    // The same claim on a non-mate-shaped (but still proven) pose, where the root
+    // is twice as wide and the tree grows with it.
+    const Board crowded = b1_crowded();
+    const B1Think c_narrow = b1_think(crowded, BLACK, 6, 24, 8);
+    const B1Think c_wide = b1_think(crowded, BLACK, 6, 64, 32);
+    assert(c_narrow.nodes < c_wide.nodes);
+    assert(c_narrow.root_total < c_wide.root_total);
+    assert(c_narrow.nodes == 888 && c_narrow.root_total == 39);
+    assert(c_wide.nodes == 1861 && c_wide.root_total == 79);
+    assert(c_narrow.score == 100000 && c_wide.score == 100000);
+    assert(c_narrow.best.pos.row == 7 && c_narrow.best.pos.col == 6);
+    assert(c_wide.best.pos == c_narrow.best.pos);
+
+    // Recorded, deliberately NOT asserted - the one honest cost of the stage: on
+    // the quiet pose (see REVIEW_LOG) the wide and narrow arms still agree on the
+    // move but disagree on the number the player is shown, because a truncated
+    // root proves a different bound. That is exactly why Tier0 and Tier1 are never
+    // cut, and pinning a score here would freeze whichever bound this box happened
+    // to reach.
+    std::cout << "test_move_generator_width_lowers_nodes_and_root_size passed (midgame "
+              << "BLACK 160/533/1114 nodes over 11/33/73 root candidates, WHITE "
+              << "97/461/937 over 6/28/68, crowded BLACK 888/1861 over 39/79, every arm "
+              "on the same proven win)"
+              << std::endl;
+}
+
+// B1-5: 禁手格子进不了任何一层 (the 「禁手剪枝」 half of 2.5.1).
+//
+// (7,7) on double_three is the 三三 point of the 7,6+7,8 / 6,7+8,7 cross. It is
+// illegal for BLACK, so it must reach no tier at any ply and any width. For WHITE it
+// is legal - and it only shows up at the MAXIMUM width, because its
+// candidate_pair_value puts it at vicinity[28] of a 45-cell Tier2, under the root
+// cap of 24. An assert written at the default width would be red for the wrong
+// reason: it would be measuring the cut, not the colour rule.
+void test_move_generator_drops_black_forbidden() {
+    const Board pose = b1_double_three();
+
+    // The premise, read off the rule rather than off the generator.
+    assert(PatternRecognizer::is_forbidden(pose, 7, 7, BLACK));
+    assert(!PatternRecognizer::is_forbidden(pose, 7, 7, WHITE));
+    const B1Populations black_pop = b1_populations(pose, BLACK);
+    const B1Populations white_pop = b1_populations(pose, WHITE);
+    assert(black_pop.forbidden == 1);      // exactly (7,7), out of 71 active cells
+    assert(white_pop.forbidden == 0);
+    assert(black_pop.active == 71 && white_pop.active == 71);
+
+    const std::vector<std::pair<int, int>> widths = {{24, 8}, {2, 2}, {64, 32}};
+    for (const auto& w : widths) {
+        const B1Rig rig(w.first, w.second);
+        const MoveGenerator& gen = rig.generator;
+        for (const int ply : {0, 1, 2, 3, 6}) {
+            CandidateSet set;
+            gen.generate(pose, BLACK, ply, false, &set);
+            assert(!b1_in_any_tier(set, 7, 7));
+            assert(!b1_in_flat(gen.generate_moves(pose, BLACK, ply, false), 7, 7));
+            // and not through quiescence either
+            CandidateSet quiet;
+            gen.generate(pose, BLACK, ply, true, &quiet);
+            assert(!b1_in_any_tier(quiet, 7, 7));
+        }
+    }
+
+    // The mirror arm, at the width that can actually show it: legal for WHITE, and
+    // present in WHITE's Tier2 at the surface maximum at the recorded rank.
+    {
+        const B1Rig max_rig(64, 32);
+        const MoveGenerator& max_gen = max_rig.generator;
+        CandidateSet white;
+        max_gen.generate(pose, WHITE, 0, false, &white);
+        assert(white.vicinity.size() == 45);
+        assert(white.vicinity.size() == white_pop.vicinity);  // not cut: 45 of 45
+        assert(b1_in_tier(white.vicinity, 7, 7));
+        bool at_recorded_rank = false;
+        for (size_t i = 0; i < white.vicinity.size(); ++i) {
+            if (white.vicinity[i].move.pos.row == 7 && white.vicinity[i].move.pos.col == 7) {
+                at_recorded_rank = (i == 28 && white.vicinity[i].score == 112);
+                break;
+            }
+        }
+        assert(at_recorded_rank);  // vicinity[28], score 112
+        CandidateSet black_at_max;
+        max_gen.generate(pose, BLACK, 0, false, &black_at_max);
+        assert(black_at_max.vicinity.size() == 34);
+        assert(!b1_in_any_tier(black_at_max, 7, 7));
+        assert(black_at_max.vicinity.size() < white.vicinity.size());  // the one cell it cost
+    }
+
+    // At the DEFAULT width the same square is cut for WHITE as well - pinned so the
+    // finding itself is recorded, not just the workaround above.
+    {
+        const B1Rig at_default_rig(24, 8);
+        const MoveGenerator& at_default = at_default_rig.generator;
+        CandidateSet white_default;
+        at_default.generate(pose, WHITE, 0, false, &white_default);
+        assert(white_default.vicinity.size() == 24);
+        assert(!b1_in_tier(white_default.vicinity, 7, 7));
+    }
+
+    // The second 禁手 arm: crowded drops exactly (4,5) for BLACK and nothing else.
+    {
+        const Board crowded = b1_crowded();
+        const B1Populations crowded_black = b1_populations(crowded, BLACK);
+        const B1Populations crowded_white = b1_populations(crowded, WHITE);
+        assert(PatternRecognizer::is_forbidden(crowded, 4, 5, BLACK));
+        assert(!PatternRecognizer::is_forbidden(crowded, 4, 5, WHITE));
+        assert(crowded_black.forbidden == 1);
+        assert(crowded_white.forbidden == 0);
+        // 173 = 174 active - the one illegal square; no other cell went missing.
+        assert(crowded_black.active == 174);
+        assert(crowded_black.forced + crowded_black.threats + crowded_black.vicinity +
+                   crowded_black.remote == 173);
+        assert(crowded_white.forced + crowded_white.threats + crowded_white.vicinity +
+                   crowded_white.remote == 174);
+
+        for (const auto& w : widths) {
+            const B1Rig rig(w.first, w.second);
+            const MoveGenerator& gen = rig.generator;
+            for (const int ply : {0, 3}) {
+                CandidateSet set;
+                gen.generate(crowded, BLACK, ply, false, &set);
+                assert(!b1_in_any_tier(set, 4, 5));
+                assert(!b1_in_flat(gen.generate_moves(crowded, BLACK, ply, false), 4, 5));
+            }
+        }
+    }
+
+    std::cout << "test_move_generator_drops_black_forbidden passed ((7,7) in no tier at "
+              "3 width settings x 5 plies for BLACK, at WHITE's vicinity[28] score 112 "
+              "only at the maximum width, and crowded's single 禁手 is (4,5))"
+              << std::endl;
+}
+
+// B1-6: 静搜那一行还是原来的强制着法过滤器 - the control for the rewiring.
+//
+// Quiescence used to build its own list inline; it now consumes Tier1 of the same
+// generator with in_quiescence set. That claim is only worth anything if the row is
+// rebuilt the way the old code did it and compared cell by cell and score by score,
+// so that is what this does. Green on both trees by construction: it is a 控制, not
+// a discriminator (and it cannot compile on HEAD, which has no MoveGenerator).
+void test_quiescence_row_is_the_forcing_filter() {
+    const Evaluator evaluator = b1_evaluator(24, 8);
+    const MoveGenerator gen(evaluator);
+
+    // The list HEAD's AlphaBetaSearch::quiescence built, transcribed: recognize for
+    // the side to play, keep FIVE / LIVE_FOUR / RUSH_FOUR / LIVE_THREE, drop a
+    // BLACK-forbidden square, price with the pattern already recognized, order by
+    // value -> centre -> cell index.
+    auto old_inline_row = [&](const Board& board, int color) {
+        std::vector<std::pair<int, Move>> scored;
+        for (const Position& pos : board.active_empty()) {
+            if (!board.is_empty(pos.row, pos.col)) continue;
+            const PositionPattern pattern =
+                PatternRecognizer::recognize_position(board, pos.row, pos.col, color);
+            bool is_threat = false;
+            for (int d = 0; d < 4; ++d) {
+                const PatternType t = pattern.directions[d].type;
+                if (t == PatternType::FIVE || t == PatternType::LIVE_FOUR ||
+                    t == PatternType::RUSH_FOUR || t == PatternType::LIVE_THREE) {
+                    is_threat = true;
+                    break;
+                }
+            }
+            if (!is_threat) continue;
+            if (color == BLACK && PatternRecognizer::is_forbidden_from_pattern(pattern)) continue;
+            scored.emplace_back(
+                evaluator.evaluate_position_with_pattern(board, pos.row, pos.col, pattern, color),
+                Move(pos.row, pos.col, color));
+        }
+        std::stable_sort(scored.begin(), scored.end(),
+                         [](const std::pair<int, Move>& a, const std::pair<int, Move>& b) {
+                             return RootScore(a.second, a.first) > RootScore(b.second, b.first);
+                         });
+        return scored;
+    };
+
+    struct Arm {
+        const char* name;
+        Board board;
+        int color;
+    };
+    const std::vector<Arm> arms = {
+        {"midgame", [&] { Board b; build_midgame(b); return b; }(), BLACK},
+        {"midgame", [&] { Board b; build_midgame(b); return b; }(), WHITE},
+        {"white_open_four", b1_white_open_four(), BLACK},
+        {"white_open_four", b1_white_open_four(), WHITE},
+        {"double_three", b1_double_three(), BLACK},
+        {"double_three", b1_double_three(), WHITE},
+        {"crowded", b1_crowded(), BLACK},
+    };
+
+    size_t compared = 0;
+    for (const Arm& arm : arms) {
+        const std::vector<std::pair<int, Move>> want = old_inline_row(arm.board, arm.color);
+        CandidateSet set;
+        gen.generate(arm.board, arm.color, 0, true, &set);
+
+        // 「仅强制着法」: Tier1 and nothing else.
+        assert(set.forced.empty() && set.vicinity.empty() && set.remote.empty());
+        assert(set.threats.size() == want.size());
+        for (size_t i = 0; i < want.size(); ++i) {
+            assert(set.threats[i].move.pos == want[i].second.pos);
+            assert(set.threats[i].move.color == want[i].second.color);
+            assert(set.threats[i].score == want[i].first);
+        }
+        compared += want.size();
+
+        // The row is never truncated, whatever the knobs say - a quiescence subtree
+        // has no width, and a 活四 answer is not something a layer may be cut off.
+        const B1Rig narrow_rig(2, 2);
+        const MoveGenerator& narrow = narrow_rig.generator;
+        CandidateSet narrow_set;
+        narrow.generate(arm.board, arm.color, 0, true, &narrow_set);
+        assert(narrow_set.threats.size() == want.size());
+        for (size_t i = 0; i < want.size(); ++i)
+            assert(narrow_set.threats[i].move.pos == want[i].second.pos);
+    }
+
+    std::cout << "test_quiescence_row_is_the_forcing_filter passed (" << arms.size()
+              << " arms, " << compared << " candidates matched cell by cell and score by "
+              "score against the old inline filter, other three tiers empty)"
+              << std::endl;
+}
+
+// B1-7: 一层的取舍只由局面决定 (A6's claim, moved from the root to the tiers).
+//
+// A6 pinned that the root's *choice* is a function of the position and not of
+// active_empty()'s swap-remove order. The tiers now decide which candidates a layer
+// even gets to search, which is the same question one level up: if the pre-sort
+// order reached a decision, a board that merely played-and-undone a stone would hand
+// the search a different list. This extends A6 rather than duplicating it - it says
+// nothing about which move wins.
+void test_tier_choice_reproducible_across_undo_cycles() {
+    Board direct;
+    build_midgame(direct);
+
+    Board detour;
+    build_midgame(detour);
+    // The documented way active_empty() changes order without changing the position:
+    // a cell inside the active window and not at its front, played and then taken
+    // back. undo_last_move puts it at the END of the vector and the swap-remove that
+    // opened its slot moved the window's last cell into it.
+    assert(detour.place_stone(1, 1, WHITE));
+    detour.undo_last_move();
+
+    assert(detour.move_count() == direct.move_count());
+    assert(detour.has_last_move() == direct.has_last_move());
+    assert(detour.last_move().pos == direct.last_move().pos);
+    assert(detour.zobrist_hash() == direct.zobrist_hash());
+    for (int r = 0; r < BOARD_SIZE; ++r)
+        for (int c = 0; c < BOARD_SIZE; ++c) assert(detour.get(r, c) == direct.get(r, c));
+    // The premise: the two boards are the same position stated in a different
+    // candidate order. If this ever holds trivially the case proves nothing.
+    assert(direct.active_empty() != detour.active_empty());
+
+    const B1Rig at_default_rig(24, 8);
+    const MoveGenerator& at_default = at_default_rig.generator;
+    size_t tiers_compared = 0;
+    for (const int color : {BLACK, WHITE}) {
+        for (const int ply : {0, 1, 3}) {
+            CandidateSet a, b;
+            at_default.generate(direct, color, ply, false, &a);
+            at_default.generate(detour, color, ply, false, &b);
+            // Contents AND order, score by score, for all four tiers - the kept set
+            // is a function of the position, so is the order it comes back in.
+            const std::vector<Candidate>* ta[4] = {&a.forced, &a.threats, &a.vicinity, &a.remote};
+            const std::vector<Candidate>* tb[4] = {&b.forced, &b.threats, &b.vicinity, &b.remote};
+            for (int t = 0; t < 4; ++t) {
+                assert(ta[t]->size() == tb[t]->size());
+                for (size_t i = 0; i < ta[t]->size(); ++i) {
+                    assert((*ta[t])[i].move.pos == (*tb[t])[i].move.pos);
+                    assert((*ta[t])[i].move.color == (*tb[t])[i].move.color);
+                    assert((*ta[t])[i].score == (*tb[t])[i].score);
+                }
+                tiers_compared += ta[t]->size();
+            }
+            const std::vector<Move> fa = a.flatten(), fb = b.flatten();
+            assert(fa.size() == fb.size());
+            for (size_t i = 0; i < fa.size(); ++i) assert(fa[i].pos == fb[i].pos);
+            // The cut has to be real for the claim to be a claim.
+            assert(a.vicinity.size() == 24 || a.vicinity.size() == 16 ||
+                   a.vicinity.size() == 8);
+        }
+    }
+
+    std::cout << "test_tier_choice_reproducible_across_undo_cycles passed ("
+              << tiers_compared << " tier entries compared across a played-and-undone "
+              "stone, with the candidate list genuinely reordered and 67 -> 24/16/8 "
+              "cut both ways)"
+              << std::endl;
+}
+
 int main() {
     std::cout << "Running search tests..." << std::endl;
 
@@ -4316,6 +5146,14 @@ int main() {
     test_search_context_reports_why_it_stopped();
     test_search_context_deadlines_share_one_start_reading();
     test_search_context_counters_account_for_the_tree();
+
+    test_move_generator_tiers_never_drop_forced();
+    test_move_generator_vicinity_obeys_the_layer_width();
+    test_move_generator_tier3_and_the_no_threat_widening();
+    test_move_generator_width_lowers_nodes_and_root_size();
+    test_move_generator_drops_black_forbidden();
+    test_quiescence_row_is_the_forcing_filter();
+    test_tier_choice_reproducible_across_undo_cycles();
 
     std::cout << "All search tests passed!" << std::endl;
     return 0;

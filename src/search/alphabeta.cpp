@@ -16,45 +16,19 @@ namespace {
 constexpr int kAspirationDelta = 50;
 constexpr int kAspirationWidenings = 4;
 
-// The total order every root and ordering decision is made on: value, then being
-// nearer the centre (search_limits.h's center_distance), then the lower cell
-// index. The last key is what makes it a total order - no two cells share an
-// index, so no comparison can come back "equal" and leave the answer to whatever
-// order a container happened to iterate in - and the second is what makes the
-// engine's choice in a tie be the central one instead of an accident of
-// Board::active_empty()'s swap-remove order.
-struct RootScore {
-    int score;
-    int center_dist;
-    int cell_index;
-
-    RootScore(const Move& m, int s)
-        : score(s), center_dist(center_distance(m.pos)), cell_index(m.pos.to_index()) {}
-
-    bool operator>(const RootScore& other) const {
-        if (score != other.score) return score > other.score;
-        if (center_dist != other.center_dist) return center_dist < other.center_dist;
-        return cell_index < other.cell_index;
-    }
-};
-
 }
 
 AlphaBetaSearch::AlphaBetaSearch(const Evaluator& evaluator, TranspositionTable& tt)
-    : evaluator_(evaluator), tt_(tt), node_limit_(2000000),
+    : evaluator_(evaluator), tt_(tt), move_gen_(evaluator), node_limit_(2000000),
       clock_(&system_search_clock()) {}
 
-std::vector<Move> AlphaBetaSearch::generate_moves(const Board& board, int color) {
-    std::vector<Move> moves;
-    const auto& candidates = board.active_empty();
-
-    for (const auto& pos : candidates) {
-        if (!board.is_empty(pos.row, pos.col)) continue;
-        if (PatternRecognizer::is_forbidden(board, pos.row, pos.col, color)) continue;
-        moves.push_back(Move(pos.row, pos.col, color));
-    }
-
-    return moves;
+std::vector<Move> AlphaBetaSearch::generate_moves(const Board& board, int color, int ply) {
+    // The tiered list (design doc 2.5.1): Tier0/Tier1 in full, Tier2 down to the
+    // layer's width, Tier3 only where the position has no threat at all. What the
+    // width cannot keep is a candidate this layer never searches, which is the
+    // branch-factor cut P1's depth-6 timeout is asking for; the ordering pass below
+    // then ranks what survived.
+    return move_gen_.generate_moves(board, color, ply, /*in_quiescence=*/false);
 }
 
 void AlphaBetaSearch::sort_moves(std::vector<Move>& moves, const Board& board, int color,
@@ -82,6 +56,15 @@ void AlphaBetaSearch::sort_moves(std::vector<Move>& moves, const Board& board, i
     // would rerun is_forbidden (which does a second recognize_position) on
     // every node of every ply. Score both sides directly and skip that
     // redundant work.
+    //
+    // The tiered generator has already produced this list's scores, so the pass
+    // below does read them a second time. Deliberately so, for this stage: which
+    // squares survive a width is the generator's decision (design doc 2.5.1), while
+    // the order a layer searches them in is still the one A6 put under the root's
+    // choice - one place, and the pins on the root order and the interrupted-layer
+    // fallback keep describing the engine's actual path. Stage B2 replaces this
+    // pass with the TT/killer/history ordering of 2.4.2, and stage C's candidate
+    // score cache is what makes the re-scoring cheap until then.
     int start = tt_swapped ? 1 : 0;
     int count = static_cast<int>(moves.size()) - start;
     if (count <= 1) return;
@@ -136,50 +119,18 @@ NodeResult AlphaBetaSearch::quiescence(Board& board, int alpha, int beta, int co
     if (stand_pat >= beta) return {stand_pat, true};
     if (stand_pat > alpha) alpha = stand_pat;
 
-    const auto& candidates = board.active_empty();
-    std::vector<std::pair<int, Move>> scored;
-    scored.reserve(candidates.size());
-
-    for (const auto& pos : candidates) {
-        if (!board.is_empty(pos.row, pos.col)) continue;
-
-        PositionPattern pattern = PatternRecognizer::recognize_position(board, pos.row, pos.col, color);
-        bool is_threat = false;
-        for (int d = 0; d < 4; ++d) {
-            PatternType t = pattern.directions[d].type;
-            if (t == PatternType::FIVE || t == PatternType::LIVE_FOUR ||
-                t == PatternType::RUSH_FOUR || t == PatternType::LIVE_THREE) {
-                is_threat = true;
-                break;
-            }
-        }
-
-        if (is_threat) {
-            if (color == BLACK && PatternRecognizer::is_forbidden_from_pattern(pattern)) {
-                continue;
-            }
-            // Score from the pattern we just recognized; calling
-            // evaluate_position here would re-run the same four scans.
-            int s = evaluator_.evaluate_position_with_pattern(board, pos.row, pos.col, pattern,
-                                                              color);
-            scored.emplace_back(s, Move(pos.row, pos.col, color));
-        }
-    }
-
-    if (scored.empty()) return {stand_pat, true};
-
-    // Decorate-sort-undecorate: scores are already attached, so the sort does
-    // no pattern recognition. The triple below the score is what keeps a quiet
-    // subtree's ordering (and so its cut pattern, and so the bounds it hands back)
-    // a function of the position rather than of the candidate list's order.
-    std::stable_sort(scored.begin(), scored.end(),
-                     [](const std::pair<int, Move>& a, const std::pair<int, Move>& b) {
-                         return RootScore(a.second, a.first) > RootScore(b.second, b.first);
-                     });
+    // Design doc 2.5.1's quiescence row: Tier1 in full, and nothing else. The
+    // filter and the price come off one four-direction pass (the generator's
+    // decorate-sort-undecorate is what keeps this ordering, and so this subtree's
+    // cut pattern and the bounds it hands back, a function of the position rather
+    // than of the candidate list's order).
+    CandidateSet forcing;
+    move_gen_.generate(board, color, /*ply=*/0, /*in_quiescence=*/true, &forcing);
+    if (forcing.threats.empty()) return {stand_pat, true};
 
     bool node_sound = true;
-    for (const auto& entry : scored) {
-        const Move& move = entry.second;
+    for (const Candidate& entry : forcing.threats) {
+        const Move& move = entry.move;
         if (ctx_.hard_stopped()) {
             node_sound = false;
             break;
@@ -267,7 +218,7 @@ NodeResult AlphaBetaSearch::alphabeta(Board& board, int depth, int alpha, int be
         return quiescence(board, alpha, beta, color, stop_flag, 0);
     }
 
-    auto moves = generate_moves(board, color);
+    auto moves = generate_moves(board, color, ply);
     if (moves.empty()) return {evaluator_.evaluate_board(board, color), true};
 
     sort_moves(moves, board, color, tt_move);
@@ -386,7 +337,7 @@ Move AlphaBetaSearch::search(const Board& board, int color, const SearchLimits& 
     Move best_move;
     int best_score = 0;
 
-    auto root_moves = generate_moves(board, color);
+    auto root_moves = generate_moves(board, color, /*ply=*/0);
     if (root_moves.empty()) {
         // An invalid move says "nothing to play". The centre square may already
         // be occupied, or be a forbidden point for BLACK.

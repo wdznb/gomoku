@@ -31,6 +31,7 @@ set(GOMOKU_CORE_SOURCES
     src/search/greedy.cpp
     src/search/vcf.cpp
     src/search/vct.cpp
+    src/search/move_generator.cpp
     src/search/alphabeta.cpp
     src/search/search_engine.cpp
     src/search/controller.cpp

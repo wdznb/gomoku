@@ -186,6 +186,11 @@ int Evaluator::evaluate_position_pair(const Board& board, int row, int col, int 
     PositionPattern mine, theirs;
     PatternRecognizer::recognize_position_both(board, row, col, color, mine, theirs);
 
+    return candidate_pair_value(mine, theirs, row, col, color);
+}
+
+int Evaluator::candidate_pair_value(const PositionPattern& mine, const PositionPattern& theirs,
+                                    int row, int col, int color) const {
     return candidate_value(row, col, mine, color) +
            candidate_value(row, col, theirs, opponent(color));
 }

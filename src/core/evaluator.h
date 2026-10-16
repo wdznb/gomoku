@@ -73,6 +73,13 @@ public:
     // opponent(color)), but from a single shared four-direction pass. Used for
     // move ordering, which always wants both sides of every candidate.
     int evaluate_position_pair(const Board& board, int row, int col, int color) const;
+
+    // The same sum for a caller that already holds both patterns. The tiered
+    // candidate generator (design doc 2.5.1) has to look at the patterns anyway to
+    // decide which tier a square belongs to, so scoring it must not be a second
+    // pass over the four directions.
+    int candidate_pair_value(const PositionPattern& mine, const PositionPattern& theirs,
+                             int row, int col, int color) const;
     
     int evaluate_board(const Board& board, int my_color) const;
     
