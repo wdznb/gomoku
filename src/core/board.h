@@ -60,6 +60,10 @@ public:
     
     int move_count() const { return move_count_; }
     const Move& last_move() const;
+    // Whether there is a last move at all. last_move() answers an empty board with a
+    // default Move, so "no stone has been played" reaches the caller only as a
+    // Position of (-1,-1) — a sentinel the caller has to know. This says it outright.
+    bool has_last_move() const { return !moves_.empty(); }
     const std::vector<Move>& move_history() const { return moves_; }
     
     int check_winner() const;
@@ -79,6 +83,15 @@ public:
     int run_length(int dir, int row, int col, int color) const;
     
     const std::vector<Position>& active_empty() const { return active_empty_; }
+    // Read-only views of the candidate bookkeeping below, so a caller that tiers
+    // candidates (move_generator, design doc 2.5.1) does not re-derive the 5x5 count
+    // or search active_empty_ by hand. Both are defined on empty cells: neighbor_count_
+    // is maintained only while a cell is empty, so an occupied cell answers with the
+    // count frozen when it was filled. The order active_empty_ comes back in is not
+    // one of these contracts — undo returns cells by swap-remove — so tiering reads
+    // the count, never the position in the list.
+    int neighbor_count_at(Position pos) const;
+    bool is_active(Position pos) const;
     void update_active_empty(int row, int col);
     
     std::vector<Position> get_candidate_moves() const;

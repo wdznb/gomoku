@@ -1979,6 +1979,53 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次121 引擎重构 A8：候选分层的两只门打开了 — engine redesign stage A8
+
+规格 `docs/ENGINE_REDESIGN.md` §2.5.1 + §6 文件清单的 `src/core/board.h/.cpp` 行（冻结，不改写）。A8 是给 B1 前置的
+一轮：宽度裁剪要问的两件事，`Board` 早就知道，只是不说。
+
+### Found
+
+- §2.5.1 的 Tier 划分依赖两个事实：这一格的 5×5 邻域里有几颗子（决定它属不属于「上一手 2 格邻域 ∪ 已有棋子的
+  2 格邻域」），以及它此刻到底还在不在候选集里。`Board` 两个都维护着（`neighbor_count_` / `active_index_`，
+  board.h:107-108），但**都是私有** ⇒ 下一个消费者只能自己重扫 5×5，或者对 `active_empty()` 线性查找。
+- `last_move()` 用默认构造的 `Move` 回答空盘，即 `Position(-1,-1)`；调用方要区分「没有上一手」与「上一手在 (0,0)」，
+  只能靠记住这个哨兵——而 §2.5.1 的「上一手邻域」正是要先问有没有上一手。
+
+### Fixed
+
+- `neighbor_count_at(Position) const`（界外答 0）、`is_active(Position) const`（界外答 false）、
+  `has_last_move() const` 三个只读访问器，全部直接读已有的那两个数组，零新状态、零新成本。
+- **`rebuild_active_empty` 的行优先顺序一个字没动**，但访问器的注释把「顺序不是契约」写死：分层读的是计数与
+  成员资格，不是格在表里的位置。这句话是 A6 之后必须的 —— `undo_last_move` 的 swap-remove 会打乱表序，而下游
+  再也不能从顺序里读任何东西。
+- `neighbor_count_` 的**定义域**在注释里挑明：它只在空格上被维护（落子与悔子的两处循环都 `if (cells != EMPTY) continue`），
+  所以占用的格答的是「它被填满那一刻」的冻结值。访问器不假装这件事不存在，测也就只测空格。
+
+### New
+
+- `test_neighbor_count_at_matches_a_recount`：**每落一子、每悔一子之后**把全部空格逐格与一次朴素 5×5 重数比对
+  （不是只在终态比一次），布局含中央一团与三个角上的孤子，让窗口在盘边也成立；界外取 0。这是增量记账**第一次**
+  被差分测到 —— 之前 `test_active_empty_incremental_undo` 只能比「整盘重建 vs swap-remove」的集合与哈希。
+- `test_is_active_agrees_with_the_candidate_list`：225 格全查 `is_active(p)` ⟺ p 在 `active_empty()` 里，外加
+  「占用的格永远不在」与「计数为 0 的格永远不在」两条独立规则；再悔到只剩中心一子，此时候选集**不靠 Board** 数出来
+  是 5×5 减中心 = 24 格，逐格比对并钉住表长恰为 24。
+- `test_has_last_move_distinguishes_an_empty_board`：空盘 `false` 且 `last_move().pos` 无效、落子 `true`、悔到空盘
+  回到 `false`、空盘再悔是 no-op（`move_count()` 不变负）。
+
+### Verified
+
+- **无 HEAD-negative，新词汇的既有例外**：三个方法在 `87ee891` 上不存在，当前的 `test_board.cpp` 在改动前树无法
+  编译，与 A1 的新骨架、A6 的 `center_distance` 同类。`has_last_move()` 的既有等价物本来就是 `move_count() > 0`，
+  所以它是可读性而不是行为；本轮真正的**内容**是给 B1 一个不必重扫的入口，其价值在 B1 的用例里体现。
+- `test_active_empty_incremental_undo` 继续绿（前提：新访问器读的就是它检查的那两个数组），`test_board` 全套 15 条
+  用例一字未改地在最后的断言之前跑过。
+- diff 面：`src/core/board.h` 13/0、`src/core/board.cpp` 10/0、`tests/test_board.cpp` 141/0。三条新用例插在
+  `test_active_empty_incremental_undo` 与 `test_line_bitboard_tracks_cells` 之间 ⇒ `tests/test_search.cpp` 的两条
+  受保护前提不受影响（仍在 `:2563` 与 `:3958`）。
+- 门禁数字见下一条 A7 条目末的 **Gate**：本轮与 A7 在同一片工作树上一起测（A8 只往 `board.*` 加了三个无人调用的
+  const 访问器与 `test_board` 的三条用例，其余七个套件跑的仍是 A7 的那棵树）。
+
 ## 轮次121 引擎重构 A7：一层中断是一个帧，不是一次沉默 — engine redesign stage A7
 
 规格 `docs/ENGINE_REDESIGN.md` §2.3.3 末段 + 验收 G2（冻结，不改写）。A1–A6 把分层记账做进了引擎，但它出不了
