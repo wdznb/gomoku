@@ -5,6 +5,7 @@
 #include "search_limits.h"
 #include <atomic>
 #include <cstdint>
+#include <vector>
 
 namespace gomoku {
 
@@ -109,6 +110,97 @@ private:
     // start_think() ages the table instead of clearing it, and an aged uninitialised
     // cell would order the very first think of a session on stack noise.
     int history_[2][BOARD_SIZE * BOARD_SIZE] = {};
+};
+
+// Design doc 2.4.4's first option: the triangular PV table. One line per ply; a
+// node writes its own line when a child raises its alpha, and what it writes is
+// `[that move] + line(ply + 1)`.
+//
+// It exists because the line a layer proved died with the node that proved it:
+// `SearchStats::pv` had no writer at all, so the answer the player got was one cell
+// and the reply this search expected to the opponent's best reply - which is the
+// whole reason that cell was worth playing - was thrown away. The same line is what
+// a ponder preset would re-search on the next hand (doc 2.4.3 ②), and what a
+// stronger layer would reuse, so it lives in the think's state rather than being
+// rebuilt from the result.
+//
+// Every node clears its own slot on entry. That is what makes copying one ply down
+// safe: the slot below is either the child that just returned or empty, never the
+// line some earlier sibling left at the same ply. It is also why the reported line
+// can end short - at a quiescence leaf or a terminal five - instead of stopping
+// wherever the last node that touched this ply happened to stop.
+class PvTable {
+public:
+    // The same ply ceiling as the killers. A node deeper than this has no slot, so
+    // the line it produced is simply not extended, and the parent's entry stands as
+    // the end of the variation.
+    static const int kMaxPly = 64;
+    // A line cannot outlive the tree it came from: at most the documented depth
+    // ceiling (20) of tree plies below the root, plus the root's own move.
+    static const int kMaxLen = 24;
+
+    void start_think() {
+        for (int p = 0; p < kMaxPly; ++p) length_[p] = 0;
+    }
+
+    // Called at the top of every node, including the paths that return without
+    // searching anything.
+    void clear(int ply) {
+        if (in_range(ply)) length_[ply] = 0;
+    }
+
+    // This node's line: the move it is playing, then the line the child one ply
+    // deeper left behind.
+    void extend(int ply, const Move& move, int child_ply) {
+        if (!in_range(ply)) return;
+        int n = 0;
+        line_[ply][n++] = move;
+        if (in_range(child_ply)) {
+            const int child_len = length_[child_ply];
+            for (int i = 0; i < child_len && n < kMaxLen; ++i) {
+                line_[ply][n++] = line_[child_ply][i];
+            }
+        }
+        length_[ply] = n;
+    }
+
+    // A line this node cannot attest deeper than one move: the value it is returning
+    // came out of the table, so the rest of that variation belongs to whichever node
+    // wrote the entry and is not in this think's slots. The move itself is still the
+    // one that search proved, which is what makes the parent's line continue rather
+    // than stop.
+    void set_single(int ply, const Move& move) {
+        if (!in_range(ply)) return;
+        if (!move.pos.is_valid()) {
+            length_[ply] = 0;
+            return;
+        }
+        line_[ply][0] = move;
+        length_[ply] = 1;
+    }
+
+    int length(int ply) const { return in_range(ply) ? length_[ply] : 0; }
+
+    const Move& at(int ply, int i) const {
+        static const Move kNone;
+        if (!in_range(ply) || i < 0 || i >= length_[ply]) return kNone;
+        return line_[ply][i];
+    }
+
+    // Out of the think's state and into the record the caller reads.
+    void copy_out(int ply, std::vector<Move>* out) const {
+        out->clear();
+        if (!in_range(ply)) return;
+        for (int i = 0; i < length_[ply]; ++i) out->push_back(line_[ply][i]);
+    }
+
+private:
+    static bool in_range(int ply) { return ply >= 0 && ply < kMaxPly; }
+
+    Move line_[kMaxPly][kMaxLen];
+    // Zero at construction for the same reason history is: the first think of a
+    // session must not read a line out of stack noise.
+    int length_[kMaxPly] = {};
 };
 
 // Everything one think mutates that is not a result: the budget it is spending,

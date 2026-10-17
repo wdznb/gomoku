@@ -104,6 +104,11 @@ private:
     // state, aged between thinks, and it is why a second think of one session is not
     // a repeat of the first.
     MoveHeuristics heuristics_;
+    // Design doc 2.4.4's triangular PV table, keyed by the same ply the killers use.
+    // Nothing in the search reads it: it is written on an alpha raise and copied out
+    // once when a layer commits, which is what keeps the line and the node count two
+    // separate questions.
+    PvTable pv_;
     int node_limit_;
     // Only the layered accounting left in the object: the counters and the three
     // ways a think can end live in the context, so the stop test is one function
@@ -120,12 +125,26 @@ private:
     // `ply` is how far this node sits from the root of the think. The table needs it
     // to keep a mate score as a distance from that root rather than as the remaining
     // depth of whichever node proved it, which is only comparable inside one
-    // iteration of one think.
+    // iteration of one think. It is also the slot this node's line is written to, and
+    // the slot its children read - the triangular PV table of design doc 2.4.4, which
+    // is why the same node visited twice in one think never inherits a line from the
+    // first visit.
     NodeResult alphabeta(Board& board, int depth, int alpha, int beta, int color,
                          std::atomic<bool>& stop_flag, int ply = 0);
 
     NodeResult quiescence(Board& board, int alpha, int beta, int color,
                           std::atomic<bool>& stop_flag, int qdepth);
+
+    // One child of a tree node, in the shape design doc 2.7 calls PVS: the whole
+    // window for the first candidate of a node and for every candidate of a node that
+    // has no bottom to measure against yet, a one-point probe for each later one, and
+    // a full-window re-search only for a probe that lands strictly inside the node's
+    // window. `board` already carries this node's move, `color` is the side that
+    // played it, and the value comes back in the parent's perspective. The probe is
+    // what buys the cut: a candidate that cannot raise this node's alpha is never
+    // searched again.
+    NodeResult search_child_pvs(Board& board, int depth, int alpha, int beta, int color,
+                                 int ply, bool scout, std::atomic<bool>& stop_flag);
 
     // The tiered candidates this layer may search, in the order the generator put
     // them: Tier0/Tier1 whole, Tier2 down to the layer's width, Tier3 only in a
@@ -149,7 +168,10 @@ private:
     // returned score is the layer's best and its `sound` half says whether any root
     // child short-circuited; how many candidates were actually searched is in
     // stats_.root_moves_done, which is what distinguishes "the window crossed after
-    // the last one" from "it crossed in the middle".
+    // the last one" from "it crossed in the middle". The layer's best also writes
+    // slot 0 of the PV table - the root is not a tree node, so its line has no node
+    // to be written by - and only a layer that both finished and stayed sound commits
+    // it into stats_.pv.
     NodeResult search_root_layer(Board& board, const std::vector<Move>& root_moves,
                                  int depth, int color, Move& best_move,
                                  int alpha, int beta, std::atomic<bool>& stop_flag);

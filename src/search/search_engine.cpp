@@ -333,6 +333,10 @@ SearchResult SearchEngine::search(const Board& board, int color,
         result.root_moves_total = info.root_moves_total;
         result.seldepth = info.seldepth;
         result.stopped = stop_reason_name(info.stopped);
+        // The line the committed layer proved, the same field the two tactics phases
+        // already answer with. Until the search kept a variation there was nothing to
+        // put here (design doc 2.4.4: SearchInfo::pv was never written by anything).
+        result.principal_variation = info.principal_variation;
 
         // AlphaBeta's own count starts with that phase and covers only it; the
         // caller is owed the whole move, so the measure is taken below - after the

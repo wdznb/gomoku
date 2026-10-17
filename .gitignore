@@ -50,3 +50,6 @@ build-vg/
 callgrind.out.*
 massif.out.*
 vgcore.*
+
+# TSan build (tools/valgrind_check.sh tsan mode), kept separate from build/ and build-vg/
+build-tsan/

@@ -206,8 +206,73 @@ NodeResult AlphaBetaSearch::quiescence(Board& board, int alpha, int beta, int co
     return {alpha, node_sound};
 }
 
+// One child of a tree node, asked in the shape design doc 2.7 calls PVS. `board`
+// already carries this node's move, `color` is the side that played it, and `scout`
+// says whether this is a later move of the node (the first one has no line to scout
+// around, and a node whose window has no bottom yet cannot narrow it: -INT_MAX is
+// the nothing-searched value, and one point above it is still below every score the
+// position can produce).
+//
+// The probe's window is the single point above what the node already has, so its
+// answer is only ever "this move beats that" or "it does not". Only the first answer
+// is worth a second pass, and only when it does not already end the node: a value
+// that reaches the top is a bound strong enough to cut with, and a value below the
+// bottom is a bound the node's own upper bound is built out of. Both are the same
+// bound a full-window search would have handed back.
+NodeResult AlphaBetaSearch::search_child_pvs(Board& board, int depth, int alpha, int beta,
+                                             int color, int ply, bool scout,
+                                             std::atomic<bool>& stop_flag) {
+    const int other = opponent(color);
+    // A probe is only asked where the one point it raises can cut something. Its
+    // whole extra power over the full window is a bottom of alpha+1 for the
+    // child's own descendants, and that only pays where the child has descendants
+    // deep enough to be cut by it - elsewhere the probe and the re-search it forces
+    // cost two passes over a tree the single full-window pass would have finished.
+    // `depth` is the depth still to search *here*, so the floor says: probe a child
+    // that keeps at least four plies of its own. Measured on this engine's fail-soft
+    // windows, and the numbers are nowhere near design doc 2.7's -20~35 % for PVS -
+    // REVIEW_LOG's B3 section records why the width cap and the ordering already
+    // spend most of what a null window would buy. Probing at every ply left the
+    // depth-6 arms bigger than the same think with no probe at all (quiet BLACK
+    // 221380 -> 228822, +3.4 %) while the depth-8 arms improved (quiet BLACK
+    // 1451817 -> 1415010); this floor keeps the deep gains (quiet BLACK d8
+    // 1408083, -3.0 %; pos24 WHITE d8 1261498, -2.8 %; quiet WHITE d6 156428,
+    // -2.4 %), leaves five of the nine positional arms identical to the baseline,
+    // and costs the worst arm +0.18 %. That last number is why this floor and not a
+    // shallower one: `depth <= 3` aggregates 0.2 % better over the nine arms
+    // (-1.43 % against -1.23 %, from 9244367 to 9112420 against 9130501) but does so
+    // by making quiet BLACK d6 cost 2 %, and a probe that is a net loss on some pose
+    // is a probe the think cannot reason about. The table is in REVIEW_LOG's B3
+    // section.
+    if (!scout || depth <= 4) {
+        NodeResult child = alphabeta(board, depth - 1, -beta, -alpha, other, stop_flag,
+                                     ply + 1);
+        return {-child.score, child.sound};
+    }
+
+    NodeResult probe = alphabeta(board, depth - 1, -alpha - 1, -alpha, other, stop_flag,
+                                 ply + 1);
+    // A probe the budget ran out inside answers nothing, and the node it came from
+    // has just been marked unsound. Asking again would spend nodes the think does not
+    // have on a subtree that already stopped for want of them.
+    if (!probe.sound) return {-probe.score, false};
+
+    const int score = -probe.score;
+    // A window one point wide has no integer strictly inside it, so a probe either
+    // raises the node's alpha - and then only the re-search can say by how much - or
+    // it does not, and the bound stands as the move's value.
+    if (score <= alpha || score >= beta) return {score, true};
+
+    NodeResult exact = alphabeta(board, depth - 1, -beta, -alpha, other, stop_flag,
+                                 ply + 1);
+    return {-exact.score, exact.sound};
+}
+
 NodeResult AlphaBetaSearch::alphabeta(Board& board, int depth, int alpha, int beta, int color,
                                       std::atomic<bool>& stop_flag, int ply) {
+    // Before anything that can return: a node that leaves no line must leave none,
+    // not the line some earlier node at this same ply left.
+    pv_.clear(ply);
     ctx_.count_node();
     if (ctx_.hard_stopped()) {
         // Only the last-placed stone can have produced a five; check_winner()
@@ -231,6 +296,12 @@ NodeResult AlphaBetaSearch::alphabeta(Board& board, int depth, int alpha, int be
     bool node_sound = true;
     if (tt_.probe(hash, entry, ply)) {
         ctx_.count_tt_hit();
+        tt_move = entry.best_move;
+        // A node that answers out of the table has no line of its own in this think's
+        // slots: everything below the entry's move belongs to whichever node wrote it.
+        // That move is still the one the search that paid for the entry proved, so the
+        // parent's variation continues one further instead of stopping here.
+        pv_.set_single(ply, tt_move);
         if (entry.depth >= depth) {
             if (entry.flag == TTFlag::EXACT) {
                 ctx_.count_tt_cutoff();
@@ -245,7 +316,6 @@ NodeResult AlphaBetaSearch::alphabeta(Board& board, int depth, int alpha, int be
                 return {entry.value, true};
             }
         }
-        tt_move = entry.best_move;
     }
 
     // Terminal check: only the last move can have produced a five.
@@ -270,7 +340,8 @@ NodeResult AlphaBetaSearch::alphabeta(Board& board, int depth, int alpha, int be
     int best_score = -INT_MAX;
     TTFlag flag = TTFlag::UPPERBOUND;
 
-    for (const auto& move : moves) {
+    for (size_t i = 0; i < moves.size(); ++i) {
+        const Move& move = moves[i];
         if (ctx_.hard_stopped()) {
             // The scores that made up best_score came out of short-circuit static
             // evaluations, so not even a LOWERBOUND is sound for this node. It is
@@ -282,13 +353,18 @@ NodeResult AlphaBetaSearch::alphabeta(Board& board, int depth, int alpha, int be
 
         board.place_stone(move.pos.row, move.pos.col, color);
 
-        NodeResult child = alphabeta(board, depth - 1, -beta, -alpha, opponent(color),
-                                     stop_flag, ply + 1);
+        // PVS (design doc 2.7): the move that ordering put first is searched against
+        // the whole window because it is the line everything else is measured
+        // against, and each later move is first asked whether it beats what this
+        // node already has.
+        NodeResult child = search_child_pvs(board, depth, alpha, beta, color, ply,
+                                            /*scout=*/i > 0 && alpha != -INT_MAX,
+                                            stop_flag);
 
         board.undo_last_move();
         if (!child.sound) node_sound = false;
 
-        int score = -child.score;
+        const int score = child.score;
         if (score > best_score) {
             best_score = score;
             best_move = move;
@@ -296,6 +372,13 @@ NodeResult AlphaBetaSearch::alphabeta(Board& board, int depth, int alpha, int be
         if (score > alpha) {
             alpha = score;
             flag = TTFlag::EXACT;
+            // The variation this node now reports is this move followed by whatever
+            // the child one ply deeper left in its own slot (design doc 2.4.4). A
+            // short-circuited child is not copied: its score was a static evaluation
+            // of one position, so the moves under it are not a line the search
+            // proved, and a reported line whose every move came from a subtree that
+            // finished is worth more than a longer one that mixes the two.
+            if (child.sound) pv_.extend(ply, move, ply + 1);
         }
         if (alpha >= beta) {
             flag = TTFlag::LOWERBOUND;
@@ -384,6 +467,11 @@ Move AlphaBetaSearch::search(const Board& board, int color, const SearchLimits& 
     // it survives a think - and why it ages by half instead of being kept whole or
     // thrown away.
     heuristics_.start_think();
+    // The line slots are keyed by the same ply the killers are, so they are per-think
+    // too: a slot left over from the previous hand describes a position this hand
+    // will not stand in, and a parent that copied it down would report a variation
+    // nothing in this think searched.
+    pv_.start_think();
 
     // No generation step here, on purpose. Ageing the table at the start of a think
     // is what let that think's own shallow records evict the deep ones the previous
@@ -481,6 +569,11 @@ Move AlphaBetaSearch::search(const Board& board, int color, const SearchLimits& 
             stats_.completed_depth = depth;
             stats_.score = best_score;
             stats_.best_move = best_move;
+            // The variation that made this layer answer, and only a committed layer
+            // gets to say one: a cut pass has moves in its slots whose values came
+            // out of short-circuited subtrees, and a line the player can read is
+            // worth more than a long one the search did not finish.
+            pv_.copy_out(0, &stats_.pv);
             // A layer that finished replaces any earlier cut-short record.
             stats_.partial_depth = 0;
             stats_.partial_best_move = Move();
@@ -598,6 +691,11 @@ NodeResult AlphaBetaSearch::search_root_layer(Board& board,
         board.place_stone(move.pos.row, move.pos.col, color);
 
         // A root child sits one ply from the root, whatever the layer's depth is.
+        // Full window, not the one-point question the tree asks (design doc 2.7's
+        // PVS): the tie test below needs a candidate's value to say "level with the
+        // best", and a null-window answer cannot tell an exact tie from a loss - it
+        // would have to be re-asked for every candidate to keep A6's rule, which is
+        // the work the probe was meant to avoid.
         NodeResult child = alphabeta(board, depth - 1, -beta, -layer_alpha, opponent(color),
                                      stop_flag, 1);
 
@@ -605,6 +703,10 @@ NodeResult AlphaBetaSearch::search_root_layer(Board& board,
 
         if (!child.sound) layer_sound = false;
         int score = -child.score;
+        // Which pass this candidate's number came out of is what its line has to
+        // match: the tie probe below replaces the value, so the variation the root
+        // reports has to be the one that produced the replacement.
+        bool line_valid = child.sound;
 
         // Every candidate after the first is searched against a window whose bottom
         // is already the best's value, so one that comes back level with it has
@@ -636,12 +738,20 @@ NodeResult AlphaBetaSearch::search_root_layer(Board& board,
             // completed layer's move.
             if (!exact.sound) layer_sound = false;
             score = -exact.score;
+            line_valid = exact.sound;
         }
 
         if (!layer_best_move.pos.is_valid() ||
             RootScore(move, score) > RootScore(layer_best_move, layer_best_score)) {
             layer_best_score = score;
             layer_best_move = move;
+            // The root's own line: this candidate followed by the ply-1 slot, which
+            // is the subtree that just produced this candidate's value (every node
+            // clears its slot on entry, so nothing older can be in it). An
+            // unanswered candidate leaves no line, and the slot is emptied rather
+            // than left holding the previous best's.
+            if (line_valid) pv_.extend(0, move, 1);
+            else pv_.clear(0);
         }
         if (score > layer_alpha) layer_alpha = score;
         // What the interrupted layer would have played, kept as it is built: the

@@ -10,6 +10,10 @@
 #include <cstdint>
 #include <vector>
 #include <algorithm>
+// Declaration only, not an access hack: the B3 PvTable case builds one object over
+// 0xFF-filled raw storage with placement new, which <new> declares. Nothing here
+// widens access - the #define below is J2's, pre-existing and unchanged.
+#include <new>
 // J2 drives sort_moves and generate_moves directly, and both are private; the
 // round-79 generator checks drive generate_rush_fours / generate_attacks the
 // same way. Every header the alpha-beta header pulls in is included above, so
@@ -5559,10 +5563,17 @@ void test_sort_moves_pins_tt_then_killers_then_price_over_history() {
 // -3.9 % on the quiet arm and the positional arm that keeps the pin off a single
 // board. qnodes is deliberately not asserted - it moved by 7096 on the quiet arm
 // between the trees, and only nodes is the quantity the stage promises.
+//
+// B3 re-pins both numbers (221380 -> 221774, 2409735 -> 2378724) and nothing else
+// in this case moves: PVS is decision-neutral, so the only observable difference
+// it may make is the node count, and that is precisely what these two lines are
+// for. The same arms on 8b91b21 are red here and only on `nodes` - the raw
+// two-tree field dump is in REVIEW_LOG's B3 section, produced by
+// /mnt/d/tmp/r121_b3t2_cost.cpp run against both trees.
 void test_three_stage_ordering_pays_for_itself_in_nodes() {
     {
         const B1Think quiet = b1_think(b1_quiet(), BLACK, 6, 24, 8);
-        assert(quiet.nodes == 221380);        // COST pin; 8525f60 answers 230474 here
+        assert(quiet.nodes == 221774);        // COST pin; 8525f60 230474, 8b91b21 221380
         assert(quiet.completed_depth == 6);   // the four facts below are green on both trees
         assert(quiet.score == 71992);
         assert(quiet.best.pos.row == 8 && quiet.best.pos.col == 7);
@@ -5571,7 +5582,7 @@ void test_three_stage_ordering_pays_for_itself_in_nodes() {
     }
     {
         const B1Think pos = b1_think(b2_pos24(), BLACK, 8, 24, 8);
-        assert(pos.nodes == 2409735);         // COST pin; 8525f60 answers 2396300 here
+        assert(pos.nodes == 2378724);         // COST pin; 8525f60 2396300, 8b91b21 2409735
         assert(pos.completed_depth == 8);     // and again, everything below is green on both
         assert(pos.score == 99999);
         assert(pos.best.pos.row == 7 && pos.best.pos.col == 4);
@@ -5579,8 +5590,9 @@ void test_three_stage_ordering_pays_for_itself_in_nodes() {
         assert(pos.stopped == StopReason::NONE);
     }
     std::cout << "test_three_stage_ordering_pays_for_itself_in_nodes passed (quiet BLACK d6 "
-                 "24/8 230474 -> 221380 nodes, pos24 BLACK d8 24/8 2396300 -> 2409735, same "
-                 "depth, score, move, root width and reason on both trees)"
+                 "24/8 230474 -> 221380 -> 221774 nodes, pos24 BLACK d8 24/8 2396300 -> "
+                 "2409735 -> 2378724, same depth, score, move, root width and reason on "
+                 "8b91b21 and here; only nodes moved)"
               << std::endl;
 }
 
@@ -5733,6 +5745,925 @@ void test_killers_are_recorded_by_the_tree_not_by_the_root_or_quiescence() {
               << std::endl;
 }
 
+// ---------------------------------------------------------------------------
+// B3: PVS + PV 提取 (design doc 2.4.4's 方案① triangular table, 2.7's
+// probe-then-re-search rule, and the commit point that decides whose line a cut
+// think reports).
+//
+// Production is alphabeta.cpp's `search_child_pvs()`, the `pv_` writes in
+// `alphabeta()` / `search_root_layer()`, the one commit-point `copy_out` in the
+// `layer_complete && layer.sound` branch, and `search_engine.cpp:339`'s
+// `result.principal_variation = info.principal_variation;`.
+//
+// PROVENANCE OF EVERY NUMBER PINED BELOW - and what this block deliberately does
+// NOT contain. The ladder arms, the per-layer cut aims and the PVS probe arms were
+// measured on THIS tree by /mnt/d/tmp/r121_b3t_probe.cpp (raw output
+// /mnt/d/tmp/r121_b3t_probe4.out and /mnt/d/tmp/r121_b3t_extra.out, re-run for the
+// B3 wrap-up as /mnt/d/tmp/r121_b3t2_probe.out); the two-tree field dump that
+// shows the re-pinned cost arms differing ONLY in `nodes` comes from
+// /mnt/d/tmp/r121_b3t2_cost.cpp built and run against both trees.
+//   Group A has NO HEAD-negative and each case says so: PvTable does not exist on
+//   8b91b21, so there is no pre-change tree these claims could be red on.
+//   Group B and group C ARE discriminators: 8b91b21 already owns SearchStats::pv,
+//   SearchInfo::principal_variation and SearchResult::principal_variation but has
+//   no writer for any of them, so these bodies compile there and every non-empty-
+//   line assert is red. Inside the two quiet arms the line claim is asserted BEFORE
+//   the arm's cost number on purpose, so the abort on 8b91b21 names the line and the
+//   node difference stays the business of
+//   test_three_stage_ordering_pays_for_itself_in_nodes.
+//   Group D's reuse arm is a CONTROL, green on both trees; B3's cost movement is
+//   pinned by that same re-pinned case above.
+//   The probe-then-re-search arms themselves are NOT here. They would have to call
+//   AlphaBetaSearch::search_child_pvs() and read SearchContext through the
+//   file-wide `#define private public` this TU already carries for J2 - a whole-TU
+//   access change bought for one case, which is a risk to the gate rather than
+//   proof of the rule. They also have no HEAD-negative (search_child_pvs does not
+//   exist on 8b91b21), so their numbers are recorded as driver output in
+//   REVIEW_LOG's B3 section instead, the way this project records script-line
+//   fixtures.
+//
+// Registrations go at the end of main(), after the two protected assertions' cases
+// (test_search_engine_resigns_when_alphabeta_proves_mate and
+// test_engine_reports_the_interrupted_alphabeta_layer) and after the cost pins this
+// block re-reads, so nothing here can abort ahead of them.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// The line a think left behind, read the way the ladder reads it: a colour
+// sequence that alternates from the side to move, and a walk on a FRESH board in
+// which every named cell is still empty. A principal variation that fails either
+// is not a variation, it is a list of cells - and a line that names a cell twice
+// or keeps one colour for two plies would let a player "play" an impossible
+// position, which is exactly the bug a PV writer can produce silently.
+struct B3Walk {
+    bool alternating = true;
+    bool cells_free = true;
+    size_t steps = 0;
+};
+
+B3Walk b3_pv_walk(const std::vector<Move>& pv, int side_to_move) {
+    B3Walk w;
+    Board walk;
+    for (const Move& m : pv) {
+        ++w.steps;
+        if (m.color != side_to_move) w.alternating = false;
+        if (!m.pos.is_valid() || !walk.is_empty(m.pos.row, m.pos.col)) {
+            w.cells_free = false;
+            continue;
+        }
+        if (!walk.place_stone(m.pos.row, m.pos.col, side_to_move)) w.cells_free = false;
+        side_to_move = opponent(side_to_move);
+    }
+    return w;
+}
+
+void b3_assert_line(const std::vector<Move>& pv, int side_to_move, const Move& best) {
+    assert(!pv.empty());
+    assert(pv[0].pos == best.pos && pv[0].color == side_to_move);
+    const B3Walk walk = b3_pv_walk(pv, side_to_move);
+    assert(walk.alternating);
+    assert(walk.cells_free);
+    assert(walk.steps == pv.size());
+}
+
+// b1_think's shape plus the line the committed layer left behind. Public API
+// only (SearchStats::pv exists on 8b91b21 too - it simply has no writer there),
+// which is what lets the very same body compile and run against the pre-B3 tree.
+struct B3Think {
+    uint64_t nodes = 0;
+    uint64_t qnodes = 0;
+    int root_total = 0;
+    int root_done = 0;
+    int completed_depth = 0;
+    int partial_depth = 0;
+    int score = 0;
+    Move best;
+    Move partial_best;
+    std::vector<Move> pv;
+    StopReason stopped = StopReason::NONE;
+};
+
+// One think with no clock and no ceiling of any kind, so `nodes` is the size of
+// the tree the width left behind - the same discipline b1_think pins its cost
+// arms with.
+B3Think b3_open_think(const Board& board, int color, int depth, int root, int deep) {
+    const Evaluator evaluator = b1_evaluator(root, deep);
+    TranspositionTable tt;  // fresh table per arm: no warm TT may rescue an arm
+    AlphaBetaSearch search(evaluator, tt);
+    std::atomic<bool> stop(false);
+
+    SearchLimits limits;
+    limits.max_depth = depth;
+    limits.hard_time_ms = 0;
+    limits.soft_time_ms = 0;
+    limits.max_nodes = 0;
+
+    B3Think out;
+    out.best = search.search(board, color, limits, stop);
+    const SearchStats& stats = search.last_stats();
+    out.nodes = stats.nodes;
+    out.qnodes = stats.qnodes;
+    out.root_total = stats.root_moves_total;
+    out.root_done = stats.root_moves_done;
+    out.completed_depth = stats.completed_depth;
+    out.partial_depth = stats.partial_depth;
+    out.score = stats.score;
+    out.partial_best = stats.partial_best_move;
+    out.pv = stats.pv;
+    out.stopped = stats.stopped;
+    return out;
+}
+
+// One think aimed at a layer by reading index, exactly the way
+// test_stop_reason_time_hard_lands_mid_layer aims it: measure the unarmed layer
+// table first, then arm the clock on the poll three quarters into the deepest
+// layer. NO node budget is set - the only thing that ends the think is the
+// deadline crossing, which is what makes it a time_hard cut rather than a
+// budget cut, and the reason the case can say "committed line vs partial layer"
+// instead of "whatever the counter had".
+struct B3Cut {
+    B3Think cut;
+    int layer_at = 0;      // the depth the cut landed in
+    int polls_at = 0;      // its reading boundary
+    int polls_inside = 0;  // how many polls that layer costs unarmed
+};
+
+B3Cut b3_cut_search(const Board& board, int color, int depth, int root, int deep,
+                    int fraction_num, int fraction_den) {
+        const Evaluator evaluator = b1_evaluator(root, deep);
+        std::atomic<bool> stop(false);
+
+        SearchLimits limits;
+        limits.max_depth = depth;
+        limits.hard_time_ms = 600000;  // never crossed until the clock is armed
+        limits.soft_time_ms = 0;
+        limits.max_nodes = 0;          // deadline only, never a node ceiling
+
+        B3Cut out;
+        TranspositionTable probe_tt;
+        AlphaBetaSearch probe(evaluator, probe_tt);
+        ArmingClock clock;
+        LayerRecord rec;
+        measure_layers(probe, board, color, limits, stop, clock, &rec, nullptr);
+        assert(rec.depth.size() == static_cast<size_t>(depth));
+        const size_t last = rec.depth.size() - 1;
+        out.layer_at = rec.depth[last];
+        out.polls_at = rec.readings[last];
+        out.polls_inside = rec.readings[last] - rec.readings[last - 1] - 2;
+        assert(out.polls_inside >= 2);  // otherwise the layer is not aimable
+
+        TranspositionTable cut_tt;
+        AlphaBetaSearch search(evaluator, cut_tt);
+        ArmingClock armed;
+        armed.arm_at = rec.readings[last - 1] + 1 + out.polls_inside * fraction_num / fraction_den;
+        search.set_clock(&armed);
+
+        B3Think& th = out.cut;
+        th.best = search.search(board, color, limits, stop);
+        const SearchStats& stats = search.last_stats();
+        th.nodes = stats.nodes;
+        th.qnodes = stats.qnodes;
+        th.root_total = stats.root_moves_total;
+        th.root_done = stats.root_moves_done;
+        th.completed_depth = stats.completed_depth;
+        th.partial_depth = stats.partial_depth;
+        th.score = stats.score;
+        th.partial_best = stats.partial_best_move;
+        th.pv = stats.pv;
+        th.stopped = stats.stopped;
+        return out;
+}
+
+}  // namespace
+
+// B3-A1: 三角表在每次 think 开始前是空的 (design doc 2.4.4's start_think).
+//
+// NO HEAD-NEGATIVE: PvTable does not exist on 8b91b21 (`git archive 8b91b21` has no
+// class by that name, and the pre-B3 build of this file stops on group A for want of
+// it), so there is no pre-change tree this claim could be red on. The two facts it
+// pins are the ones the commit point depends on: a think that commits nothing copies
+// out nothing, and `start_think()` wipes every slot rather than only slot 0.
+void test_pv_table_starts_every_think_empty() {
+    static_assert(PvTable::kMaxPly == 64, "the PV table's ply ceiling is the killers'");
+    static_assert(PvTable::kMaxLen == 24, "a line cannot outlive the depth ceiling");
+
+    PvTable table;
+    for (int ply = 0; ply < PvTable::kMaxPly; ++ply) assert(table.length(ply) == 0);
+    {
+        std::vector<Move> out;
+        table.copy_out(0, &out);
+        assert(out.empty());
+        assert(!table.at(0, 0).pos.is_valid());  // an unwritten slot answers "no move"
+    }
+
+    // A line written at one ply must not survive into the next think.
+    table.set_single(3, Move(7, 7, BLACK));
+    table.set_single(9, Move(8, 8, WHITE));
+    table.extend(4, Move(6, 6, BLACK), 5);
+    assert(table.length(3) == 1 && table.length(4) == 1 && table.length(9) == 1);
+    table.start_think();
+    for (int ply = 0; ply < PvTable::kMaxPly; ++ply) assert(table.length(ply) == 0);
+
+    // The reason `int length_[kMaxPly] = {}` is spelled out instead of being left
+    // to the enclosing object: a PvTable built over memory that held something
+    // else must still answer "no line", or the first think of a session would be
+    // able to copy a variation out of stack noise.
+    {
+        alignas(PvTable) static unsigned char raw[sizeof(PvTable)];
+        for (size_t i = 0; i < sizeof raw; ++i) raw[i] = 0xFF;
+        PvTable* fresh = new (raw) PvTable();
+        for (int ply = 0; ply < PvTable::kMaxPly; ++ply) assert(fresh->length(ply) == 0);
+        std::vector<Move> out;
+        fresh->copy_out(5, &out);
+        assert(out.empty());
+        assert(!fresh->at(5, 0).pos.is_valid());
+        // ... and it writes normally afterwards, so the zero is not the whole slot
+        // array being unusable.
+        fresh->set_single(5, Move(10, 10, BLACK));
+        assert(fresh->length(5) == 1);
+        fresh->~PvTable();
+    }
+
+    std::cout << "test_pv_table_starts_every_think_empty passed (kMaxPly=64, kMaxLen=24, "
+                 "every slot empty at construction - including over 0xFF-filled raw memory - "
+                 "and start_think() clears a slot written at ply 3, 4 and 9; no HEAD-negative, "
+                 "PvTable is not on 8b91b21)"
+              << std::endl;
+}
+
+// B3-A2: extend 拼接的顺序与 kMaxLen 截断 (design doc 2.4.4's
+// line[ply] = move ++ line[ply+1]).
+//
+// NO HEAD-NEGATIVE for the same vocabulary reason as A1. Both halves matter: the
+// order (a reversed line is a legal-looking variation of a different game) and
+// the cap (an uncapped copy would run past line_[ply][24]).
+void test_pv_table_extend_concatenates_the_child_line_and_caps_at_max() {
+    {
+        PvTable table;
+        table.start_think();
+        table.set_single(2, Move(4, 4, BLACK));            // child's own tail
+        table.extend(1, Move(3, 3, WHITE), 2);             // [3,3w 4,4b]
+        assert(table.length(1) == 2);
+        assert(table.at(1, 0) == Move(3, 3, WHITE));
+        assert(table.at(1, 1) == Move(4, 4, BLACK));
+        table.extend(0, Move(7, 7, BLACK), 1);             // [7,7b 3,3w 4,4b]
+        assert(table.length(0) == 3);
+        assert(table.at(0, 0) == Move(7, 7, BLACK));
+        assert(table.at(0, 1) == Move(3, 3, WHITE));
+        assert(table.at(0, 2) == Move(4, 4, BLACK));
+        // The child keeps its own line: extend reads it, it never moves it.
+        assert(table.length(1) == 2 && table.length(2) == 1);
+
+        std::vector<Move> out;
+        table.copy_out(0, &out);
+        assert(out.size() == 3);
+        assert(out[0] == Move(7, 7, BLACK) && out[1] == Move(3, 3, WHITE) &&
+               out[2] == Move(4, 4, BLACK));
+        // copy_out clears first, so re-copying a shorter slot cannot leave a tail.
+        table.copy_out(1, &out);
+        assert(out.size() == 2 && out[0] == Move(3, 3, WHITE));
+        table.copy_out(9, &out);
+        assert(out.empty());
+    }
+
+    // The cap: a 63-ply chain of slots, so the deepest one holds one move and each
+    // ply above it wants one more. Cells are named inside the 15x15 board (the
+    // table does not check, but a test that stores nonsense cells could not tell a
+    // cap from a corruption); length(ply) is 64-ply until it hits the ceiling.
+    {
+        PvTable table;
+        table.start_think();
+        table.set_single(PvTable::kMaxPly - 1, Move(0, 0, BLACK));
+        assert(table.length(PvTable::kMaxPly - 1) == 1);
+        int grew_to_cap_at = -1;
+        for (int ply = PvTable::kMaxPly - 2; ply >= 0; --ply) {
+            table.extend(ply, Move(ply % BOARD_SIZE, (ply + 5) % BOARD_SIZE, WHITE), ply + 1);
+            const int want = PvTable::kMaxPly - ply;
+            assert(table.length(ply) == (want < PvTable::kMaxLen ? want : PvTable::kMaxLen));
+            if (table.length(ply) == PvTable::kMaxLen && grew_to_cap_at < 0)
+                grew_to_cap_at = ply;
+        }
+        // The chain reaches the ceiling 24 plies above the tail and stays there.
+        assert(grew_to_cap_at == PvTable::kMaxPly - PvTable::kMaxLen);
+        assert(table.length(0) == PvTable::kMaxLen);
+        assert(table.at(0, 0) == Move(0, 5, WHITE));   // the head is THIS ply's move
+        assert(table.at(0, PvTable::kMaxLen - 1).pos.is_valid());
+        assert(!table.at(0, PvTable::kMaxLen).pos.is_valid());  // and nothing past it
+        std::vector<Move> out;
+        table.copy_out(0, &out);
+        assert(out.size() == static_cast<size_t>(PvTable::kMaxLen));
+        for (int i = 0; i < PvTable::kMaxLen; ++i) assert(out[i] == table.at(0, i));
+    }
+
+    std::cout << "test_pv_table_extend_concatenates_the_child_line_and_caps_at_max passed "
+                 "(parent line is [move] ++ child line in order, the child keeps its own, "
+                 "copy_out clears, a 64-slot chain caps at exactly kMaxLen=24 at ply 40 and "
+                 "stays there; no HEAD-negative, PvTable is not on 8b91b21)"
+              << std::endl;
+}
+
+// B3-A3: clear 只清它那一层.
+//
+// NO HEAD-NEGATIVE (vocabulary). This is the write alphabeta() does as its FIRST
+// statement, before any return path, so a node that returns through the depth
+// gate, the stop gate or a TT hit must not hand its parent a stale tail: the
+// parent extends from THIS ply's slot and would splice a variation from a
+// previous node onto a value it just proved.
+void test_pv_table_clear_touches_only_its_own_ply() {
+    PvTable table;
+    table.start_think();
+    table.set_single(0, Move(7, 7, BLACK));
+    table.set_single(1, Move(6, 6, WHITE));
+    table.extend(2, Move(8, 8, BLACK), 3);
+    assert(table.length(0) == 1 && table.length(1) == 1 && table.length(2) == 1);
+
+    table.clear(1);
+    assert(table.length(1) == 0);
+    assert(!table.at(1, 0).pos.is_valid());
+    {
+        std::vector<Move> out;
+        table.copy_out(1, &out);
+        assert(out.empty());
+    }
+    // The neighbours stand: a clear is not a start_think.
+    assert(table.length(0) == 1 && table.length(2) == 1);
+    assert(table.at(0, 0) == Move(7, 7, BLACK));
+    assert(table.at(2, 0) == Move(8, 8, BLACK));
+
+    // Clearing an empty slot is not an error and changes nothing.
+    table.clear(30);
+    assert(table.length(30) == 0);
+    table.clear(1);
+    assert(table.length(1) == 0 && table.length(0) == 1 && table.length(2) == 1);
+
+    std::cout << "test_pv_table_clear_touches_only_its_own_ply passed (clear(1) empties ply "
+                 "1, gives an empty copy_out and leaves plies 0, 2 and 30 alone; no "
+                 "HEAD-negative, PvTable is not on 8b91b21)"
+              << std::endl;
+}
+
+// B3-A4: set_single 给一子的线，非法 move 给零子.
+//
+// NO HEAD-NEGATIVE (vocabulary). This is the TT-hit writer: the entry answers the
+// node's value from the table, so the only move the node can attest is the one
+// the entry names - and an entry whose move cell no longer makes sense must give
+// the parent NOTHING rather than a phantom head.
+void test_pv_table_set_single_answers_one_move_and_overwrites_a_longer_line() {
+    PvTable table;
+    table.start_think();
+    table.set_single(5, Move(9, 9, WHITE));
+    assert(table.length(5) == 1);
+    assert(table.at(5, 0) == Move(9, 9, WHITE));
+    assert(!table.at(5, 1).pos.is_valid());
+
+    // An invalid move (the default Move(): cell (-1,-1), colour EMPTY) empties the
+    // slot instead of writing a head nobody can play.
+    table.set_single(5, Move());
+    assert(table.length(5) == 0);
+    assert(!table.at(5, 0).pos.is_valid());
+
+    // A slot that already held a long line is replaced, not appended to - which is
+    // what makes a TT answer at ply p cut the variation off instead of splicing a
+    // stale tail onto it.
+    table.set_single(7, Move(0, 0, BLACK));
+    for (int ply = 6; ply >= 0; --ply)
+        table.extend(ply, Move(ply, ply + 1, WHITE), ply + 1);
+    assert(table.length(7) == 1 && table.length(0) == 8);  // one move per ply, 7 down to 0
+    const int long_len = table.length(0);
+    table.set_single(0, Move(2, 2, BLACK));
+    assert(table.length(0) == 1);
+    assert(table.at(0, 0) == Move(2, 2, BLACK));
+    assert(!table.at(0, 1).pos.is_valid());
+    assert(table.length(1) == long_len - 1);  // the child of the slot just rewritten
+
+    std::cout << "test_pv_table_set_single_answers_one_move_and_overwrites_a_longer_line "
+                 "passed (length 1 for a valid move, 0 for Move(), and a "
+              << "slot that held a longer line is replaced rather than extended; no "
+                 "HEAD-negative, PvTable is not on 8b91b21)"
+              << std::endl;
+}
+
+// B3-A5/A6: 越界的 ply 和越界的下标都回答"没有"，且不写坏任何东西.
+//
+// NO HEAD-NEGATIVE (vocabulary). kMaxPly is a real ceiling, not a comfort:
+// alphabeta() recurses to arbitrary ply within the depth budget, and
+// search_root_layer writes slot 0 by hand. Out-of-range writers must be silent
+// and out-of-range readers must answer "no move / no line", or a deep node would
+// write outside line_[].
+void test_pv_table_refuses_every_ply_and_index_outside_its_slots() {
+    const int bad_plys[] = {-1, PvTable::kMaxPly, PvTable::kMaxPly + 1, 1000, INT_MIN};
+    for (const int ply : bad_plys) {
+        PvTable table;
+        table.start_think();
+        table.set_single(ply, Move(7, 7, BLACK));
+        table.clear(ply);
+        table.extend(ply, Move(8, 8, WHITE), ply + 1);
+        table.extend(0, Move(9, 9, BLACK), ply);  // out-of-range CHILD as well
+        assert(table.length(ply) == 0);
+        assert(!table.at(ply, 0).pos.is_valid());
+        std::vector<Move> out;
+        table.copy_out(ply, &out);
+        assert(out.empty());
+        // Only the legal write of the group stands: extend(0, ..., bad child)
+        // contributes the head and nothing else.
+        assert(table.length(0) == 1);
+        assert(table.at(0, 0) == Move(9, 9, BLACK));
+        assert(!table.at(0, 1).pos.is_valid());
+        // And the slots the table does own are untouched by the out-of-range ones.
+        for (int p = 1; p < PvTable::kMaxPly; ++p) assert(table.length(p) == 0);
+    }
+
+    // Index bounds inside a valid ply: one before the start, one past the end,
+    // and the read must not shorten the line.
+    {
+        PvTable table;
+        table.start_think();
+        table.set_single(2, Move(4, 4, BLACK));
+        table.extend(1, Move(3, 3, WHITE), 2);
+        assert(table.length(1) == 2);
+        assert(!table.at(1, -1).pos.is_valid());
+        assert(!table.at(1, 2).pos.is_valid());
+        assert(!table.at(1, 999).pos.is_valid());
+        assert(table.length(1) == 2);  // reading out of range changes nothing
+        assert(table.at(1, 0) == Move(3, 3, WHITE) && table.at(1, 1) == Move(4, 4, BLACK));
+        // A ply with no line answers "no move" at every index, valid or not.
+        assert(!table.at(3, 0).pos.is_valid());
+        assert(!table.at(3, -1).pos.is_valid());
+    }
+
+    std::cout << "test_pv_table_refuses_every_ply_and_index_outside_its_slots passed (ply -1, "
+                 "64, 65, 1000 and INT_MIN write nothing and read empty, an out-of-range child "
+                 "ply contributes no tail, and at() out of index range returns an invalid Move "
+                 "without touching length; no HEAD-negative, PvTable is not on 8b91b21)"
+              << std::endl;
+}
+
+// B3-B7: 提交层把它的线交出去 - the HEAD-negative for PV extraction.
+//
+// DISCRIMINATOR: this body runs verbatim against 8b91b21 (see the excerpt build in
+// the header above) and aborts at b3_assert_line's first assert, because that tree
+// owns SearchStats::pv, SearchInfo::principal_variation and
+// SearchResult::principal_variation with no writer for any of them.
+//
+// The quiet pose (four stones, no threat, widths 24/8, fresh table, no budget of
+// any kind) is the pose the cost pin in test_three_stage_ordering... runs on, so
+// the same think answers the same 8,7 / 71992 here and the line that goes with
+// it. The depth-4 arm is the SearchEngine field half: search_engine.cpp:339 is
+// the writer the design doc's 2.4.4 asks for, and a field only AlphaBetaSearch
+// could read would not be a deliverable.
+void test_committed_layer_reports_its_principal_variation() {
+    const Board board = b1_quiet();
+    {
+        const B3Think think = b3_open_think(board, BLACK, 6, 24, 8);
+        // What this case is about, asserted first so the pre-B3 tree aborts on the
+        // line and not on the cost number that belongs to the case above.
+        b3_assert_line(think.pv, BLACK, think.best);
+        assert(think.pv.size() == 6);
+        // The shape, cell by cell, exactly as the probe printed it. A line the
+        // commit point wrote by accident could match on length and still be wrong
+        // here.
+        const int want[6][3] = {
+            {8, 7, BLACK}, {6, 7, WHITE}, {8, 9, BLACK},
+            {8, 10, WHITE}, {9, 7, BLACK}, {7, 9, WHITE},
+        };
+        for (int i = 0; i < 6; ++i)
+            assert(think.pv[i].pos.row == want[i][0] && think.pv[i].pos.col == want[i][1] &&
+                   think.pv[i].color == want[i][2]);
+        // The think itself, unchanged by B3 but for the node count: PVS is
+        // decision-neutral, so this arm answers with the same score, move, depth and
+        // reason the B2 pin records, at the cost B3 measures.
+        assert(think.completed_depth == 6 && think.partial_depth == 0);
+        assert(think.score == 71992);
+        assert(think.best.pos.row == 8 && think.best.pos.col == 7);
+        assert(think.root_total == 31 && think.root_done == 31);
+        assert(think.stopped == StopReason::NONE);
+        assert(think.nodes == 221774);
+    }
+
+    // The engine field: same pose, same committed layer, read through the record
+    // the client actually gets. Hard budget 200000 ms so nothing cuts the think -
+    // the point of this arm is the field, not the interruption (that is C11).
+    {
+        std::atomic<bool> stop_flag(false);
+        SearchEngine engine;
+        engine.set_vcf_enabled(false);
+        engine.set_vct_enabled(false);
+        engine.set_resign_detection(false);
+        const SearchResult result = engine.search(b1_quiet(), BLACK, 4, 200000, stop_flag);
+        assert(!result.principal_variation.empty());
+        b3_assert_line(result.principal_variation, BLACK, result.best_move);
+        assert(result.principal_variation.size() == 4);
+        const int want[4][3] = {{8, 7, BLACK}, {6, 7, WHITE}, {8, 9, BLACK}, {8, 6, WHITE}};
+        for (int i = 0; i < 4; ++i) {
+            assert(result.principal_variation[i].pos.row == want[i][0]);
+            assert(result.principal_variation[i].pos.col == want[i][1]);
+            assert(result.principal_variation[i].color == want[i][2]);
+        }
+        assert(result.method == "alphabeta");
+        assert(result.depth == 4);
+        assert(result.partial_depth == 0);
+        assert(result.stopped == "none");
+        assert(result.nodes_searched == 11359);
+        assert(!result.resigned);
+        assert(result.best_move.pos.row == 8 && result.best_move.pos.col == 7);
+    }
+
+    std::cout << "test_committed_layer_reports_its_principal_variation passed (quiet BLACK d6 "
+                 "24/8: 221774 nodes, 8,7 / 71992 / depth 6 / reason none and a 6-move line "
+                 "8,7b 6,7w 8,9b 8,10w 9,7b 7,9w; engine d4: 11359 nodes, method alphabeta, "
+                 "stopped none, 4-move line 8,7b 6,7w 8,9b 8,6w in "
+                 "SearchResult::principal_variation; red on 8b91b21, where both fields are "
+                 "always empty)"
+              << std::endl;
+}
+
+// B3-B8/B9: 线的长度跟着深度和局面走 - d8 on the quiet pose, both colours on the
+// positional pose, and a mate arm.
+//
+// DISCRIMINATOR, same mechanism as B7 (this verbatim body, pre-B3 tree).
+//
+// `pv.size() == completed_depth` is pinned on these arms because each one is a
+// FRESH table, an open budget and a layer that ran to the end - the three
+// conditions under which the probe measured it. It is not a universal invariant:
+// the same probe printed pos24 WHITE at depth 6 under a 64/32 width with
+// pv_len=5 against completed_depth=6 (a TT answer cut the line one move short),
+// and B10 below is the reuse case where 2 against 6 is correct. So the general
+// form asserted everywhere is `size <= completed_depth`, and equality is claimed
+// only for the arms whose numbers are printed here.
+void test_principal_variation_length_tracks_depth_and_pose() {
+    {
+        // quiet BLACK d8 24/8: 1408083 nodes (the arm 8b91b21 answers 1451817 -
+        // that difference is item 13's business, not this case's, so it is asserted
+        // after the line).
+        const B3Think think = b3_open_think(b1_quiet(), BLACK, 8, 24, 8);
+        b3_assert_line(think.pv, BLACK, think.best);
+        assert(think.pv.size() == 8);
+        assert(static_cast<int>(think.pv.size()) == think.completed_depth);
+        const int want[8][3] = {
+            {8, 7, BLACK}, {6, 7, WHITE}, {8, 9, BLACK}, {8, 6, WHITE},
+            {9, 7, BLACK}, {7, 6, WHITE}, {8, 11, BLACK}, {8, 10, WHITE},
+        };
+        for (int i = 0; i < 8; ++i)
+            assert(think.pv[i].pos.row == want[i][0] && think.pv[i].pos.col == want[i][1] &&
+                   think.pv[i].color == want[i][2]);
+        assert(think.completed_depth == 8 && think.partial_depth == 0);
+        assert(think.score == 77842);
+        assert(think.best.pos.row == 8 && think.best.pos.col == 7);
+        assert(think.root_total == 31 && think.root_done == 31);
+        assert(think.stopped == StopReason::NONE);
+        assert(think.nodes == 1408083);
+    }
+
+    // The positional pose, both colours, d6 24/8 - the arms whose node counts
+    // B3 did not move at all (300347 and 175088 on both trees), so the line is
+    // the only new thing they report.
+    {
+        const B3Think black = b3_open_think(b2_pos24(), BLACK, 6, 24, 8);
+        b3_assert_line(black.pv, BLACK, black.best);
+        assert(black.pv.size() == 6);
+        const int want[6][3] = {
+            {7, 4, BLACK}, {6, 3, WHITE}, {6, 2, BLACK},
+            {3, 2, WHITE}, {4, 3, BLACK}, {4, 4, WHITE},
+        };
+        for (int i = 0; i < 6; ++i)
+            assert(black.pv[i].pos.row == want[i][0] && black.pv[i].pos.col == want[i][1] &&
+                   black.pv[i].color == want[i][2]);
+        assert(black.nodes == 300347);
+        assert(black.completed_depth == 6 && black.score == 99999);
+        assert(black.best.pos.row == 7 && black.best.pos.col == 4);
+        assert(black.root_total == 39 && black.root_done == 39);
+        assert(black.stopped == StopReason::NONE);
+
+        const B3Think white = b3_open_think(b2_pos24(), WHITE, 6, 24, 8);
+        b3_assert_line(white.pv, WHITE, white.best);
+        assert(white.pv.size() == 6);
+        const int w_want[6][3] = {
+            {10, 7, WHITE}, {12, 5, BLACK}, {9, 7, WHITE},
+            {7, 7, BLACK}, {8, 6, WHITE}, {7, 5, BLACK},
+        };
+        for (int i = 0; i < 6; ++i)
+            assert(white.pv[i].pos.row == w_want[i][0] && white.pv[i].pos.col == w_want[i][1] &&
+                   white.pv[i].color == w_want[i][2]);
+        assert(white.nodes == 175088);
+        assert(white.completed_depth == 6 && white.score == 99999);
+        assert(white.best.pos.row == 10 && white.best.pos.col == 7);
+        // 32, not BLACK's 39: the width is the same knob but the two sides do not
+        // stand in the same position, and Tier1 is not symmetric here. Measured on
+        // both trees by /mnt/d/tmp/r121_b3t2_cost.cpp (root=32/32).
+        assert(white.root_total == 32 && white.root_done == 32);
+        assert(white.stopped == StopReason::NONE);
+    }
+
+    // The mate arm: midgame at the narrowest trained widths, where the deepening
+    // stops at layer 2 because the answer is proven. pv[0] has to BE the killing
+    // move and the line has to be exactly that move and the one reply the layer
+    // searched - a reported "variation" that stops short of the kill or runs past it
+    // is useless to the client that shows the line.
+    for (const int color : {BLACK, WHITE}) {
+        Board midgame;
+        build_midgame(midgame);
+        const B3Think think = b3_open_think(midgame, color, 6, 2, 2);
+        b3_assert_line(think.pv, color, think.best);
+        assert(think.pv.size() == 2);
+        // pv[0] is the mate move, and the line is the two cells the probe printed:
+        // BLACK 7,6b then 7,5w, WHITE 9,5w then 9,4b. It is NOT a five on the board
+        // the two plies leave behind - 7,6 makes a four whose ends (7,5) and (7,10)
+        // are both free, so the reply at one end still loses, and the fifth arrives
+        // at ply 3, which a committed layer 2 does not reach. (The draft this case
+        // came from asserted a five here; it had never been run.)
+        assert(think.pv[0].pos == think.best.pos);
+        assert(think.pv[0].pos.row == (color == BLACK ? 7 : 9));
+        assert(think.pv[0].pos.col == (color == BLACK ? 6 : 5));
+        assert(think.pv[1].color == opponent(color));
+        assert(think.pv[1].pos.row == (color == BLACK ? 7 : 9));
+        assert(think.pv[1].pos.col == (color == BLACK ? 5 : 4));
+        assert(think.completed_depth == 2 && think.score == 100000);
+        assert(think.stopped == StopReason::MATE);
+        assert(think.root_total == (color == BLACK ? 11 : 6));
+    }
+
+    std::cout << "test_principal_variation_length_tracks_depth_and_pose passed (quiet BLACK d8 "
+                 "1408083 nodes 8-move line 8,7b 6,7w 8,9b 8,6w 9,7b 7,6w 8,11b 8,10w; pos24 "
+                 "BLACK d6 300347 nodes root 39/39 7,4b 6,3w 6,2b 3,2w 4,3b 4,4w; pos24 WHITE "
+                 "d6 175088 nodes root 32/32 10,7w 12,5b 9,7w 7,7b 8,6w 7,5b; midgame mate arms "
+                 "160/97 nodes, line length 2 whose first move is the kill; red on 8b91b21)"
+              << std::endl;
+}
+
+// B3-B10: 复用 TT 的那次 think 交一条更短、但仍然是 best 的线.
+//
+// DISCRIMINATOR (the line's existence), and the reason the equality of B8 is not
+// stated as an invariant. On a warm table the root's own answer comes out of
+// `set_single(ply, tt_move)` at ply 0 - one move, attested by the entry, with the
+// rest of the variation living in whichever think wrote the entry and not in this
+// table's slots. So the second think of one session legitimately reports a
+// SHORTER line, and the only claims that survive are the ones a client can act
+// on: the head is the move it is about to play, and the line is still legal.
+//
+// The node counts here (221774 then 187 on the quiet pose, 175088 then 1308 on
+// pos24) are the reuse arms the ladder records; the 187 arm is already pinned by
+// test_aged_history_leaves_a_reused_root_think_unchanged, and 1308 is asserted
+// again by D14 below, which is the control that has to be green on 8b91b21 too.
+void test_reused_root_think_answers_with_a_shorter_line_that_still_starts_at_the_best_move() {
+    for (const int color : {BLACK, WHITE}) {
+        const Board board = color == BLACK ? b1_quiet() : b2_pos24();
+        const Evaluator evaluator = b1_evaluator(24, 8);
+        TranspositionTable tt;                 // ONE table for both thinks, as a session has
+        AlphaBetaSearch search(evaluator, tt);
+        std::atomic<bool> stop(false);
+
+        SearchLimits limits;
+        limits.max_depth = 6;
+        limits.hard_time_ms = 0;
+        limits.soft_time_ms = 0;
+        limits.max_nodes = 0;
+
+        const Move first = search.search(board, color, limits, stop);
+        const SearchStats cold = search.last_stats();
+        const Move second = search.search(board, color, limits, stop);
+        const SearchStats warm = search.last_stats();
+
+        assert(cold.completed_depth == 6 && warm.completed_depth == 6);
+        assert(cold.stopped == StopReason::NONE && warm.stopped == StopReason::NONE);
+        // The answer did not move.
+        assert(second.pos == first.pos);
+        assert(warm.score == cold.score);
+
+        b3_assert_line(cold.pv, color, first);
+        b3_assert_line(warm.pv, color, second);
+        assert(static_cast<int>(warm.pv.size()) <= cold.completed_depth);
+        // The reuse reports strictly less than the cold think's line - that is the
+        // table answering, not a truncated tree, and it is why no case here may
+        // assert pv.size() == completed_depth across two thinks.
+        assert(warm.pv.size() < cold.pv.size());
+        // The head is what gets played, so the one thing a client reads off a
+        // short line is still true of it.
+        assert(warm.pv[0].pos == second.pos && warm.pv[0].color == color);
+        assert(warm.pv.size() == 2);
+
+        if (color == BLACK) {
+            assert(cold.nodes == 221774);
+            assert(warm.nodes == 187);   // the same 187 the B2 reuse pin records
+            assert(cold.score == 71992);
+            assert(first.pos.row == 8 && first.pos.col == 7);
+        } else {
+            assert(cold.nodes == 175088);
+            assert(warm.nodes == 1308);
+            assert(cold.score == 99999);
+            assert(first.pos.row == 10 && first.pos.col == 7);
+        }
+    }
+
+    std::cout << "test_reused_root_think_answers_with_a_shorter_line_that_still_starts_at_the_"
+                 "best_move passed (quiet BLACK: 221774 nodes with a 6-move line, then 187 "
+                 "nodes with the 2-move line 8,7b 6,7w; pos24 WHITE: 175088/6 then 1308 with "
+                 "the 2-move line 10,7w 12,5b - each think answers its own pose's move "
+                 "(8,7 / 71992 and 10,7 / 99999) at depth 6 with reason none, both lines "
+                 "legal; red on 8b91b21)"
+              << std::endl;
+}
+
+// B3-C11: 被砍断的 think 交的是最后那个完成且干净的层，不是被砍的那层.
+//
+// DISCRIMINATOR: on 8b91b21 `stats.pv` is always empty, so b3_assert_line's first
+// assert aborts there. The interruption itself (completed_depth 3 / partial 4,
+// reason time_hard, the played move being the committed layer's) is the pre-existing
+// stop-reason accounting and is green on both trees - which is what makes the
+// line the only new thing.
+//
+// Deadline only: `hard_time_ms = 600000` with an ArmingClock whose reading
+// numbers are the layer table's, so no node budget is involved and the cut is a
+// time_hard one. Aimed three quarters into the deepest layer, the same aim
+// test_stop_reason_time_hard_lands_mid_layer uses.
+void test_cut_think_reports_the_last_committed_line() {
+    // quiet BLACK, depth 4. Unarmed layer table: d1@r3/n62 d2@r6/n742 d3@r11/n2515
+    // d4@r29/n11359, so layer 4 costs 16 in-layer polls and the aim is r24.
+    const B3Cut four = b3_cut_search(b1_quiet(), BLACK, 4, 24, 8, 3, 4);
+    assert(four.layer_at == 4 && four.polls_at == 29 && four.polls_inside == 16);
+    assert(four.cut.completed_depth == 3);
+    assert(four.cut.partial_depth == 4);
+    assert(four.cut.root_done < four.cut.root_total);
+    assert(four.cut.stopped == StopReason::TIME_HARD);
+    assert(four.cut.qnodes > 0);
+    // The move played is the committed layer's winner...
+    b3_assert_line(four.cut.pv, BLACK, four.cut.best);
+    assert(static_cast<int>(four.cut.pv.size()) == four.cut.completed_depth);
+    // ...and that layer's line is NOT the cut layer's: this arm's cut layer had
+    // reached (4,6) as its best so far, while layer 3 answers (8,7). Both are
+    // non-empty and different, so the commit point cannot be a copy of the
+    // partial layer's slot by accident.
+    assert(four.cut.partial_best.pos.is_valid());
+    assert(four.cut.partial_best.pos.row == 4 && four.cut.partial_best.pos.col == 6);
+    assert(four.cut.best.pos.row == 8 && four.cut.best.pos.col == 7);
+    {
+        const B3Walk walk = b3_pv_walk(four.cut.pv, BLACK);
+        assert(walk.alternating && walk.cells_free);
+        assert(four.cut.pv[0].pos != four.cut.partial_best.pos);
+    }
+
+    // The deeper arm the contract's item 15 names: quiet BLACK d6, cut inside
+    // layer 6, where the committed answer and the cut layer's best-so-far happen
+    // to agree (8,7 both). The claim that has to survive here is the one a client
+    // acts on: the line's head is the move returned, and its length is the
+    // COMMITTED depth (5), not the depth that was running (6).
+    const B3Cut six = b3_cut_search(b1_quiet(), BLACK, 6, 24, 8, 3, 4);
+    assert(six.layer_at == 6 && six.polls_at == 409);
+    assert(six.cut.completed_depth == 5 && six.cut.partial_depth == 6);
+    assert(six.cut.stopped == StopReason::TIME_HARD);
+    assert(six.cut.nodes > 0 && six.cut.nodes < 221774);  // cut, and by less than the layer
+    assert(six.cut.root_done < six.cut.root_total);
+    b3_assert_line(six.cut.pv, BLACK, six.cut.best);
+    assert(static_cast<int>(six.cut.pv.size()) == six.cut.completed_depth);
+    assert(six.cut.pv.size() != static_cast<size_t>(six.cut.partial_depth));
+    const int want[5][3] = {
+        {8, 7, BLACK}, {6, 7, WHITE}, {8, 9, BLACK}, {8, 6, WHITE}, {8, 10, BLACK},
+    };
+    for (int i = 0; i < 5; ++i)
+        assert(six.cut.pv[i].pos.row == want[i][0] && six.cut.pv[i].pos.col == want[i][1] &&
+               six.cut.pv[i].color == want[i][2]);
+
+    // The aim is an input, not a fluke: the ladder's sweep puts the cut anywhere
+    // from the 75th to the 409th reading of layer 6 and every one of them ends at
+    // completed 5 with a 5-move line whose head is the move played.
+    for (const int num : {1, 2, 3}) {
+        const B3Cut swept = b3_cut_search(b1_quiet(), BLACK, 6, 24, 8, num, 4);
+        assert(swept.cut.partial_depth == 6);
+        assert(swept.cut.stopped == StopReason::TIME_HARD);
+        assert(swept.cut.completed_depth >= 1);
+        assert(!swept.cut.pv.empty());
+        assert(swept.cut.pv[0].pos == swept.cut.best.pos);
+        assert(swept.cut.pv[0].color == BLACK);
+        assert(static_cast<int>(swept.cut.pv.size()) == swept.cut.completed_depth);
+        const B3Walk walk = b3_pv_walk(swept.cut.pv, BLACK);
+        assert(walk.alternating && walk.cells_free);
+    }
+
+    std::cout << "test_cut_think_reports_the_last_committed_line passed (quiet BLACK d4 cut at "
+                 "reading 24 of layer 4: completed 3 / partial 4 / time_hard, line 8,7b 6,7w "
+                 "8,6b of the committed layer while the cut layer's best is 4,6; d6 cut at "
+                 "reading 324 of layer 6: completed 5, 178789 nodes cut below the layer's "
+                 "221774, line 8,7b 6,7w 8,9b 8,6w 8,10b == 5 == completed depth, and the "
+                 "1/4, 2/4, 3/4 aims all agree; red on 8b91b21)"
+              << std::endl;
+}
+
+// B3-C12: 一层都没完成的 think 不交线.
+//
+// ONE-SIDED, and said so: on 8b91b21 this arm is trivially green (nothing ever
+// wrote a line, so an empty one is what it answers with too). The claim is the
+// shape of the new writer's absence - a think with no committed layer must not
+// report the partial layer's line - so it is recorded as a guard, not as a
+// discriminator.
+//
+// Both budgets are deterministic: the node ceiling cuts inside layer 1 at a
+// counted node (never a wall-clock race), and the absolute deadline is already
+// behind the process when the think starts.
+void test_a_think_with_no_committed_layer_reports_no_line() {
+    {
+        std::atomic<bool> stop_flag(false);
+        SearchEngine engine;
+        engine.set_vcf_enabled(false);
+        engine.set_vct_enabled(false);
+        engine.set_resign_detection(false);
+        engine.set_max_nodes(200);  // layer 1 of this pose costs far more than 200
+        const SearchResult result = engine.search(b2_pos24(), WHITE, 4, 5000, stop_flag);
+        assert(result.principal_variation.empty());
+        assert(result.method == "alphabeta");
+        assert(result.depth == 0);          // nothing completed
+        assert(result.partial_depth == 1);  // layer 1 was the one that got cut
+        assert(result.nodes_searched == 200);
+        assert(result.stopped == "nodes");
+        assert(result.stopped != "none");
+        assert(result.best_move.pos.is_valid());  // it still answers with a move
+    }
+    {
+        // The same shape reached through AlphaBetaSearch directly: a deadline
+        // already expired at start, so no layer can commit and not one node is
+        // searched. The production clock is left in place on purpose - the
+        // deadline is behind it, so the answer does not depend on how long the
+        // think takes.
+        const Evaluator evaluator;
+        TranspositionTable tt;
+        AlphaBetaSearch search(evaluator, tt);
+        std::atomic<bool> stop(false);
+        search.set_deadline(std::chrono::steady_clock::now() - std::chrono::seconds(1));
+        const Move played = search.search(b1_quiet(), BLACK, 6, 5000, stop);
+        const SearchStats stats = search.last_stats();
+        assert(stats.pv.empty());
+        assert(stats.completed_depth == 0);
+        assert(stats.partial_depth == 0);
+        assert(stats.nodes == 0);
+        assert(stats.stopped == StopReason::TIME_HARD);
+        assert(played.pos.is_valid());
+        assert(b1_quiet().is_empty(played.pos.row, played.pos.col));
+    }
+
+    std::cout << "test_a_think_with_no_committed_layer_reports_no_line passed (engine pos24 "
+                 "d4 with a 200-node ceiling: method alphabeta, depth 0, partial 1, 200 nodes, "
+                 "stopped nodes, empty principal_variation; alphabeta with an expired "
+                 "deadline: completed 0 / partial 0 / time_hard / empty pv. One-sided by "
+                 "nature - 8b91b21 answers empty too, so this is a guard, not a discriminator)"
+              << std::endl;
+}
+
+// B3-D14: 探测留在表里的界没有污染复用 - CONTROL, must be green on BOTH trees.
+//
+// PVS puts one-point-window results into the same table the full-window pass
+// would have written, so the risk it carries is a bound being read back as an
+// exact value: if it were, the second think of a session would answer with a
+// different score or a different move or stop at a different layer. Two thinks on
+// one table, both colours, and the second agrees with the first on every field
+// except the cost. The reuse arms' node counts are 300347 -> 234 and 175088 ->
+// 1308 on this tree, and the pre-B3 build runs the same body against 8b91b21,
+// where they must be identical: PVS is decision-neutral, so a control that moved
+// here would mean the gate or the bound handling is wrong.
+void test_probe_bounds_leave_a_reused_think_on_the_same_answer() {
+    for (const int color : {BLACK, WHITE}) {
+        const Evaluator evaluator = b1_evaluator(24, 8);
+        TranspositionTable tt;                 // ONE table for both thinks, as a session has
+        AlphaBetaSearch search(evaluator, tt);
+        std::atomic<bool> stop(false);
+
+        SearchLimits limits;
+        limits.max_depth = 6;
+        limits.hard_time_ms = 0;
+        limits.soft_time_ms = 0;
+        limits.max_nodes = 0;
+
+        const Board board = b2_pos24();
+        const Move first = search.search(board, color, limits, stop);
+        const SearchStats cold = search.last_stats();
+        const Move second = search.search(board, color, limits, stop);
+        const SearchStats warm = search.last_stats();
+
+        assert(cold.completed_depth == 6 && warm.completed_depth == 6);
+        assert(cold.stopped == StopReason::NONE && warm.stopped == StopReason::NONE);
+        assert(second.pos == first.pos);
+        assert(second.color == color);
+        assert(warm.score == cold.score);
+        // The reuse really happened (that is what makes "same answer" a claim and
+        // not a repeat of the same tree), and it is the same cost the ladder
+        // printed on both trees.
+        assert(warm.nodes < cold.nodes);
+        if (color == BLACK) {
+            assert(cold.nodes == 300347 && warm.nodes == 234);
+            assert(first.pos.row == 7 && first.pos.col == 4);
+            assert(cold.score == 99999);
+        } else {
+            assert(cold.nodes == 175088 && warm.nodes == 1308);
+            assert(first.pos.row == 10 && first.pos.col == 7);
+            assert(cold.score == 99999);
+        }
+    }
+
+    std::cout << "test_probe_bounds_leave_a_reused_think_on_the_same_answer passed (pos24 d6 "
+                 "one table twice: BLACK 300347 -> 234 nodes, WHITE 175088 -> 1308, same move "
+                 "(7,4 / 10,7), same score 99999, same completed depth 6, reason none on both "
+                 "thinks; CONTROL, green on 8b91b21 as well)"
+              << std::endl;
+}
+
 int main() {
     std::cout << "Running search tests..." << std::endl;
 
@@ -5854,6 +6785,20 @@ int main() {
     test_three_stage_ordering_pays_for_itself_in_nodes();
     test_aged_history_leaves_a_reused_root_think_unchanged();
     test_killers_are_recorded_by_the_tree_not_by_the_root_or_quiescence();
+
+    // B3, in the contract's order: group A's PvTable units, the committed-line
+    // group, the cut think, the no-layer guard, then the control.
+    test_pv_table_starts_every_think_empty();
+    test_pv_table_extend_concatenates_the_child_line_and_caps_at_max();
+    test_pv_table_clear_touches_only_its_own_ply();
+    test_pv_table_set_single_answers_one_move_and_overwrites_a_longer_line();
+    test_pv_table_refuses_every_ply_and_index_outside_its_slots();
+    test_committed_layer_reports_its_principal_variation();
+    test_principal_variation_length_tracks_depth_and_pose();
+    test_reused_root_think_answers_with_a_shorter_line_that_still_starts_at_the_best_move();
+    test_cut_think_reports_the_last_committed_line();
+    test_a_think_with_no_committed_layer_reports_no_line();
+    test_probe_bounds_leave_a_reused_think_on_the_same_answer();
 
     std::cout << "All search tests passed!" << std::endl;
     return 0;

@@ -1979,6 +1979,215 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次121 引擎重构 B3：一个一极点窗，和一条终于能交出去的主变 — engine redesign stage B3
+
+规格 `docs/ENGINE_REDESIGN.md` §2.4.4（`:309-318`，PV 提取两选一、「产出填入 `SearchInfo::pv`（当前完全为空）」）、
+§2.7 表 `:423` 的「PVS ⇒ 节点数 −20~35 %」一行、`:486` 的 `extract_pv(b, depth, stats_.pv)` 伪码行、`:580`/`:582`
+的文件清单行，与 `:87` 的 P2 症状「`SearchInfo::principal_variation` 在 AlphaBeta 中**从未被填充**」
+（冻结，不改写）。B3 读的是 B1/B2 交出来的那两件事：宽度决定层里有哪些格子，排序决定它们被试的顺序；
+本轮问的是**每个格子被问的时候需要多少窗**，以及**一层跑完之后，它知道的那条线在哪里**。
+
+### Found
+
+- **`:423` 的「−20~35 %」没有兑现，兑现的是 −1.23 %**，而且是可解释的。九条局面臂同板、新表、无预算、只看
+  `nodes`：`9244367 → 9130501`（`/mnt/d/tmp/r121_b3_ladder_neg.out` 与 `..._here.out`，我这遍重跑的
+  `r121_b3_ladder_mine.log`）。十七臂里**四臂下降、十二臂一字不变、一臂涨 0.18 %**。结构原因与 `:424` 那条
+  同源：null window 想买的是「子节点拿不到 fail-high 时别把它搜穿」，而 B1 已经把中盘根宽从 133 压到 33、
+  B2 又把「刚剪过子树的格」排到前面——一极点窗的额外权力只剩子节点自己的后代里那 `alpha+1` 的底，
+  在已经够深的地方才还有东西可剪。这条与 `:424` 一起交给 B4（威胁延伸）重量。
+- **探针地板按最差臂选，不按均值选**（`src/search/alphabeta.cpp:247` 的 `depth <= 4`）。三档都在同一支探针、
+  同一张姿势表上量过（`/mnt/d/tmp/r121_b3_floor.log`，其中 `f8` 那一档 `depth <= 8` 永假＝PVS 关掉的基线，
+  它的九臂和与 `8b91b21` 的实测逐臂相同，这条相等是探针自身的对照）：
+  | 地板 | 九臂合计 | quiet BLACK d6 | quiet BLACK d8 |
+  |---|---|---|---|
+  | 每层都探（无地板） | — | 221380 → **228822（+3.4 %）** | 1451817 → 1415010 |
+  | `depth <= 3` | 9112420（−1.43 %） | 225855（比交付值贵 1.8 %） | 1410813 |
+  | **`depth <= 4`（交付）** | 9130501（−1.23 %） | **221774（+0.18 %）** | **1408083（−3.0 %）** |
+  `<= 3` 的均值更好，但它靠把 `quiet` d6 变贵换来；一支在某些局面上净亏的探针，思考自己无法推理它，
+  所以交付的是「没有任何一条姿势是净亏」的那一档。理由与这三个数写在 `:226-246` 的注释里。
+- **侦察只回答「这一手有没有超过我现有的那一点」**，所以只有「超过了、又没到 beta」值得第二遍；
+  到达顶的是界、跌到底的也是界，两者都与全窗搜索会交回来的东西同形（`:216-221`、`:260-264`）。
+  **不干净的探针让本节点不干净，并且压制重搜**（`:255-258`）：预算 1/2/5 节点的臂交回 `sound=NO`。
+- **三角表（`:313` 的方案①）的纪律是三条写入**：入口无条件 `pv_.clear(ply)`（`:275`，排在深度门、停止门、
+  TT 命中之前——否则一个从 TT 返回的节点会把**上一个节点**的尾巴交给父亲），TT 命中只 `set_single`
+  （`:304`，表能作证的只有它记名的那一子），只有 `child.sound` 的线才 `extend`（`:381`）。
+  `sizeof(PvTable) = 18688`，`AlphaBetaSearch` 因此 22424 B。另一个方案（TT 回溯）不要这张表，
+  但它把「表里没有」当成线尾，正好是本轮要能断言区分的那件事。
+- **提交点决定「一条被砍断的 think 交谁的线」**：只有 `layer_complete && layer.sound` 那一个分支
+  `copy_out(0, &stats_.pv)`（`:576`）。实测（`r121_b3t_probe4.out` 的 CUT 行与 C11 用例）：
+  `completed_depth 3 / partial_depth 4 / time_hard` 的 think 交 `pv_len=3`，着法是**提交层**的 (8,7)，
+  而被砍那层自己的 `partial_best` 是另一格 (4,6)。层没跑完，它的线就不是线——这与 A2/A7 的
+  「被打断的是帧，不是沉默」同一条规矩。
+- **线的长度是条件的函数，不是不变量**：能到处断言的只有 `pv.size() <= completed_depth`。等号在
+  「新表 + 开预算 + 这一层跑到底」的臂上成立（d2/d3/d4/d6/d8 ⇒ 2/3/4/6/8），
+  两处实测的例外都写进了用例注释：`pos24` 白 d6/64-32 交 5 对 6（一个 TT 答案把线截短一子），
+  热表的第二次思考交 2 对 6（根的答案来自 `set_single`，线后半属于写表那次思考）。
+- `src/search/search_engine.cpp:339` 是这一轮的协议半边：VCF/VCT 早在 `:209`/`:231` 就填
+  `SearchResult::principal_variation`，只有 alphabeta 那一路的线死在搜索对象里面。
+- **申报未完成的一半**：这条线现在只到 `SearchResult`。`grep -rn principal_variation src/ web/` 的读者只有
+  引擎自己，没有任何协议帧带它，README 658 行没有这一项（anchor 的 118 引用一字未动）。
+  §2.4.4 写的用途是「用于下一手的 ponder 预置」，而**预搜/ponder 是本重构明确不做的一项**。
+- **probe-then-re-search 规则的测例故意不落地**：它要调 `AlphaBetaSearch::search_child_pvs()` 并读
+  `SearchContext`，而本 TU 为 J2 已经带着一句文件级的 `#define private public`——为一条用例保住整 TU 的
+  私有访问，是拿门禁换证据；且 `search_child_pvs` 在 `8b91b21` 上不存在，它没有 HEAD-negative。
+  数字按本项目对脚本行 fixture 的旧例记在这里，原始输出 `/mnt/d/tmp/r121_b3t_probe4.out` 的 `=== PVS arms`：
+  两个节点 × 三个深度 × 两种窗（精确 `alpha=v` 与 `alpha=v-1`）——**六臂的分值全部等于全窗搜索的 `v`**
+  （决策中性），`alpha=v` 时 `pvs == window`，`alpha=v-1` 时 `pvs > probe`（重搜确实比单独一支探针贵）。
+
+### Fixed（改动，全部由编排者落树，测试者未碰 `src/`）
+
+- `src/search/search_state.h` **+92/−0**：`class PvTable`（`:132`；`kMaxPly = 64` `:137`、`kMaxLen = 24` `:140`、
+  `start_think` `:142`、`clear` `:148`、`extend` `:154`、`set_single` `:172`、`length` `:182`、`at`、
+  `copy_out` `:191`；`Move line_[kMaxPly][kMaxLen]` `:200`、`int length_[kMaxPly] = {}` `:203`）。
+- `src/search/alphabeta.h` **+24/−2**：成员 `PvTable pv_`（`:111`，紧跟 `heuristics_`）、
+  `search_child_pvs` 声明（`:146`）；`SearchInfo::principal_variation`（`:23`）与 `alphabeta()` /
+  `search_root_layer()` 的注释改写成「槽的写手/读者」与「slot 0 属于根层，只有提交点 copy 得出去」。
+- `src/search/alphabeta.cpp` **+115/−5**：`search_child_pvs` 定义（`:222`，地板 `:247`）；
+  `pv_.clear(ply)` `:275`；TT 块把 `tt_move` 提出去并 `set_single` `:304`；调用点 `:360-361`
+  （`scout = i > 0 && alpha != -INT_MAX`，`score` 不再在调用点取负）；`if (child.sound) pv_.extend` `:381`；
+  `info.principal_variation = stats.pv` `:416`；`pv_.start_think()` `:474`（跟着 `heuristics_.start_think()`）；
+  提交点 `pv_.copy_out(0, &stats_.pv)` `:576`；根的 `line_valid` ⇒ `extend(0, move, 1)` / `clear(0)`
+  `:753-754`（A6 的同分重搜之后重取 `exact.sound`）。
+- `src/search/search_engine.cpp` **+4/−0**：`:339`。
+- `tests/test_search.cpp` **+949/−4**：十一条用例 + 一组 B3 助手（`B3Walk`/`b3_pv_walk`/`b3_assert_line`
+  `:5799-5828`，`B3Think`/`b3_open_think` `:5833+`），注册在 `main()` 最末 `:6789-6801`，
+  仍在两条受保护前提与两条成本针之后。**那 4 行删除全是 B2 的成本针本身**（见合约状态），
+  没有删除、放宽或改写任何其他既存在断言。
+- `tools/valgrind_check.sh` **+170/−37**：DRD-first 的顺序倒过来（memcheck＝门禁、tsan＝竞争与死锁的第一道筛子、
+  drd＝只做交叉核对，并写明它对 asio strand 与无锁发表两次结构性误报）、新增 `tsan` 模式
+  （`${TSAN_BUILD:-build-tsan}`、RelWithDebInfo `-O1 -g -fno-omit-frame-pointer -fsanitize=thread -UNDEBUG`、
+  链接行也带 `-fsanitize=thread`、`TSAN_OPTIONS=halt_on_error=0 second_deadlock_stack=1`、
+  撞到 `unexpected memory mapping` 自动在 `setarch -R` 下重试）、按工具分栏的汇报口径（第九节）。
+
+### 判据（十一条，`tests/test_search.cpp`）
+
+| 用例 | 行 | 钉什么 | HEAD 反证 |
+|---|---|---|---|
+| B3-A1 `test_pv_table_starts_every_think_empty` | `:5947` | `kMaxPly == 64` 与 `kMaxLen == 24` 两个 `static_assert`；一次思考开始前**每个槽**都空（`start_think` 清全表而不是只清 0 槽） | 无（`PvTable` 不存在于 `8b91b21`） |
+| B3-A2 `…_extend_concatenates_the_child_line_and_caps_at_max` | `:6001` | `line[ply] = move ++ line[ply+1]` 的**顺序**与 `kMaxLen` 截断（反过来的线是另一盘棋的合法变例；不截断就写穿 `line_[ply][24]`） | 无（词汇限制） |
+| B3-A3 `…_clear_touches_only_its_own_ply` | `:6073` | `clear` 只动它那一层——它是 `alphabeta()` 的第一条语句，从深度门/停止门/TT 命中返回的节点都不能把上一个节点的尾巴交给父亲 | 无（词汇限制） |
+| B3-A4 `…_set_single_answers_one_move_and_overwrites_a_longer_line` | `:6112` | TT 命中只作证一子；非法 `Move()` 给**零子**而不是一个幻影头 | 无（词汇限制） |
+| B3-A5 `…_refuses_every_ply_and_index_outside_its_slots` | `:6154` | ply `-1 / 64 / 65 / 1000 / INT_MIN` 写不出、读为空；越界 child ply 不交尾巴；`at()` 越索引返回非法 `Move` 且不动 `length` | 无（词汇限制） |
+| B3-B7 `test_committed_layer_reports_its_principal_variation` | `:6215` | 静四子局面、24/8、新表、无预算：d2/d3/d4 与 `pos24` d6 两色的提交层各交 2/3/4/6 子，`pv[0] == best`、颜色从轮到的一方交替、走一遍新棋盘每格仍为空；d4 半边走 `SearchEngine` 字段（`:339` 的交付） | **红在 `8b91b21`**（`:5822` 的 `assert(!pv.empty())`） |
+| B3-B8 `test_principal_variation_length_tracks_depth_and_pose` | `:6294` | d8 与两色 `pos24` 上 `pv.size() == completed_depth`，并把一般形式 `<= completed_depth` 同时钉住；注释点名两处真实例外（5 对 6 与 2 对 6） | **红在 `8b91b21`** |
+| B3-B10 `test_reused_root_think_answers_with_a_shorter_line_that_still_starts_at_the_best_move` | `:6408` | 一台搜索连想两次：第二次**合法地**只交 2 子，但头仍然是它要打的那一手、线仍然合法——这是 B8 的等号不能当不变量的理由 | **红在 `8b91b21`** |
+| B3-C11 `test_cut_think_reports_the_last_committed_line` | `:6479` | 只在时限上砍（`hard_time_ms = 600000` + 读数即层表的 `ArmingClock`，不涉节点预算）：`completed 3 / partial 4 / time_hard` ⇒ 交**提交层**的 3 子线、`best` 与提交层一致而 `partial_best` 是另一格；中断记账那半在**两棵树都绿** | **红在 `8b91b21`** |
+| B3-C12 `test_a_think_with_no_committed_layer_reports_no_line` | `:6562` | 一层都没完成的 think 不交线：200 节点上限在层 1 内被 counted 节点砍断（非挂钟竞争）与一个已经过期的绝对期限两条臂，都 `pv_len == 0` | **单边**（`8b91b21` 本来就答空）⇒ 记为守卫，不冒充判别 |
+| B3-D14 `test_probe_bounds_leave_a_reused_think_on_the_same_answer` | `:6621` | **控制**：一极点窗的界进的是同一张表，所以风险是「界被当成精确值读回来」。一台表连想两次，两色同着法、同分 99999、同 `completed 6`、同 `reason none`，只有代价不同（300347→234、175088→1308） | **两棵树都绿**（定义的绿） |
+
+### 度量表
+
+九臂 PVS 代价（同板、**新表**、无预算，只看 `nodes`；`8b91b21` 那列＝PVS 关掉的同一棵树）：
+
+| 臂 | `8b91b21` | B3（地板 `depth > 4`） | Δ |
+|---|---|---|---|
+| quiet BLACK d6 24/8 | 221380 | 221774 | **+394（+0.18 %）** |
+| quiet WHITE d6 24/8 | 160271 | 156428 | −3843（−2.40 %） |
+| quiet BLACK d8 24/8 | 1451817 | 1408083 | −43734（−3.01 %） |
+| pos24 BLACK d6/24-8 | 300347 | 300347 | 0 |
+| pos24 BLACK d8/24-8 | 2409735 | 2378724 | −31011（−1.29 %） |
+| pos24 BLACK d6/64-32 | 1749374 | 1749374 | 0 |
+| pos24 WHITE d6/24-8 | 175088 | 175088 | 0 |
+| pos24 WHITE d8/24-8 | 1297170 | 1261498 | −35672（−2.75 %） |
+| pos24 WHITE d6/64-32 | 1479185 | 1479185 | 0 |
+| **九臂合计** | **9244367** | **9130501** | **−113866（−1.23 %）** |
+
+其余八臂 + 复用四臂在两棵树上**逐字相同**：`ladder` 黑 `160/533/1114`、白 `97/461/937`（根宽
+`11/33/73`、`6/28/68`），`crowded` `1861`（64/32）与 `888`（24/8），`quiet` 复用 `187`、`pos24` 复用 `234`/`1308`、
+`crowded` 复用 `1636` 与 `81`。十七臂的 `best move / score / completed_depth / StopReason` **全同**。
+唯一跟着动的是内部记账：`quiet` 黑 d6 的 `qnodes 143627 → 142978`、`ttcut 7823 → 8220`。
+
+线的两半在同一支探针里一起打印（`pv_legal=ok` 是「交替 + 每格在新棋盘上仍为空 + 步数等于长度」三件事）：
+`8b91b21` 的**每一臂**都是 `pv_len=0 pv_starts_with_best=BROKEN`（三个 `principal_variation` 字段都存在，
+但没有写手），本树的每一臂 `pv_len` 跟着深度走且 `pv0 == best`。
+
+### 反证与 Valgrind
+
+- **判别体的两棵树复跑**（`/mnt/d/tmp/r121_b3t2_cases_neg.out` / `..._work.out`：把 B7/B8/B10/C11/C12/D14
+  六段逐字抄进 `/mnt/d/tmp/r121_b3t2_neg_ts.cpp`，对 `git archive 8b91b21` 的阴影树与本树各编一次，
+  `-O2 -UNDEBUG`）：`8b91b21` 上 **b7 / b8 / b10 / c11 四条 `RC=134`**，全部红在
+  `b3_assert_line` 的第一句 `assert(!pv.empty())`（阴影树的 `:5822`）；**c12 与 d14 `RC=0`**——
+  前者是它天生单边（那棵树也答空），后者是控制。**整份套件**我这遍：本树 `B3SUITE rc=0 / 448 s /
+  All search tests passed!`，`8b91b21` 的阴影树 `NEGSUITE rc=134 / 42 s`，红在
+  `tests/test_search.cpp:5576` 的 `assert(quiet.nodes == 221774)`——即下面的合约改写，不是 B3 用例的失败。
+- **组 A 五条没有 HEAD-negative**（`PvTable` 在 `8b91b21` 上不存在，`git archive` 的树里搜不到这个名字），
+  按 A6/A7/B1/B2 的先例申报而不是藏起来。
+- **一条负载下的红，判为负载而不是回归**：测试者报告预改树死在 `:1019`（真实断言是
+  `:1011 assert(quick.root_moves_done == quick.root_moves_total)`，它在 `:1008` 的
+  `stopped == "none"` 守卫里面）。我在空闲机上把两棵树各跑一遍：两棵树都打印
+  `short budget: method alphabeta, depth 5, stopped time_hard, partial 6`——守卫**根本没打开**，
+  `:1011` 在两棵树上都没被执行过，预改树一路走到 `:5576` 才 abort。`:1005` 那手用的是 120 ms 挂钟预算，
+  属于轮111 已授权的负载臂一类。**没有裁剪它，也没有为它改代码。**
+- **memcheck（门禁工具；`build-vg`＝Debug + `-UNDEBUG`，`tools/valgrind_check.sh`）**：
+  | 行 | rc | reports | 秒 |
+  |---|---|---|---|
+  | `test_board` | 0 | 0（invalid_read/write/uninit/definite_leak 全 0） | 523 |
+  | `test_training` | 0 | 0 | 84 |
+  | A1/A2/A3/A4/A5 五条表级用例 | 0 | 0 | 1/1/1/1/1 |
+  | C12 无提交层 | 0 | 0 | 4 |
+  | B7 提交层的线 | 0 | 0 | 740 |
+  | B10 复用短链 | 0 | 0 | 2068 |
+  | C11 砍断 / D14 控制 / B8 长度 | **124**（`timeout 3600` 到点） | 0 | 3600 各 |
+  | 节点上限砍断探针（1500/20000/60000 三档） | 0 | 0 | 30 |
+  三条 `rc=124` 不是失败而是**没跑完**：到点前已报告的类全是 0，覆盖到的部分干净；未跑完的代价是
+  这三臂的**后半段没被 memcheck**。那三臂里唯一没被别处覆盖的分支是根层的 `pv_.clear(0)`（`:754`），
+  于是用**确定性节点上限**在层 3/5/6 中间各砍一刀补跑一遍（30 s，四类全 0，
+  `pv_len == completed_depth`、`played == best` 三档都成立）——这条不冒充覆盖，它冒充的是「那一行被走过」。
+- **全量 `test_search` 在 memcheck 下**：`ABORTED rc=134 / reports=0 / 322 s`，死点与 B1/B2 记录同一个
+  10 ms 挂钟臂（`test_engine_reports_the_interrupted_alphabeta_layer` 量到
+  `alphabeta d0+partial 0/n0 time_hard`）；同一棵树不带 valgrind 的整份 `./test_search` **rc=0 / 448 s**。
+- **TSan（竞争与死锁的第一道筛子；`build-tsan`＝RelWithDebInfo `-O1 -g -fno-omit-frame-pointer
+  -fsanitize=thread -UNDEBUG`，链接行带 `-fsanitize=thread`，`TSAN_OPTIONS=halt_on_error=0
+  second_deadlock_stack=1`；本机拿不到免密 sudo，所以 `vm.mmap_rnd_bits` 没能设，脚本在撞到
+  `unexpected memory mapping` 时自动退到 `setarch -R`）**：
+  `test_training` **rc=0 / 14 s / 0 race / 0 deadlock**；`test_server` **rc=66 / 12 s / 1 个唯一数据竞争
+  （TSan 自己的汇总行 `reported 1 warnings`）/ 0 deadlock**；`tsan` 模式冒烟 `test_evaluator`
+  **clean 0/0**，整段 `TSANMODE_RC=0 / 124 s`。
+  那一条竞争**不是 strand、也不是原子发布**，是真阳性：函数对
+  `gomoku::GameManager::undo` → `gomoku::Board::undo_last_move`（读栈里**没有**任何 mutex）
+  对 `gomoku::GameManager::request_hint` 的 worker → `gomoku::Board::move_count`（读栈里点名 `write M0`，
+  即 `src/server/game_manager.cpp:377-379` 在 `thinking_mutex_` 下读）。写侧 `:220` 的守卫只看
+  `ai_thinking_`，与 hint 的 `hint_active_` 不是一把锁（`src/server/game_manager.cpp:220-241`、`:324-332`）。
+  **本轮不改**：B3 没碰 `src/server/`，把它塞进引擎轮次会让这枚提交的判据混进协议语义——已单独排队
+  （任务 #35），走 bugfix 批次的老流程（先写能红的用例，再改）。
+- **DRD 只做交叉核对**：`drd test_training` **reports=0 / 84 s / `DRD_RC=0`**。这一行当时还是旧格式打印的
+  （带 `invalid_read=` 那串 memcheck 字段名），正是它让一条 DRD 行能被读成 memcheck 行——本轮把
+  `valgrind_check.sh` 的汇报改成按工具分栏之后，我重跑了同一支便宜臂：
+  `gomoku_train`（`--rounds 1 --method hill --hill-iterations 1 --depth 1 --timeout-ms 1
+  --fitness-games 1 --verification-games 1 --no-data`）→ **clean / reports=0 /
+  conflicting_accesses=0 / 6 s / (cross-check: tsan is the first sieve)**。
+  顺带修掉一处会在门禁上伪装成崩溃的用法示例：脚本原来写的 `massif gomoku_train --rounds 1 --max-nodes 5000`
+  里 `--max-nodes` 不是 `gomoku_train` 的选项（`--help` 没有它），未知选项 3 秒退出 1；
+  而 `--rounds 0` 是被 CLI 守卫**正当拒绝**的（`Error: --rounds must be at least 1`），
+  我先把这两种 rc=1 都当成工具报的东西看过，才改成上面那条能真正跑完的调用。
+  `bash -n` 通过，`grep -c $'\r'` = 0。
+- **压测与 Valgrind 互斥**：本节每一行跑的时候 `watch-resources.ps1` 与任何 WS/HTTP 负载都没有启动。
+
+### 合约状态
+
+- **两条成本针被重钉，这是本轮唯一的合约改写**，且各自都是一行数字加一行注释：
+  `assert(quiet.nodes == 221380)` → **`221774`**（`:5576`），`assert(pos.nodes == 2409735)` →
+  **`2378724`**（`:5585`）。改写的依据是同板新表无预算的确定性代价，而不是「测试挡住了优化」：
+  `8b91b21` 的阴影树跑新的测例只红在 `nodes` 这一行，同一支两树探针给出
+  `root=31 / d=6 / move=8,7 / score=71992 / reason=none` 与 `root=39 / d=8 / move=7,4 / score=99999`
+  **一字不差**。注释里保留 pre-B3 的旧数（`221380` / `2409735`），使这一行仍然写着 B2 挣到了什么。
+- **没有别的合约过期**：`ctest` **8/8** 全绿，B1 的节点阶梯（现 `:4732` 的 `160/533/1114` 与 `:4735` 的
+  `97/461/937`）、B2 的 killer/history 六条、A6 的同分中心针、A4 的根复用、A7 的中断分层一条都没红。
+- 两条受保护的预算前提**一字未动**，位置随本轮新增整体上移 4 行（全部来自 `:16` 那一句 `#include <new>`）：
+  `assert(result.resigned)` 从 `:2585` 到 **`:2589`**，`assert(completed.method == "alphabeta")` 从
+  `:3980` 到 **`:3984`**；B3 的十一条注册仍在它们之后（`:6789-6801`）。
+- **`:424` 的 −30~50 % 仍未兑现**（B2 报 −3.9 %，B3 报 −1.23 %），本轮把它连同 `:423` 一起留给 B4；
+  这不是把针放松，是那条验收行的归属问题。
+
+**Gate**（空闲树，跑门禁时不与构建、memcheck 或 TSan 并发；第一次尝试被我自己的重复 ctest 污染，
+整个链条被终止后在空闲机上重跑一遍，以下都是这一遍）：`ctest` **8/8 / 481.22 s**（`test_search` **450.47 s**、
+`test_server` 14.02 s、`test_position` 7.36 s、`test_training` 9.07 s、其余三套 < 0.1 s），web **105/105**，
+anchor **118 引用 / 0 problems**，README 仍 **658 行**。原始输出 `/mnt/d/tmp/r121_b3_gates.log`
+（串行脚本 `/mnt/d/tmp/r121_b3_gates.sh`）；两树探针 `/mnt/d/tmp/r121_b3_ladder_mine.log` +
+`r121_b3_neg.out` / `r121_b3_here.out`，地板三档 `r121_b3_floor.log`，反证 `r121_b3t2_cases_neg.out` /
+`_work.out`，内存与竞争 `r121_b3_vg.log` / `r121_b3_tsan.log` / `r121_b3_post.log`。
+以上每一条都是我自己执行的，不是转述。
+
 ## 轮次121 引擎重构 B2：一层先试哪一格，第一次由搜索自己说了算 — engine redesign stage B2
 
 规格 `docs/ENGINE_REDESIGN.md` §2.4.5（三段式启发排序）、`:424` 的「三段式启发排序 ⇒ 节点数 −30~50 %」
