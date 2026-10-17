@@ -1,11 +1,115 @@
 #ifndef GOMOKU_SEARCH_STATE_H
 #define GOMOKU_SEARCH_STATE_H
 
+#include "../core/types.h"
 #include "search_limits.h"
 #include <atomic>
 #include <cstdint>
 
 namespace gomoku {
+
+// Two squares are the same square by their cell, not by the record that carries
+// them: a killer stored by the side that moved last ply and read back by the side
+// that moves this ply must still be found.
+inline bool same_cell(const Move& move, const Position& pos) {
+    return move.pos.is_valid() && pos.is_valid() &&
+           move.pos.to_index() == pos.to_index();
+}
+
+// Design doc 2.4.5's stages ② and ③: the two moves that cut this same layer before
+// (killers, one slot per ply) and, per colour and cell, how often a move played at
+// this depth has produced a cutoff (history, accumulated by depth² and aged).
+//
+// They exist because the width limit decides *which* squares a layer sees while the
+// static score only knows what a square is worth on its own. A square that just cut
+// a subtree is worth searching first for a reason the price cannot express, and
+// searching it first is what makes the sibling's window fail high on move one
+// instead of after all of them.
+//
+// Both are keyed to one think: `ply` counts from the root the caller started this
+// think at, so a killer from the previous think sits at a ply that now means a
+// different position. A think therefore begins with empty slots, and history ages
+// by half rather than being thrown out - it is the only thing that says "this cell
+// keeps cutting" across the two or three thinks that play one move.
+class MoveHeuristics {
+public:
+    // A node deeper than this has no killer slot, so stage ② has nothing to place
+    // and its order starts at the price. The cap is the search's own ceiling (design
+    // doc: depth 20) plus room for the re-searches, and a killer index that ran past
+    // it would write outside the table.
+    static const int kMaxPly = 64;
+    static const int kKillerSlots = 2;
+
+    void start_think() {
+        for (int p = 0; p < kMaxPly; ++p) {
+            killer_[p][0] = Move();
+            killer_[p][1] = Move();
+        }
+        for (int c = 0; c < 2; ++c) {
+            for (int i = 0; i < BOARD_SIZE * BOARD_SIZE; ++i) {
+                history_[c][i] >>= 1;
+            }
+        }
+    }
+
+    // The move that made this node fail high. Both tables answer for it at once:
+    // the layer it happened on, and the depth that was still left below it.
+    void record_cutoff(int ply, const Move& move, int color, int depth) {
+        history_[color_slot(color)][move.pos.to_index()] += depth * depth;
+        if (ply < 0 || ply >= kMaxPly) return;
+        if (same_cell(killer_[ply][0], move.pos)) return;
+        killer_[ply][1] = killer_[ply][0];
+        killer_[ply][0] = move;
+    }
+
+    // Ages history between the iterations of one think, which is what 随搜索衰减
+    // says: a cutoff found two layers below this one is evidence about a shallower
+    // tree, and by the time the search is six layers deep it should not still be
+    // deciding which of two equally-priced cells a layer tries first. One shift per
+    // layer keeps the freshest iteration dominant and lets old, weakly-supported
+    // entries fall to 0 on their own, with no threshold for the search to tune
+    // against.
+    void start_layer() {
+        for (int c = 0; c < 2; ++c) {
+            for (int i = 0; i < BOARD_SIZE * BOARD_SIZE; ++i) {
+                history_[c][i] >>= 1;
+            }
+        }
+    }
+
+    // Slot order is rank order: slot 0 cut this layer most recently.
+    const Move& killer(int ply, int slot) const {
+        static const Move kNone;
+        if (ply < 0 || ply >= kMaxPly || slot < 0 || slot >= kKillerSlots) return kNone;
+        return killer_[ply][slot];
+    }
+
+    int history_value(int color, const Position& pos) const {
+        if (!pos.is_valid()) return 0;
+        return history_[color_slot(color)][pos.to_index()];
+    }
+
+    // For the tests that want to read what a think left behind rather than infer it
+    // from an order.
+    int killer_count(int ply) const {
+        if (ply < 0 || ply >= kMaxPly) return 0;
+        int n = 0;
+        for (int slot = 0; slot < kKillerSlots; ++slot) {
+            if (killer_[ply][slot].pos.is_valid()) ++n;
+        }
+        return n;
+    }
+
+    static int color_slot(int color) { return color == BLACK ? 0 : 1; }
+
+private:
+    Move killer_[kMaxPly][kKillerSlots];
+    // One entry per cell, indexed exactly the way Position::to_index() numbers the
+    // board, so reading a move's history costs no lookup. Zero at construction:
+    // start_think() ages the table instead of clearing it, and an aged uninitialised
+    // cell would order the very first think of a session on stack noise.
+    int history_[2][BOARD_SIZE * BOARD_SIZE] = {};
+};
 
 // Everything one think mutates that is not a result: the budget it is spending,
 // the counters that report how much it spent, and why it stopped. Pulling it out

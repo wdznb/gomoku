@@ -1979,6 +1979,161 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次121 引擎重构 B2：一层先试哪一格，第一次由搜索自己说了算 — engine redesign stage B2
+
+规格 `docs/ENGINE_REDESIGN.md` §2.4.5（三段式启发排序）、`:424` 的「三段式启发排序 ⇒ 节点数 −30~50 %」
+一行、`:582` 把 killer/history 分到 `src/search/search_state.h` 的文件清单行（冻结，不改写）。B2 读的是
+B1 交出来的那张表：宽度决定**哪些格子进层**，静态分决定**一个格子本身值多少**，而「刚在这一层剪掉一棵子树」
+这件事两者都说不出来——B2 给它一个说法。
+
+### Found
+
+- 排序的四个阶段是**优先级**而不是键：①TT 着法钉在 0 位并被排除在后面三段之外，②本层的两枚 killer 按槽序
+  紧跟其后，④/③ 剩下的尾段按 `(静态价, history, 中心距离, 格号)` 一个字典序键排。①不是本轮新事——
+  `8525f60` 的 `sort_moves` 已经把「TT 着法已在 0 位也要钉住」修好了（A 阶段 J2，`tests/test_search.cpp:3246`
+  至今还绿），B2 从它手里接过 `start = tt_swapped ? 1 : 0` 那半句，把「从 start 起按价格重排」改成
+  「先按槽序压进 ②，再让 ④③ 排剩下的」，头一处偏移因此是 `head` 而不是 0/1 两个常量。
+- §2.4.5 把 ③ 写在 ④ 上面，本树**把 ④ 写在 ③ 上面**，这是本轮唯一的文档偏离，且是可复算的取舍而不是口味：
+  同一块板、新表、无预算，只看 `nodes`——history 作第一键时 pos24 黑 d8 **2396300 → 8895598（3.7 倍）**、
+  白 d8 **1298311 → 5941620（4.6 倍）**。理由写在 `src/search/alphabeta.cpp:120-132` 上方的注释：一格的历史值
+  说的是**上一个节点**站过的局面，而 `evaluate_position_pair` 是从**本节点**的棋盘重算的，把 ③ 提上去会让搜索
+  重新去开那些价格已经排过序的弱格。度量表见下。
+- `:424` 的「−30~50 %」本轮**没有兑现**，兑现的是 **−3.9 %**（`quiet` 黑 d6 `230474 → 221380`）。拆开看谁挣到的：
+  只记不用 history 的 ②-only 列给 222118（即 ② 本身就拿到 −3.6 %），③ 作次级键再拿 −0.3 %；pos24 的六臂
+  相对 pre-B2 在 ±3 % 内（其中三臂略**涨**：300347/1749374/1479185）。B1 已经把分支因子从 133 压到 33，
+  等势格的数量不足以让 killer 再挣三成的节点——这条验收要留给 B3/B4（PVS 与 PV 回填）重新量。
+- killer 与 history 都** keyed 到本次思考**：`ply` 从根起算，上一次思考留下的 killer 落在一个现在意义不同的
+  ply 上，所以一次思考从空槽开始，而 history 只**减半**不清零——它是唯一能说「这一格老是在剪」跨越同一手棋
+  那两三次思考的东西。`start_layer()` 每层一次衰减，正是「随搜索衰减」的字面实现：一层一次右移，最新那次迭代
+  占主导，老的弱证据自己掉到 0，不需要给搜索留一个阈值去调。
+- **根填不了自己的槽**：根的子节点在 ply 1 上被搜（`src/search/alphabeta.cpp:601` 与同分重搜 `:631`），而
+  `alphabeta()` 是唯一的写手，所以一次真实思考**永远不会**写 ply 0 的 killer 槽。本轮把这件事钉成断言
+  （`killer_count(0) == 0`）而不是发明一条「根按 killer 排序」的假用例。
+- `sort_moves` 的新参数 `int ply = 0` 有默认值，所以**根**那一次调用（`:429`，带 A4 的 `hint_move`）读的是 ply 0
+  的槽——即空槽，于是根的序就是「①提示着法 + ④价格 + ③ + 两个几何键」。这一点必须由测例钉住（B2-3(e)），
+  因为 A4/A6/B1 关于根的所有针都建立在它之上。
+- `src/search/search_state.h:111` 的 `int history_[2][BOARD_SIZE * BOARD_SIZE] = {}` 里那个 `= {}` 不是风格：
+  `start_think()` 是**衰减**而不是清空，未初始化表里第一次思考就会按栈噪声排序。B2-2 用「构造后 225 格全读 0」
+  把这一行钉住，删掉 `= {}` 就红。
+- **一条规格与实现的冲突，申报而不是绕开**（B2-6）：契约点名用 crowded 宽臂（`qnodes/nodes = 1558/1861`）验
+  「至少一层有 killer」。实测两棵树都是**已证杀**且加深停在第 2 层（`completed_depth == 2`、`stopped == MATE`），
+  它最深的 alphabeta 节点是 ply 1 且 `depth == 1`，`depth >= 2` 的门**从不打开**：64 个槽、450 格 history 全 0。
+  该臂 (a)(b) 成立、(c) 不可能成立。(c) 与边界针因此移到 `pos24` d3（4422/2923，`killer_counts[1] == 2`、
+  ply≥2 全 0）与 `quiet` d3（2515 节点，同样只有 ply 1）；「quiescence 不记录」改用结构论证钉：d1 的臂里每个
+  alphabeta 节点都以 `depth == 0` 返回，跑的只有根的一层子节点与 quiescence，
+  `nodes == root_total + qnodes` 成立时表还全空，就只能是 quiescence 没写（crowded d1 = 79+129，quiet d1 = 31+31，
+  且 crowded 的 `qnodes 129 > root_total 79`、`seldepth >= 2`、`score == 99999` 说明它真的递归并走出过杀形）。
+- **记录边界是深度的函数而不是局面的函数**（逐 ply 实测 `/mnt/d/tmp/r121_b2t_probe.new.out`）：`max_depth D` 的
+  思考里只有 ply `1 … D-2` 可能持有 killer——`quiet` d6 ⇒ 1/2/3/4，`pos24` d8 ⇒ 1…6，`pos24` 与 `quiet` 的 d3
+  ⇒ 只有 1，`quiet` d2/d1 ⇒ 全空。B2-6 把 `ply >= max_depth` 全 0 钉成断言，这是 `kMaxPly` 越界保护的
+  生产半边。
+
+### Fixed（改动，全部由编排者落树，测试者未碰 `src/`）
+
+- `src/search/search_state.h` **+104/−0**：`same_cell(const Move&, const Position&)`（认格不认色，
+  无效 `Move()` 永不等有效 `Position`）、`class MoveHeuristics`（`kMaxPly = 64`、`kKillerSlots = 2`、
+  `start_think/record_cutoff/start_layer/killer/history_value/killer_count/color_slot`）。
+- `src/search/alphabeta.h` **+15/−1**：成员 `MoveHeuristics heuristics_`（`:106`）；`sort_moves` 签名加
+  `int ply = 0`（`:144-145`），老调用点一字不改。
+- `src/search/alphabeta.cpp` **+78/−18**：`sort_moves` 三段（①`:40-48`、②`:54-66`、比较器 `:120-132`）；
+  `:307` 的 `if (depth >= 2) heuristics_.record_cutoff(ply, move, color, depth);`；`:386` `start_think()`；
+  `:469` 每层一次 `start_layer()`；quiescence 不调 `sort_moves`、不记录。
+- `tests/test_search.cpp` **+700/−0**：六条用例 + 一套 B2 助手（`:5043-5184`），注册在 `main()` 末尾
+  `:5851-5856`。**没有删除或放宽任何既存在断言。**
+
+### 判据（六条，`tests/test_search.cpp`）
+
+| 用例 | 行 | 钉什么 | HEAD 反证 |
+|---|---|---|---|
+| B2-1 `test_move_heuristics_killer_slots_hold_two_moves_per_ply` | `:5194` | 移一次、同格重记是**完全不动**（用白棋在同格再记一次仍读回黑棋那枚，钉住认色无关）、ply 隔离、`killer(-1,0)/killer(kMaxPly,0)/killer(0,2)` 与 `killer_count(-1)`、`record_cutoff(-1,…)`/`record_cutoff(kMaxPly,…)` 不写槽但把 history 抬到 9 再到 25 | 新 API，无（编不过） |
+| B2-2 `…_history_accumulates_by_depth_squared_and_ages_by_half` | `:5258` | 构造后 225 格全 0、`color_slot` 0/1、两次 depth 3 恰好 +18、黑白互不串、`start_layer` 折半且留 killer、`start_think` 折半且清空、17→8,4,2,1,0 并停在 0 | 新 API，无 |
+| B2-3 `test_sort_moves_pins_tt_then_killers_then_price_over_history` | `:5345` | 中盘黑 33 个候选上：(a) 取全表**最低价**的 TT 仍落 0 位、(a2) 已在 0 位的 TT 留在 0 位且 killer 在 1/2 位等着、(b) 两枚 killer 按槽序压在价格把它们排到最后的尾段之前、(c) 被宽度切掉的 killer（已占格 (5,5)）不出现也不移任何人、(d) 最长等价段里播**最后一枚**的历史 ⇒ 它跳到段首（④ 仍是第一键）、(e) 空表 = A6 三元组逐格相同 | 新 API（`sort_moves` 多了 ply、`MoveHeuristics` 不存在），无 |
+| B2-4 `test_three_stage_ordering_pays_for_itself_in_nodes` | `:5562` | **成本针**：`quiet` 黑 d6 24/8 ⇒ `nodes == 221380`、`pos24` 黑 d8 24/8 ⇒ `nodes == 2409735`，各自另钉 `completed_depth / score / best / root_total / stopped` | **红在 `8525f60`**（见下） |
+| B2-5 `test_aged_history_leaves_a_reused_root_think_unchanged` | `:5596` | 一台 `AlphaBetaSearch` + 一张表连想三次：#2 与 #3 同为 **187** 节点、同着法 (8,7)、同分 71992、同深度 6、`stopped == NONE`，并前置 `cold_nodes > 187` | **两棵树都绿**（控制） |
+| B2-6 `test_killers_are_recorded_by_the_tree_not_by_the_root_or_quiescence` | `:5657` | (a) 真实思考后 `killer_count(0) == 0`、(b) `ply >= max_depth` 全 0（`kMaxPly` 越界的生产半边）、(c) `[1, max_depth)` 至少一层非 0；外加「只有 quiescence 跑的臂表全空」的结构论证 | 新 API，无 |
+
+### 度量表（同板、新表、无预算，只看 `nodes`；四列由同一支探针 `/mnt/d/tmp/r121_b2_ladder.cpp` 在两棵树与两份
+临时改过的比较器上测得）
+
+| 臂 | pre-B2 `8525f60` | 文档序 ③>④ | ②-only（记而不用） | **交付：④>③** |
+|---|---|---|---|---|
+| quiet BLACK d6 24/8 | 230474 | 286957 | 222118 | **221380** |
+| pos24 BLACK d6 24/8 | 298654 | 626730 | 299497 | 300347 |
+| pos24 BLACK d8 24/8 | 2396300 | 8895598 | 2400249 | 2409735 |
+| pos24 BLACK d6 64/32 | 1745526 | 3991260 | 1743321 | 1749374 |
+| pos24 WHITE d6 24/8 | 180479 | 415625 | 174519 | 175088 |
+| pos24 WHITE d8 24/8 | 1298311 | 5941620 | 1292402 | 1297170 |
+| pos24 WHITE d6 64/32 | 1446349 | 3513467 | 1473272 | 1479185 |
+| crowded BLACK d6 64/32 | 1861 | 1861 | 1861 | 1861 |
+| mate ladder 黑 160/533/1114、白 97/461/937；根 11/33/73、6/28/68 | 四列全同 | | | |
+| 以上每一臂 best move / score / completed_depth / StopReason | 四列全同 | | | |
+
+四列全同是「为什么允许偏离」的下半场：本轮没有逼着任何一条既存的杀形/战术/根宽针搬家。
+
+### 反证与 Valgrind
+
+- 六条里只有 **B2-4** 能反证：它只用两棵树都有的公开 API（`AlphaBetaSearch` / `SearchLimits` /
+  `last_stats()`）。`/mnt/d/tmp/r121_b2t_headneg.sh` 把两份**逐字抄自测例**的用例体（`/mnt/d/tmp/r121_b2t_head.cpp`，
+  不点 `MoveHeuristics` 之类的名）对两棵树各编一次（各自的 `src/`，`-O2 -UNDEBUG`）：
+  - **本树 `RUN_RC=0`** 三臂全绿；**`8525f60` 的阴影树 `RUN_RC=134`**，quiet 臂红在
+    `r121_b2t_head.cpp:101` 的 `assert(quiet.nodes == 221380)`，pos24 臂红在 `:111` 的
+    `assert(pos.nodes == 2409735)`。
+  - 红只在**节点数**这一行：同一脚本先跑打印模式，两棵树并排给出
+    `quiet d6 24/8 nodes=221380 / 230474 root=31 d=6 move=8,7 score=71992 reason=none`、
+    `pos24 d8 24/8 nodes=2409735 / 2396300 root=39 d=8 move=7,4 score=99999 reason=none`——
+    深度、根宽、着法、分值、停止原因**一字不差**，只有代价不同。这正是规格要的判别形状。
+  - 阴影树身份：`git rev-parse --short HEAD` = `8525f60`，`search_state.h` 里 `MoveHeuristics` 出现
+    **0** 次（本树 >0），`sort_moves` 签名没有 `int ply`（本树 `…= Move(), int ply = 0`），
+    且 `diff -r -q` 对**新做的** `git archive 8525f60` 全树为空。
+- **B2-5 是控制**：一台搜索 + 一张表连想三次，`#2/#3` 在两棵树上都是 **187** 节点、同一着法 (8,7)、同分
+  71992、同深度 6、`stopped == NONE`——两棵树都绿是它的定义，不是它的失败。它证明 `start_think()` 的
+  「衰减而不清零」没有污染 A4 的根复用。
+- B2-1 / B2-2 / B2-3 / B2-6 点名了只有本树才有的符号（`MoveHeuristics`、`same_cell`、`sort_moves` 的 `ply`
+  形参），在 `8525f60` 上**编不过** ⇒ 词汇限制，按 A6/A7/B1 的写法申报而不隐藏。
+- **套件代价**：六条让 `test_search` 从 B1 落树时的 **36.85 s** 涨到 **254.57 s**（我这遍 ctest 的第 4 行；
+  测试者那遍 259.13 s），增量几乎全在 B2-4 的两条成本针里（`/mnt/d/tmp/r121_b2t_subset_plain.txt` 的
+  `B2-TIMING` 行：`cost_pin 218.309 s`、`reuse_control 7.615 s`、其余四条合计 **0.63 s**）。这是把
+  「②/③ 挣到什么」写成可断言数量的定价，本轮不裁剪；C 阶段（评估性能四步）落地后这两个数会自己变小，
+  那时按 B1 的先例把针重钉成新常量。
+- memcheck 子集驱动 `/mnt/d/tmp/r121_b2t_vg_subset_main.cpp`（`#define main suite_main_b2`，只挂六条中的
+  五条便宜臂；`build-vg` 是 Debug + `-UNDEBUG`，对象取自 `build-vg/CMakeFiles/test_search.dir`）：
+  直跑 **`PLAIN_RC=0`**（8 s，5 条全绿），我这遍 memcheck **RC=0 / reports=0 / 744 s / completed=5**
+  （测试者那遍 768 s）。memcheck 下的逐臂计时（`/mnt/d/tmp/r121_b2o_vg_subset.out`）：
+  `reuse_control 687.012 s`、`tree_records 53.99 s`、`sort_moves_stages 1.50 s`、两条表级用例 0.01 s——
+  744 s 里九成六是 B2-5 的第一次思考，而**那一次思考就是 B2-4 的 quiet 成本针**（同一板、同一 24/8、
+  同 221380 节点），这一点是下面「未覆盖」那条能站住的依据。
+- **未覆盖，申报**：第六臂（B2-4 的 221380 + 2409735 节点）在测得的约 **92×** 减速下单条就要数小时，
+  因此**没有**对它做 memcheck。它的 quiet 半边已经在覆盖里——B2-5 的第一次思考就是同一次 221380 节点的
+  `quiet` d6 24/8，那一臂 memcheck **687.012 s、reports=0**。没覆盖的只是 pos24 从 d6 深到 d8 多出来的
+  两轮迭代，走的是 `sort_moves`/`record_cutoff`/`start_layer` 的同一份代码。申报为未覆盖，不冒充覆盖。
+- **全量·便宜三套**（`tools/valgrind_check.sh memcheck test_board test_pattern test_evaluator`，
+  `build-vg`）：`test_board` **clean reports=0 780 s**、`test_pattern` **clean 0 6 s**、
+  `test_evaluator` **clean 0 1 s**，整段 **`CHEAP3_RC=0` / 788 s**（我这遍）。
+- **全量·`test_search`**（同一工具、同一 `build-vg`）：**`ABORTED rc=134 / reports=0 / 325 s`**，
+  中止点与 B1 记录的同一个——最后打印的是 `test_engine_progress_frames_share_the_search_clock passed`，
+  接着 `test_engine_reports_the_interrupted_alphabeta_layer` 在 memcheck 下量到
+  `alphabeta d0+partial 0/n0 time_hard`，红在 `tests/test_search.cpp:3967`
+  `assert(interrupted.partial_depth == 1)`。10 ms 的预算臂在约 **92×** 减速下一根候选都开不出来，这是
+  挂钟脆弱而不是本轮的回归：**同树不带 valgrind 的整份 `./test_search` rc=0 / All search tests passed**，
+  受保护的那条 `:3980` 在其后 13 行、从未被走到。`reports=0` 说的是中止前跑过的每一臂都干净。
+
+### 合约状态
+
+- **没有合约过期**：`make` 干净、`ctest` **8/8** 全绿，B1 的节点阶梯
+  （`tests/test_search.cpp:4728` 的 `160/533/1114` 与 `:4731` 的 `97/461/937`）、A6 的同分中心针
+  （`test_root_tiebreak_prefers_centre` / `test_root_choice_reproducible`）、A4 的根复用、A7 的中断分层
+  一条都没红。四列度量表里「best move / score / completed_depth / StopReason 全同」是这件事的量化形状。
+- 两条受保护的预算前提**一字未动**，位置也没移动：`assert(result.resigned)` 仍在 **`:2585`**，
+  `assert(completed.method == "alphabeta")` 仍在 **`:3980`**（本轮的 700 行全部加在 `main()` 之前，
+  它们在上面）。
+- `tests/test_search.cpp` **+700/−0**：没有删除、放宽或改写任何既存在断言。
+
+**Gate**（空闲树，跑门禁时不与构建或 memcheck 并发）：`ctest` **8/8 / 284.23 s**（`test_search` **254.57 s**、
+`test_position` 7.71 s、`test_server` 12.55 s、`test_training` 9.08 s、其余四套 < 0.2 s），web **105/105**，
+anchor **118 引用 / 0 problems**，README 仍 **658 行**。以上每一条都是我在测例落树后自己复跑的（串行脚本
+`/mnt/d/tmp/r121_b2_orun.sh`，原始输出 `/mnt/d/tmp/r121_b2o_ctest.txt` / `_web.txt` / `_anchor.txt` /
+`r121_b2o_vg_subset.{out,err}` / `r121_b2o_vg_cheap3.txt` / `r121_b2o_vg_fullsearch.txt`），不是转述。
+
 ## 轮次121 引擎重构 B1：一层能搜的格子终于有了上限 — engine redesign stage B1
 
 规格 `docs/ENGINE_REDESIGN.md` §2.5.1（候选分层与宽度限制）、§3.2（候选生成伪码）、§2.7 的「双威胁前置识别」一行与

@@ -5040,6 +5040,699 @@ void test_tier_choice_reproducible_across_undo_cycles() {
               << std::endl;
 }
 
+namespace {
+
+// pos24: a 24-stone positional fight with nothing immediate on it, so neither the
+// answer nor the tree is decided by one forced reply. Same list as
+// /mnt/d/tmp/r121_b2_ladder.cpp measured, stone for stone.
+Board b2_pos24() {
+    return b1_board({
+        {9, 11, BLACK}, {0, 14, WHITE}, {10, 2, BLACK}, {6, 6, WHITE},
+        {10, 4, BLACK}, {9, 2, WHITE}, {4, 2, BLACK}, {5, 3, WHITE},
+        {2, 3, BLACK}, {10, 1, WHITE}, {12, 12, BLACK}, {2, 6, WHITE},
+        {1, 8, BLACK}, {14, 8, WHITE}, {4, 1, BLACK}, {13, 4, WHITE},
+        {1, 14, BLACK}, {8, 11, WHITE}, {10, 10, BLACK}, {8, 7, WHITE},
+        {12, 1, BLACK}, {11, 6, WHITE}, {5, 2, BLACK}, {0, 7, WHITE},
+    });
+}
+
+// The evaluator and the search it owns, kept alive together for the same reason
+// B1Rig exists (move_generator.h and alphabeta.h both hold the evaluator by
+// reference), plus the transposition table the search is built on.
+struct B2Rig {
+    explicit B2Rig(int root, int deep)
+        : evaluator(b1_evaluator(root, deep)), table(), search(evaluator, table) {}
+    const Evaluator evaluator;
+    TranspositionTable table;
+    AlphaBetaSearch search;
+};
+
+struct B2Think {
+    uint64_t nodes = 0;
+    uint64_t qnodes = 0;
+    int root_total = 0;
+    int root_done = 0;
+    int completed_depth = 0;
+    int seldepth = 0;
+    int score = 0;
+    Move best;
+    StopReason stopped = StopReason::NONE;
+    std::vector<int> killer_counts;  // one entry per ply, [0, kMaxPly)
+    int history_cells = 0;            // cells with a non-zero entry for either colour
+    int history_max = 0;
+};
+
+// b1_think's shape plus what the think left in the heuristic tables, read through
+// the same `#define private public` include J2 uses. That is why the cases that have
+// to compile on the tree before B2 keep to b1_think and its public-only fields.
+B2Think b2_think(const Board& board, int color, int depth, int root, int deep) {
+    const Evaluator evaluator = b1_evaluator(root, deep);
+    TranspositionTable tt;  // fresh table per arm, as b1_think's are
+    AlphaBetaSearch search(evaluator, tt);
+    std::atomic<bool> stop(false);
+
+    SearchLimits limits;
+    limits.max_depth = depth;
+    limits.hard_time_ms = 0;
+    limits.soft_time_ms = 0;
+    limits.max_nodes = 0;
+
+    B2Think out;
+    out.best = search.search(board, color, limits, stop);
+    const SearchStats& stats = search.last_stats();
+    out.nodes = stats.nodes;
+    out.qnodes = stats.qnodes;
+    out.root_total = stats.root_moves_total;
+    out.root_done = stats.root_moves_done;
+    out.completed_depth = stats.completed_depth;
+    out.seldepth = stats.seldepth;
+    out.score = stats.score;
+    out.stopped = stats.stopped;
+
+    const MoveHeuristics& h = search.heuristics_;
+    out.killer_counts.assign(MoveHeuristics::kMaxPly, 0);
+    for (int ply = 0; ply < MoveHeuristics::kMaxPly; ++ply)
+        out.killer_counts[ply] = h.killer_count(ply);
+    for (int i = 0; i < BOARD_SIZE * BOARD_SIZE; ++i) {
+        const Position pos = Position::from_index(i);
+        const int hb = h.history_value(BLACK, pos);
+        const int hw = h.history_value(WHITE, pos);
+        if (hb != 0 || hw != 0) ++out.history_cells;
+        out.history_max = std::max(out.history_max, std::max(hb, hw));
+    }
+    return out;
+}
+
+// What the shipped tail actually sorts on, stated as data rather than as a second
+// copy of the comparator: ④ the static price first, ③ this cell's history under it,
+// then the two geometric keys of the A6 triple. A case can then assert that a whole
+// list is non-increasing on this key instead of hand-picking one tie.
+struct B2TailKey {
+    int price;
+    int history;
+    int center_dist;
+    int index;
+};
+
+bool b2_key_earlier(const B2TailKey& a, const B2TailKey& b) {
+    if (a.price != b.price) return a.price > b.price;
+    if (a.history != b.history) return a.history > b.history;
+    if (a.center_dist != b.center_dist) return a.center_dist < b.center_dist;
+    return a.index < b.index;
+}
+
+std::vector<B2TailKey> b2_tail_keys(const std::vector<Move>& moves, size_t from,
+                                    const Board& board, const Evaluator& evaluator, int color,
+                                    const MoveHeuristics& h) {
+    std::vector<B2TailKey> keys;
+    keys.reserve(moves.size() - from);
+    for (size_t i = from; i < moves.size(); ++i) {
+        const Move& m = moves[i];
+        keys.push_back({evaluator.evaluate_position_pair(board, m.pos.row, m.pos.col, color),
+                        h.history_value(color, m.pos), center_distance(m.pos),
+                        m.pos.to_index()});
+    }
+    return keys;
+}
+
+// The order the A6 triple alone gives: value, then nearer the centre, then the lower
+// cell index. This is what sort_moves must reproduce when the tables hold nothing,
+// and what B1's and A6's pins are still describing.
+std::vector<Move> b2_triple_order(const std::vector<Move>& moves, const Board& board,
+                                 const Evaluator& evaluator, int color) {
+    std::vector<std::pair<RootScore, Move>> ranked;
+    ranked.reserve(moves.size());
+    for (const Move& m : moves) {
+        const int price = evaluator.evaluate_position_pair(board, m.pos.row, m.pos.col, color);
+        ranked.emplace_back(RootScore(m, price), m);
+    }
+    std::stable_sort(ranked.begin(), ranked.end(),
+                     [](const std::pair<RootScore, Move>& a,
+                        const std::pair<RootScore, Move>& b) { return a.first > b.first; });
+    std::vector<Move> out;
+    out.reserve(ranked.size());
+    for (const auto& r : ranked) out.push_back(r.second);
+    return out;
+}
+
+int b2_index_of(const std::vector<Move>& moves, const Position& pos) {
+    for (size_t i = 0; i < moves.size(); ++i)
+        if (moves[i].pos == pos) return static_cast<int>(i);
+    return -1;
+}
+
+}  // namespace
+
+// B2-1: killer 槽位（design doc 2.4.5 ②，src/search/search_state.h）.
+//
+// Unit-level on a new API, so there is no HEAD-negative arm for it: 8525f60 owns
+// neither MoveHeuristics nor a ply argument, and inventing a pre-B2 comparison here
+// would be measuring the absence of a class. What is pinned is the contract the
+// search depends on: two slots per ply in rank order, a re-record of the front slot
+// that changes nothing, ply isolation, and out-of-range reads and writes that cost
+// nothing and corrupt nothing.
+void test_move_heuristics_killer_slots_hold_two_moves_per_ply() {
+    MoveHeuristics h;
+    const Position a(7, 6), b(9, 5);
+    assert(!h.killer(3, 0).pos.is_valid());
+    assert(!h.killer(3, 1).pos.is_valid());
+    assert(h.killer_count(3) == 0);
+
+    h.record_cutoff(3, Move(a.row, a.col, BLACK), BLACK, 4);
+    assert(h.killer_count(3) == 1);
+    assert(h.killer(3, 0).pos == a);
+    assert(!h.killer(3, 1).pos.is_valid());
+
+    h.record_cutoff(3, Move(b.row, b.col, BLACK), BLACK, 3);
+    assert(h.killer(3, 0).pos == b);
+    assert(h.killer(3, 1).pos == a);          // the shift down, exactly once
+    assert(h.killer_count(3) == 2);
+
+    // Re-recording the front slot changes nothing: no shift, no duplicate. Stated as
+    // WHITE's move on the same cell, because the identity that decides it is the
+    // cell's, not the record's - a killer written by the side that moved last ply is
+    // still the same killer when this ply reads it back.
+    h.record_cutoff(3, Move(b.row, b.col, WHITE), WHITE, 5);
+    assert(h.killer(3, 0).pos == b);
+    assert(h.killer(3, 0).color == BLACK);     // the slot was not overwritten
+    assert(h.killer(3, 1).pos == a);
+    assert(h.killer_count(3) == 2);
+
+    // A record at ply 3 is invisible at ply 4 and at every other ply.
+    assert(h.killer_count(4) == 0);
+    assert(!same_cell(h.killer(4, 0), a));
+    assert(!same_cell(h.killer(4, 1), b));
+    assert(!same_cell(h.killer(2, 0), a));
+
+    // Out-of-range reads come back as the invalid move, never as somebody else's slot.
+    assert(!h.killer(-1, 0).pos.is_valid());
+    assert(!h.killer(MoveHeuristics::kMaxPly, 0).pos.is_valid());
+    assert(!h.killer(0, MoveHeuristics::kKillerSlots).pos.is_valid());
+    assert(!h.killer(0, -1).pos.is_valid());
+    assert(h.killer_count(-1) == 0);
+    assert(h.killer_count(MoveHeuristics::kMaxPly) == 0);
+
+    // Out-of-range writes record no killer at all - and must not write one into any
+    // ply, which is what kMaxPly as a bound is for - while still raising history.
+    MoveHeuristics g;
+    const Position c(2, 13);
+    g.record_cutoff(-1, Move(c.row, c.col, WHITE), WHITE, 3);
+    for (int ply = 0; ply < MoveHeuristics::kMaxPly; ++ply) assert(g.killer_count(ply) == 0);
+    assert(g.history_value(WHITE, c) == 9);
+    g.record_cutoff(MoveHeuristics::kMaxPly, Move(c.row, c.col, WHITE), WHITE, 4);
+    for (int ply = 0; ply < MoveHeuristics::kMaxPly; ++ply) assert(g.killer_count(ply) == 0);
+    assert(g.history_value(WHITE, c) == 25);   // 9 + 16, both writes landed
+
+    std::cout << "test_move_heuristics_killer_slots_hold_two_moves_per_ply passed (shift once, "
+                 "re-record a no-op, colour-blind identity, ply isolation, out-of-range ply "
+                 "-1 and kMaxPly write history but no slot)"
+              << std::endl;
+}
+
+// B2-2: history 按 depth² 累加、随搜索衰减（design doc 2.4.5 ③）.
+//
+// Also unit-level on a new API, so no HEAD-negative. The first block is the one that
+// dies if anyone removes the `= {}` on history_[]: start_think() ages the table
+// instead of clearing it, so a table that began the session holding stack garbage
+// would order the very first think on numbers no search ever wrote.
+void test_move_heuristics_history_accumulates_by_depth_squared_and_ages_by_half() {
+    const int cells = BOARD_SIZE * BOARD_SIZE;
+
+    {
+        MoveHeuristics fresh;
+        for (int i = 0; i < cells; ++i) {
+            const Position pos = Position::from_index(i);
+            assert(fresh.history_value(BLACK, pos) == 0);
+            assert(fresh.history_value(WHITE, pos) == 0);
+        }
+        assert(fresh.history_value(BLACK, Position()) == 0);   // an invalid cell costs nothing
+        for (int ply = 0; ply < MoveHeuristics::kMaxPly; ++ply)
+            assert(fresh.killer_count(ply) == 0);
+    }
+
+    MoveHeuristics h;
+    const Position deep(7, 4), other(3, 3);
+    assert(MoveHeuristics::color_slot(BLACK) == 0);
+    assert(MoveHeuristics::color_slot(WHITE) == 1);
+
+    h.record_cutoff(2, Move(deep.row, deep.col, BLACK), BLACK, 3);
+    assert(h.history_value(BLACK, deep) == 9);       // depth*depth, exactly
+    h.record_cutoff(2, Move(deep.row, deep.col, BLACK), BLACK, 3);
+    assert(h.history_value(BLACK, deep) == 18);      // two records at depth 3
+    assert(h.killer_count(2) == 1);                  // and still no duplicate slot
+
+    // The colour slots are independent tables, not one table with a colour check.
+    assert(h.history_value(WHITE, deep) == 0);
+    h.record_cutoff(2, Move(other.row, other.col, WHITE), WHITE, 4);
+    assert(h.history_value(WHITE, other) == 16);
+    assert(h.history_value(BLACK, deep) == 18);
+    assert(h.killer(2, 0).pos == other && h.killer(2, 1).pos == deep);
+    assert(h.killer_count(2) == 2);
+
+    h.start_layer();                       // ages history, leaves the killers alone
+    assert(h.history_value(BLACK, deep) == 9);
+    assert(h.history_value(WHITE, other) == 8);
+    assert(h.killer(2, 0).pos == other && h.killer(2, 1).pos == deep);
+    assert(h.killer_count(2) == 2);
+
+    h.start_think();                       // ages history AND empties every slot
+    assert(h.history_value(BLACK, deep) == 4);
+    assert(h.history_value(WHITE, other) == 4);
+    for (int ply = 0; ply < MoveHeuristics::kMaxPly; ++ply)
+        assert(h.killer_count(ply) == 0);
+
+    // Halving is a shift, not a reset: 17 goes 8, 4, 2, 1, 0 and each step is the
+    // floor of the half. A reset would make 随搜索衰减 a clear, and a clear would
+    // throw away the one thing that says "this cell keeps cutting" across thinks.
+    MoveHeuristics g;
+    const Position cell(11, 0);
+    g.record_cutoff(1, Move(cell.row, cell.col, BLACK), BLACK, 3);   // 9
+    g.record_cutoff(1, Move(cell.row, cell.col, BLACK), BLACK, 2);   // 4
+    g.record_cutoff(1, Move(cell.row, cell.col, BLACK), BLACK, 2);   // 4
+    assert(g.history_value(BLACK, cell) == 17);
+    const int ages[5] = {8, 4, 2, 1, 0};
+    for (int step = 0; step < 5; ++step) {
+        g.start_layer();
+        assert(g.history_value(BLACK, cell) == ages[step]);
+    }
+    g.start_layer();
+    assert(g.history_value(BLACK, cell) == 0);   // and it stays at 0, never negative
+
+    std::cout << "test_move_heuristics_history_accumulates_by_depth_squared_and_ages_by_half "
+                 "passed (all 225 cells zero at construction, += depth^2 exact, colour slots "
+                 "independent, start_layer keeps killers, start_think empties them, 17 ages "
+                 "8/4/2/1/0)"
+              << std::endl;
+}
+
+// B2-3: 三段式的次序本身（design doc 2.4.5 ①②③④）.
+//
+// sort_moves drove the whole of J2 through the file's `#define private public`
+// include; the signature gained `int ply` (defaulted, which is why every pre-B2 call
+// site in the file still compiles unchanged) and the two killer stages, so this is a
+// new API and has no HEAD-negative arm. What it pins, in the order the shipped code
+// applies it:
+//   (a) ① the TT move at index 0 - including the one that is ALREADY at index 0, the
+//       case the old swap-then-resort-from-0 used to unpinned;
+//   (b) ② both killers in slot order right after it, ahead of a tail that prices them
+//       last, and slot order beating price between the pair;
+//   (c) a killer the width limit cut is simply absent, and shifts nothing;
+//   (d) the tail non-increasing on (price, history, centre, index) as one key, over
+//       the whole tail, with a seeded history entry that visibly reorders an
+//       equal-priced cell without letting it cross a price boundary;
+//   (e) with nothing learned the order is exactly the A6 triple - the assert that
+//       breaks if anyone promotes ③ above ④ without re-measuring.
+void test_sort_moves_pins_tt_then_killers_then_price_over_history() {
+    Board board;
+    build_midgame(board);
+    B2Rig gen_rig(24, 8);
+    const Evaluator& evaluator = gen_rig.evaluator;
+    const std::vector<Move> generated = gen_rig.search.generate_moves(board, BLACK);
+    assert(generated.size() >= 24);                     // measured 33 at this width
+    const auto multiset = cell_multiset(generated);
+    const std::vector<int> price = heuristic_scores(generated, board, evaluator, BLACK);
+    assert(price.size() == generated.size());
+
+    // Rank the cells cheapest-first; the arms below pick from this order rather than
+    // from hand-picked coordinates, so the case follows the board if the price table
+    // ever moves again.
+    std::vector<size_t> by_price(generated.size());
+    for (size_t i = 0; i < by_price.size(); ++i) by_price[i] = i;
+    std::stable_sort(by_price.begin(), by_price.end(),
+                     [&](size_t x, size_t y) { return price[x] < price[y]; });
+    const size_t cheapest = by_price[0];
+    const size_t dearest = by_price.back();
+    assert(price[cheapest] < price[dearest]);           // the list has a price spread
+    const Move cheap_move = generated[cheapest];
+    const Move dear_move = generated[dearest];
+
+    // ---- (e) nothing learned: an empty table must reproduce the A6 triple exactly.
+    const std::vector<Move> triple = b2_triple_order(generated, board, evaluator, BLACK);
+    {
+        B2Rig rig(24, 8);
+        // Fed in reversed, so "the order came out right" cannot be "the input was
+        // already right". The premise that the reversed list is NOT the answer is
+        // checked, not assumed.
+        std::vector<Move> ordered(generated.rbegin(), generated.rend());
+        assert(ordered != triple);
+        rig.search.sort_moves(ordered, board, BLACK);   // ply defaults to 0, no TT move
+        assert(cell_multiset(ordered) == multiset);
+        assert(ordered.size() == triple.size());
+        for (size_t i = 0; i < triple.size(); ++i) assert(ordered[i].pos == triple[i].pos);
+        for (const Move& m : ordered)
+            assert(rig.search.heuristics_.history_value(BLACK, m.pos) == 0);
+    }
+
+    // ---- (a) ① pinned, whatever its own price says.
+    {
+        B2Rig rig(24, 8);
+        std::vector<Move> ordered = generated;
+        rig.search.sort_moves(ordered, board, BLACK, cheap_move);
+        assert(ordered[0].pos == cheap_move.pos);        // the cheapest cell in the list
+        assert(cell_multiset(ordered) == multiset);
+        // and everything behind it is the triple order of the rest, unchanged: the TT
+        // move is excluded from the re-ordering, not merely placed in front of it.
+        std::vector<Move> rest;
+        for (const Move& m : generated)
+            if (!(m.pos == cheap_move.pos)) rest.push_back(m);
+        const std::vector<Move> want_rest = b2_triple_order(rest, board, evaluator, BLACK);
+        for (size_t i = 1; i < ordered.size(); ++i) assert(ordered[i].pos == want_rest[i - 1].pos);
+    }
+    {
+        // The old no-op bug: the TT move already at index 0 used to be re-sorted away
+        // because the code only swapped when it was not at the front and then started
+        // its sort from 0. Here it is at the front AND two killers are waiting, so
+        // the head accounting has to keep it there and open the killer seats at 1.
+        B2Rig rig(24, 8);
+        std::vector<Move> ordered = generated;
+        std::iter_swap(ordered.begin(), ordered.begin() + cheapest);
+        assert(ordered[0].pos == cheap_move.pos);
+        const int ply = 7;
+        // Slot 0 is the TT move's own cell: the branch that must not pull a killer up
+        // beside itself. Slot 1 is a different cell and has to land at index 1.
+        const size_t slot1_src = by_price[1];
+        rig.search.heuristics_.record_cutoff(ply, generated[slot1_src], BLACK, 2);
+        rig.search.heuristics_.record_cutoff(ply, cheap_move, BLACK, 2);
+        assert(rig.search.heuristics_.killer(ply, 0).pos == cheap_move.pos);
+        assert(rig.search.heuristics_.killer(ply, 1).pos == generated[slot1_src].pos);
+        rig.search.sort_moves(ordered, board, BLACK, cheap_move, ply);
+        assert(ordered[0].pos == cheap_move.pos);
+        assert(ordered[1].pos == generated[slot1_src].pos);
+        assert(cell_multiset(ordered) == multiset);
+    }
+
+    // ---- (b) ② right after ①, in slot order, ahead of a tail that prices both of
+    // them below everything it holds.
+    {
+        B2Rig rig(24, 8);
+        const int ply = 5;
+        // slot 0 = the cheapest cell of the list, slot 1 = the cheapest cell strictly
+        // dearer than it. The pair's own order is therefore visibly not a price order,
+        // and both of them price below the whole tail.
+        const size_t slot0_src = by_price[0];
+        int slot1_src = -1;
+        for (size_t j = 1; j + 1 < generated.size(); ++j) {
+            if (price[by_price[j]] > price[by_price[0]]) {
+                slot1_src = static_cast<int>(by_price[j]);
+                break;
+            }
+        }
+        assert(slot1_src >= 0);
+        assert(price[slot1_src] > price[slot0_src]);
+        const Move slot0 = generated[slot0_src];
+        const Move slot1 = generated[slot1_src];
+        rig.search.heuristics_.record_cutoff(ply, slot1, BLACK, 2);   // shifts down to slot 1
+        rig.search.heuristics_.record_cutoff(ply, slot0, BLACK, 3);   // takes slot 0
+        assert(rig.search.heuristics_.killer(ply, 0).pos == slot0.pos);
+        assert(rig.search.heuristics_.killer(ply, 1).pos == slot1.pos);
+        assert(rig.search.heuristics_.killer_count(ply) == 2);
+        std::vector<Move> ordered = generated;
+        rig.search.sort_moves(ordered, board, BLACK, dear_move, ply);
+        assert(ordered[0].pos == dear_move.pos);       // ① first, and here it is the dearest
+        assert(ordered[1].pos == slot0.pos);           // ② slot 0 before slot 1
+        assert(ordered[2].pos == slot1.pos);
+        assert(ordered[1].pos != ordered[2].pos);
+        assert(cell_multiset(ordered) == multiset);
+        // The tail's best price beats both killers' - so ② really did jump the queue,
+        // and it did it in the rank the layer earned rather than the rank their prices
+        // would have given them.
+        const std::vector<B2TailKey> tail =
+            b2_tail_keys(ordered, 3, board, evaluator, BLACK, rig.search.heuristics_);
+        assert(tail.size() == ordered.size() - 3);
+        assert(tail.front().price > price[slot0_src]);
+        assert(tail.front().price > price[slot1_src]);
+        for (size_t i = 1; i < tail.size(); ++i) assert(!b2_key_earlier(tail[i], tail[i - 1]));
+    }
+
+    // ---- (c) a killer the width limit cut never happened to this list at all.
+    {
+        B2Rig rig(24, 8);
+        const int ply = 6;
+        // An occupied square: no candidate list of this board can contain it, so the
+        // slot is filled and unplaceable - the case the code comments as "simply not a
+        // candidate here".
+        const Position gone(5, 5);
+        assert(!board.is_empty(gone.row, gone.col));
+        rig.search.heuristics_.record_cutoff(ply, Move(gone.row, gone.col, BLACK), BLACK, 4);
+        assert(rig.search.heuristics_.killer_count(ply) == 1);
+        std::vector<Move> ordered = generated;
+        rig.search.sort_moves(ordered, board, BLACK, Move(), ply);
+        assert(!b1_in_flat(ordered, gone.row, gone.col));
+        assert(cell_multiset(ordered) == multiset);
+        // and nothing else moved: the order is the same one the empty tables produced.
+        for (size_t i = 0; i < triple.size(); ++i) assert(ordered[i].pos == triple[i].pos);
+    }
+
+    // ---- (d) ④ over ③, asserted as an invariant over the whole list, with ③ shown
+    // to be consulted rather than decorative. History is seeded through the out-of
+    // range ply, which writes no killer (B2-1 pinned that), so this arm moves ③ alone.
+    {
+        B2Rig rig(24, 8);
+        auto price_of = [&](const Move& m) {
+            return evaluator.evaluate_position_pair(board, m.pos.row, m.pos.col, BLACK);
+        };
+        // The longest run of equal-priced neighbours in the triple order. Without such
+        // a run this arm could not show ③ deciding anything, so the run is a premise
+        // and not a hope.
+        int run_start = 0, run_len = 1, best_start = 0, best_len = 1;
+        for (size_t i = 1; i < triple.size(); ++i) {
+            if (price_of(triple[i]) == price_of(triple[i - 1])) {
+                ++run_len;
+                if (run_len > best_len) { best_len = run_len; best_start = run_start; }
+            } else {
+                run_start = static_cast<int>(i);
+                run_len = 1;
+            }
+        }
+        assert(best_len >= 2);
+        const int run_end = best_start + best_len - 1;
+        const Move seeded = triple[run_end];   // the triple put it LAST of the group
+        const int seeded_price = price_of(seeded);
+        rig.search.heuristics_.record_cutoff(-1, seeded, BLACK, 4);   // history += 16
+        assert(rig.search.heuristics_.history_value(BLACK, seeded.pos) == 16);
+        assert(rig.search.heuristics_.killer_count(0) == 0);          // and no killer at all
+
+        std::vector<Move> ordered = generated;
+        rig.search.sort_moves(ordered, board, BLACK, Move(), 0);
+        assert(cell_multiset(ordered) == multiset);
+        const std::vector<B2TailKey> keys =
+            b2_tail_keys(ordered, 0, board, evaluator, BLACK, rig.search.heuristics_);
+        assert(keys.size() == ordered.size());
+        // The invariant, over the whole tail: no entry may be earlier on the key than
+        // the entry standing in front of it.
+        for (size_t i = 1; i < keys.size(); ++i) assert(!b2_key_earlier(keys[i], keys[i - 1]));
+        // The group of cells sharing the seeded cell's price, read off the output.
+        int block_start = -1, block_end = -1;
+        for (size_t i = 0; i < keys.size(); ++i) {
+            if (keys[i].price != seeded_price) continue;
+            if (block_start < 0) block_start = static_cast<int>(i);
+            block_end = static_cast<int>(i);
+        }
+        assert(block_start >= 0 && block_end >= block_start);
+        const int at = b2_index_of(ordered, seeded.pos);
+        assert(at >= 0);
+        assert(at == block_start);            // ③: highest history leads its price group
+        assert(at < run_end);                 // it moved ahead of cells the triple ranked
+                                              // above it, so ③ is not decorative
+        // ④: and it moved nowhere else. The group occupies exactly the span the triple
+        // gave it, which is what dies if anyone promotes ③ above ④.
+        assert(block_start == best_start);
+        assert(block_end == run_end);
+    }
+
+    std::cout << "test_sort_moves_pins_tt_then_killers_then_price_over_history passed ("
+              << generated.size() << " candidates: TT pinned at 0 even at the list's minimum "
+              "price and even already at 0, two killers in slot order ahead of a tail that "
+              "prices them last, a cut killer absent and nothing shifted, tail non-increasing "
+              "on (price, history, centre, index), empty tables reproduce the A6 triple)"
+              << std::endl;
+}
+
+// B2-4: 三段式的代价判据 - the cost pin, and the HEAD-negative arm.
+//
+// Public API only (b1_think's own shape), so this very body compiles on 8525f60 -
+// which is the point: the node count is 230474 there, so the equality is RED on that
+// tree while every fact around it (depth, score, move, root width, reason) is green
+// on both. That is the discriminator: not "a different search", the same search
+// paying for fewer nodes. Both arms are COST pins; the value and the move of these
+// poses are already pinned by other cases, so what these two lines buy is ②/③'s
+// -3.9 % on the quiet arm and the positional arm that keeps the pin off a single
+// board. qnodes is deliberately not asserted - it moved by 7096 on the quiet arm
+// between the trees, and only nodes is the quantity the stage promises.
+void test_three_stage_ordering_pays_for_itself_in_nodes() {
+    {
+        const B1Think quiet = b1_think(b1_quiet(), BLACK, 6, 24, 8);
+        assert(quiet.nodes == 221380);        // COST pin; 8525f60 answers 230474 here
+        assert(quiet.completed_depth == 6);   // the four facts below are green on both trees
+        assert(quiet.score == 71992);
+        assert(quiet.best.pos.row == 8 && quiet.best.pos.col == 7);
+        assert(quiet.root_total == 31);
+        assert(quiet.stopped == StopReason::NONE);
+    }
+    {
+        const B1Think pos = b1_think(b2_pos24(), BLACK, 8, 24, 8);
+        assert(pos.nodes == 2409735);         // COST pin; 8525f60 answers 2396300 here
+        assert(pos.completed_depth == 8);     // and again, everything below is green on both
+        assert(pos.score == 99999);
+        assert(pos.best.pos.row == 7 && pos.best.pos.col == 4);
+        assert(pos.root_total == 39);
+        assert(pos.stopped == StopReason::NONE);
+    }
+    std::cout << "test_three_stage_ordering_pays_for_itself_in_nodes passed (quiet BLACK d6 "
+                 "24/8 230474 -> 221380 nodes, pos24 BLACK d8 24/8 2396300 -> 2409735, same "
+                 "depth, score, move, root width and reason on both trees)"
+              << std::endl;
+}
+
+// B2-5: 衰减的 history 没有把 A4 的根复用弄脏 - the control, green on BOTH trees.
+//
+// start_think() ages history instead of clearing it, which is the one thing in B2
+// that lets a previous think's numbers reach a later think. A4's promise is that a
+// session re-asking about the same position lands on the same answer at the same
+// cost, so if aged history moved the root's first candidate or reopened a closed
+// subtree, the second think would stop being 187 nodes. It is 187 on this tree and
+// on 8525f60, with the same move and the same score, and the case is written in
+// public API only so that claim is checkable on both.
+void test_aged_history_leaves_a_reused_root_think_unchanged() {
+    const Board board = b1_quiet();
+    const Evaluator evaluator = b1_evaluator(24, 8);
+    TranspositionTable tt;                 // ONE table for all three thinks, as a session has
+    AlphaBetaSearch search(evaluator, tt);
+    std::atomic<bool> stop(false);
+
+    SearchLimits limits;
+    limits.max_depth = 6;
+    limits.hard_time_ms = 0;
+    limits.soft_time_ms = 0;
+    limits.max_nodes = 0;
+
+    Move first;
+    int first_score = 0;
+    uint64_t cold_nodes = 0;
+    for (int think = 1; think <= 3; ++think) {
+        const Move best = search.search(board, BLACK, limits, stop);
+        const SearchStats& stats = search.last_stats();
+        assert(stats.completed_depth == 6);
+        assert(stats.stopped == StopReason::NONE);
+        assert(stats.root_moves_total == 31);
+        if (think == 1) {
+            first = best;
+            first_score = stats.score;
+            cold_nodes = stats.nodes;
+        } else {
+            assert(best.pos == first.pos);
+            assert(stats.score == first_score);
+            assert(stats.nodes == 187);    // green on 8525f60 too: the reuse is B2-free
+        }
+    }
+    assert(first.pos.row == 8 && first.pos.col == 7);
+    assert(first_score == 71992);
+    // The premise that makes 187 a claim rather than a tautology: think #1 paid for
+    // the whole tree, so #2 and #3 are the reuse and not a repeat. The cold number
+    // itself differs between the trees (that is B2-4) and is not claimed here.
+    assert(cold_nodes > 187);
+
+    std::cout << "test_aged_history_leaves_a_reused_root_think_unchanged passed (three thinks, "
+                 "one table: #2 and #3 both 187 nodes with the same 8,7 / 71992 / depth 6 / "
+                 "reason none on this tree and on 8525f60)"
+              << std::endl;
+}
+
+// B2-6: 记号是树写下的，不是根、也不是静态搜索写下的 (design doc 2.4.5 ②/③).
+//
+// The recording site is alphabeta()'s beta-cutoff branch, gated on depth >= 2, and
+// the root's own order is built by a sort_moves call at ply 0 whose children are
+// searched at ply 1. Three things follow, and all three are asserted against what a
+// real think leaves in the private table (read the way J2 reads sort_moves):
+//   (a) ply 0 is always empty - a real think can never fill the root's slots, so the
+//       root ordering is A4's hint plus the price, never "the root's killers";
+//   (b) no ply at or below the layer's own depth can hold anything, because a node
+//       that far from the root has no depth left to cut with; this is also the
+//       production half of the kMaxPly bounds;
+//   (c) some ply inside the tree does hold something, i.e. stage ② is live.
+// Plus the sharper half the contract asked for: quiescence walks the generator's own
+// Tier1 order and never calls sort_moves, so a think whose only non-root nodes are
+// quiescence nodes records nothing at all - and that "only" is not assumed, it is
+// arithmetic on the counters (nodes == root candidates + quiescence nodes).
+void test_killers_are_recorded_by_the_tree_not_by_the_root_or_quiescence() {
+    // The arm the contract names for quiescence-dominance is the crowded wide one,
+    // 1558 of its 1861 nodes quiescence. Measured here (and on the tree before B2):
+    // it is a proven mate and the deepening stops at layer 2, so its deepest
+    // alphabeta node is ply 1 at depth 1 and the depth >= 2 gate never fires - every
+    // slot is empty at every ply. (a) and (b) hold on it; (c) cannot, which is
+    // reported rather than worked around. (b) is the interesting fact here: had the
+    // ply index escaped the tree, a slot would be set.
+    const B2Think mate_arm = b2_think(b1_crowded(), BLACK, 6, 64, 32);
+    assert(mate_arm.nodes == 1861 && mate_arm.qnodes == 1558);
+    assert(mate_arm.completed_depth == 2 && mate_arm.stopped == StopReason::MATE);
+    assert(mate_arm.killer_counts[0] == 0);
+    for (int ply = MoveHeuristics::kMaxPly - 1; ply >= 6; --ply)
+        assert(mate_arm.killer_counts[ply] == 0);
+
+    // (c) and the shape of the recording boundary, on an arm the suite can afford:
+    // pos24 at depth 3 is quiescence-dominant the same way (2923 of its 4422 nodes),
+    // its tree reaches ply 3, and exactly one ply of it can hold a cutoff.
+    const B2Think tree = b2_think(b2_pos24(), BLACK, 3, 24, 8);
+    assert(tree.nodes == 4422 && tree.qnodes == 2923);
+    assert(tree.completed_depth == 3 && tree.root_done == tree.root_total);
+    assert(tree.stopped == StopReason::NONE);
+    assert(tree.killer_counts[0] == 0);                       // (a)
+    assert(tree.killer_counts[1] >= 1);                       // (c)
+    for (int ply = 3; ply < MoveHeuristics::kMaxPly; ++ply)   // (b)
+        assert(tree.killer_counts[ply] == 0);
+    // The footprint of the depth >= 2 gate: a node at ply p of a max_depth D think
+    // carries at most D - p depth, so D - 2 is the deepest ply that can record and
+    // every ply from D - 1 up cannot. Both halves are pinned, so the gate is neither
+    // missing nor tighter than it claims, and the boundary is a function of the depth
+    // rather than of this position - D6 on the quiet pose puts it at ply 4, D8 on
+    // pos24 at ply 6, measured in REVIEW_LOG's B2 table.
+    assert(tree.killer_counts[1] == 2);
+    for (int ply = 2; ply < MoveHeuristics::kMaxPly; ++ply) assert(tree.killer_counts[ply] == 0);
+    assert(tree.history_cells > 0);
+
+    // quiescence never records, and never sorts. Take a think whose alphabeta nodes
+    // all arrive with depth 0: each one returns through `if (depth <= 0) return
+    // quiescence(...)` before its move loop, so the ONLY nodes that ran are the root
+    // layer's children and quiescence. If nodes equals root candidates plus
+    // quiescence nodes, that is the whole tree, and then an empty table can only mean
+    // quiescence wrote nothing - even though it recursed and resolved forcing lines.
+    const B2Think quiet_only = b2_think(b1_crowded(), BLACK, 1, 64, 32);
+    assert(quiet_only.completed_depth == 1 && quiet_only.stopped == StopReason::NONE);
+    assert(quiet_only.root_done == quiet_only.root_total);   // each child searched once
+    assert(quiet_only.nodes == quiet_only.root_total + quiet_only.qnodes);
+    assert(quiet_only.qnodes > quiet_only.root_total);  // 129 over 79: it recursed
+    assert(quiet_only.seldepth >= 2);                   // and walked a forcing line
+    assert(quiet_only.score == 99999);                  // which is what answered, not a stand-pat
+    for (int ply = 0; ply < MoveHeuristics::kMaxPly; ++ply)
+        assert(quiet_only.killer_counts[ply] == 0);
+    assert(quiet_only.history_cells == 0);
+
+    // The same structural arm on the quiet pose, where the arithmetic is visible down
+    // to the last node: one quiescence node per root candidate and nothing else.
+    const B2Think one_ply = b2_think(b1_quiet(), BLACK, 1, 24, 8);
+    assert(one_ply.nodes == 62 && one_ply.root_total == 31 && one_ply.qnodes == 31);
+    assert(one_ply.nodes == one_ply.root_total + one_ply.qnodes);
+    for (int ply = 0; ply < MoveHeuristics::kMaxPly; ++ply)
+        assert(one_ply.killer_counts[ply] == 0);
+    assert(one_ply.history_cells == 0);
+
+    // The control that keeps the two arms above from being read as "this pose never
+    // cuts": the same board, the same widths, two more plies of tree, and both tables
+    // fill at the one ply that can now hold a depth-2 cutoff.
+    const B2Think three_ply = b2_think(b1_quiet(), BLACK, 3, 24, 8);
+    assert(three_ply.nodes == 2515 && three_ply.completed_depth == 3);
+    assert(three_ply.killer_counts[0] == 0);
+    assert(three_ply.killer_counts[1] == 2);
+    assert(three_ply.history_cells > one_ply.history_cells);
+
+    std::cout << "test_killers_are_recorded_by_the_tree_not_by_the_root_or_quiescence passed "
+                 "(crowded d6 1861/1558 leaves ply 0 empty and records nothing at all, because "
+                 "the mate break stops the deepening at layer 2; pos24 d3 fills only ply 1 and "
+                 "nothing from ply 2; crowded d1 satisfies nodes == 79+129 and quiet d1 "
+                 "62 == 31+31 with both tables empty; quiet d3 then fills them)"
+              << std::endl;
+}
+
 int main() {
     std::cout << "Running search tests..." << std::endl;
 
@@ -5154,6 +5847,13 @@ int main() {
     test_move_generator_drops_black_forbidden();
     test_quiescence_row_is_the_forcing_filter();
     test_tier_choice_reproducible_across_undo_cycles();
+
+    test_move_heuristics_killer_slots_hold_two_moves_per_ply();
+    test_move_heuristics_history_accumulates_by_depth_squared_and_ages_by_half();
+    test_sort_moves_pins_tt_then_killers_then_price_over_history();
+    test_three_stage_ordering_pays_for_itself_in_nodes();
+    test_aged_history_leaves_a_reused_root_think_unchanged();
+    test_killers_are_recorded_by_the_tree_not_by_the_root_or_quiescence();
 
     std::cout << "All search tests passed!" << std::endl;
     return 0;

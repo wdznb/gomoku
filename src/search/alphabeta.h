@@ -99,6 +99,11 @@ private:
     // allowed to search is its decision, the search only orders and iterates the
     // result.
     MoveGenerator move_gen_;
+    // The layer's own memory of what cut: this ply's killers and, per colour and
+    // cell, the history behind the price (design doc 2.4.5 ②/③). It is per-think
+    // state, aged between thinks, and it is why a second think of one session is not
+    // a repeat of the first.
+    MoveHeuristics heuristics_;
     int node_limit_;
     // Only the layered accounting left in the object: the counters and the three
     // ways a think can end live in the context, so the stop test is one function
@@ -127,8 +132,17 @@ private:
     // position with no threat. `ply` selects the width (design doc 2.5.1's table),
     // so the root asks for ply 0.
     std::vector<Move> generate_moves(const Board& board, int color, int ply = 0);
+    // The three stages of design doc 2.4.5 plus the price it puts last: ① the TT
+    // move, pinned at index 0 and left out of everything below, ② this ply's two
+    // killers in slot order, then ④ the static price and, under it, ③ the history of
+    // the cells this search has already seen cut. ③ and ④ are swapped against the
+    // doc's list because that is the order this engine's prices can pay for - the
+    // measurement is in alphabeta.cpp's comparator and the table is in
+    // REVIEW_LOG's B2 section. The last two keys are the ones the root chooses on, so
+    // a layer with nothing learned yet searches exactly the order A6 pinned. `ply` is
+    // the node's distance from this think's root, which is what keys the killer slots.
     void sort_moves(std::vector<Move>& moves, const Board& board, int color,
-                    const Move& tt_move = Move());
+                    const Move& tt_move = Move(), int ply = 0);
 
     // One layer of the root loop: every root candidate inside one window, searched
     // in order until the window's top is reached or the budget is gone. The

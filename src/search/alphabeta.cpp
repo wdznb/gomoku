@@ -32,21 +32,42 @@ std::vector<Move> AlphaBetaSearch::generate_moves(const Board& board, int color,
 }
 
 void AlphaBetaSearch::sort_moves(std::vector<Move>& moves, const Board& board, int color,
-                                  const Move& tt_move) {
-    // The TT move earns its place by the previous search, so it must stay at
+                                  const Move& tt_move, int ply) {
+    // ① The TT move earns its place by the previous search, so it must stay at
     // index 0 and out of the heuristic re-ordering below. Looking for it
     // anywhere but the front used to leave it unpinned when it already was the
     // first move, which is exactly the common case.
     bool tt_swapped = false;
     if (tt_move.pos.is_valid()) {
         auto it = std::find_if(moves.begin(), moves.end(),
-            [&](const Move& m) { return m.pos.row == tt_move.pos.row && m.pos.col == tt_move.pos.col; });
+            [&](const Move& m) { return same_cell(m, tt_move.pos); });
         if (it != moves.end()) {
             if (it != moves.begin()) std::iter_swap(moves.begin(), it);
             tt_swapped = true;
         }
     }
 
+    // ② The two moves that cut this same layer before, in slot order. They come
+    // straight after the TT move and keep their own rank: a killer is a statement
+    // about this layer, and slot 0 is the more recent one, so sorting the pair by
+    // any other key would lose that.
+    size_t head = tt_swapped ? 1 : 0;
+    for (int slot = 0; slot < MoveHeuristics::kKillerSlots; ++slot) {
+        const Move& killer = heuristics_.killer(ply, slot);
+        if (!killer.pos.is_valid()) continue;
+        // A killer already sitting in the pinned seat (the common case: the TT move
+        // and the last cut are usually the same move) must not be pulled up beside
+        // itself, and one that the width limit cut is simply not a candidate here.
+        auto it = std::find_if(moves.begin() + head, moves.end(),
+                               [&](const Move& m) { return same_cell(m, killer.pos); });
+        if (it == moves.end()) continue;
+        if (it != moves.begin() + head) std::iter_swap(moves.begin() + head, it);
+        ++head;
+    }
+
+    // ③/④ Everything else, on what the cell is worth (the static price) and then on
+    // what this search has seen of it (history).
+    //
     // evaluate_position_both runs four pattern recognitions per call; the
     // comparator used to invoke it O(n log n) times per node. Score once up
     // front and sort the pairs instead.
@@ -58,14 +79,11 @@ void AlphaBetaSearch::sort_moves(std::vector<Move>& moves, const Board& board, i
     // redundant work.
     //
     // The tiered generator has already produced this list's scores, so the pass
-    // below does read them a second time. Deliberately so, for this stage: which
-    // squares survive a width is the generator's decision (design doc 2.5.1), while
-    // the order a layer searches them in is still the one A6 put under the root's
-    // choice - one place, and the pins on the root order and the interrupted-layer
-    // fallback keep describing the engine's actual path. Stage B2 replaces this
-    // pass with the TT/killer/history ordering of 2.4.2, and stage C's candidate
-    // score cache is what makes the re-scoring cheap until then.
-    int start = tt_swapped ? 1 : 0;
+    // below does read them a second time. Deliberately so, until stage C's
+    // candidate score cache replaces it: the price is still the fallback the design
+    // doc's ④ asks for, and the killer/history stages have nothing to say about a
+    // cell they have never cut.
+    int start = static_cast<int>(head);
     int count = static_cast<int>(moves.size()) - start;
     if (count <= 1) return;
 
@@ -76,16 +94,41 @@ void AlphaBetaSearch::sort_moves(std::vector<Move>& moves, const Board& board, i
         int s = evaluator_.evaluate_position_pair(board, m.pos.row, m.pos.col, color);
         scored.emplace_back(s, static_cast<size_t>(start + i));
     }
-    // Score alone is not a total order: two candidates of the same value compare
-    // equal, and std::sort then leaves their relative order down to the input
-    // order - which is active_empty()'s swap-remove order, and that order changes
-    // once a board has played and undone stones. Ordering the pairs by the same
-    // triple the root chooses on makes the result a function of the position;
+    // The price is the first key and history the second, then the two geometric
+    // keys of the A6 triple. That is the reverse of the order design doc 2.4.5
+    // lists ③ and ④ in, and it is a measured call rather than a reading: a cell's
+    // history says what happened in the position the *previous* node stood in,
+    // while evaluate_position_pair is recomputed from the board this node is on, so
+    // promoting ③ above ④ makes the search re-open weak cells that the price had
+    // already ranked. Same probe, history as the first key: a positional midgame at
+    // depth 8 goes 2396300 -> 8895598 nodes for BLACK and 1298311 -> 5941620 for
+    // WHITE. With history under the price instead: 221380 against the 230474 the
+    // same arm cost before B2 (-3.9 %), and every other arm inside +-3 %. The table
+    // is in REVIEW_LOG's B2 section.
+    //
+    // What the ordering must still be is a function of the board, not of a
+    // container. Score alone is not a total order: two candidates of the same value
+    // compare equal, and std::sort then leaves their relative order down to the
+    // input order - which is active_empty()'s swap-remove order, and that order
+    // changes once a board has played and undone stones. The triple the root chooses
+    // on is what closes that off below the price; history only ever reorders cells
+    // the triple would have had to decide geometrically, and on the first think of a
+    // session every history entry is 0, which makes that think exactly the price
+    // order the A6 pins already describe.
     // stable_sort is the same belt from the other side, with nothing left to
     // stabilise.
     std::stable_sort(scored.begin(), scored.end(), [&](const std::pair<int, size_t>& a,
                                                         const std::pair<int, size_t>& b) {
-        return RootScore(moves[a.second], a.first) > RootScore(moves[b.second], b.first);
+        if (a.first != b.first) return a.first > b.first;
+        const int ha = heuristics_.history_value(color, moves[a.second].pos);
+        const int hb = heuristics_.history_value(color, moves[b.second].pos);
+        if (ha != hb) return ha > hb;
+        const Position pa = moves[a.second].pos;
+        const Position pb = moves[b.second].pos;
+        const int da = center_distance(pa);
+        const int db = center_distance(pb);
+        if (da != db) return da < db;
+        return pa.to_index() < pb.to_index();
     });
 
     std::vector<Move> reordered(moves.size());
@@ -221,7 +264,7 @@ NodeResult AlphaBetaSearch::alphabeta(Board& board, int depth, int alpha, int be
     auto moves = generate_moves(board, color, ply);
     if (moves.empty()) return {evaluator_.evaluate_board(board, color), true};
 
-    sort_moves(moves, board, color, tt_move);
+    sort_moves(moves, board, color, tt_move, ply);
 
     Move best_move;
     int best_score = -INT_MAX;
@@ -256,6 +299,12 @@ NodeResult AlphaBetaSearch::alphabeta(Board& board, int depth, int alpha, int be
         }
         if (alpha >= beta) {
             flag = TTFlag::LOWERBOUND;
+            // The move that ended this layer's job is the one the next layer of this
+            // think should try first, and the deeper the subtree it cut was the more
+            // strongly it says so (design doc 2.4.5 ②/③). Recorded for this node's
+            // ply and the side to move here, which is what makes a killer found at
+            // ply 3 of layer 6 the same statement as one found at ply 3 of layer 7.
+            if (depth >= 2) heuristics_.record_cutoff(ply, move, color, depth);
             break;
         }
     }
@@ -329,6 +378,12 @@ Move AlphaBetaSearch::search(const Board& board, int color, const SearchLimits& 
 
     ctx_.start(limits, *clock_, stop_flag);
     if (has_deadline_) ctx_.set_absolute_deadline(deadline_ms_);
+    // Killers are numbered by how far a node sits from the root of *this* think, so
+    // the previous think's slots describe positions this one will not visit; they
+    // start empty. History is keyed by cell rather than by ply, which is exactly why
+    // it survives a think - and why it ages by half instead of being kept whole or
+    // thrown away.
+    heuristics_.start_think();
 
     // No generation step here, on purpose. Ageing the table at the start of a think
     // is what let that think's own shallow records evict the deep ones the previous
@@ -407,6 +462,11 @@ Move AlphaBetaSearch::search(const Board& board, int color, const SearchLimits& 
             stats_.stopped = StopReason::TIME_SOFT;
             break;
         }
+
+        // A deeper iteration re-asks the same plies with more tree below them, so
+        // the layer before it is the evidence that still applies; ageing here is what
+        // keeps a cutoff found at depth 2 from ordering depth 6.
+        heuristics_.start_layer();
 
         Move layer_move;
         NodeResult layer = search_root_with_aspiration(work_board, root_moves, depth,
