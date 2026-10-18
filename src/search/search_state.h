@@ -228,6 +228,9 @@ public:
         qnodes_ = 0;
         tt_hits_ = 0;
         tt_cutoffs_ = 0;
+        eval_scans_ = 0;
+        eval_reuses_ = 0;
+        eval_patches_ = 0;
         seldepth_ = 0;
         check_counter_ = 0;
         reason_ = StopReason::NONE;
@@ -298,12 +301,28 @@ public:
     void count_quiescence_node() { ++nodes_; ++qnodes_; }
     void count_tt_hit() { ++tt_hits_; }
     void count_tt_cutoff() { ++tt_cutoffs_; }
+
+    // Design doc 2.6 step 1's three cost counters: how many positions a think paid a
+    // whole-board scan for, how many it read off the table instead, and how many of
+    // those scans found somewhere in the table to leave their score. They are
+    // deliberately not part of SearchStats: that struct is a progress frame, and a
+    // frame's fields are read by the session archive and the client, while these three
+    // numbers describe work the search did not do - a fact about cost, not about the
+    // position, and one that a node-neutral reuse changes without changing anything a
+    // player sees.
+    void count_eval_scan() { ++eval_scans_; }
+    void count_eval_reuse() { ++eval_reuses_; }
+    void count_eval_patch() { ++eval_patches_; }
+
     void note_quiescence_depth(int depth) { if (depth > seldepth_) seldepth_ = depth; }
 
     uint64_t nodes() const { return nodes_; }
     uint64_t quiescence_nodes() const { return qnodes_; }
     uint64_t tt_hits() const { return tt_hits_; }
     uint64_t tt_cutoffs() const { return tt_cutoffs_; }
+    uint64_t eval_scans() const { return eval_scans_; }
+    uint64_t eval_reuses() const { return eval_reuses_; }
+    uint64_t eval_patches() const { return eval_patches_; }
     int seldepth() const { return seldepth_; }
 
 private:
@@ -328,6 +347,9 @@ private:
     uint64_t qnodes_ = 0;
     uint64_t tt_hits_ = 0;
     uint64_t tt_cutoffs_ = 0;
+    uint64_t eval_scans_ = 0;
+    uint64_t eval_reuses_ = 0;
+    uint64_t eval_patches_ = 0;
     int seldepth_ = 0;
     unsigned check_counter_ = 0;
     StopReason reason_ = StopReason::NONE;

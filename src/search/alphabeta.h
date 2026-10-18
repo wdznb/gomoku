@@ -133,7 +133,23 @@ private:
                          std::atomic<bool>& stop_flag, int ply = 0);
 
     NodeResult quiescence(Board& board, int alpha, int beta, int color,
-                          std::atomic<bool>& stop_flag, int qdepth);
+                          std::atomic<bool>& stop_flag, int qdepth, uint64_t hash,
+                          int32_t tt_eval);
+
+    // The one read of a position's static score (design doc 2.6 step 1). `cached` is
+    // what an earlier lookup on this node already found - the record's field, or
+    // NO_STATIC_EVAL - and is only asked for when it says nothing, so a node that
+    // probed the table for its bound does not walk the bucket again for the score.
+    // A miss costs the whole-board scan and leaves its result where the next visit of
+    // this layout finds it: on the record this position has, or in a slot of the same
+    // bucket that holds nothing else.
+    //
+    // The stored number is BLACK's side of the evaluation and the returned one is
+    // `color`'s, which is the same fact read through the antisymmetry of
+    // evaluate_board; the field has no byte for whose side it is and this way it needs
+    // none. Every path here returns exactly the integer evaluate_board(board, color)
+    // would, so the reuse cannot move a score, a cutoff or a node.
+    int static_score(const Board& board, int color, uint64_t hash, int32_t cached);
 
     // One child of a tree node, in the shape design doc 2.7 calls PVS: the whole
     // window for the first candidate of a node and for every candidate of a node that

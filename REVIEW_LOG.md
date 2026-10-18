@@ -1979,6 +1979,218 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次121 引擎重构 C1：置换表第一次替节点省下一次全盘扫描 — engine redesign stage C1
+
+规格 `docs/ENGINE_REDESIGN.md` `:399-404`：§2.6「评估性能子系统（对应 P4 / G5）」的 preamble
+「按『小步、可验证』顺序推进（README 已记录一次全盘增量评估被否决，因此不再一次性重写）」与
+**Step 1** 行「节点首次计算静态分后随 TT 一起存；命中时直接复用，省掉重复全盘扫描。低风险、立即可测。」；
+再加三个约束行：`:549` 的 C 阶段验收（单线程 ≥1M nps；depth 8 在 4s 内完成）、`:556` 回归保障第 3 条
+（「评估函数改动（位置项、增量缓存）必须与旧实现逐格比对」）、`:568` 风险行里对 Step 3 的限定
+（「先只用于『无威胁局面』，有威胁时回退全盘评估」——那是 C3 的事，也点名了 B5 的 `opp_four` 的下一个消费者）。
+文件清单 `:586` 那一行（`transposition.h/.cpp`：4 路 bucket、depth 优先替换、高位混合索引、**`static_eval` 字段**、
+mate 归一化、代龄按手推进）里，前四项是 A3 落的，`static_eval` 字段本身也是那时占下的一个格，但**没有任何读者**：
+`af43a05` 上它的唯一一句说明是「Filled in by the search that first evaluates the position (design doc 2.6 step 1)」——
+一个从没被填过的字段。C1 落的就是这半行。
+
+C 阶段是一条成本链，不是一条棋力链，所以本轮的口径比 B 阶段更硬：**一次都不许多搜，也一次都不许少搜**。
+树的不变量用两层证据钉（下面「中立性」段），收益只写成计数器与 `-O2` 探针树上的每节点成本，墙钟一律标诊断。
+
+### 落地的三件事
+
+1. **表的两个新面**：`int32_t static_eval_of(uint64_t hash) const` 与
+   `bool put_static_eval(uint64_t hash, int32_t static_eval)`（声明 `src/optimization/transposition.h:85-112`、
+   定义 `src/optimization/transposition.cpp:104-146`）。两者都只做一次 bucket 走、只碰 `static_eval`：
+   不返回值、不剪枝、不决定替换——这正是「用一个它们的思考与不用一个的思考搜同一棵树」的依据。
+   - 读优先：同一 tag 下**真实记录**（`flag != TTFlag::NONE`）先答，没有记录才读 `depth == kEvalOnlyDepth` 的那一格。
+   - 写优先：有记录就写在记录上；没有记录才占用一个 `flag == NONE` 的格，并且**优先占用从未承载过任何东西的空槽**
+     （而不是把某一格已经带的数再回收一次），于是一个 bucket 缓存的是四路里能缓存的全部评估。四格都成了真实记录时它返回 `false`
+     ——分数是被放弃的那个，不是把一条界赶出表。
+   - 一处取舍要说清楚：同一 tag 第二次补分而它没有记录时，新的数可能落进**另一格**，于是同一个 tag 有两格各自带数。
+     这不是错的：同一布局的 `evaluate_board` 是确定的，两格带的必然同一个数，而 `static_eval_of` 取索引最小的那一格，
+     读回来的还是它自己。它也不值得改：把「同 tag 优先」加进去是一个不改任何一条读数、不改任何一次节点计数的改动，
+     而它要重跑整套门禁——本轮的口径是「一步成本改动不许动树」，多余的表内 churn 不在要解决的清单上。
+   - `kEvalOnlyDepth = -1`（`transposition.h:21-25`）：搜索深度永不为负，且 `store()` 写不出它，所以
+     `flag == NONE && depth == kEvalOnlyDepth` 恰好、并且唯一地描述这一类格子； untouched 空槽的默认 tag 是 0，
+     一个 tag 恰好为 0 的位置会匹配上它，靠这个 `-1` 跳过。
+   - **`store()` 的继承**（`transposition.cpp:71-80`）：调用方把 `static_eval` 留在 `NO_STATIC_EVAL` 不再是
+     「忘掉这一格的分」，而是「我对这一格的分没有意见」；只有 tag 相同（即即将描述同一位置）的槽保留原数，
+     满 bucket 里最浅的受害者属于别的位置，它的分数跟着它一起走。
+2. **搜索侧唯一的读点**：`int AlphaBetaSearch::static_score(const Board&, int color, uint64_t hash, int32_t cached)`
+   （声明 `src/search/alphabeta.h:138-152`、定义 `src/search/alphabeta.cpp:142-162`）。`cached` 是同一个节点已经查到
+   的数（记录上那一个），它说不上话时才走表，表也空时才扫描；存的数固定是**黑侧**的，返回时按 `color` 决定符号。
+   接上的四处：`quiescence` 的中止分支与 `stand_pat`（`alphabeta.cpp:174-181`，签名多了 `hash` 与 `tt_eval`，
+   子节点调用把 `board.zobrist_hash()` 传下去——哈希是 board 的一个字段，这次递归本来就要读它）；`alphabeta()`
+   把 probe 命中的 `entry.static_eval` 收进 `node_eval`（`:336-342`），用于 `depth <= 0` 的交接（`:374-375`）、
+   `moves.empty()` 的兜底（`:379`），以及最后把同一个数交回 `store()`（`:448`）。
+   **没有**接上的一处也写在代码里：`alphabeta()` 自己的中止分支仍然直接调 `evaluate_board`（`:314-322` 的注释给出
+   理由——那要把 probe 抬到 stop 判定之上，于是每个被打断的节点都多一次表命中和一次 PV 槽写入，那是改
+   **上报帧**的改动，不是改成本的改动；quiescence 的中止分支接，是因为那个节点手里已经握着 hash 和 cached 分数）。
+3. **三只成本计数器**：`eval_scans_ / eval_reuses_ / eval_patches_`（`src/search/search_state.h:305-325`，
+   `start()` 里随其余计数一起清零）。刻意**不进 `SearchStats`**：那个结构是一个进度帧，字段被 session 归档与
+   客户端读，而这三个数描述的是「搜索没有做的工作」——一件关于代价、不关于局面的事，一次中立的复用会改变它
+   而什么都不改变给玩家看的东西。
+
+### 「这个数是哪一边的」，以及为什么 28 字节里不需要那个字节
+
+`sizeof(TTEntry) == 28` 钉在 `tests/test_search.cpp:183`，A3 的注释解释过文档的 24 字节条目到不了（合法分值
+范围到 ±99999，而引擎的杀棋哨兵是 ±100000，`int16` 装不下）。28 字节里没有剩余字节用来标「这一格的分是黑侧
+还是白侧」。本轮的答案不需要那个字节，因为 `evaluate_board` 是**精确反对称**的：675 盘普查 0 处不符、
+`max|eval| = 99999`（`/mnt/d/tmp/r121_c1_r3.log` 的 `PART1 boards=675 antisymmetric=675 violations=0
+max_abs_eval=99999`，两棵树同一行）——两个候选求和互换，位置项与贴边项本来就是差值，所以 `eval(W) == -eval(B)`
+对任何一组系数都成立。存下黑侧那一个数就答得出任一色的读者，包括一条活得比写它那一手的行棋方更久的记录；
+`NO_STATIC_EVAL = INT32_MIN` 因此是一个扫描写不出的值。
+
+### 先量出来、再改掉的一种读法（R1 → R3）
+
+最直觉的实现是「分数只往已经存在的记录上补」（R1）。它在 `-O2` 探针树上量到的是
+`PART3 totals nodes=808936 qnodes=513725 scans=513725 reuses=0 patches=0 reuse_pct=0.0`
+（`/mnt/d/tmp/c1_meas.log`）——**0 %**。原因不是实现错了，是结构：`quiescence` 一条记录都不写，而一个手里有记录的
+节点是命中即剪、走不到评估那一步的。R1 因此连中立性都是免费的，但收益是零。R2 允许占用一个 `flag == NONE` 的格，
+reuse 才第一次发生：同一份探针的六臂计数器变成 `scans=318391 reuses=195334`（`/mnt/d/tmp/r2_p34.txt`，38.0 %）。
+R3 = R2 + `store()` 的继承，而这两版之间的**全部**区别就落在 warm 那一行上：
+
+```
+R2  WARM quiet on a full table color=1 nodes=187 scans=1 reuses=0
+R3  WARM quiet on a full table color=1 nodes=187 scans=0 reuses=1
+```
+
+六臂的 `nodes/qnodes/tt_hits/scans/reuses/patches/move/score` 八列在两棵树上一字不差（`r2_p34.txt` 与
+`r121_c1_r3.log` 对读），因为继承只改记录上带的那个**数**，不改谁去读它——同一个数，读出来还是一样。选 R3 不是
+因为 R2 过不了别的用例，而是两件事：继承让 `store()` 的契约说得通（`NO_STATIC_EVAL` 不是命令表遗忘），
+以及上面那一行是可断言的（C1-5 的 warm 块就是它）。
+三份实现的源码留在 `/mnt/d/tmp/r121_r1_transposition.{h,cpp}` 与 `r121_r2_transposition.{h,cpp}`。
+
+### 中立性：一步成本改动不许动树
+
+- **归纳论证**（写在 `transposition.h:85-112` 与 `transposition.cpp:104-119` 的注释里）：一个只装分数的格子，对
+  `probe()`（它看 `flag == NONE`）、对 `hashfull()`（它数 `flag != NONE`）、对 `store()` 的受害格选择（`flag == NONE`
+  就是它要找的那个空格）**都恰好等同于它所替换的那个空格** ⇒ 真实记录的下标与多重集在每一步之后仍然相同 ⇒ 树相同。
+  唯一的例外是 `put_static_eval` 返回 `false` 的那次（四格全被真实记录占了），它什么都不写。
+- **359 臂逐行比对**：每臂同板、新表、`nodes` 不 binding 于时限。`PART2 wide4 arms=275 total_nodes=4079261` 与
+  `PART2 deep6 arms=84 total_nodes=14358319`，与 `af43a05` 控制树的逐行文件 diff 为空
+  （`PART3_NEUTRAL: R3 rows identical to control (359 arms)`，`/mnt/d/tmp/r121_c1_r3.log`；逐行读数
+  `/mnt/d/tmp/r3_p2.txt` 与 `/mnt/d/tmp/c1_p2_neg.txt`）。R1、R2 两版当时也各自跑过同一比对，同样为空。
+
+### 收益：省下来的是扫描，不是搜索
+
+六臂（`quiet`/`scattered`/`crowded` × 两色，depth 6，同一份 `-O2` 探针树）：
+
+- `PART3 totals nodes=808936 qnodes=513725 scans=318391 reuses=195334 patches=318387 reuse_pct=38.0`
+  ⇒ **扫描少了 38 %**；`scans + reuses == qnodes` 每臂成立（本轮把它钉进了用例）；`patches` 比 `scans` 少 4，
+  那 4 次是 bucket 已被四条真实记录占满、分数无处可放。逐臂读数在 `/mnt/d/tmp/r121_c1_r3.log` 的六行 `COUNTER`，
+  其中 `quiet` BLACK 一臂是 `nodes=221774 qnodes=142978 tt_hits=21361 scans=75855 reuses=67123 patches=75852`
+  ——读的次数比 TT 命中多，因为 eval-only 格子本来就不是记录，`tt_hits` 不数它。
+- 价钱：`PART4 sink=-171021440 boards=400 scan_ns=12185.6 bucket_read_ns=5.2 read+write_ns=11759.4 ratio=2332.2`
+  （R3 那一遍；R1/R2 的两遍是 `scan_ns=11044.1 / 11377.7`、`bucket_read_ns=5.4 / 4.8`，同一棵树上的散布）。
+  一次全盘扫描 ≈ 11.0–12.2 µs，一次 bucket 走 ≈ 4.8–5.2 ns（相差 2031–2352 倍）。注意 `read+write_ns` 几乎等于
+  一次扫描：**写了不等于省了**，省的是命中那一路；这也是为什么每次扫描都附一次 `put_static_eval` 仍然净赚。
+- 墙钟（18 臂 × 6952575 节点，`-O2`，**诊断不是钉数**）：`ns_per_node 7060.5 / 7025.6 → 5802.3 / 5634.6`（**−19 %**），
+  `knps 141.6 / 142.3 → 172.3 / 177.5`（每棵树两遍，交错跑，`/mnt/d/tmp/r3_p5{a,b}.txt` 与 `c1_p5_new/neg`）。
+  同一台机器空闲时整套 `test_search` 原生跑也从 B5 记的 **515.00 s** 回到 **410.75 s**（提交树那一轮；门禁段
+  还记了作废那一轮的 421.90 s）。
+- **`:549` 那一行本轮未达成，报实测**：单线程吞吐 ≈ 17.7 万节点/秒，距 ≥1M nps 差一个数量级；depth 8 在 4 s 内
+  完成也没有到。结构性原因是每个静默节点仍然付一次全盘 `evaluate_board`，Step 1 只是让它发生得少三成八。
+  把数量级拿下来的是 Step 2（排序路径的候选格缓存）与 Step 3（评估本体的局部 stand_pat），这一行是 C 阶段整段
+  的验收，它到 C4 才有一次成形的读数。
+
+### 用例（`tests/test_search.cpp` 五条，`+359/-2`；那两行删掉的是一条**注释**，不是一条断言）
+
+段首注释（`:6880-6892`）自己说清楚了一件事：这一步是记录上的一个 int32 加一对只碰它的读写，所以这些用例
+**大半在钉这个字段「不是什么」**。
+
+- **C1-1 `test_static_eval_on_a_record_leaves_its_bound_alone`**（`:6922`）：空表没有分数可给；先有分数后有记录时，
+  记录的界是调用方说的那一句（`1234/5/EXACT/(7,6)`），分数是这一格本来就带的 `-4321`；第二次补分写在记录上而不是
+  另占一格；同 bucket 的另一个 tag 既读不到、也 `probe` 不出。`hashfull()` 从 0 到 2（两分一格 + 一条记录），
+  一步没多。
+- **C1-2 `test_an_evaluation_slot_is_invisible_to_the_bound_readers`**（`:6980`）：三条记录时 `hashfull()==7`；
+  第四个 tag 只有分数——它读得回来、`probe` 不出来、计数不动（仍是 7）；随后一条真记录落进那一格（`hashfull()==10`），
+  上面三条记录的界逐条仍在；第五个 tag 的分数被拒（`put_static_eval` 返回 `false`），拒绝不动任何计数。
+- **C1-3 `test_static_score_reuses_a_cached_number_for_either_colour`**（`:7029`）：一次冷扫描 + 三次读，
+  `scans/reuses/patches` 的字面序列 `1/0/1 → 1/1 → 1/2 → 1/3`；`cached` 非空时连表都不走；第二个块是记录路径——
+  一条没有分数的记录仍然付一次扫描，扫完写在记录上，界读回来还是 `999/4/EXACT/(3,3)`，并且下一次换颜色读它免费。
+- **C1-4 `test_a_cached_sign_answers_both_sides_of_every_shape`**（`:7184`）：`:556` 那条「逐格比对」在这一层做——
+  5 支姿势 × `SYMMETRY_COUNT` = 40 个形状（钉 `shapes == 40`），每个形状两色各扫一次、两棵树各读一次，
+  每一次读都等于它替掉的那次扫描，并且 `black_score == -white_score`、`|eval| <= 99999`、`!= NO_STATIC_EVAL`
+  三件事在同一个循环里逐形状成立。缓存没有和自己对拍：它比的是 `evaluate_board` 自己的两个答案。
+- **C1-5 `test_a_quiet_think_pays_for_each_evaluation_only_once`**（`:7114`）：`b1_quiet` 两色 depth 6、新表、
+  `set_node_limit(INT_MAX)`。钉的是**两层**：树本身（`nodes 221774/156428`、`qnodes 142978/102340`、
+  `score 71992/97044`——这四行是 B5 段已经承诺过的读数，一步敢动树的改动会在那里变红而不是在这里），
+  和这一步自己的账本（`scans 75855 + reuses 67123 == qnodes`、`patches 75852`、`reuses > 0`、`scans < qnodes`）。
+  最后一块是 warm：同一根第二次思考 `nodes == 187`、`eval_scans() == 0`、`eval_reuses() == 1`——
+  第一次思考写的分数在它替掉的那条记录上，而不是被抹掉。
+
+夹具一处：`c1_bucket_keys(wanted)`（`:6900`）造同 bucket、且落进 `hashfull()` 采样的一百格里的 tag；
+寻址是**重算**的而不是取访问器——它本身就是这些用例在谈论的布局的一部分（同 `:334` 的旧例）。
+
+### 反证申报：无 HEAD 反证，以三枚 mutation 代替
+
+`static_eval_of`、`put_static_eval`、`static_score` 三个符号在 `af43a05` 上都不存在，这五条用例在那棵树上连编译都
+过不去——本轮申报**无 HEAD 反证**，理由是结构性的。代替它的是三枚变异，各破 Step 1 的一句话（`/mnt/d/tmp/r121_c1_mut.sh`；
+驱动 `/mnt/d/tmp/r121_c1_driver.cpp` 只跑这五条，把整套的 `main` 用 `-Dmain=suite_main` 改名后从链接里排除，于是第一次
+变红的 assert 一定属于 Step 1；被变异的 TU 在 `/mnt/d/tmp/mut121_c1/src` 的副本上改，用与门禁同一组
+`-std=gnu++17 -UNDEBUG` 编译，再替回 `link.txt` 里它自己的 `.o`）：
+
+| 变异 | 破掉的那句话 | 结果 |
+| --- | --- | --- |
+| M1 `put_static_eval(hash, score)` | 存的必须是黑侧的数 | rc=134 停在 `tests/test_search.cpp:7216` `other.static_eval_of(hash) == black_score`（C1-4，前面 3 条已绿） |
+| M2 `if (false) stored = tt_.static_eval_of(hash);` | 命中时直接复用 | rc=134 停在 `:7060` `search.ctx_.eval_scans() == 1`（C1-3，前面 2 条已绿） |
+| M3 `if (false) {`（`store()` 的继承） | `NO_STATIC_EVAL` 不是「忘掉它」 | rc=134 停在 `:6957` `entry.static_eval == -4321`（C1-1，第一条就红） |
+
+控制臂是提交树的同一驱动：`RUN base rc=0 seconds=16 cases_passed=5`（`/mnt/d/tmp/r121_c1_mut.log`，逐条读数
+`/mnt/d/tmp/mut121_c1/{base,m1_sign,m2_noread,m3_noinherit}.out`）。三条各红一条，说明符号约定、读、继承三件事
+各自有断言守着；M1 的红点尤其说明「反对称」那个前提不是纸面上的：把约定反过来写，只有跨颜色的读能抓到它。
+
+### 门禁
+
+四段跑的都是提交树。`ctest` **8/8 / 438.39 s**（`test_search` **410.75 s**，B5 记的是 **515.00 s**——一步
+成本改动在整套用例自己的墙钟上留下了 20 % 的印子，方向与 PART5 的 −19 % 一致；其余七支最慢 7.49 s，
+`/mnt/d/tmp/c1_ctest_final.log`）、`node tests/web_frontend_check.js` **105/105**、
+`node tests/readme_anchor_check.js` **118 引用 / 0 problems**、`README.md` **658 行**。
+
+要说清楚的一次重跑：`:196-197` 那两行注释（原文写着「A3 lands the field; the search that fills it in is
+the static-evaluation reuse step, so **until then** every record carries the explicit no evaluation here」）
+被本轮的事实作废，我在第一轮 ctest 已经跑起来之后才改它——那一轮（450.16 s / `test_search` 421.90 s）因此
+**作废**，改写后按提交树重跑上面这一轮取读数。改写刻意保持在**两行换两行**，所以文件行数不变、`:198` 的断言
+仍然成立、它下面每一条断言的行号都没有动：两条受保护的预算前提**内容一字未动、行号也未动**，
+`assert(result.resigned)` 仍在 **`:2591`**、`assert(completed.method == "alphabeta")` 仍在 **`:3986`**，
+memcheck 会死在那里的 10 ms 臂仍在 **`:3973`**——五条新用例的定义全部落在 `:6922-7226`、注册落在 `main()`
+（`:7228`）体内，行号都比这三处大，所以它们一行都没有被推动。
+合约过期：**无**，本轮没有改写任何一条既有断言的内容。
+
+### Valgrind
+
+四臂串行、空闲，脚本 `/mnt/d/tmp/r121_c1_final.sh` 的 phase 3（构建与 ctest 都在同一支脚本里排在前面，
+没有任何 memcheck 臂与构建或另一支臂同时跑）。`--tool=memcheck -q --error-exitcode=9 --leak-check=full
+--show-leak-kinds=definite --errors-for-leak-kinds=definite --track-origins=yes --num-callers=16`。
+
+- **新代码自己**（`-O0 -g` 的 C1 驱动：五条用例，含三次 depth 6 的全盘思考）：**rc=0 / 1385 s / reports=0 /
+  invalid_read=0 / invalid_write=0 / uninitialised=0 / definite_leak=0**（`/mnt/d/tmp/vg121_c1/driver.log`，
+  同一份 stderr 旁边是五条 `passed` 行）。这是四臂里最贵的一支（B5 的对应臂 335 s），因为它把 22 万节点 ×
+  3 次思考整体套进 valgrind：按用例自己钉住的读数，两支冷思考一共走表 **245318** 次（101044 次命中 +
+  144274 次扫描未命中），其中 144274 次各附一次 `put_static_eval` 的写。
+- **`test_training`**（`build-vg/`，Debug `-UNDEBUG`）：**rc=0 / 158 s / 0 / 0 / 0 / 0 / 0**，`All training tests passed`。
+- **`test_search`**（装着五条 C1 用例的那套）：**rc=134 / 255 s / reports=0 / invalid_read=0 / invalid_write=0 /
+  uninitialised=0 / definite_leak=0**。stderr 里唯一的非 memcheck 行还是那句
+  `Assertion 'interrupted.partial_depth == 1' failed`（`tests/test_search.cpp:3973`，A2/A7 那一支的 **10 ms 臂**），
+  死在它之前的最后一行是 `test_engine_progress_frames_share_the_search_clock passed (pre-search 646 ms,
+  first frame 843 ms, 3 frames, terminal 2916 ms of 2916 ms)`。同一套不套 valgrind 是绿的：门禁段的
+  `test_search 410.75 s`。
+- **`test_server`**：**rc=134 / 24 s / 0 / 0 / 0 / 0 / 0**，`Assertion 'hint_results == 0' failed`
+  （`tests/test_server.cpp:1710`，`test_hint_answer_for_a_superseded_position`）。
+- 口径按 2026-10-17 的约定分开报：`reports` 是 valgrind 自己的 `==NNNN==` 行数，另外四列是
+  `Invalid read of size` / `Invalid write of size` / `uninitialised` / `definitely lost` 的计数，构建目录与
+  `-UNDEBUG` 已在每条里点名。**两处 rc=134 都是断言，不是内存错误**：五列读数在两条臂上都是 0。
+- **两处 rc=134 都在改动前的树上重测，并且逐字复现**（`/mnt/d/tmp/r121_c1_vg_neg.sh`；树
+  `/mnt/d/tmp/neg121_c1` = `git archive af43a05` + 它自己的一份 `build-vg`（Debug `-UNDEBUG`），脚本第一件事是
+  证明那棵树里**没有** `put_static_eval` 才开始跑）：
+  `NEG_test_search rc=134 / 332 s / 0 / 0 / 0 / 0 / 0` 与 `NEG_test_server rc=134 / 29 s / 0 / 0 / 0 / 0 / 0`，
+  两句 assert 的文件、行号、断言文本与提交树**完全相同**（`:3973` 与 `:1710`——本轮的插入全在 `main()` 之前，
+  没有推动任何一条既有断言）。所以这两支依旧是「被 valgrind 的时间尺度打到墙钟/竞态断言上的旧脆弱」：
+  `test_search` 那支是 A2/A7 的 10 ms 臂（B2、B3、B5 三轮记过同一根臂），`test_server` 那支是任务 #35 排在队里的
+  「`make_move`/`undo` 不等待 in-flight 搜索」的锁面。本轮不修剪任何断言，也不把它们挪进 bugfix 提交。
+- 一个顺带的对照，与门禁段的墙钟同向：同一根 10 ms 臂在 memcheck 时间尺度里从 **332 s（控制树）走到 255 s
+  （本轮树）**，用例整套的原生墙钟从 515.00 s 走到 410.75 s。省下来的确实主要是评估扫描。
+
 ## 轮次121 引擎重构 B5：战术层第一次由局面决定它要不要跑 — engine redesign stage B5
 
 规格 `docs/ENGINE_REDESIGN.md` `:142` 流水线 ③ 行「战术层 VCF/VCT ── 由「威胁探针」按需触发（改造：不再固定

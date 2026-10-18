@@ -19,6 +19,11 @@ enum class TTFlag : uint8_t {
 // evaluator can produce: the aggregate is clamped to +-99999.
 constexpr int32_t NO_STATIC_EVAL = INT32_MIN;
 
+// The depth field of a slot that carries an evaluation and no bound. Search depths
+// are never negative, and no store() can write it, so `flag == TTFlag::NONE &&
+// depth == kEvalOnlyDepth` identifies these slots exactly - see put_static_eval().
+constexpr int16_t kEvalOnlyDepth = -1;
+
 // A record of one position, kept in a four-way bucket with three of its siblings.
 // The table no longer stores the 64-bit hash: a bucket is addressed by a bit slice
 // of a mixed hash, so the full key cannot be compared there, and a 32-bit tag of
@@ -29,8 +34,19 @@ constexpr int32_t NO_STATIC_EVAL = INT32_MIN;
 struct TTEntry {
     uint32_t key;
     int32_t value;
-    // Filled in by the search that first evaluates the position (design doc 2.6
-    // step 1); until then it carries NO_STATIC_EVAL and readers must ignore it.
+    // Design doc 2.6 step 1: this position's static score, kept from BLACK's side of
+    // it. A node that reads a record carrying one skips its own whole-board scan; a
+    // record written before any node evaluated the position carries NO_STATIC_EVAL
+    // and readers must ignore it. A slot whose only contents are such a score is
+    // marked by kEvalOnlyDepth and is invisible to everything but this field.
+    //
+    // BLACK's side rather than the side to move's, because the hash is the layout and
+    // nothing else: the field has no byte left to say whose number it is (see the
+    // 28-byte note below), while evaluate_board is exactly antisymmetric - its two
+    // candidate sums swap and the position and edge terms are already differences, so
+    // eval(W) == -eval(B) holds for every coefficient set. One stored sign therefore
+    // answers a reader of either colour, and it answers it correctly even for a
+    // record that outlives the turn its writer had.
     int32_t static_eval;
     int16_t depth;
     TTFlag flag;
@@ -52,6 +68,14 @@ public:
     // scores are stored relative to it and read back relative to the probing node's
     // own ply, so an entry found at the edge of one iteration still says the right
     // thing when a later iteration reaches the same position from a different depth.
+    //
+    // `static_eval` is the writing node's own cached score for this position - what
+    // its probe handed it, or the number it just scanned for. NO_STATIC_EVAL is not a
+    // request to forget: a record replacing another one of the same position keeps the
+    // score that position already had, and only a record that lands on a *different*
+    // position (a full bucket's shallowest victim, or an empty slot) has no number to
+    // keep. A node that evaluated the position should still hand its own number over,
+    // which is what makes a re-scan of a deeper record replace the shallower score.
     void store(uint64_t hash, int depth, int value, Move best_move, TTFlag flag,
                int ply = 0, int32_t static_eval = NO_STATIC_EVAL);
 
@@ -59,6 +83,33 @@ public:
     // entry is not handed back as a pointer: a store into the same bucket can
     // overwrite the slot a caller is still reading.
     bool probe(uint64_t hash, TTEntry& out, int ply = 0) const;
+
+    // Design doc 2.6 step 1's two halves on their own, for a node that wants this
+    // position's evaluation and has no bound to read or write. Both look at the slot
+    // probe() would find - the same bucket, the same tag test - and touch only
+    // static_eval: neither returns a value, takes a cutoff, nor decides a replacement.
+    //
+    // A real record answers first. If the position has one, its field is the answer,
+    // even when it holds NO_STATIC_EVAL; only a slot with no real record behind it
+    // can be an evaluation-only one. So a bound record is never shadowed by an older
+    // evaluation of the same tag, and a table that has filled its bound records
+    // simply stops answering these.
+    int32_t static_eval_of(uint64_t hash) const;
+
+    // Puts the score on the record this position already has, or - if it has none -
+    // keeps the score in a slot of that bucket on its own. An evaluation alone is not
+    // a record: it is written with flag NONE, which is what every other reader of the
+    // table already treats as "no record here", so probe() cannot cut off on it,
+    // hashfull() does not count it, and store() evicts it as the empty slot it is.
+    // That last part is the reason the two tables hold the same bound records: a
+    // bucket that looks full to store() is full whether or not some of its empty
+    // slots carry scores, and the slot store() picks is the first one either way.
+    //
+    // The score of a tag collision is then reused by the colliding position, which is
+    // the same one-in-four-billion risk probe() already accepts for a bound - with
+    // less consequence, since an evaluation only feeds a stand_pat, never a proven
+    // score. Returns whether the score landed somewhere.
+    bool put_static_eval(uint64_t hash, int32_t static_eval);
 
     // One step of the clock the replacement policy reads. It advances when a stone
     // is committed to a board, not when a think starts: ageing the table at the start

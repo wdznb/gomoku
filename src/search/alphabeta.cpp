@@ -139,8 +139,31 @@ void AlphaBetaSearch::sort_moves(std::vector<Move>& moves, const Board& board, i
     moves = std::move(reordered);
 }
 
+int AlphaBetaSearch::static_score(const Board& board, int color, uint64_t hash,
+                                  int32_t cached) {
+    int32_t stored = cached;
+    if (stored == NO_STATIC_EVAL) stored = tt_.static_eval_of(hash);
+    if (stored != NO_STATIC_EVAL) {
+        ctx_.count_eval_reuse();
+        return color == BLACK ? stored : -stored;
+    }
+    ctx_.count_eval_scan();
+    const int score = evaluator_.evaluate_board(board, color);
+    // The scan is kept, whether or not this position has a record yet - put_static_eval
+    // writes onto the record if there is one and otherwise holds the number in a slot
+    // of the same bucket that every bound-facing reader of the table calls empty.
+    // Keeping it is what makes the reuse happen: of the 513725 evaluations the six C1
+    // measurement arms ask for, 195334 (38.0 %) are answered by a bucket walk instead
+    // of a scan, and the tree is the same tree it was without any of this.
+    if (tt_.put_static_eval(hash, color == BLACK ? score : -score)) {
+        ctx_.count_eval_patch();
+    }
+    return score;
+}
+
 NodeResult AlphaBetaSearch::quiescence(Board& board, int alpha, int beta, int color,
-                                       std::atomic<bool>& stop_flag, int qdepth) {
+                                       std::atomic<bool>& stop_flag, int qdepth,
+                                       uint64_t hash, int32_t tt_eval) {
     // Quiescence can recurse for tens of moves on a still-live position. Without
     // a node increment here, the node budget only bounds the alphabeta tree and a
     // timeout or abort flag set at a shallow depth can still be trapped inside
@@ -149,11 +172,13 @@ NodeResult AlphaBetaSearch::quiescence(Board& board, int alpha, int beta, int co
     ctx_.note_quiescence_depth(qdepth);
     if (ctx_.hard_stopped()) {
         // A static evaluation of one position: the number the parent shows the
-        // player, and nothing the parent may build a bound out of.
-        return {evaluator_.evaluate_board(board, color), false};
+        // player, and nothing the parent may build a bound out of. This is the node
+        // the budget dies in, and it is the one step 1 most obviously pays for - the
+        // unwind after a cut short-circuits at every node it passes back through.
+        return {static_score(board, color, hash, tt_eval), false};
     }
 
-    int stand_pat = evaluator_.evaluate_board(board, color);
+    int stand_pat = static_score(board, color, hash, tt_eval);
 
     // Fail-soft on the stand-pat cutoff: returning `beta` (the window edge)
     // would let the parent store that bound as TTFlag::EXACT. Returning
@@ -188,8 +213,12 @@ NodeResult AlphaBetaSearch::quiescence(Board& board, int alpha, int beta, int co
             return {100000, true};
         }
 
+        // The child's own layout, read after the stone is on the board: the hash is a
+        // field of the board, so this costs nothing the recursion did not already pay
+        // for, and it is what lets the child look its evaluation up instead of
+        // scanning for it.
         NodeResult child = quiescence(board, -beta, -alpha, opponent(color), stop_flag,
-                                      qdepth + 1);
+                                      qdepth + 1, board.zobrist_hash(), NO_STATIC_EVAL);
         board.undo_last_move();
         if (!child.sound) node_sound = false;
 
@@ -285,6 +314,12 @@ NodeResult AlphaBetaSearch::alphabeta(Board& board, int depth, int alpha, int be
             if (lm.color == color) return {100000 + depth, true};
             return {-100000 - depth, true};
         }
+        // Step 1's read is not wired here on purpose, and it is this node's own hash
+        // that makes the choice: the probe below is what would answer, and moving the
+        // probe above the stop test would put a table hit - and a PV slot write -
+        // inside the path every aborted node of a cut think takes, which is a change
+        // to the frames that think reports. Quiescence's abort branch does reuse,
+        // because that node has its hash and its cached score in hand already.
         return {evaluator_.evaluate_board(board, color), false};
     }
 
@@ -293,9 +328,18 @@ NodeResult AlphaBetaSearch::alphabeta(Board& board, int depth, int alpha, int be
     // bucket and evict the record this node is still reading.
     TTEntry entry;
     Move tt_move;
+    // The score this position's record carries, if it carries one (design doc 2.6
+    // step 1). Two things read it: the leaf handoff below, which is the same layout
+    // and therefore does not need to look it up twice, and the store, which hands it
+    // back so that a deeper record of this position replaces the shallower one with
+    // its evaluation still on it. A record written by a node that never evaluated the
+    // position keeps the number its slot already had either way - store() reads
+    // NO_STATIC_EVAL as "this node has nothing to say", not as "forget it".
+    int32_t node_eval = NO_STATIC_EVAL;
     bool node_sound = true;
     if (tt_.probe(hash, entry, ply)) {
         ctx_.count_tt_hit();
+        node_eval = entry.static_eval;
         tt_move = entry.best_move;
         // A node that answers out of the table has no line of its own in this think's
         // slots: everything below the entry's move belongs to whichever node wrote it.
@@ -328,11 +372,11 @@ NodeResult AlphaBetaSearch::alphabeta(Board& board, int depth, int alpha, int be
     if (board.move_count() >= MAX_MOVES) return {0, true};
 
     if (depth <= 0) {
-        return quiescence(board, alpha, beta, color, stop_flag, 0);
+        return quiescence(board, alpha, beta, color, stop_flag, 0, hash, node_eval);
     }
 
     auto moves = generate_moves(board, color, ply);
-    if (moves.empty()) return {evaluator_.evaluate_board(board, color), true};
+    if (moves.empty()) return {static_score(board, color, hash, node_eval), true};
 
     sort_moves(moves, board, color, tt_move, ply);
 
@@ -401,7 +445,7 @@ NodeResult AlphaBetaSearch::alphabeta(Board& board, int depth, int alpha, int be
     // it. The window is wide enough to hold +-100000 plus the ply correction and
     // narrow enough to keep the -INT_MAX nothing-was-searched value out.
     if (node_sound && best_score > -1000000 && best_score < 1000000) {
-        tt_.store(hash, depth, best_score, best_move, flag, ply);
+        tt_.store(hash, depth, best_score, best_move, flag, ply, node_eval);
     }
 
     return {best_score, node_sound};

@@ -193,8 +193,8 @@ void test_transposition_table() {
     assert(entry.value == 500);
     assert(entry.flag == TTFlag::EXACT);
     assert(entry.best_move == m);
-    // A3 lands the field; the search that fills it in is the static-evaluation reuse
-    // step, so until then every record carries the explicit "no evaluation here".
+    // A3 lands the field, C1 fills it in; a record whose node never evaluated this
+    // position still says NO_STATIC_EVAL, since store() inherits only from a same-tag slot.
     assert(entry.static_eval == NO_STATIC_EVAL);
 
     TTEntry miss;
@@ -6876,6 +6876,355 @@ void test_a_threatless_think_pays_the_probe_and_nothing_else() {
               << std::endl;
 }
 
+// ---------------------------------------------------------------------------
+// C1 - 转置表携带静态分 (design doc 2.6 Step 1: 「节点首次计算静态分后随 TT 一起
+// 存；命中时直接复用，省掉重复全盘扫描」, :399-402).
+//
+// The step is one int32 on the record plus a read/write pair that touches only it, so
+// these cases are mostly about what the field is *not*: not a bound (probe() answers
+// as it did when the field was absent), not a sample of the population (hashfull()
+// does not count a slot that holds nothing but a score), not a displacement (a record
+// still lands in the slot the table would have given it), and not a second opinion (a
+// reused number is the number evaluate_board itself answers). The last of those four
+// is why the eight B5 rows at test_a_threatless_think_pays_the_probe_and_nothing_else
+// are this section's real regression - they are not re-pinned here, and none of them
+// moved.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Tags that share one bucket, and share one of the hundred buckets hashfull()
+// samples, so the population metric can be read in the same case that fills the
+// table. The addressing is recomputed rather than taken from an accessor: it is part
+// of the layout these cases talk about (same reasoning as :334).
+std::vector<uint64_t> c1_bucket_keys(size_t wanted) {
+    auto bucket_of = [](uint64_t h) {
+        return static_cast<size_t>((h * 0x9E3779B97F4A7C15ULL) >> (64 - 10));
+    };
+    std::vector<uint64_t> keys;
+    for (uint64_t h = 1; h < 8000000 && keys.size() < wanted; ++h) {
+        const uint64_t candidate = (h << 32) | 0x5A5A5A5AULL;
+        if (keys.empty()) {
+            if (bucket_of(candidate) < 100) keys.push_back(candidate);
+            continue;
+        }
+        if (bucket_of(candidate) != bucket_of(keys[0])) continue;
+        keys.push_back(candidate);
+    }
+    return keys;
+}
+
+}
+
+// The two halves of step 1 on a position that already has a record: the score is
+// written onto that record, the record still says what it said, and a score for a
+// different position in the same bucket cannot be mistaken for it.
+void test_static_eval_on_a_record_leaves_its_bound_alone() {
+    const std::vector<uint64_t> keys = c1_bucket_keys(2);
+    assert(keys.size() == 2);
+    const uint64_t hash = keys[0];
+    const uint64_t twin = keys[1];
+    assert(hash >> 32 != twin >> 32);
+
+    TranspositionTable tt(1 << 12);
+    TTEntry entry;
+
+    // An empty table has no score to hand out.
+    assert(tt.static_eval_of(hash) == NO_STATIC_EVAL);
+    assert(!tt.probe(hash, entry));
+
+    // A score kept before any bound exists is kept, is read back, and is still not a
+    // record: probe() says no, and the population metric says untouched.
+    assert(tt.put_static_eval(hash, -4321));
+    assert(tt.static_eval_of(hash) == -4321);
+    assert(!tt.probe(hash, entry));
+    assert(tt.hashfull() == 0);
+
+    // The other position of the bucket is not the same position.
+    assert(tt.static_eval_of(twin) == NO_STATIC_EVAL);
+
+    // A record of the first position, written by a node that did not evaluate it. The
+    // bound is exactly what the caller said; the score is the one the slot already
+    // carried, because a caller with no number of its own has nothing to say about
+    // this position's evaluation.
+    tt.store(hash, 5, 1234, Move(7, 6, BLACK), TTFlag::EXACT, 2);
+    assert(tt.hashfull() == 2);
+    assert(tt.probe(hash, entry));
+    assert(entry.value == 1234);
+    assert(entry.depth == 5);
+    assert(entry.flag == TTFlag::EXACT);
+    assert(entry.best_move == Move(7, 6, BLACK));
+    assert(entry.static_eval == -4321);
+
+    // A second score for the same position goes onto the record rather than into
+    // another slot of the bucket, and the neighbour keeps its own.
+    assert(tt.put_static_eval(hash, 900));
+    assert(tt.static_eval_of(hash) == 900);
+    assert(tt.put_static_eval(twin, 200));
+    assert(tt.static_eval_of(twin) == 200);
+    assert(tt.static_eval_of(hash) == 900);
+    assert(tt.probe(hash, entry));
+    assert(entry.static_eval == 900);
+    assert(entry.value == 1234);
+    assert(!tt.probe(twin, entry));
+
+    std::cout << "test_static_eval_on_a_record_leaves_its_bound_alone passed (bucket "
+              << static_cast<size_t>((hash * 0x9E3779B97F4A7C15ULL) >> (64 - 10))
+              << ", one bound and two scores, hashfull 0 -> 2)" << std::endl;
+}
+
+// The neutrality claim of step 1 in one bucket: a slot that holds nothing but a score
+// is what every bound-facing reader of the table already calls empty, so records land
+// where they would have landed, the population count moves only for records, and a
+// bucket with no empty slot refuses a score instead of buying the slot from a record.
+void test_an_evaluation_slot_is_invisible_to_the_bound_readers() {
+    const std::vector<uint64_t> keys = c1_bucket_keys(5);
+    assert(keys.size() == 5);
+
+    TranspositionTable tt(1 << 12);
+    TTEntry entry;
+
+    // Three of the four ways hold records.
+    tt.store(keys[0], 4, 400, Move(7, 7, BLACK), TTFlag::EXACT);
+    tt.store(keys[1], 5, 500, Move(7, 7, BLACK), TTFlag::EXACT);
+    tt.store(keys[2], 6, 600, Move(7, 7, BLACK), TTFlag::EXACT);
+    assert(tt.hashfull() == 7);
+
+    // The fourth position is only a score. Three numbers say it is not a record: it
+    // reads back, it does not probe, and it does not count.
+    assert(tt.put_static_eval(keys[3], 313));
+    assert(tt.static_eval_of(keys[3]) == 313);
+    assert(!tt.probe(keys[3], entry));
+    assert(tt.hashfull() == 7);
+
+    // Nor does it displace one. This store wants an empty slot, and the slot holding
+    // only a score is that slot; the three records above it do not move, and the
+    // fourth way is still the fourth position's own record afterwards.
+    tt.store(keys[3], 7, 700, Move(2, 2, WHITE), TTFlag::EXACT);
+    assert(tt.hashfull() == 10);
+    assert(tt.probe(keys[3], entry));
+    assert(entry.value == 700 && entry.depth == 7);
+    assert(entry.static_eval == 313);
+    assert(tt.probe(keys[0], entry) && entry.value == 400);
+    assert(tt.probe(keys[1], entry) && entry.value == 500);
+    assert(tt.probe(keys[2], entry) && entry.value == 600);
+
+    // A bucket of four records has no room left, and a score is the thing that goes
+    // without rather than pushing a bound out of the table.
+    assert(!tt.put_static_eval(keys[4], 111));
+    assert(tt.static_eval_of(keys[4]) == NO_STATIC_EVAL);
+    assert(tt.hashfull() == 10);
+    assert(tt.probe(keys[0], entry) && entry.value == 400);
+    assert(tt.probe(keys[3], entry) && entry.value == 700);
+
+    std::cout << "test_an_evaluation_slot_is_invisible_to_the_bound_readers passed "
+                 "(3 records -> hashfull 7, +1 score -> 7, +1 record -> 10, fifth score "
+                 "refused)" << std::endl;
+}
+
+// Step 1's reader and writer on one position, driven through the search object that
+// owns the table. Every number compared below is a number the evaluator itself gives
+// for that position - the cache is allowed to save a scan, never to change what the
+// scan answers, and that is what these five reads pin.
+void test_static_score_reuses_a_cached_number_for_either_colour() {
+    const Board board = b1_quiet();
+    Evaluator evaluator;
+    const uint64_t hash = board.zobrist_hash();
+    const int black_score = evaluator.evaluate_board(board, BLACK);
+    const int white_score = evaluator.evaluate_board(board, WHITE);
+    // The premise the one-stored-sign convention rests on, here rather than only in
+    // the 675-board census of /mnt/d/tmp/r121_c1_probe.cpp part 1: the two candidate
+    // sums swap and the position and edge terms are differences, so the aggregate is
+    // exactly antisymmetric and never reaches INT32_MIN, which is NO_STATIC_EVAL.
+    assert(black_score == -white_score);
+    assert(black_score != NO_STATIC_EVAL);
+
+    std::atomic<bool> stop(false);
+    SearchLimits limits;
+
+    {
+        TranspositionTable tt(1 << 12);
+        AlphaBetaSearch search(evaluator, tt);
+        search.ctx_.start(limits, system_search_clock(), stop);
+
+        // Cold: the scan answers what the evaluator answers, and the score is kept.
+        assert(search.static_score(board, BLACK, hash, NO_STATIC_EVAL) == black_score);
+        assert(search.ctx_.eval_scans() == 1);
+        assert(search.ctx_.eval_reuses() == 0);
+        assert(search.ctx_.eval_patches() == 1);
+        assert(tt.static_eval_of(hash) == black_score);
+
+        // The same position met again - a transposition in the tree below - reads
+        // instead of scanning.
+        assert(search.static_score(board, BLACK, hash, NO_STATIC_EVAL) == black_score);
+        assert(search.ctx_.eval_scans() == 1);
+        assert(search.ctx_.eval_reuses() == 1);
+
+        // Either colour reads the one stored sign, and the number a WHITE reader gets
+        // is what evaluate_board says for WHITE.
+        assert(search.static_score(board, WHITE, hash, NO_STATIC_EVAL) == white_score);
+        assert(search.ctx_.eval_scans() == 1);
+        assert(search.ctx_.eval_reuses() == 2);
+
+        // A node handed a number of its own is not asked to look one up.
+        assert(search.static_score(board, BLACK, hash, 12345) == 12345);
+        assert(search.ctx_.eval_scans() == 1);
+        assert(search.ctx_.eval_reuses() == 3);
+    }
+
+    {
+        // The record path: a position with a bound that carries no score still pays
+        // one scan, writes it onto the record, and leaves the bound alone.
+        TranspositionTable tt(1 << 12);
+        AlphaBetaSearch search(evaluator, tt);
+        search.ctx_.start(limits, system_search_clock(), stop);
+        tt.store(hash, 4, 999, Move(3, 3, BLACK), TTFlag::EXACT);
+        assert(tt.static_eval_of(hash) == NO_STATIC_EVAL);
+
+        assert(search.static_score(board, BLACK, hash, NO_STATIC_EVAL) == black_score);
+        assert(search.ctx_.eval_scans() == 1);
+        assert(search.ctx_.eval_reuses() == 0);
+        assert(search.ctx_.eval_patches() == 1);
+
+        TTEntry record;
+        assert(tt.probe(hash, record));
+        assert(record.value == 999);
+        assert(record.depth == 4);
+        assert(record.flag == TTFlag::EXACT);
+        assert(record.best_move == Move(3, 3, BLACK));
+        assert(record.static_eval == black_score);
+
+        // And the write is what makes the next read free, for the other side too.
+        assert(search.static_score(board, WHITE, hash, NO_STATIC_EVAL) == white_score);
+        assert(search.ctx_.eval_scans() == 1);
+        assert(search.ctx_.eval_reuses() == 1);
+    }
+
+    std::cout << "test_static_score_reuses_a_cached_number_for_either_colour passed ("
+              << "quiet BLACK " << black_score << ", WHITE " << white_score
+              << "; four reads on one scan, then one scan onto a record whose bound "
+                 "still says 999/4/EXACT/(3,3))" << std::endl;
+}
+
+// What step 1 buys across a whole think, and what it does not touch. The two cold
+// arms are the quiet pose of the B5 pin table at depth 6 on a fresh table with no
+// clock, so the tree is a fixed shape: the node and score lines below are the numbers
+// that case already promises - a step that reordered the tree would be caught there,
+// not here - and the scan/reuse/patch triple is step 1's own ledger against them.
+void test_a_quiet_think_pays_for_each_evaluation_only_once() {
+    struct Row {
+        int color;
+        uint64_t nodes;
+        uint64_t qnodes;
+        uint64_t scans;
+        uint64_t reuses;
+        uint64_t patches;
+        int score;
+    };
+    const Row rows[] = {
+        {BLACK, 221774, 142978, 75855, 67123, 75852, 71992},
+        {WHITE, 156428, 102340, 68419, 33921, 68419, 97044},
+    };
+    const Board board = b1_quiet();
+    Evaluator evaluator;
+    std::atomic<bool> stop(false);
+
+    for (const Row& row : rows) {
+        TranspositionTable tt;
+        AlphaBetaSearch search(evaluator, tt);
+        search.set_node_limit(INT_MAX);
+        search.search(board, row.color, 6, 0, stop);
+        // The tree step 1 was not allowed to change.
+        assert(search.stats_.nodes == row.nodes);
+        assert(search.stats_.qnodes == row.qnodes);
+        assert(search.stats_.score == row.score);
+        // Its ledger. Every evaluation this think asked for is either a scan or a
+        // read - the quiet pose has nothing to evaluate outside quiescence, so the
+        // two add up to the quiescence node count - and a scan found somewhere to
+        // keep its score all but three times, those three being the buckets that had
+        // filled up with records.
+        assert(search.ctx_.eval_scans() == row.scans);
+        assert(search.ctx_.eval_reuses() == row.reuses);
+        assert(search.ctx_.eval_patches() == row.patches);
+        assert(search.ctx_.eval_scans() + search.ctx_.eval_reuses() == row.qnodes);
+        assert(search.ctx_.eval_reuses() > 0);
+        assert(search.ctx_.eval_scans() < search.stats_.qnodes);
+    }
+
+    // The same root on the table the first think filled: 187 nodes is the answer read
+    // out of the records, and the one evaluation the second think still asks for is
+    // answered without a scan - the score the first think wrote is on the record the
+    // second one replaced, not erased by it.
+    {
+        TranspositionTable tt;
+        AlphaBetaSearch first(evaluator, tt);
+        first.set_node_limit(INT_MAX);
+        first.search(board, BLACK, 6, 0, stop);
+        AlphaBetaSearch second(evaluator, tt);
+        second.set_node_limit(INT_MAX);
+        second.search(board, BLACK, 6, 0, stop);
+        assert(second.stats_.nodes == 187);
+        assert(second.ctx_.eval_scans() == 0);
+        assert(second.ctx_.eval_reuses() == 1);
+    }
+
+    std::cout << "test_a_quiet_think_pays_for_each_evaluation_only_once passed (quiet "
+                 "BLACK 75855 scans + 67123 reads over 142978 quiescence nodes, WHITE "
+                 "68419 + 33921 over 102340, both on the 221774 / 156428 node trees "
+                 "the B5 rows promise; warm repeat 187 nodes with 0 scans)" << std::endl;
+}
+
+// The sign convention differential-tested against the scan it replaces, one shape at
+// a time: for every symmetry of every pose, the number step 1 keeps is the number
+// evaluate_board itself answers for BLACK, and the read for WHITE is its negation -
+// which is the same equality evaluate_board has between its own two colours, so the
+// cache is never being compared with itself. The range line is the other half of the
+// convention: NO_STATIC_EVAL is INT32_MIN, and a score that could reach it would be
+// invisible to a reader.
+void test_a_cached_sign_answers_both_sides_of_every_shape() {
+    const Board poses[] = {b1_quiet(), b1_scattered(), b1_crowded(), b1_white_open_four(),
+                           b1_double_three()};
+    Evaluator evaluator;
+    std::atomic<bool> stop(false);
+    SearchLimits limits;
+    int shapes = 0;
+
+    for (const Board& base : poses) {
+        for (int variant = 0; variant < SYMMETRY_COUNT; ++variant) {
+            const Board board = transform_board(base, variant);
+            const uint64_t hash = board.zobrist_hash();
+            const int black_score = evaluator.evaluate_board(board, BLACK);
+            const int white_score = evaluator.evaluate_board(board, WHITE);
+            assert(black_score == -white_score);
+            assert(black_score <= 99999 && black_score >= -99999);
+            assert(black_score != NO_STATIC_EVAL);
+
+            TranspositionTable tt(1 << 12);
+            AlphaBetaSearch search(evaluator, tt);
+            search.ctx_.start(limits, system_search_clock(), stop);
+            assert(search.static_score(board, BLACK, hash, NO_STATIC_EVAL) == black_score);
+            assert(tt.static_eval_of(hash) == black_score);
+            assert(search.static_score(board, WHITE, hash, NO_STATIC_EVAL) == white_score);
+            assert(search.ctx_.eval_scans() == 1);
+            assert(search.ctx_.eval_reuses() == 1);
+
+            // The same shape kept from the other side answers the same two numbers.
+            TranspositionTable other(1 << 12);
+            AlphaBetaSearch flip(evaluator, other);
+            flip.ctx_.start(limits, system_search_clock(), stop);
+            assert(flip.static_score(board, WHITE, hash, NO_STATIC_EVAL) == white_score);
+            assert(other.static_eval_of(hash) == black_score);
+            assert(flip.static_score(board, BLACK, hash, NO_STATIC_EVAL) == black_score);
+            ++shapes;
+        }
+    }
+    assert(shapes == 40);
+
+    std::cout << "test_a_cached_sign_answers_both_sides_of_every_shape passed (" << shapes
+              << " shapes x 2 colours, every read equal to the scan it replaced)"
+              << std::endl;
+}
+
 int main() {
     std::cout << "Running search tests..." << std::endl;
 
@@ -7016,6 +7365,14 @@ int main() {
     // enumerations, then what a gated think costs.
     test_threat_probe_answers_what_the_two_phases_would_enumerate();
     test_a_threatless_think_pays_the_probe_and_nothing_else();
+
+    // C1, in the contract's order: the field on a record, the slot with no record,
+    // one position read four ways, then the whole think's ledger.
+    test_static_eval_on_a_record_leaves_its_bound_alone();
+    test_an_evaluation_slot_is_invisible_to_the_bound_readers();
+    test_static_score_reuses_a_cached_number_for_either_colour();
+    test_a_cached_sign_answers_both_sides_of_every_shape();
+    test_a_quiet_think_pays_for_each_evaluation_only_once();
 
     std::cout << "All search tests passed!" << std::endl;
     return 0;
