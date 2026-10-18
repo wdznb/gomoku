@@ -13,9 +13,10 @@ struct MoveBudget {
     int max_nodes = 0;
 };
 
-// Turns the caller's request into a budget. The engine used to hand the same
-// fixed proportions to VCF (35%) and VCT (55%) whatever the position needed;
-// this is where the per-move decisions live instead.
+// Turns the caller's request into a budget. The engine handed fixed proportions
+// to VCF (35 %) and VCT (55 %) until B5 replaced them with the probe-gated
+// 20 %/30 % caps (search_engine.cpp:17-18); this is where those decisions were
+// meant to live instead, and it still has no caller.
 class TimeManager {
 public:
     // The side to move is not an input: the candidate set is colour-independent

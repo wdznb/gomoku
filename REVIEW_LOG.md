@@ -1979,6 +1979,182 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次121 引擎重构 B5：战术层第一次由局面决定它要不要跑 — engine redesign stage B5
+
+规格 `docs/ENGINE_REDESIGN.md` `:142` 流水线 ③ 行「战术层 VCF/VCT ── 由「威胁探针」按需触发（改造：不再固定
+比例）」、`:253-260` 的整段「VCF/VCT 由固定比例改为按需触发」（三条触发事实、「只有命中才启动对应战术搜索，并
+给予**独立上限**（如 hard 的 20%/30%）而不是 35%/55%」、「无威胁局面直接进 AlphaBeta，把全部预算给主搜索」）、
+`:548` 的 B 阶段验收行，与 `:583` 的文件清单行「`search_engine.h/.cpp`：VCF/VCT 按需触发；`TimeManager` 预算
+分配」（冻结，不改写）。B5 读的是 B1 交出来的那件事：既然一层能搜哪些格子已经由局面上的形状决定，那么一次思考
+要不要为战术层花钱，也该由同一个来源决定，而不是由日历决定。
+
+### 落地的三件事
+
+1. **探针**：`ThreatProbe threat_probe(const Board&, int color)`（声明 `src/search/move_generator.h:73-81`、
+   定义 `src/search/move_generator.cpp:103-143`）。一次 `O(候选数)` 的 `recognize_position_both` 同时读出**己方与
+   对方**在这一格的形状，回答文档的三条事实：`own_four`（己方 ≥ 冲四：成五/活四/冲四）、`own_three`（己方 ≥ 活三）、
+   `opp_four`（对方 ≥ 冲四）。每半边先过那一侧自己的禁手判定——禁手里的形状不是那一侧**能做出**的威胁，所以不算。
+   域是 `board.active_empty()`，与 `VCFSearch::generate_rush_fours`、`VCTSearch::generate_attacks` 自己列根的域同一个。
+2. **按需触发**（`src/search/search_engine.cpp:203-241`）：VCF 只在 `own_four` 时启动（`:212`），VCT 只在
+   `own_three` 时启动（`:234`）；两者的份额从 35 %/55 % 改成 **20 %/30 %**（`kVcfBudgetPercent` /
+   `kVctBudgetPercent`，`search_engine.cpp:17-18`，注释 `:10-16`）。先后仍是文档给的那一对（VCT 是两份里宽的那一份），两个都命中时主搜索仍拿到
+   ≥ 70 % 的预算；探针排在快路径与预算起点（`:194-202`）之后、④ 之前，与 `:142` 的流水线顺序一致。
+3. **认输探针没有被门控**（`src/search/search_engine.cpp:387`）：文档 ③ 行管的是 AlphaBeta **之前**的战术层调度，
+   `find_defense` 在 AlphaBeta 之后、是另一个消费者；跳过它的收益同样是「无可观察差异」（根列表空 ⇒ 它本来立刻
+   返回未证明）。把它并进本轮等于在「按需触发」里夹一次棋力面的改变，B5 不做。
+
+### 规格冲突与判定
+
+`:257` 把「对方 ≥ 冲四（必须防）」写成探针的第三条**触发**条件，但战术层里没有一次搜索以对方的强制着法为根：
+VCF/VCT 的根列表都是**行棋方自己**的强制着法。对方冲四的承接者是 B1 已经落地的 Tier0 挡点（`:335`「对方能在这里
+成五的格子，不许被宽度裁掉」），不是 ③。所以 `opp_four` 被计算、被等价性钉住，但**不门控 stage B 的任何一次搜索**；
+文档为它指名的下一个消费者是 C 阶段 Step-3 的「局部 stand_pat 先只用于『无威胁局面』」（`:568`）。这条判定写在
+`move_generator.cpp:133-138` 的注释里，`search_engine.cpp:203-209` 的注释指回它。
+
+### 等价性（战术不漏）
+
+`PART1 roots=275 cells=23739 mismatches=0 own_four=112 own_three_only=129 no_own_threat_but_opp_four=121
+fully_threatless=33`（`/mnt/d/tmp/b5_remeasure.log`，我这遍重跑；原始行 `/mnt/d/tmp/b5m_p1_new.txt`）。275 个根 = B4
+的 42 支姿势 × 两色（84）+ 24 局种子随机对局的 191 个中盘根；三件事与两次列表的**空/非空**逐根比对，**0 处不符**，
+`own_four ⇒ own_three` 的嵌套同时成立。把同一个比对跑在 `4b18a78` 的引擎 + 抄进去的探针模块上，PART1 行**逐字
+相同**（`/mnt/d/tmp/b5m_p1_neg.txt`）——探针看到的与两个相位自己看到的，在两棵树上是一回事。
+
+- **`own_three` 而 `!own_four` 是常态，不是漏**：275 根里 black **56** / white **73** 根只有活三没有冲四
+  （`/mnt/d/tmp/b5p6.txt` 的 `PART6 own_three_without_own_four: black=56 white=73`）。原因不是禁手（先把禁手解释
+  量掉，同一份日志的 ONLY3 行给出这些根的 `opp_four`），而是一手做出的活三，它的**成四点要第二手才存在**——VCF
+  的根列表因此合法地保持为空。两道门是两个独立的事实，都需要，不能合成一道。
+
+### 引擎答案：门控不该改变任何东西，它确实没改变
+
+275 根 × 同板、每根新引擎（空表）、`set_max_nodes(40000)`、`time_limit=60000` 深到不 binding，只看 depth 4 的
+答案：`PART2_IDENTICAL (275 rows)`，`total_nodes` 两边都是 **4079261**（`/mnt/d/tmp/b5m_p2_new.txt` 与
+`..._neg.txt` 的 diff 为空）。method 分布两边相同：`alphabeta` 202 / `vcf` **54** / `must_block` 8 /
+`greedy_five` 7 / `vct` **4**。也就是说被探针关掉的 **197** 次相位启动（VCF 关 163 次、VCT 关 34 次）里没有一次
+是会被赢棋用到的：真正赢的那 54 + 4 次照样跑、照样交同样的 `score` 与 `move`。文档那句「无威胁局面直接进
+AlphaBeta，把全部预算给主搜索」在这一批根上的形状是 **33** 根两色都没威胁、**1** 根只有对方有冲四。
+
+这条相等不是免费的：**它靠 VCF/VCT 都不读写共享置换表**（两个类只把 `TranspositionTable&` 绑在成员上，
+`vcf.cpp`/`vct.cpp` 里没有任何一次 probe/store）。这也是本轮**没有 HEAD 反证**的结构性原因（见下）。
+
+### 探针的价钱，和预算回到主搜索的证据
+
+- **价钱**：`PART3 sink=681400 probe_us_per_root=6.78 two_phase_passes_us_per_root=9.45 ratio=0.718`
+  （`/mnt/d/tmp/b5m_p3_new.txt`，200 遍 × 275 根）。一次探针是它替掉的那两次列表的 **0.718 倍**；在无威胁的根上是
+  净省，在有威胁的根上多付一次探针换两次启动判定。
+- **墙钟诊断臂（不是钉数）**：20 个「有战术工作但没有胜算」的根（B4 姿势表里 method 不是 `vcf`/`vct` 的那些）×
+  1500 ms × 3 次 × 两遍，两棵树各自取平均：深度和 **109.67 → 111.33**，更深 **5** / 持平 **15** / 更浅 **0**，
+  同一墙钟里 AlphaBeta 拿到的节点 **2636964 → 3101705（+17.6 %）**（逐根读数 `/mnt/d/tmp/b5_p4_table.txt`，
+  每根一行 `head_dep b5_dep d head_nodes b5_nodes head_ms b5_ms`；`ms` 两列都贴着 1500，说明绑的是时限不是层数）。
+  这一臂只证明 20 %/30 % 确实把时间还给了主搜索；
+  墙钟不是确定性量，所以它不进用例。确定性判据留在 `nodes` 上（上一条 275 根的 diff 为空）。
+- 顺带量到的一个坑，与本轮无关但对以后有用：**`time_limit_ms = 0` 在 `SearchEngine::search` 里不是确定性配置**
+  （`src/search/search_engine.cpp:256-260` 把 `remaining_time` 兜到 100 ms，于是节点预算变成 `20000`、硬时限变成
+  100 ms，层的切割点跟着机器的忙闲走）。第一遍 275 根的 diff 非空就是这个原因；改成「每根新引擎 + `set_max_nodes`
+  + 一个不 binding 的时限」之后才干净。B5 之后任何拿 `nodes` 做判据的臂都得显式声明自己走的是哪一种。
+
+### 用例（`tests/test_search.cpp`，两条，全部走公开面 + 本 TU 已有的 `#define private public`）
+
+- **B5-1 `test_threat_probe_answers_what_the_two_phases_would_enumerate`**（`:6756`）：7 支姿势 × 两色 = 14 行，
+  每行钉三件事的字面值、VCF 与 VCT 自己的列表加对方一次列表的**长度**、三条 `==` 等价式与 `own_four ⇒ own_three`
+  的嵌套。`double_three` 那行是探针的禁手半边：(7,7) 是两个方向的活三 ⇒ `is_forbidden` 为真，它被从两边的列表里
+  都点名排除（本轮为此加了 `absent()` 断言，不让它藏在「20」这个数里），而 `own_three` 仍为真——因为另有
+  20 个格子能做出活三。同一个**坐标** (7,7) 在生成器用例 `test_generators_keep_five_points_and_drop_forbidden`
+  （`:2118`，两条点名排除在 `:2164-2165`，VCF 与 VCT 各一条）里也被钉过，但那是一盘不同的姿势、一条不同的禁手
+  规则——那里 (7,7) 是**四四**（行四与列四同时成），本轮这一行是**三三**；两条断言不是同一件事的重复。
+- **B5-2 `test_a_threatless_think_pays_the_probe_and_nothing_else`**（`:6826`）：八次引擎思考钉
+  `method/depth/score/move/nodes`。前六行是被门控的那一侧 —— `quiet` 两色 `71992/221774` 与 `97044/156428`、
+  `scattered` 两色 `98460/177061` 与 `98948/251149`，加 `white_open_four` 的 `resign` 与 `greedy_five` 两条快路径；
+  这六行是 **PIN，不是 discriminator**：`4b18a78` 的引擎（配上抄进去的探针模块）交回同样的六行 —— `PINS_IDENTICAL
+  (12 FIX, 6 PIN)`，12 行探针读数与 6 行引擎读数字节相同。后两行是**门控的正控制**：`crowded` BLACK 与
+  `double_three` WHITE 仍然交 `vcf` / `100000` / `(7,6)` 与 `(2,5)`，`/mnt/d/tmp/r121_b5_pc.cpp` 在两棵树上读出的
+  这四项逐字相同 —— 也就是说它们和前面六行一样绿，但它们绿的原因不同：探针被焊死成 `false`（或者把 `!` 打错在
+  门上）在这里变红，而前面六行在任何一种坏门下都还是绿的。这两行是本轮唯一能断言「门确实在开」的断言。
+
+### HEAD-negative 申报
+
+**本轮申报：无 HEAD 反证。** 两条理由都是结构性的：`threat_probe` 这个符号在 `4b18a78` 上不存在，B5-1 不可能在
+那棵树上编译；而 B5-2 前六行钉的是「门控之后答案不变」——一道工作正常的门，被它关掉的那次搜索交回的是同一个未知，
+门控本身在被关掉的思考里**不留下可观察痕迹**。按本项目对等价改动的旧例，证据是两棵树逐字相同的读数，上面已给齐
+（PART1 两棵树同一行、275 根 method 全等、12+6 行 PIN 全等、正控制两行的四项在两棵树上也相同）。
+
+**代替 HEAD 反证的是一遍 mutation**：在 `4b18a78` 之后的这棵树上把两个门条件各追加一个 `&& false`
+（`/mnt/d/tmp/r121_b5_mut.sh` 造一份 `src/` 副本 `/mnt/d/tmp/b5mut`，改 `search_engine.cpp:212/:234`，用同一个
+八行驱动程序读出来，`/mnt/d/tmp/b5_mut_rows.txt`）。八行里**恰好两行变红**：`crowded` BLACK 与 `double_three`
+WHITE 从 `vcf / depth 0 / nodes 0` 变成 `alphabeta / depth 2 / nodes 888` 与 `alphabeta / depth 2 / nodes 533`
+——`score` 与 `move` 都不变，AlphaBeta 自己也在同一层看到这两个胜，所以这两行钉的是「相位先答」而不是
+「只有相位答得出」。剩下六行在焊死的门下与门正常时逐字相同，那正是上面「门控不留痕迹」那句话从反方向看到的
+同一个事实。也就是说本轮的断言强度是：**两行红 + 六行不因门控而红**，两边都量到了。
+
+### 门禁
+
+`ctest` **8/8 / 540.70 s**（`test_search` **515.00 s**；B4 记的 451.57 s 之上是这两条 B5 用例：B5-1 的 14 行探针
+比对几乎免费，B5-2 的八次思考里贵的是 `resign` 那一臂的一次 400 k 节点认输探针和四臂 depth-6 主搜索，两个
+`vcf` 正控制在相位里就返回了；其余七支最慢 9.24 s）、
+`node tests/web_frontend_check.js` **105/105**、`node tests/readme_anchor_check.js` **118 引用 / 0 problems**、
+`README.md` **658 行**。合约过期：无。四段跑的就是提交树，只有一处例外要说清楚：`time_manager.h` 注释里那个
+指向 `search_engine.cpp` 的行号在本轮收尾时写成了 `:16-17`，发现时 ctest 已经在跑（构建已结束），改成 `:17-18`
+是一次纯字符的注释修正，不改一行代码，也不改任何一条读数。中途锚点掉到 117 是我重写预算注释时把 `README:343` 那一行引用删掉了
+（`search_engine.cpp:14` 现在重新引用它），补回后回到 118。两条受保护的预算前提**内容一字未动**，行号因为
+`:1086` 处那段注释多了两行而下移：`assert(result.resigned)` 从 `4b18a78` 的 `:2589` 现在在 **`:2591`**，
+`assert(completed.method == "alphabeta")` 从 `:3984` 现在在 **`:3986`**。
+`src/search/time_manager.h` 那句「the engine used to hand the same fixed proportions to VCF (35%) and
+VCT (55%)」（`4b18a78` 上的 `:16-18`）在本轮变成了需要时态说明的话，改成四行（本树 `:16-19`）写清楚 35/55
+是被本轮的 20/30 换下来的、而 `TimeManager`
+仍然没有调用者，并把新位置指回 `search_engine.cpp:17-18`——**纯注释**，八行 mutation 读数与全部钉数都在改前改后同一棵行为树上。
+
+### Valgrind
+
+- **探针本体（本轮新增代码，`-O0 -g` 副本驱动，real line 可读）**：`r121_b5_probe.cpp` 的模式 19 = 275 根的
+  三件事比对 + 10 次被门控/被放行的引擎思考，`valgrind --tool=memcheck -q --error-exitcode=9 --leak-check=full
+  --show-leak-kinds=definite --errors-for-leak-kinds=definite --track-origins=yes --num-callers=16` 跑完
+  **rc=0 / 335 s / reports=0 / invalid_read=0 / invalid_write=0 / uninitialised=0 / definite_leak=0**，
+  驱动自己的读数在同一份 stderr 旁边是 `PART1=1 VG=10 MISMATCH=0`（`/mnt/d/tmp/b5_vg.log`）。
+- **`test_training`**（`build-vg`，Debug `-UNDEBUG`）：**clean / 217 s / 0 / 0 / 0 / 0 / 0**。
+- **`test_search`**（装着两条 B5 用例的那套）：空闲重跑 **rc=134 / 325 s / reports=0 / invalid_read=0 /
+  invalid_write=0 / uninitialised=0 / definite_leak=0**。stderr 里唯一的非 memcheck 行是
+  `Assertion 'interrupted.partial_depth == 1' failed`（`tests/test_search.cpp:3973`，A2/A7 那次的 **10 ms 臂**——
+  它的读走在 assert 之前，所以 stdout 已经打了 `interrupted: alphabeta d0+partial 0/n0 time_hard`，减速下的这一手
+  连一个根着法都没能走完）。同一根臂不是本轮才断的：B2、B3 两轮的门禁段就记过它当时停在 `:3967`，本轮因为
+  `:1086` 的注释多了两行而写成 `:3973`；原生（不套 valgrind）的这套是绿的，见 `/mnt/d/tmp/b5_vgnative.txt`
+  的 **RC=0 / All search tests passed** 与下面门禁段的 `ctest` 8/8。**这一条按旧例在改动前的树上重测**（见下）。
+- **`test_server`**：空闲重跑 **rc=134 / 24 s / reports=0 / invalid_read=0 / invalid_write=0 / uninitialised=0 /
+  definite_leak=0**，`Assertion 'hint_results == 0' failed`（`tests/test_server.cpp:1710`，
+  `test_hint_answer_for_a_superseded_position`（函数在 `:1662`）：局面被 `undo` 撤掉之后那支 hint 在本该被陈旧判定丢掉的路上，
+  在 valgrind 的时间尺度里交出了一个 `hint_result`）。同一套不套 valgrind 是 `ctest` 8/8 里绿的那一支。
+- 口径按 2026-10-17 的约定分开报：`reports` 是 valgrind 自己的 `==NNNN==` 行数，另外四列是
+  `Invalid read of size` / `Invalid write of size` / `uninitialised` / `definitely lost` 的计数，
+  构建目录与 `-UNDEBUG` 已在每条里点名。**两处 rc=134 都是断言，不是内存错误**：memcheck 的读数在两条臂上都是全 0。
+- 第一次跑这三臂时我把 `make -j8 test_search` 与整套用例直接压在了 memcheck 旁边，`test_server` 在 32 s、
+  `test_search` 在 330 s 死掉；因为 `tools/valgrind_check.sh:166/:250` 用 mktemp 建日志又删掉，那一次的断言文本
+  我没能读到了（而且我据此猜错过一次：把它认成了下一支用例 `test_search_engine_finds_five`）。上面两条是**空闲**
+  重跑并把日志留在 `/mnt/d/tmp/b5vg_test_search.{out,err}` 与 `b5vg_test_server.{out,err}` 的读数，
+  脚本 `/mnt/d/tmp/r121_b5_vg3.sh`；同一棵树的 `build-vg/test_search` 不套 valgrind 跑整套是
+  **RC=0 / All search tests passed**（`/mnt/d/tmp/b5_vgnative.txt`）。
+
+**两处 rc=134 都在改动前的树上重测过，并且逐字复现**（`/mnt/d/tmp/r121_b5_negvg.sh`，树
+`/mnt/d/tmp/neg121_b5` = `git archive 4b18a78` + 抄进去的 `move_generator.{h,cpp}`，自己的一份 `build-vg`
+Debug `-UNDEBUG`）：`NEG_test_server rc=134 / 24 s / 0 / 0 / 0 / 0 / 0`，同一句
+`tests/test_server.cpp:1710 … test_hint_answer_for_a_superseded_position(): Assertion 'hint_results == 0' failed`；
+`NEG_test_search rc=134 / 328 s / 0 / 0 / 0 / 0 / 0`，`Assertion 'interrupted.partial_depth == 1' failed` 在那棵树
+写在 **`:3971`**（本树 `:3973`，差的就是 `:1086` 注释的两行），而且它 stdout 上那行读数在两棵树上逐字相同
+（`interrupted: alphabeta d0+partial 0/n0 time_hard, last frame d0/n0, control: alphabeta d0+partial 1/n2494`）。
+所以这两支都是**被 valgrind 的时间尺度打到墙钟/竞态断言上的旧脆弱**，不是本轮带进来的：`test_search` 那一支是
+A2/A7 的 10 ms 臂（B2、B3 两轮记过同一根臂），`test_server` 那一支是「减速后引擎交出的那一点在撤销后的盘面上
+仍然合法，于是走 `hint_result` 而不是 `error`」——正是任务 #35 记在队里的那对「`make_move`/`undo` 不等待
+in-flight 搜索」的锁面，`tests/test_server.cpp:1656-1661` 的注释自己就写了这件事。两处 memcheck 读数
+依旧全 0，本轮不修剪任何断言，也不把这两支挪进 bugfix 提交。
+
+### 申报未完成的一半
+
+`:583` 那一行还写着「`TimeManager` 预算分配」。`src/search/time_manager.{h,cpp}` 自 A1 就在树上，
+`MoveBudget TimeManager::allocate()` 的五条修正（`soft = 0.65·hard`、候选数修正、开局/中盘/残局修正、上一手
+> 0.8·hard 时下调 `soft`、训练模式直接返回节点预算）**没有任何调用者**：`grep -rn "TimeManager" src/` 只命中它
+自己的两个文件，`SearchEngine` 仍然自己算 `remaining_time` / `node_budget`（`:256-291`）。不接线的理由写在这里而
+不是藏在状态文档里：接线会改变**每一次**思考的软窗（现在客户端不点名就没有软窗，README:343 把这个缺省写成了
+文档行为，接线要同步改 README 那一行），它是全棋力面的改动，而它的验收按 `:555` 回归保障第 2 条要「新引擎 vs
+旧引擎」的验证赛 Elo——本轮的验收口径是结构不变量 + 定向用例，明确不含对局赛。这一项连同它的口径冲突记进
+`docs/ENGINE_REDESIGN_STATUS.md` 的「部分完成」。B5 落的是 `:583` 那一行的前一半。
+
 ## 轮次121 引擎重构 B4：等价深度买到了，便宜没买到 — engine redesign stage B4（本期不做）
 
 规格 §2.7 表 `:427` 的那一行「威胁延伸（冲四/活三 +1 层） | 战术不漏，深度等效 +1~2 | 风险 低」，加上

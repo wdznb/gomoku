@@ -1084,8 +1084,10 @@ void test_engine_stamps_elapsed_on_tactical_wins() {
 }
 
 // R95 Z1, case B: the AlphaBeta path. VCF and VCT run first and each owns a fixed
-// share of the budget (35 % / 55 % of the same start, round 85 F4), so a
-// forcing-rich position with no proof spends those shares before AlphaBeta opens
+// share of the budget when the threat probe admits them (20 % / 30 % of the same
+// start since B5, which also made both shares conditional; the shares were 35 % /
+// 55 % before that, round 85 F4), so a forcing-rich position with no proof spends
+// those shares before AlphaBeta opens
 // its own clock - here ~1.1 s of a 2 s move. What that path handed back was the
 // AlphaBeta sub-segment, so the single 耗时 the replay panel and
 // ai_move.thinking_time_ms show was ~1.1 s of the 2 s short (899 ms of 2000).
@@ -6664,6 +6666,216 @@ void test_probe_bounds_leave_a_reused_think_on_the_same_answer() {
               << std::endl;
 }
 
+// ---------------------------------------------------------------------------
+// B5 - 威胁探针 (design doc 2.3.4: 「③ 战术层 VCF/VCT ── 由「威胁探针」按需触发
+// （改造：不再固定比例）」, and :255-260 for the three facts it answers).
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// One row of the probe's truth table. `black`/`white` are the three facts -
+// own_four / own_three / opp_four - for that side to move, and `black_lists` /
+// `white_lists` are the sizes of the enumerations the two phases do for
+// themselves at their own roots: VCF's list and VCT's list for the side to move,
+// then VCF's list for the opponent. Both halves of every row were read off
+// /mnt/d/tmp/r121_b5_probe.cpp part 7, on this tree and on 4b18a78's engine with
+// the probe module copied in, and they agree there exactly as they do here.
+struct B5ProbeRow {
+    const char* name;
+    std::vector<std::array<int, 3>> stones;
+    int black[3];
+    int white[3];
+    int black_lists[3];
+    int white_lists[3];
+};
+
+const std::vector<std::array<int, 3>> b5_no_stones = {};
+const std::vector<std::array<int, 3>> b5_scattered_stones = {
+    {2, 2, BLACK}, {12, 12, WHITE}, {2, 12, BLACK}, {12, 2, WHITE}};
+const std::vector<std::array<int, 3>> b5_quiet_stones = {
+    {7, 7, BLACK}, {7, 8, WHITE}, {8, 8, BLACK}, {6, 6, WHITE}};
+const std::vector<std::array<int, 3>> b5_white_open_four_stones = {
+    {7, 5, WHITE}, {7, 6, WHITE}, {7, 7, WHITE}, {7, 8, WHITE},
+    {10, 10, BLACK}, {10, 11, BLACK}, {3, 3, BLACK}};
+const std::vector<std::array<int, 3>> b5_black_makes_five_stones = {
+    {7, 4, BLACK}, {7, 5, BLACK}, {7, 6, BLACK}, {7, 7, BLACK},
+    {10, 10, WHITE}, {10, 11, WHITE}, {3, 3, WHITE}};
+const std::vector<std::array<int, 3>> b5_double_three_stones = {
+    {7, 6, BLACK}, {7, 8, BLACK}, {6, 7, BLACK}, {8, 7, BLACK},
+    {2, 2, WHITE}, {2, 3, WHITE}, {2, 4, WHITE}};
+const std::vector<std::array<int, 3>> b5_crowded_stones = {
+    {7, 7, BLACK}, {7, 8, BLACK}, {7, 9, BLACK},
+    {9, 6, WHITE}, {9, 7, WHITE}, {9, 8, WHITE},
+    {5, 5, BLACK}, {10, 4, BLACK}, {11, 11, BLACK},
+    {4, 9, WHITE}, {3, 11, WHITE}, {2, 2, WHITE},
+    {6, 7, BLACK}, {8, 6, WHITE}, {10, 10, BLACK}, {5, 10, WHITE},
+    {12, 3, BLACK}, {4, 4, WHITE}, {6, 12, BLACK}, {12, 8, WHITE},
+    {13, 13, BLACK}, {1, 6, WHITE}, {3, 5, BLACK}, {11, 6, WHITE}};
+
+const B5ProbeRow b5_probe_rows[] = {
+    // Nothing on the board: the window is all 225 cells and no cell makes a shape
+    // for anybody, so the probe says 无威胁 and both phases would have had an empty
+    // root list.
+    {"empty", b5_no_stones, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}},
+    // B1's 「无威胁时放宽」 poses: four and two isolated pairs of stones, too far
+    // apart for any single move to make a three or a four.
+    {"scattered", b5_scattered_stones, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}},
+    {"quiet", b5_quiet_stones, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}},
+    // WHITE holds 活四 on row 7. BLACK to move has no four of its own (two black
+    // stones cannot reach four in one move) but it does have 活三 points on row 10 -
+    // (10,8) (10,9) (10,12) (10,13) - and the 「对方 ≥ 冲四」 half is the four white
+    // cells on row 7, its two five-points among them.
+    {"white_open_four", b5_white_open_four_stones,
+     {0, 1, 1}, {1, 1, 0}, {0, 4, 4}, {4, 4, 0}},
+    // The mirror: BLACK to move completes five at (7,3)/(7,8), so own_four and
+    // own_three both hold on two cells; WHITE to move has the 活三 on row 10 and
+    // reads black's two five-points as opp_four.
+    {"black_makes_five", b5_black_makes_five_stones,
+     {1, 1, 0}, {0, 1, 1}, {2, 2, 0}, {0, 4, 2}},
+    // (7,7) here is the 三三 point - two live threes from one square, which BLACK is
+    // forbidden to play - so the probe's own_* halves drop that cell, and VCT's list
+    // is 20 *other* cells. BLACK's four-list is empty for a plainer reason: no black
+    // square reaches a four in one move. This row is the forbidden half of the probe,
+    // and the exclusion itself is asserted below rather than left inside the count -
+    // the same cell the generator case drops at :2164.
+    {"double_three", b5_double_three_stones,
+     {0, 1, 1}, {1, 1, 0}, {0, 20, 4}, {4, 4, 0}},
+    // B1's crowded pose: work for both phases on either side.
+    {"crowded", b5_crowded_stones,
+     {1, 1, 1}, {1, 1, 1}, {8, 15, 9}, {9, 20, 8}},
+};
+
+}
+
+// B5-1: the probe is only a safe gate if it answers the same question the phases
+// ask for themselves. VCFSearch::generate_rush_fours and VCTSearch::generate_attacks
+// are the phases' own root enumerations - same domain (board.active_empty()), same
+// legal-move test, same pattern set - so the three facts have to agree with those
+// lists being empty or not, on every position, for both sides to move. That is what
+// 战术不漏 means here, and it is what this case pins rather than hoped.
+void test_threat_probe_answers_what_the_two_phases_would_enumerate() {
+    Evaluator evaluator;
+    TranspositionTable tt;
+    VCFSearch vcf(evaluator, tt);
+    VCTSearch vct(evaluator, tt);
+
+    int rows = 0;
+    for (const B5ProbeRow& row : b5_probe_rows) {
+        for (int color : {BLACK, WHITE}) {
+            const Board board = b1_board(row.stones);
+            const ThreatProbe probe = threat_probe(board, color);
+            const int* expected = (color == BLACK) ? row.black : row.white;
+            const int* expected_lists = (color == BLACK) ? row.black_lists : row.white_lists;
+
+            assert(probe.own_four == (expected[0] != 0));
+            assert(probe.own_three == (expected[1] != 0));
+            assert(probe.opp_four == (expected[2] != 0));
+
+            const auto fours = vcf.generate_rush_fours(board, color);
+            const auto attacks = vct.generate_attacks(board, color);
+            const auto opponent_fours = vcf.generate_rush_fours(board, opponent(color));
+            assert(fours.size() == static_cast<size_t>(expected_lists[0]));
+            assert(attacks.size() == static_cast<size_t>(expected_lists[1]));
+            assert(opponent_fours.size() == static_cast<size_t>(expected_lists[2]));
+
+            // The gate reads the probe and then decides per phase, so a false here
+            // would skip a phase that had a move to try.
+            assert(probe.own_four == !fours.empty());
+            assert(probe.own_three == !attacks.empty());
+            assert(probe.opp_four == !opponent_fours.empty());
+            // One cell's four is also one cell's forcing threat, so the flags nest.
+            assert(!probe.own_four || probe.own_three);
+
+            // On the 三三 row, the forbidden square is excluded by name rather than
+            // only through the size of the list it was left out of.
+            if (std::string(row.name) == "double_three" && color == BLACK) {
+                const auto absent = [](const std::vector<Move>& moves) {
+                    for (const Move& m : moves) {
+                        if (m.pos.row == 7 && m.pos.col == 7) return false;
+                    }
+                    return true;
+                };
+                assert(board.is_empty(7, 7));
+                assert(PatternRecognizer::is_forbidden(board, 7, 7, BLACK));
+                assert(absent(fours) && absent(attacks));
+            }
+            ++rows;
+        }
+    }
+
+    std::cout << "test_threat_probe_answers_what_the_two_phases_would_enumerate passed ("
+              << rows << " position/side rows, every fact equal to the phase's own list, "
+              "own_four nesting into own_three; on the 三三 row (7,7) is forbidden, is "
+              "named-absent from both lists, and VCT's list is still 20 cells while VCF's "
+              "is 0)" << std::endl;
+}
+
+// B5-2: what the gate does to the think it gates. A position with no threat at all
+// used to pay two full candidate enumerations - VCF's root pass and VCT's root
+// pass, both of which answer "nothing to try" out of an empty list - and now pays
+// one probe pass for the same answer. The answer side is identical by construction,
+// because neither phase touches the shared table (both take a TranspositionTable&
+// and never read or write it), so skipping an empty-list phase cannot change what
+// AlphaBeta later finds. All eight rows below were read on 4b18a78's engine with the
+// probe module copied in and answer the same as they do here - /mnt/d/tmp/r121_b5_pc.cpp
+// for the last two, part 8 of r121_b5_probe.cpp for the first six - which is why this
+// case is a PIN and not a discriminator. The last two rows are also what keeps the
+// gate honest: they are the only rows here whose pinned number a welded-shut gate
+// would change, so they are the red-able half of a stage whose other half cannot go
+// red on any tree.
+void test_a_threatless_think_pays_the_probe_and_nothing_else() {
+    struct Pin {
+        Board board;
+        int color;
+        const char* method;
+        int depth;
+        int score;
+        int row;
+        int col;
+        int nodes;
+    };
+
+    std::atomic<bool> stop(false);
+    // Depth 6 with a time budget so far above what these poses cost that the depth
+    // is the only thing that can stop the deepening - no clock in the answer.
+    const Pin pins[] = {
+        {b1_quiet(), BLACK, "alphabeta", 6, 71992, 8, 7, 221774},
+        {b1_quiet(), WHITE, "alphabeta", 6, 97044, 6, 7, 156428},
+        {b1_scattered(), BLACK, "alphabeta", 6, 98460, 3, 3, 177061},
+        {b1_scattered(), WHITE, "alphabeta", 6, 98948, 11, 3, 251149},
+        // The two rows that are not the main search: BLACK to move against WHITE's
+        // 活四 still resigns - the loss probe is not gated by the probe's opp_four
+        // half, because our own reply can make a point the opponent may legally
+        // play five on - and WHITE to move with that 活四 takes it on the fast path.
+        {b1_white_open_four(), BLACK, "resign", 0, 0, -1, -1, 0},
+        {b1_white_open_four(), WHITE, "greedy_five", 0, 100000, 7, 4, 0},
+        // The other half of the same claim, and the gate's positive control: where
+        // the probe says there is work, the phase still runs and still wins. A probe
+        // welded false - or a `!` typed on the wrong line of the gate - answers these
+        // two from AlphaBeta, not `vcf` / 100000.
+        {b1_crowded(), BLACK, "vcf", 0, 100000, 7, 6, 0},
+        {b1_double_three(), WHITE, "vcf", 0, 100000, 2, 5, 0},
+    };
+
+    for (const Pin& pin : pins) {
+        SearchEngine engine;
+        const SearchResult result = engine.search(pin.board, pin.color, 6, 600000, stop);
+        assert(result.method == pin.method);
+        assert(result.depth == pin.depth);
+        assert(result.score == pin.score);
+        assert(result.best_move.pos.row == pin.row);
+        assert(result.best_move.pos.col == pin.col);
+        assert(result.nodes_searched == pin.nodes);
+    }
+
+    std::cout << "test_a_threatless_think_pays_the_probe_and_nothing_else passed (quiet 71992/221774 "
+                 "and 97044/156428, scattered 98460/177061 and 98948/251149 nodes at depth 6, same "
+                 "move on both trees; white_open_four keeps resign and greedy_five; crowded BLACK and "
+                 "double_three WHITE still answer vcf/100000 at (7,6) and (2,5) - all eight rows are "
+                 "PIN, green on 4b18a78 as well, and the last two are the ones a broken gate turns red)"
+              << std::endl;
+}
+
 int main() {
     std::cout << "Running search tests..." << std::endl;
 
@@ -6799,6 +7011,11 @@ int main() {
     test_cut_think_reports_the_last_committed_line();
     test_a_think_with_no_committed_layer_reports_no_line();
     test_probe_bounds_leave_a_reused_think_on_the_same_answer();
+
+    // B5, in the contract's order: the probe's truth table against the phases' own
+    // enumerations, then what a gated think costs.
+    test_threat_probe_answers_what_the_two_phases_would_enumerate();
+    test_a_threatless_think_pays_the_probe_and_nothing_else();
 
     std::cout << "All search tests passed!" << std::endl;
     return 0;

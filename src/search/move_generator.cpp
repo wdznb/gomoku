@@ -22,12 +22,28 @@ bool makes_five(const PositionPattern& pattern) {
 
 // The square makes a shape the opponent has to answer: 成五, 活四, 冲四 or 活三.
 // This is the filter the quiescence subtree has always used, and design doc
-// 2.5.1's quiescence row keeps it as the only one ("仅强制着法").
+// 2.5.1's quiescence row keeps it as the only one ("仅强制着法"). It is also
+// VCTSearch::generate_attacks' own membership test, and so the 「≥ 活三」 row of
+// the threat probe below.
 bool makes_forcing_threat(const PositionPattern& pattern) {
     for (int d = 0; d < 4; ++d) {
         const PatternType t = pattern.directions[d].type;
         if (t == PatternType::FIVE || t == PatternType::LIVE_FOUR ||
             t == PatternType::RUSH_FOUR || t == PatternType::LIVE_THREE) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// The square makes a four: 成五, 活四 or 冲四, which is design doc 2.3.4's
+// 「己方 ≥ 冲四」 and VCFSearch::generate_rush_fours' own membership test. Every
+// four is also a forcing threat, so `makes_four` ⊂ `makes_forcing_threat`.
+bool makes_four(const PositionPattern& pattern) {
+    for (int d = 0; d < 4; ++d) {
+        const PatternType t = pattern.directions[d].type;
+        if (t == PatternType::FIVE || t == PatternType::LIVE_FOUR ||
+            t == PatternType::RUSH_FOUR) {
             return true;
         }
     }
@@ -82,6 +98,48 @@ std::vector<Move> CandidateSet::flatten() const {
     for (const auto& entry : vicinity) out.push_back(entry.move);
     for (const auto& entry : remote) out.push_back(entry.move);
     return out;
+}
+
+ThreatProbe threat_probe(const Board& board, int color) {
+    ThreatProbe probe;
+    const int opp = opponent(color);
+
+    for (const Position& pos : board.active_empty()) {
+        if (!board.is_empty(pos)) continue;
+
+        // One pass gives both sides' shapes at this square, which is what makes the
+        // probe O(候选数) rather than two O(候选数) passes.
+        PositionPattern mine, theirs;
+        PatternRecognizer::recognize_position_both(board, pos.row, pos.col, color, mine, theirs);
+
+        // A shape is a threat only where the side that would make it may legally
+        // play it; that is the same test VCFSearch::generate_rush_fours and
+        // VCTSearch::generate_attacks run before they admit a square, which is what
+        // makes own_four / own_three answer exactly "is that phase's root list
+        // non-empty".
+        const bool mine_legal = !(color == BLACK &&
+                                  PatternRecognizer::is_forbidden_from_pattern(mine));
+        const bool theirs_legal = !(opp == BLACK &&
+                                    PatternRecognizer::is_forbidden_from_pattern(theirs));
+
+        if (mine_legal && !probe.own_four) {
+            if (makes_four(mine)) {
+                probe.own_four = true;
+                probe.own_three = true;
+            } else if (makes_forcing_threat(mine)) {
+                probe.own_three = true;
+            }
+        }
+
+        // opp_four is the doc's 「对方 ≥ 冲四（必须防）」 read on the *current* board.
+        // Nothing in stage B gates a search on it: a reply we play can change what
+        // the opponent is forbidden to play, so a false here is not proof that no
+        // four-point exists one move later. Stage C's 「无威胁局面」 test is the
+        // consumer the doc names.
+        if (theirs_legal && !probe.opp_four) probe.opp_four = makes_four(theirs);
+    }
+
+    return probe;
 }
 
 void MoveGenerator::generate(const Board& board, int color, int ply, bool in_quiescence,

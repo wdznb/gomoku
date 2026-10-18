@@ -52,6 +52,34 @@ struct CandidateSet {
     std::vector<Move> flatten() const;
 };
 
+// Design doc 2.3.4's 「威胁探针」: the one O(候选数) pass that answers, before a think
+// pays for a tactical search, whether this position has tactical work in it at all.
+// The three facts are the doc's three bullets, read off the same four-direction
+// pattern the tiers already use:
+//   own_four   - a square where `color` makes 成五 / 活四 / 冲四 (「己方 ≥ 冲四」),
+//   own_three  - a square where it makes 活三 or better (「或 ≥ 活三」),
+//   opp_four   - a square where the *opponent* makes 成五 / 活四 / 冲四 (「对方 ≥ 冲四，
+//                必须防」).
+// Each half is filtered by what that side may legally play, because a shape a side
+// is forbidden to make is not a threat it can make: `own_*` use the same
+// forbidden test VCF and VCT apply to their own root lists, and `opp_four` the
+// opponent's. `own_four` implies `own_three`.
+//
+// The pass runs over board.active_empty() - the domain VCFSearch and VCTSearch
+// enumerate - which is what makes `own_four` answer exactly "is VCF's root list
+// non-empty" and `own_three` exactly "is VCT's root list non-empty". A think that
+// skips a phase on a false therefore cannot skip one that had a move to try; that
+// equivalence is 战术不漏, and it is pinned as an invariant rather than hoped.
+struct ThreatProbe {
+    bool own_four = false;
+    bool own_three = false;
+    bool opp_four = false;
+};
+
+// The pass itself. `color` is the side to move; the probe is not a candidate list,
+// so it does not depend on a ply or on a width.
+ThreatProbe threat_probe(const Board& board, int color);
+
 // Where the candidate squares of one layer come from (design doc 2.5.1, 3.2).
 //
 // This replaces the old "every active empty cell, no width" list, which made the

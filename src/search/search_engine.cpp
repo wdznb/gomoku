@@ -1,4 +1,5 @@
 #include "search_engine.h"
+#include "move_generator.h"
 #include <chrono>
 #include <climits>
 
@@ -6,11 +7,15 @@ namespace gomoku {
 
 namespace {
 
-// AlphaBeta keeps the tail of the move budget: while VCF/VCT shared the whole
-// deadline, an expensive tactical phase left AlphaBeta only the 100 ms floor
-// and a depth-0 fallback (README:343 wants deeper searches to get more time).
-constexpr int kVcfBudgetPercent = 35;
-constexpr int kVctBudgetPercent = 55;
+// Design doc 2.3.4's 「独立上限」 row: the tactical phases are keyed off the threat
+// probe below, so when they do run they are running on a position with work for
+// them, and they no longer need the share an unconditional VCF/VCT had to be given
+// "just in case" - 35% and 55% of the move, which left AlphaBeta the tail of a
+// deadline README:343 wants spent on deeper search. 20/30 keeps the same ordering
+// (VCT gets the wider slice of the two) and leaves the main search at least 70% of
+// the budget even when both phases fire.
+constexpr int kVcfBudgetPercent = 20;
+constexpr int kVctBudgetPercent = 30;
 
 }
 
@@ -195,7 +200,16 @@ SearchResult SearchEngine::search(const Board& board, int color,
     auto search_deadline = search_start
                            + std::chrono::milliseconds(has_deadline ? time_limit_ms : 0);
 
-    if (vcf_enabled_ && !stop_flag.load()) {
+    // Design doc 2.3.4: one O(候选数) pass decides whether this position has any
+    // tactical work in it before a think pays for a tactical search. The probe
+    // enumerates the same squares and applies the same legal-move test as the two
+    // phases' own root passes, so own_four is exactly "VCF has a move to try" and
+    // own_three exactly "VCT has one" - a skipped phase was a phase that would have
+    // answered UNKNOWN out of an empty list. See threat_probe() for the three facts
+    // and why opp_four gates nothing here.
+    const ThreatProbe probe = threat_probe(board, color);
+
+    if (vcf_enabled_ && probe.own_four && !stop_flag.load()) {
         VCFSearch vcf(evaluator_, tt_alphabeta_);
         if (has_deadline) {
             vcf.set_deadline(search_start + std::chrono::milliseconds(
@@ -217,7 +231,7 @@ SearchResult SearchEngine::search(const Board& board, int color,
         // will naturally find the best defensive move.
     }
 
-    if (vct_enabled_ && !stop_flag.load()) {
+    if (vct_enabled_ && probe.own_three && !stop_flag.load()) {
         VCTSearch vct(evaluator_, tt_alphabeta_);
         if (has_deadline) {
             vct.set_deadline(search_start + std::chrono::milliseconds(
