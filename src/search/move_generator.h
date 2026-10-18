@@ -4,6 +4,7 @@
 #include "../core/board.h"
 #include "../core/evaluator.h"
 #include "search_limits.h"
+#include "search_state.h"
 #include <vector>
 
 namespace gomoku {
@@ -85,9 +86,16 @@ ThreatProbe threat_probe(const Board& board, int color);
 // This replaces the old "every active empty cell, no width" list, which made the
 // branch factor of a midgame node 60-100 and is why a depth-6 layer could not be
 // finished in the time a think gets.
+//
+// The tier of a square and the price it is ordered by both come off one
+// four-direction pass, and design doc 2.6 step 2 says that pass must not be the
+// per-node cost of every candidate: the shapes and prices this generator works
+// out are kept in a CandidateCache it owns, and the search's ordering pass reads
+// the same records rather than recognizing a second time.
 class MoveGenerator {
 public:
-    explicit MoveGenerator(const Evaluator& evaluator) : evaluator_(evaluator) {}
+    explicit MoveGenerator(const Evaluator& evaluator)
+        : evaluator_(evaluator), cache_(evaluator) {}
 
     // Fill `out` with the tiers of this position for `color` at distance `ply`
     // from the root of the think. `ply` picks the width: the root keeps
@@ -106,8 +114,26 @@ public:
     std::vector<Move> generate_moves(const Board& board, int color, int ply,
                                      bool in_quiescence) const;
 
+    // What one square is worth to both sides at once: exactly
+    // `evaluate_position_pair(board, row, col, colour)` for either colour, read
+    // through the cache rather than by a fresh four-direction pass. This is the
+    // price design doc 2.4.5 puts at ④, and the ordering pass is its only reader
+    // that does not also need the shapes.
+    int candidate_price(const Board& board, const Position& pos) const {
+        return cache_.pair_score(board, pos.row, pos.col);
+    }
+
+    // Step 2's ledger, for the cases that want to say how much of a think's
+    // candidate work was shared rather than redone.
+    const CandidateCache& cache() const { return cache_; }
+
 private:
     const Evaluator& evaluator_;
+    // The tiers answer a question about the position, and a node looking at a
+    // position does not change it, so `generate()` stays const and this is the
+    // scratch state that lets it be: a record is reused while the four lines
+    // through its square are unchanged, whatever board asked.
+    mutable CandidateCache cache_;
 };
 
 }

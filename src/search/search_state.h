@@ -1,6 +1,9 @@
 #ifndef GOMOKU_SEARCH_STATE_H
 #define GOMOKU_SEARCH_STATE_H
 
+#include "../core/board.h"
+#include "../core/evaluator.h"
+#include "../core/pattern.h"
 #include "../core/types.h"
 #include "search_limits.h"
 #include <atomic>
@@ -201,6 +204,133 @@ private:
     // Zero at construction for the same reason history is: the first think of a
     // session must not read a line out of stack noise.
     int length_[kMaxPly] = {};
+};
+
+// Design doc 2.6 step 2's 「候选格分数缓存」, and the 候选分数缓存 entry of the
+// file manifest at :582: what one empty square is worth is worked out once and
+// then read by every node that meets the same square on the same four lines,
+// instead of being recomputed by each of them.
+//
+// A square's price is a function of four things: the two colours' stones on each
+// of the four lines through it, the square's own coordinates, and the evaluator's
+// coefficients. `recognize_position_both` reads the first two - a 9-cell window
+// centred on the square per direction, plus the board walks `finish_direction`
+// runs for a BLACK four or live three, and every one of those walks stays on the
+// line it started from (board.cpp:214, pattern.cpp:363-487) - and
+// `candidate_value` adds the coordinates (the centre weight, the closed-end
+// discount) and the coefficients. Nothing outside those four lines is consulted,
+// so the eight line words are the complete dependency of the record, and
+// comparing them is both the whole invalidation test and the whole reason the
+// cache needs no move bookkeeping in `Board`: a stone anywhere on one of the
+// square's lines changes a word, and taking it off again changes the word back.
+class CandidateCache {
+public:
+    // The two colours' shapes at one square and what each is worth there. A reader
+    // picks its own side by who is to move, so one record answers a BLACK node and
+    // a WHITE node alike, and the record needs no colour field:
+    // `evaluate_position_pair(board, r, c, colour)` is `value_black + value_white`
+    // whichever colour asks, because the two terms of that sum merely swap places
+    // (evaluator.cpp:192 - the fact test_evaluator.cpp:388 already pins).
+    struct Cell {
+        PositionPattern black;
+        PositionPattern white;
+        int value_black = 0;
+        int value_white = 0;
+
+        int side_value(int color) const { return color == BLACK ? value_black : value_white; }
+        int pair_value() const { return value_black + value_white; }
+    };
+
+    explicit CandidateCache(const Evaluator& evaluator) : evaluator_(evaluator) {}
+
+    // The square's record, or null when a stone stands on it - the guard every
+    // caller already runs, and the reason a cached number can never describe an
+    // occupied square.
+    const Cell* cell(const Board& board, int row, int col) {
+        if (!board.is_empty(row, col)) return nullptr;
+        ++probes_;
+        Entry& entry = entries_[row * BOARD_SIZE + col];
+        uint64_t key[kLineWords];
+        line_key(board, row, col, key);
+        if (entry.valid) {
+            bool same = true;
+            for (int d = 0; d < kLineWords; ++d) {
+                if (entry.key[d] != key[d]) {
+                    same = false;
+                    break;
+                }
+            }
+            if (same) {
+                ++hits_;
+                return &entry.cell;
+            }
+        }
+        ++recomputes_;
+        // Ask as BLACK and the two outputs are the two colours' own patterns, in a
+        // fixed order - which is what lets one entry serve a node of either side.
+        PatternRecognizer::recognize_position_both(board, row, col, BLACK, entry.cell.black,
+                                                   entry.cell.white);
+        entry.cell.value_black =
+            evaluator_.evaluate_position_with_pattern(board, row, col, entry.cell.black, BLACK);
+        entry.cell.value_white =
+            evaluator_.evaluate_position_with_pattern(board, row, col, entry.cell.white, WHITE);
+        for (int d = 0; d < kLineWords; ++d) entry.key[d] = key[d];
+        entry.valid = true;
+        return &entry.cell;
+    }
+
+    // The two answers the search used to pay a fresh four-direction pass for.
+    int pair_score(const Board& board, int row, int col) {
+        const Cell* found = cell(board, row, col);
+        return found == nullptr ? 0 : found->pair_value();
+    }
+
+    // What the square is worth to `color` alone - the single-side price
+    // quiescence orders its forcing moves on.
+    int side_score(const Board& board, int row, int col, int color) {
+        const Cell* found = cell(board, row, col);
+        return found == nullptr ? 0 : found->side_value(color);
+    }
+
+    // Step 2's own ledger, in the same shape as step 1's: `hits + recomputes ==
+    // probes` is what says no read was answered twice or not at all.
+    uint64_t probes() const { return probes_; }
+    uint64_t hits() const { return hits_; }
+    uint64_t recomputes() const { return recomputes_; }
+
+private:
+    // One word per direction family, both colours in it. `LINE_MARGIN` puts a
+    // line's real cells at bits 8..22 and the guard bits below and above them are
+    // never set by a stone (board.h:14-18), so a colour's word always fits under
+    // bit 32 and the shift cannot lose a bit.
+    static const int kLineWords = 4;
+
+    static void line_key(const Board& board, int row, int col, uint64_t* out) {
+        for (int d = 0; d < kLineWords; ++d) {
+            const int line = line_index(d, row, col);
+            out[d] = board.line_bits(BLACK, d, line) |
+                     (board.line_bits(WHITE, d, line) << 32);
+        }
+    }
+
+    struct Entry {
+        uint64_t key[kLineWords] = {};
+        Cell cell;
+        bool valid = false;
+    };
+
+    // Indexed by cell, the way the history table is, so a read costs no lookup.
+    // `valid` starts false and only ever turns true with a key written next to it,
+    // so the first think of a session cannot read an entry it did not fill.
+    Entry entries_[BOARD_SIZE * BOARD_SIZE];
+    // The coefficients a filled price was taken with. A cache lives and dies with
+    // the search that owns it, and a search holds one evaluator for the whole
+    // think, so a record can outlive the node that wrote it but not the
+    // coefficients it was priced under.
+    const Evaluator& evaluator_;
+    uint64_t probes_ = 0;
+    uint64_t hits_ = 0;
+    uint64_t recomputes_ = 0;
 };
 
 // Everything one think mutates that is not a result: the budget it is spending,

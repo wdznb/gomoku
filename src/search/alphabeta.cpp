@@ -68,7 +68,7 @@ void AlphaBetaSearch::sort_moves(std::vector<Move>& moves, const Board& board, i
     // ③/④ Everything else, on what the cell is worth (the static price) and then on
     // what this search has seen of it (history).
     //
-    // evaluate_position_both runs four pattern recognitions per call; the
+    // evaluate_position_pair runs four pattern recognitions per call; the
     // comparator used to invoke it O(n log n) times per node. Score once up
     // front and sort the pairs instead.
     //
@@ -78,11 +78,13 @@ void AlphaBetaSearch::sort_moves(std::vector<Move>& moves, const Board& board, i
     // every node of every ply. Score both sides directly and skip that
     // redundant work.
     //
-    // The tiered generator has already produced this list's scores, so the pass
-    // below does read them a second time. Deliberately so, until stage C's
-    // candidate score cache replaces it: the price is still the fallback the design
-    // doc's ④ asks for, and the killer/history stages have nothing to say about a
-    // cell they have never cut.
+    // The price now comes from the generator's cell cache (design doc 2.6 step 2),
+    // which is the pass that produced these candidates in the first place: the
+    // square's four lines are unchanged between generate() and this loop, so the
+    // read is a hit and the number is the one the tier was cut with. It is still
+    // asked per candidate rather than taken out of the tier list, because the
+    // three stages above this point can pin a square that generate() did not rank,
+    // and the fallback has to price whatever it is given.
     int start = static_cast<int>(head);
     int count = static_cast<int>(moves.size()) - start;
     if (count <= 1) return;
@@ -91,7 +93,7 @@ void AlphaBetaSearch::sort_moves(std::vector<Move>& moves, const Board& board, i
     scored.reserve(count);
     for (int i = 0; i < count; ++i) {
         const Move& m = moves[start + i];
-        int s = evaluator_.evaluate_position_pair(board, m.pos.row, m.pos.col, color);
+        int s = move_gen_.candidate_price(board, m.pos);
         scored.emplace_back(s, static_cast<size_t>(start + i));
     }
     // The price is the first key and history the second, then the two geometric

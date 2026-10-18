@@ -151,16 +151,24 @@ void MoveGenerator::generate(const Board& board, int color, int ply, bool in_qui
         // The candidate set is maintained by place_stone / undo_last_move, so an
         // occupied cell should never be in it; the search has always re-checked, and
         // a tier that trusted a stale list would search a square that has a stone on
-        // it.
+        // it. The cache answers the same question with null, so an occupied square
+        // reaches no pattern at all.
         if (!board.is_empty(pos)) continue;
+        const CandidateCache::Cell* found = cache_.cell(board, pos.row, pos.col);
+        if (found == nullptr) continue;
 
-        PositionPattern mine, theirs;
-        PatternRecognizer::recognize_position_both(board, pos.row, pos.col, color, mine, theirs);
+        // One record gives both sides' shapes at this square, whichever side is to
+        // move: the pass is a function of the four lines through it, not of who is
+        // asking, so a BLACK node and a WHITE node read the same two patterns off
+        // the same record and pick their own side of them.
+        const bool black_to_move = color == BLACK;
+        const PositionPattern& mine = black_to_move ? found->black : found->white;
+        const PositionPattern& theirs = black_to_move ? found->white : found->black;
 
         // A shape BLACK may not legally play is not a candidate at all, whichever
         // tier it would have landed in. Read off the pattern above: this is the same
         // test is_forbidden() runs, without its second four-direction scan.
-        if (color == BLACK && PatternRecognizer::is_forbidden_from_pattern(mine)) continue;
+        if (black_to_move && PatternRecognizer::is_forbidden_from_pattern(mine)) continue;
 
         if (in_quiescence) {
             // Quiescence is a race of forcing moves, so it prices a candidate by
@@ -168,17 +176,13 @@ void MoveGenerator::generate(const Board& board, int color, int ply, bool in_qui
             // square are what the next recursion of the subtree sees, not a reason
             // to cut it out of this one.
             if (makes_forcing_threat(mine)) {
-                out->threats.push_back(
-                    {Move(pos, color),
-                     evaluator_.evaluate_position_with_pattern(board, pos.row, pos.col, mine,
-                                                               color)});
+                out->threats.push_back({Move(pos, color), found->side_value(color)});
             }
             continue;
         }
 
         // Both sides of the square, from the patterns the tier test already used.
-        const int score =
-            evaluator_.candidate_pair_value(mine, theirs, pos.row, pos.col, color);
+        const int score = found->pair_value();
         const Candidate candidate{Move(pos, color), score};
 
         // Tier0's second half: a square where the *opponent* would complete five is

@@ -7225,6 +7225,489 @@ void test_a_cached_sign_answers_both_sides_of_every_shape() {
               << std::endl;
 }
 
+// ---------------------------------------------------------------------------
+// C2 - 候选格分数缓存 (design doc 2.6 Step 2: 「每个候选格缓存 evaluate_position_pair
+// 分数。落子/撤销只更新受影响格（该格 ±2 邻域内、以及该格自身所在 4 条线上的候选格，
+// 约 15-25 个），而不是每节点重算全部候选。这是「排序」路径的主要成本」, :406-407).
+//
+// A memo owes three answers and the first three cases give one each: the number is the
+// one the pass it replaces gives (C2-1 - the 逐格比对 :556 #3 asks for, over 225 squares x
+// two colours x 42 boards in the method that clause names), it knows when it has gone
+// stale (C2-2), and the reader asks for what the writer had (C2-3). C2-4 and C2-5 are the
+// think level: the tree and the counters C1 pinned, unmoved, with this step's own ledger
+// sitting next to them rather than in place of them.
+//
+// The doc's dirty set is not what shipped, and the reason is correctness rather than
+// taste. 「该格 ±2 邻域内、以及该格自身所在 4 条线上的候选格」 is a footprint, and a
+// footprint is not what a record depends on: finish_direction walks the very line it
+// started on out to nine cells - the fill_run loop that decides whether a BLACK four has
+// a completion point at all looks five cells past the first empty cell after the group -
+// so a stone outside every ±2/±4 footprint can still change what the square is worth.
+// C2-2 is such a square: (7,7) reads 1224 with BLACK (7,9)(7,10)(7,11) on the board, and
+// 224 after BLACK plays (7,12) - five cells away, one cell past the window's edge at
+// (7,11). The key that shipped is the four line words themselves: the complete
+// dependency, four loads, no bookkeeping in Board, which is why a make/unmake sibling
+// revalidates by comparing rather than by being remembered.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// The recognizer's whole answer, field by field: a record that got the four directions
+// right and the analyze() aggregates wrong would still order differently. The oracle is
+// the two single-colour calls, which test_pattern.cpp:464 already proves
+// recognize_position_both against - this case does not re-prove that layer, it proves the
+// record kept on top of it.
+bool c2_patterns_equal(const PositionPattern& a, const PositionPattern& b) {
+    for (int d = 0; d < 4; ++d) {
+        if (a.directions[d].type != b.directions[d].type) return false;
+        if (a.directions[d].direction != b.directions[d].direction) return false;
+    }
+    return a.four_count == b.four_count && a.three_count == b.three_count &&
+           a.live_four_count == b.live_four_count && a.rush_four_count == b.rush_four_count &&
+           a.live_three_count == b.live_three_count && a.has_four_four == b.has_four_four &&
+           a.has_four_three == b.has_four_three && a.has_three_three == b.has_three_three &&
+           a.has_live_four == b.has_live_four && a.has_rush_four == b.has_rush_four &&
+           a.has_live_three == b.has_live_three;
+}
+
+// 42 boards: 40 pseudo-random ones and the two that pack every line through the centre, so
+// the census runs over ordinary shapes and over the colour-specific corrections (WHITE
+// overline demotion, BLACK overline promotion, the locked-four and sleepy-three walks) at
+// the same time. It carries its own generator instead of std::mt19937 because this file's
+// include block sits above three assertions the suite cites by line number - :2591, :3973
+// and :3986 - and a new #include would move all three.
+std::vector<Board> c2_census_boards() {
+    std::vector<Board> boards;
+    unsigned long long state = 0x20261019ULL;
+    auto drawn = [&state](int bound) {
+        state = state * 6364136223846793005ULL + 1442695040888963407ULL;
+        return static_cast<int>((state >> 33) % static_cast<unsigned long long>(bound));
+    };
+    for (int game = 0; game < 40; ++game) {
+        Board board;
+        const int stones = 1 + drawn(45);
+        for (int i = 0; i < stones; ++i) {
+            board.place_stone(drawn(BOARD_SIZE), drawn(BOARD_SIZE), i % 2 == 0 ? BLACK : WHITE);
+        }
+        boards.push_back(board);
+    }
+    for (const int color : {BLACK, WHITE}) {
+        Board board;
+        for (int i = 0; i < BOARD_SIZE; ++i) {
+            board.place_stone(7, i, color);
+            board.place_stone(i, 7, color);
+            board.place_stone(i, i, color);
+            board.place_stone(i, BOARD_SIZE - 1 - i, color);
+        }
+        boards.push_back(board);
+    }
+    return boards;
+}
+
+// One record against the pass it stands in for, in both directions of both halves: the two
+// shapes, each shape priced for its own colour, and the pair either colour of caller asks for.
+void c2_check_record(const CandidateCache::Cell& found, const Board& board, int row, int col,
+                     const Evaluator& evaluator, long long& checked) {
+    const PositionPattern ref_black = PatternRecognizer::recognize_position(board, row, col, BLACK);
+    const PositionPattern ref_white = PatternRecognizer::recognize_position(board, row, col, WHITE);
+    assert(c2_patterns_equal(found.black, ref_black));
+    assert(c2_patterns_equal(found.white, ref_white));
+    assert(found.value_black ==
+           evaluator.evaluate_position_with_pattern(board, row, col, ref_black, BLACK));
+    assert(found.value_white ==
+           evaluator.evaluate_position_with_pattern(board, row, col, ref_white, WHITE));
+
+    for (const int side : {BLACK, WHITE}) {
+        PositionPattern mine, theirs;
+        PatternRecognizer::recognize_position_both(board, row, col, side, mine, theirs);
+        assert(c2_patterns_equal(mine, side == BLACK ? found.black : found.white));
+        assert(found.side_value(side) ==
+               evaluator.evaluate_position_with_pattern(board, row, col, mine, side));
+        assert(found.pair_value() ==
+               evaluator.candidate_pair_value(mine, theirs, row, col, side));
+        assert(found.pair_value() == evaluator.evaluate_position_pair(board, row, col, side));
+    }
+    ++checked;
+}
+
+bool c2_tier_equal(const std::vector<Candidate>& a, const std::vector<Candidate>& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (!(a[i].move == b[i].move) || a[i].score != b[i].score) return false;
+    }
+    return true;
+}
+
+bool c2_sets_equal(const CandidateSet& a, const CandidateSet& b) {
+    return c2_tier_equal(a.forced, b.forced) && c2_tier_equal(a.threats, b.threats) &&
+           c2_tier_equal(a.vicinity, b.vicinity) && c2_tier_equal(a.remote, b.remote);
+}
+
+// b1_scattered with a BLACK three at (7,9)(7,10)(7,11): the empty (7,7) reads 冲四 through
+// the hole at (7,8), and (7,12) - five cells away, one cell past the window's edge - is the
+// stone that takes that four away.
+Board c2_far_reach_board() {
+    return b1_board({{2, 2, BLACK}, {12, 12, WHITE}, {2, 12, BLACK}, {12, 2, WHITE},
+                     {7, 9, BLACK}, {7, 10, BLACK}, {7, 11, BLACK}});
+}
+
+}
+
+// The 逐格比对 :556 #3 asks of an evaluation cache, at the cache's own level: every square of
+// every board, both colours' shapes and both prices, against the fresh pass. A record that
+// was merely plausible on the poses would pass a sample; this is the case that says the
+// record is the pass, everywhere, and that an occupied square never reaches one.
+void test_the_cell_cache_answers_the_fresh_pass_on_every_square() {
+    const std::vector<Board> boards = c2_census_boards();
+    assert(boards.size() == 42);
+    Evaluator evaluator;
+    long long squares = 0, checked = 0, guarded = 0;
+
+    for (const Board& board : boards) {
+        CandidateCache cache(evaluator);
+        const CandidateCache::Cell* records[BOARD_SIZE][BOARD_SIZE] = {};
+        int empties = 0;
+
+        for (int row = 0; row < BOARD_SIZE; ++row) {
+            for (int col = 0; col < BOARD_SIZE; ++col) {
+                ++squares;
+                if (!board.is_empty(row, col)) {
+                    // A stone on the square is not a candidate for anybody. The guard answers
+                    // before the ledger is touched and before any record is read, so a stale
+                    // active_empty() list can neither price an occupied square nor spend a
+                    // probe on one - and 0 is exactly what the pass itself says.
+                    assert(cache.cell(board, row, col) == nullptr);
+                    for (const int side : {BLACK, WHITE}) {
+                        assert(cache.side_score(board, row, col, side) == 0);
+                        assert(evaluator.evaluate_position_pair(board, row, col, side) == 0);
+                    }
+                    assert(cache.pair_score(board, row, col) == 0);
+                    ++guarded;
+                    continue;
+                }
+                records[row][col] = cache.cell(board, row, col);
+                assert(records[row][col] != nullptr);
+                c2_check_record(*records[row][col], board, row, col, evaluator, checked);
+                ++empties;
+            }
+        }
+
+        assert(cache.probes() == static_cast<uint64_t>(empties));
+        assert(cache.recomputes() == static_cast<uint64_t>(empties));
+        assert(cache.hits() == 0);
+
+        // The same board asked a second time: the answer is the same record, not a copy of
+        // it, and the second trip recognizes nothing at all.
+        for (int row = 0; row < BOARD_SIZE; ++row) {
+            for (int col = 0; col < BOARD_SIZE; ++col) {
+                if (records[row][col] == nullptr) continue;
+                assert(cache.cell(board, row, col) == records[row][col]);
+            }
+        }
+        assert(cache.probes() == static_cast<uint64_t>(empties) * 2);
+        assert(cache.hits() == static_cast<uint64_t>(empties));
+        assert(cache.recomputes() == static_cast<uint64_t>(empties));
+    }
+
+    assert(squares == 42 * BOARD_SIZE * BOARD_SIZE);
+    assert(checked > 4000);
+    assert(guarded > 0);
+    assert(guarded + checked == squares);
+
+    std::cout << "test_the_cell_cache_answers_the_fresh_pass_on_every_square passed ("
+              << squares << " squares over " << boards.size() << " boards: " << checked
+              << " empty, each one's two shapes and two prices equal to the fresh pass, and "
+              << guarded << " occupied squares answered 0 with no probe spent; the second "
+                 "trip over a board is all hits and the same record addresses)" << std::endl;
+}
+
+// What the key actually depends on, measured rather than assumed: reach past the window,
+// precision off the lines, and what an undo leaves behind.
+void test_a_stone_five_cells_away_is_inside_the_records_dependency() {
+    Evaluator evaluator;
+    CandidateCache cache(evaluator);
+    Board board = c2_far_reach_board();
+    long long checked = 0;
+
+    // (7,7)'s row window is (7,3)..(7,11). Everything the windowed matcher reads for the
+    // shape is inside it; the corrections finish_direction runs for BLACK are not.
+    const CandidateCache::Cell* square = cache.cell(board, 7, 7);
+    assert(square != nullptr);
+    assert(square->black.directions[0].type == PatternType::RUSH_FOUR);
+    assert(square->value_black == 1112);
+    assert(square->value_white == 112);
+    assert(square->pair_value() == 1224);
+    c2_check_record(*square, board, 7, 7, evaluator, checked);
+    assert(checked == 1);
+    assert(cache.probes() == 1 && cache.recomputes() == 1 && cache.hits() == 0);
+    assert(cache.cell(board, 7, 7) == square);
+    assert(cache.hits() == 1 && cache.recomputes() == 1);
+
+    // BLACK at (7,12): the fill at (7,8) that made exactly five now makes six, so the four
+    // has no legal completion point left and the shape is nothing. Five cells from the
+    // square - no footprint, and not the window either, would have refreshed it. The line
+    // key does, because (7,12) is on row 7.
+    assert(board.place_stone(7, 12, BLACK));
+    const CandidateCache::Cell* after = cache.cell(board, 7, 7);
+    assert(after == square);  // the same slot, now carrying the new answer
+    assert(after->black.directions[0].type == PatternType::NONE);
+    assert(after->pair_value() == 224);
+    assert(cache.hits() == 1 && cache.recomputes() == 2);
+    c2_check_record(*after, board, 7, 7, evaluator, checked);
+
+    // Undoing the stone does not bring the old record back - the slot holds the child's key
+    // now - it makes the next read recompute, and the recomputed number is the one from
+    // before the stone. That is the sibling case a search lives on: the parent pays for this
+    // square once per changed line, not once per child.
+    board.undo_last_move();
+    assert(cache.cell(board, 7, 7)->pair_value() == 1224);
+    assert(cache.recomputes() == 3 && cache.hits() == 1);
+    assert(cache.cell(board, 7, 7)->pair_value() == 1224);
+    assert(cache.hits() == 2 && cache.recomputes() == 3);
+
+    // The other half of the claim: the key is per line, not a stamp on the whole board.
+    // (4,6) shares no row, column or diagonal with (7,7), so a sibling branch over there
+    // reprices nothing here and the record is read as it stands.
+    assert(board.place_stone(4, 6, WHITE));
+    assert(cache.cell(board, 7, 7)->pair_value() == 1224);
+    assert(cache.hits() == 3 && cache.recomputes() == 3);
+    board.undo_last_move();
+    assert(cache.cell(board, 7, 7)->pair_value() == 1224);
+    assert(cache.hits() == 4 && cache.recomputes() == 3);
+
+    assert(cache.hits() + cache.recomputes() == cache.probes());
+
+    std::cout << "test_a_stone_five_cells_away_is_inside_the_records_dependency passed ("
+                 "(7,7) 1224 -> 224 on a BLACK stone at (7,12), five cells out and one past "
+                 "the window; back to 1224 on the undo at the cost of one recompute and free "
+                 "after that; (4,6) off all four lines and free throughout; "
+              << checked << " records differential-checked against the fresh pass)" << std::endl;
+}
+
+// The two consumers of a record against the pass behind them: the tiers have to be the tiers
+// a cold generator would have produced - whatever colour filled the record - and the
+// ordering pass has to be handed the number the tier was cut on.
+void test_the_tiers_and_the_ordering_read_the_same_record_the_pass_wrote() {
+    const Board boards[] = {b1_quiet(), b1_scattered(), b1_crowded(), b1_white_open_four(),
+                            b1_black_makes_five(), b1_double_three()};
+    Evaluator evaluator;
+    int lists = 0, priced = 0;
+
+    for (const Board& board : boards) {
+        // Warm side: WHITE's pass first, so BLACK's tiers are cut from records a different
+        // colour's pass filled. Reference side: each colour on a generator that has never
+        // seen this board, which is the path this step replaced.
+        MoveGenerator flipped(evaluator);
+        CandidateSet flipped_white, flipped_black, flipped_quiet;
+        flipped.generate(board, WHITE, 0, false, &flipped_white);
+        flipped.generate(board, BLACK, 0, false, &flipped_black);
+        flipped.generate(board, BLACK, 0, true, &flipped_quiet);
+
+        MoveGenerator plain_white(evaluator), plain_black(evaluator), plain_quiet(evaluator);
+        CandidateSet ref_white, ref_black, ref_quiet;
+        plain_white.generate(board, WHITE, 0, false, &ref_white);
+        plain_black.generate(board, BLACK, 0, false, &ref_black);
+        plain_quiet.generate(board, BLACK, 0, true, &ref_quiet);
+
+        assert(c2_sets_equal(flipped_white, ref_white));
+        assert(c2_sets_equal(flipped_black, ref_black));
+        assert(c2_sets_equal(flipped_quiet, ref_quiet));
+        lists += 3;
+
+        // And every price in them is the fresh pass's price.
+        struct List {
+            const CandidateSet& set;
+            int colour;
+        };
+        const List lists_of_board[] = {{ref_white, WHITE}, {ref_black, BLACK}};
+        for (const List& item : lists_of_board) {
+            const std::vector<Candidate>* tiers[] = {&item.set.forced, &item.set.threats,
+                                                     &item.set.vicinity, &item.set.remote};
+            for (const std::vector<Candidate>* tier : tiers) {
+                for (const Candidate& c : *tier) {
+                    assert(c.score == evaluator.evaluate_position_pair(board, c.move.pos.row,
+                                                                        c.move.pos.col,
+                                                                        item.colour));
+                    ++priced;
+                }
+            }
+        }
+        // Quiescence prices one side only, because that list is a race of forcing moves and
+        // the quiet half of the square is not what the recursion is about.
+        for (const Candidate& c : ref_quiet.threats) {
+            const PositionPattern mine = PatternRecognizer::recognize_position(
+                board, c.move.pos.row, c.move.pos.col, BLACK);
+            assert(c.score == evaluator.evaluate_position_with_pattern(board, c.move.pos.row,
+                                                                      c.move.pos.col, mine,
+                                                                      BLACK));
+            ++priced;
+        }
+
+        // The ordering pass's own reader, over the whole active list rather than the squares
+        // that survived truncation: sort_moves asks for a square the tier list dropped every
+        // time a TT or killer move names it, and what it gets is the answer
+        // evaluate_position_pair gives on a board with no cache in front of it.
+        MoveGenerator gen(evaluator);
+        CandidateSet main_set;
+        gen.generate(board, BLACK, 0, false, &main_set);
+        for (const Position& pos : board.active_empty()) {
+            for (const int colour : {BLACK, WHITE}) {
+                assert(gen.candidate_price(board, pos) ==
+                       evaluator.evaluate_position_pair(board, pos.row, pos.col, colour));
+                ++priced;
+            }
+        }
+    }
+
+    // A square BLACK may not legally play is worth its other colour's side and nothing for
+    // BLACK - and one record still has to carry both halves, because the side that may stand
+    // there is the side the next node is asking about. (7,7) here is 三三: the tier rule keeps
+    // it out of every BLACK list, while the record keeps the shape itself and zeroes only the
+    // price, which is what lets a WHITE node read the same slot. The reader that reaches a
+    // square no tier carries is the ordering fallback, handed one by the TT or a killer.
+    {
+        const Board board = b1_double_three();
+        const Position forbidden(7, 7);
+        MoveGenerator gen(evaluator);
+        CandidateSet black_set;
+        gen.generate(board, BLACK, 0, false, &black_set);
+        const std::vector<Move> black_moves = black_set.flatten();
+        assert(board.is_empty(forbidden));
+        assert(std::find(black_moves.begin(), black_moves.end(), Move(forbidden, BLACK)) ==
+               black_moves.end());
+
+        CandidateCache cache(evaluator);
+        const CandidateCache::Cell* found = cache.cell(board, forbidden.row, forbidden.col);
+        assert(found != nullptr);
+        assert(found->black.has_three_three);
+        assert(found->value_black == 0);
+        assert(found->value_white > 0);
+        assert(found->pair_value() == found->value_white);
+        assert(found->pair_value() == gen.candidate_price(board, forbidden));
+        assert(cache.side_score(board, forbidden.row, forbidden.col, WHITE) == found->value_white);
+        assert(cache.side_score(board, forbidden.row, forbidden.col, BLACK) == 0);
+        for (const int colour : {BLACK, WHITE}) {
+            assert(gen.candidate_price(board, forbidden) ==
+                   evaluator.evaluate_position_pair(board, forbidden.row, forbidden.col, colour));
+        }
+    }
+
+    assert(lists == 18);
+    // 6 boards x (both colours' tier lists + the quiescence row + the whole active list
+    // priced twice over). The count is the census these assertions ran over, so it is
+    // pinned rather than left as a floor: a pose set that stopped producing candidates
+    // would quietly turn this case into a sample of one.
+    assert(priced == 1516);
+
+    std::cout << "test_the_tiers_and_the_ordering_read_the_same_record_the_pass_wrote passed ("
+              << lists << " tier lists over six boards identical to the cold generator's, "
+              << priced << " prices equal to the fresh pass, and the forbidden (7,7) priced "
+                 "at its WHITE side alone)" << std::endl;
+}
+
+// The think-level net. Step 2 was not allowed to move the tree, and C1 already pinned what
+// this pose's tree is: the node and score lines below are that promise, and so is the scan
+// ledger, field for field - step 2 caches the candidate pass and does not touch the
+// whole-board scan. On top of them sits step 2's own ledger, which is what says the half it
+// saved was saved reading a record rather than guessing.
+void test_a_quiet_think_prices_its_candidates_about_once_in_two() {
+    struct Row {
+        int color;
+        uint64_t nodes;
+        uint64_t qnodes;
+        uint64_t scans;
+        uint64_t reuses;
+        uint64_t patches;
+        uint64_t probes;
+        uint64_t hits;
+        uint64_t recomputes;
+        int score;
+    };
+    const Row rows[] = {
+        {BLACK, 221774, 142978, 75855, 67123, 75852, 4066903, 2097434, 1969469, 71992},
+        {WHITE, 156428, 102340, 68419, 33921, 68419, 3003955, 1539956, 1463999, 97044},
+    };
+    const Board board = b1_quiet();
+    Evaluator evaluator;
+    std::atomic<bool> stop(false);
+
+    for (const Row& row : rows) {
+        TranspositionTable tt;
+        AlphaBetaSearch search(evaluator, tt);
+        search.set_node_limit(INT_MAX);
+        search.search(board, row.color, 6, 0, stop);
+
+        // The tree step 2 was not allowed to change, and the scan ledger step 1 pinned.
+        assert(search.stats_.nodes == row.nodes);
+        assert(search.stats_.qnodes == row.qnodes);
+        assert(search.stats_.score == row.score);
+        assert(search.ctx_.eval_scans() == row.scans);
+        assert(search.ctx_.eval_reuses() == row.reuses);
+        assert(search.ctx_.eval_patches() == row.patches);
+        assert(search.ctx_.eval_scans() + search.ctx_.eval_reuses() == row.qnodes);
+
+        // Step 2's ledger on the same think. The hit count is what HEAD cannot report at
+        // all: on 897ab43 every one of these 4,066,903 asks pays its own four-direction
+        // pass, and the number below is the count of asks this step answers for free.
+        const CandidateCache& cache = search.move_gen_.cache();
+        assert(cache.probes() == row.probes);
+        assert(cache.hits() == row.hits);
+        assert(cache.recomputes() == row.recomputes);
+        assert(cache.hits() + cache.recomputes() == cache.probes());
+        assert(cache.hits() > 0);
+        assert(cache.recomputes() > 0);
+    }
+
+    std::cout << "test_a_quiet_think_prices_its_candidates_about_once_in_two passed (quiet "
+                 "BLACK 4066903 candidate reads = 2097434 from a record + 1969469 priced "
+                 "here, on the 221774-node tree; WHITE 3003955 = 1539956 + 1463999 on the "
+                 "156428-node tree; C1's 75855/67123/75852 and 68419/33921/68419 scan "
+                 "ledgers unmoved)" << std::endl;
+}
+
+// The cache belongs to the think. C1-5's warm repeat answers in 187 nodes off the table the
+// first think filled, and it does that with a cache of its own: a second AlphaBetaSearch
+// starts cold, pays for its own records, and finds nothing on the first think's shelf.
+// Nothing crosses a think boundary except through the table - which is what keeps the
+// coefficients a price was taken with honest, since a session can hand the next think a
+// different set.
+void test_a_warm_think_buys_its_own_records_and_no_ones_from_the_first() {
+    const Board board = b1_quiet();
+    Evaluator evaluator;
+    std::atomic<bool> stop(false);
+
+    TranspositionTable tt;
+    AlphaBetaSearch first(evaluator, tt);
+    first.set_node_limit(INT_MAX);
+    first.search(board, BLACK, 6, 0, stop);
+    const uint64_t first_probes = first.move_gen_.cache().probes();
+
+    AlphaBetaSearch second(evaluator, tt);
+    second.set_node_limit(INT_MAX);
+    second.search(board, BLACK, 6, 0, stop);
+    const CandidateCache& cache = second.move_gen_.cache();
+
+    // C1's warm answer, unchanged by step 2: the tree comes out of the table's records and
+    // the one evaluation it still needs is a read rather than a scan.
+    assert(second.stats_.nodes == 187);
+    assert(second.ctx_.eval_scans() == 0);
+    assert(second.ctx_.eval_reuses() == 1);
+
+    // Its candidate work, on the other hand, is its own: 111 reads for this think, 58 of
+    // them priced here and 53 answered from records this think itself filled. None of the
+    // first think's reads carried over.
+    assert(cache.probes() == 111);
+    assert(cache.hits() == 53);
+    assert(cache.recomputes() == 58);
+    assert(cache.hits() + cache.recomputes() == cache.probes());
+    assert(cache.probes() < first_probes);
+
+    std::cout << "test_a_warm_think_buys_its_own_records_and_no_ones_from_the_first passed "
+                 "(warm repeat 187 nodes / 0 scans / 1 reuse as C1 pins it, its own 111 "
+                 "candidate reads = 53 hits + 58 recomputes, the first think's "
+              << first_probes << " reads left behind)" << std::endl;
+}
+
 int main() {
     std::cout << "Running search tests..." << std::endl;
 
@@ -7373,6 +7856,15 @@ int main() {
     test_static_score_reuses_a_cached_number_for_either_colour();
     test_a_cached_sign_answers_both_sides_of_every_shape();
     test_a_quiet_think_pays_for_each_evaluation_only_once();
+
+    // C2, in the contract's order: the record against the pass on every square, what the
+    // record depends on, the two consumers of it, then the think's own ledger and the
+    // boundary the cache does not cross.
+    test_the_cell_cache_answers_the_fresh_pass_on_every_square();
+    test_a_stone_five_cells_away_is_inside_the_records_dependency();
+    test_the_tiers_and_the_ordering_read_the_same_record_the_pass_wrote();
+    test_a_quiet_think_prices_its_candidates_about_once_in_two();
+    test_a_warm_think_buys_its_own_records_and_no_ones_from_the_first();
 
     std::cout << "All search tests passed!" << std::endl;
     return 0;
