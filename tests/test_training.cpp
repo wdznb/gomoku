@@ -113,6 +113,26 @@ void assert_playable_line(const std::vector<Move>& moves) {
     }
 }
 
+// The board after a line, folded to its smallest symmetry variant: two openings
+// that differ only by a rotation are the same position for a symmetric engine, so a
+// set is only as diverse as the number of these keys it produces.
+std::string symmetry_key_of(const std::vector<Move>& line) {
+    Board board;
+    for (const auto& move : line) board.place_stone(move.pos, move.color);
+    std::string best;
+    for (int variant = 0; variant < SYMMETRY_COUNT; ++variant) {
+        const Board turned = transform_board(board, variant);
+        std::string cells;
+        for (int row = 0; row < BOARD_SIZE; ++row) {
+            for (int col = 0; col < BOARD_SIZE; ++col) {
+                cells += std::to_string(static_cast<char>('0' + turned.get(row, col)));
+            }
+        }
+        if (best.empty() || cells < best) best = cells;
+    }
+    return best;
+}
+
 void assert_playable(const GameRecord& record) {
     assert_playable_line(moves_of(record));
 }
@@ -1843,18 +1863,18 @@ void test_play_game_counts_only_valid_games() {
     // once, and an unfinished game scores half.
     assert(trainer.games_played() == 0);
     bool played = false;
-    assert(trainer.play_game(black, white, 1, &played) == 0.5);
+    assert(trainer.play_game(black, white, 1, {}, &played) == 0.5);
     assert(played);
     assert(trainer.games_played() == 1);
     SearchEngine black_b;
     SearchEngine white_b;
-    assert(trainer.play_game(black_b, white_b, 2) == 0.5);
+    assert(trainer.play_game(black_b, white_b, 2, {}) == 0.5);
     assert(trainer.games_played() == 2);
 
     // An explicit null out-parameter is not a crash and not a behaviour change.
     SearchEngine black_c;
     SearchEngine white_c;
-    assert(trainer.play_game(black_c, white_c, 1, nullptr) == 0.5);
+    assert(trainer.play_game(black_c, white_c, 1, {}, nullptr) == 0.5);
     assert(trainer.games_played() == 3);
 
     // Every game in a match is undecided (MOVE_LIMIT), so the average is 0.5
@@ -3520,6 +3540,7 @@ void test_trainer_refuses_a_seed_that_a_resume_would_drop() {
     }
     const std::string base =
         "--rounds 1 --population 2 --generations 1 --depth 1 --timeout-ms 1 --max-moves 2 "
+        "--match-opening-plies 0 "
         "--fitness-games 1 --verification-games 2 --no-data --quiet";
     const std::filesystem::path err = temp_path("r101_ff2_stderr.txt");
     auto read_all = [](const std::filesystem::path& p) {
@@ -3630,6 +3651,7 @@ void test_trainer_refuses_one_file_for_both_out_and_checkpoint() {
     }
     const std::string base =
         "--rounds 1 --population 2 --generations 1 --depth 1 --timeout-ms 1 --max-moves 2 "
+        "--match-opening-plies 0 "
         "--fitness-games 1 --verification-games 2 --no-data --quiet";
     const std::filesystem::path err = temp_path("r106_jj2_stderr.txt");
     auto read_all = [](const std::filesystem::path& p) {
@@ -3790,6 +3812,7 @@ void test_trainer_refuses_one_file_written_two_ways_for_out_and_checkpoint() {
     }
     const std::string base =
         "--rounds 1 --population 2 --generations 1 --depth 1 --timeout-ms 1 --max-moves 2 "
+        "--match-opening-plies 0 "
         "--fitness-games 1 --verification-games 2 --no-data --quiet";
     const std::filesystem::path err = temp_path("r110_nn1a_stderr.txt");
     auto read_all = [](const std::filesystem::path& p) {
@@ -3888,6 +3911,7 @@ void test_trainer_accepts_a_resume_and_checkpoint_that_differ_only_by_a_dot_segm
     }
     const std::string base =
         "--rounds 1 --population 2 --generations 1 --depth 1 --timeout-ms 1 --max-moves 2 "
+        "--match-opening-plies 0 "
         "--fitness-games 1 --verification-games 2 --no-data --quiet";
     const std::filesystem::path err = temp_path("r110_nn1b_stderr.txt");
     auto read_all = [](const std::filesystem::path& p) {
@@ -4138,7 +4162,7 @@ void test_trainer_config_node_budget_reaches_both_game_paths() {
     SearchEngine black;
     SearchEngine white;
     bool played = false;
-    assert(trainer.play_game(black, white, 1, &played) == 0.5);
+    assert(trainer.play_game(black, white, 1, {}, &played) == 0.5);
     assert(played);
     assert(black.max_nodes() == config.max_nodes);
     assert(white.max_nodes() == config.max_nodes);
@@ -4154,7 +4178,7 @@ void test_trainer_config_node_budget_reaches_both_game_paths() {
     SearchEngine white_b;
     black_b.set_max_nodes(9000);
     white_b.set_max_nodes(9000);
-    assert(unarmed.play_game(black_b, white_b, 1, nullptr) == 0.5);
+    assert(unarmed.play_game(black_b, white_b, 1, {}, nullptr) == 0.5);
     assert(black_b.max_nodes() == 0);
     assert(white_b.max_nodes() == 0);
 
@@ -4209,6 +4233,7 @@ void test_trainer_cli_max_nodes_probes() {
     }
     const std::string base =
         "--rounds 1 --population 2 --generations 1 --depth 1 --timeout-ms 1 --max-moves 2 "
+        "--match-opening-plies 0 "
         "--fitness-games 1 --verification-games 2 --no-data --quiet";
     const std::filesystem::path err = temp_path("r126_max_nodes_stderr.txt");
     const std::filesystem::path out_path = temp_path("r126_max_nodes_out.json");
@@ -4499,6 +4524,7 @@ void test_trainer_cli_shared_tt_probes() {
     }
     const std::string base =
         "--rounds 1 --population 2 --generations 1 --depth 1 --timeout-ms 1 --max-moves 2 "
+        "--match-opening-plies 0 "
         "--fitness-games 1 --verification-games 2 --no-data --quiet";
     const std::filesystem::path err = temp_path("r127_shared_tt_stderr.txt");
     const std::filesystem::path out_path = temp_path("r127_shared_tt_out.json");
@@ -4830,7 +4856,8 @@ void test_trainer_cli_sprt_probes() {
     }
     const std::string base =
         "--rounds 1 --method hill --hill-iterations 1 --depth 1 --timeout-ms 1 "
-        "--max-moves 2 --fitness-games 1 --verification-games 4 --no-data --quiet";
+        "--max-moves 2 --match-opening-plies 0 --fitness-games 1 "
+        "--verification-games 4 --no-data --quiet";
     const std::filesystem::path err = temp_path("r128_sprt_stderr.txt");
     const std::filesystem::path out_path = temp_path("r128_sprt_out.json");
     const std::filesystem::path ck = temp_path("r128_sprt_ck.json");
@@ -4917,6 +4944,264 @@ void test_trainer_cli_sprt_probes() {
     std::cout << "test_trainer_cli_sprt_probes passed" << std::endl;
 #endif
 }
+
+// D-4, design doc 2.8 #4. The set a match pair is played from: fixed by index, so
+// two candidates measured in one round are measured on the same positions; diverse,
+// so a match asks eight questions instead of the same one twice; and short enough to
+// replay legally, because a line the replay refuses would leave the match with no
+// denominator rather than a smaller one.
+void test_match_opening_set_is_fixed_and_diverse() {
+    // The shipped default is OFF, and this is the door that keeps it off: the round's
+    // mirror screen found 47 of 48 four-ply lines already won by one colour, so a
+    // replayed opening pins its pair at 0.5 instead of testing the coefficients. The
+    // mechanism below is what a named count arms.
+    assert(TrainingConfig().match_opening_plies == 0);
+
+    // Plies 0 is the pre-#4 contract and the arm the readings compare against.
+    assert(Trainer::match_opening_line(0, 0).empty());
+    assert(Trainer::match_opening_line(3, 0).empty());
+    assert(Trainer::match_opening_line(-2, 0).empty());
+
+    // One ply is forced - an empty board has no near-neighbour candidates - so every
+    // member opens with the same BLACK stone and the set's diversity lives after it.
+    std::set<std::string> keys;
+    for (int i = 0; i < Trainer::kMatchOpeningSet; ++i) {
+        const std::vector<Move> line = Trainer::match_opening_line(i, 4);
+        assert(line.size() == 4);
+        assert(line[0] == Move(BOARD_SIZE / 2, BOARD_SIZE / 2, BLACK));
+        assert(line[1].color == WHITE);
+        assert(line[2].color == BLACK);
+        assert(line[3].color == WHITE);
+        assert_playable_line(line);
+        keys.insert(symmetry_key_of(line));
+    }
+    // Distinct as positions, not merely as move sequences: a mirror image of an
+    // opening asks a symmetric engine the same question, so counting the fold is the
+    // only way to know the set really has eight members.
+    std::cout << "  [r129] opening set: " << Trainer::kMatchOpeningSet << " indices of 4 "
+                 "plies reach " << keys.size() << " positions after folding the "
+              << SYMMETRY_COUNT << " symmetries" << std::endl;
+    assert(keys.size() == static_cast<size_t>(Trainer::kMatchOpeningSet));
+
+    // Why four plies is the floor when the mechanism is armed and not a guess:
+    // legal_moves() only walks the cells near a stone, so with one stone on the board
+    // the reply is chosen from a handful of neighbourhood cells, and eight indices
+    // cannot yield eight positions. The reading is printed, not asserted equal to the
+    // set size - the ceiling is the reason four is the smallest useful count.
+    std::set<std::string> two_ply_keys;
+    for (int i = 0; i < Trainer::kMatchOpeningSet; ++i) {
+        const std::vector<Move> line = Trainer::match_opening_line(i, 2);
+        assert(line.size() == 2);
+        assert_playable_line(line);
+        two_ply_keys.insert(symmetry_key_of(line));
+    }
+    std::cout << "  [r129] the same 8 indices at 2 plies reach only " << two_ply_keys.size()
+              << " positions - four is the floor when the flag is armed" << std::endl;
+    assert(two_ply_keys.size() < static_cast<size_t>(Trainer::kMatchOpeningSet));
+
+    // Fixed means bounded: past the end of the set the rotation reuses the same lines
+    // instead of inventing an unbounded number of them, and asking twice answers twice
+    // the same way.
+    assert(Trainer::match_opening_line(Trainer::kMatchOpeningSet, 4) ==
+           Trainer::match_opening_line(0, 4));
+    assert(Trainer::match_opening_line(Trainer::kMatchOpeningSet + 3, 4) ==
+           Trainer::match_opening_line(3, 4));
+    assert(Trainer::match_opening_line(-Trainer::kMatchOpeningSet, 4) ==
+           Trainer::match_opening_line(0, 4));
+    assert(Trainer::match_opening_line(2, 4) == Trainer::match_opening_line(2, 4));
+    assert(Trainer::match_opening_line(2, 6).size() == 6);
+
+    // A longer request stays legal, not merely longer: BLACK's next stone is picked
+    // out of legal_moves(), which is the same filter the replay validates against.
+    for (int i = 0; i < Trainer::kMatchOpeningSet; ++i) {
+        assert_playable_line(Trainer::match_opening_line(i, 6));
+    }
+
+    std::cout << "test_match_opening_set_is_fixed_and_diverse passed" << std::endl;
+}
+
+// The wiring. A prefix play_game does not hand to SelfPlay cannot be seen from
+// outside, but an illegal prefix is loud: it discards the game, so the discard is
+// what proves the line travelled - and it is also the failure mode that matters,
+// because a generator that produced an illegal opening would silently eat the
+// match's denominator instead of failing.
+void test_match_pair_replays_its_opening_and_discards_an_illegal_one() {
+    TrainingConfig config = fast_training_config();
+    config.search_depth = 1;
+    config.timeout_ms = 50;
+    config.max_moves = 6;
+    Trainer trainer(ThreatCoefficients(), config);
+    const int before = trainer.games_played();
+
+    // Every member of the set replays: eight games played, eight games counted.
+    bool played = false;
+    for (int i = 0; i < Trainer::kMatchOpeningSet; ++i) {
+        SearchEngine black;
+        SearchEngine white;
+        const double score =
+            trainer.play_game(black, white, 1, Trainer::match_opening_line(i, 4), &played);
+        assert(played);
+        assert(score == 0.0 || score == 0.5 || score == 1.0);
+    }
+    assert(trainer.games_played() - before == Trainer::kMatchOpeningSet);
+
+    // A cell used twice is not a draw and not a half: it leaves the denominator,
+    // which is what keeps a broken opening from scoring as a survived game.
+    std::vector<Move> twice;
+    twice.emplace_back(3, 3, BLACK);
+    twice.emplace_back(3, 3, WHITE);
+    SearchEngine black_b;
+    SearchEngine white_b;
+    played = true;
+    assert(trainer.play_game(black_b, white_b, 1, twice, &played) == 0.0);
+    assert(!played);
+
+    // And the colour order is checked, not assumed: WHITE opening on an empty board
+    // fails the same way, so a set that stopped alternating would show up here.
+    std::vector<Move> wrong_colour;
+    wrong_colour.emplace_back(7, 7, WHITE);
+    SearchEngine black_c;
+    SearchEngine white_c;
+    played = true;
+    assert(trainer.play_game(black_c, white_c, 2, wrong_colour, &played) == 0.0);
+    assert(!played);
+    assert(trainer.games_played() - before == Trainer::kMatchOpeningSet);
+
+    std::cout << "  [r129] " << Trainer::kMatchOpeningSet
+              << " openings replayed and counted, 2 illegal lines discarded without "
+                 "touching the counter"
+              << std::endl;
+    std::cout << "test_match_pair_replays_its_opening_and_discards_an_illegal_one passed"
+              << std::endl;
+}
+
+// The rotation through the door the optimisers use. A match with the sequential test
+// off spends every pair it asks for, so the game count is the contract: four pairs
+// means eight games, all of them replayed from the round's openings and none of them
+// discarded. Deeper openings keep the same promise.
+void test_a_match_rotates_through_the_opening_set() {
+    TrainingConfig config = fast_training_config();
+    config.search_depth = 1;
+    config.timeout_ms = 50;
+    config.max_moves = 6;
+    config.sprt_elo = 0;
+    config.max_moves = 8;
+    config.match_opening_plies = 4;
+
+    Trainer shallow(ThreatCoefficients(), config);
+    const int before_shallow = shallow.games_played();
+    const MatchOutcome pairs =
+        shallow.score_match(ThreatCoefficients(), ThreatCoefficients(), 8);
+    std::cout << "  [r129] 8-game match at 4 opening plies: " << pairs.games
+              << " games counted, score " << pairs.score << std::endl;
+    assert(pairs.games == 8);
+    assert(shallow.games_played() - before_shallow == 8);
+
+    config.match_opening_plies = 6;
+    Trainer deep(ThreatCoefficients(), config);
+    const int before_deep = deep.games_played();
+    const MatchOutcome deeper = deep.score_match(ThreatCoefficients(), ThreatCoefficients(), 8);
+    std::cout << "  [r129] 8-game match at 6 opening plies: " << deeper.games
+              << " games counted, score " << deeper.score << std::endl;
+    assert(deeper.games == 8);
+    assert(deep.games_played() - before_deep == 8);
+
+    // Plies 0 is the arm the readings compare against: the same match, from the
+    // empty board, still spends all eight games.
+    config.match_opening_plies = 0;
+    Trainer empty_start(ThreatCoefficients(), config);
+    const int before_empty = empty_start.games_played();
+    const MatchOutcome old =
+        empty_start.score_match(ThreatCoefficients(), ThreatCoefficients(), 8);
+    assert(old.games == 8);
+    assert(empty_start.games_played() - before_empty == 8);
+
+    std::cout << "test_a_match_rotates_through_the_opening_set passed" << std::endl;
+}
+
+// The flag at the CLI door: 0 is its own answer and parses, a negative is refused by
+// name, a count that reaches the ply cap is refused because it would leave the game
+// with nothing searched, and the usage text carries the row. --max-moves 2 is the
+// shipped short-game probe, so the ceiling is one ply away and both sides of the
+// guard are reachable.
+void test_trainer_cli_match_opening_probes() {
+#ifndef _WIN32
+    if (!std::filesystem::exists("gomoku_train")) {
+        std::cout << "  --match-opening-plies probes skipped: gomoku_train is not in the "
+                     "working directory" << std::endl;
+        std::cout << "test_trainer_cli_match_opening_probes passed" << std::endl;
+        return;
+    }
+    const std::string base =
+        "--rounds 1 --method hill --hill-iterations 1 --depth 1 --timeout-ms 1 "
+        "--max-moves 2 --fitness-games 1 --verification-games 2 --no-data --quiet";
+    const std::filesystem::path out_path = temp_path("r129_open_out.json");
+    const std::filesystem::path ck = temp_path("r129_open_ck.json");
+    const std::filesystem::path err = temp_path("r129_open_stderr.txt");
+    auto read_all = [](const std::filesystem::path& p) {
+        std::ifstream in(p);
+        std::ostringstream text;
+        text << in.rdbuf();
+        return text.str();
+    };
+    auto run = [&](const std::string& arguments) {
+        const std::string command = "./gomoku_train " + base + " --out '" + out_path.string() +
+                                    "' --checkpoint '" + ck.string() + "' " + arguments +
+                                    " > /dev/null 2> '" + err.string() + "'";
+        const int status = std::system(command.c_str());
+        assert(status != -1);
+        return WEXITSTATUS(status);
+    };
+
+    std::error_code ec;
+    std::filesystem::remove(out_path, ec);
+    std::filesystem::remove(ck, ec);
+
+    // One replayed ply under a two-ply cap is still a searched game: accepted. The
+    // same request at the cap is refused, and 0 - no opening at all - is accepted.
+    const int one = run("--match-opening-plies 1");
+    const int at_cap = run("--match-opening-plies 2");
+    // Read the refusal before the next arm overwrites the log: the arm that exits 0
+    // writes nothing to it.
+    const std::string cap_err = read_all(err);
+    const int off = run("--match-opening-plies 0");
+    // Asking for nothing is the shipped default, and under --max-moves 2 the default
+    // has to clear the guard - which is only true because it is 0.
+    const int unnamed = run("");
+    std::cout << "  [r129] --match-opening-plies 1 => exit " << one << ", 2 with "
+                 "--max-moves 2 => exit "
+              << at_cap << ", 0 => exit " << off << ", unnamed => exit " << unnamed
+              << std::endl;
+    assert(one == 0);
+    assert(at_cap == 1);
+    assert(off == 0);
+    assert(unnamed == 0);
+    // The refusal names both flags: a run that dies on this combination has to be
+    // told which of the two to move.
+    assert(cap_err.find("--match-opening-plies") != std::string::npos);
+    assert(cap_err.find("--max-moves") != std::string::npos);
+
+    assert(run("--match-opening-plies -1") == 1);
+    assert(run("--match-opening-plies") == 1);
+    assert(run("--match-opening-plies 1e1") == 1);
+    assert(run("--match-opening-plies ''") == 1);
+
+    const std::filesystem::path usage = temp_path("r129_open_usage.txt");
+    assert(std::system(("./gomoku_train --help > '" + usage.string() + "' 2>&1").c_str()) != -1);
+    const std::string help = read_all(usage);
+    std::cout << "  [r129] --help mentions --match-opening-plies: "
+              << (help.find("--match-opening-plies") != std::string::npos ? "yes" : "no")
+              << std::endl;
+    assert(help.find("--match-opening-plies") != std::string::npos);
+
+    std::filesystem::remove(out_path, ec);
+    std::filesystem::remove(ck, ec);
+    std::filesystem::remove(err, ec);
+    std::filesystem::remove(usage, ec);
+    std::cout << "test_trainer_cli_match_opening_probes passed" << std::endl;
+#endif
+}
+
 
 int main() {
     std::cout << "Running training tests..." << std::endl;
@@ -5010,6 +5295,13 @@ int main() {
     test_a_closed_sprt_ends_the_match_early();
     test_a_reject_verdict_keeps_a_candidate_the_bar_would_promote();
     test_trainer_cli_sprt_probes();
+
+    // D4, in the contract's order: the set itself, the door a line goes through,
+    // the rotation over a match's pairs, then the flag at the CLI.
+    test_match_opening_set_is_fixed_and_diverse();
+    test_match_pair_replays_its_opening_and_discards_an_illegal_one();
+    test_a_match_rotates_through_the_opening_set();
+    test_trainer_cli_match_opening_probes();
 
     std::cout << "All training tests passed" << std::endl;
     return 0;

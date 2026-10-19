@@ -58,7 +58,7 @@ SearchEngine& Trainer::prepare(SearchEngine& engine) const {
 }
 
 double Trainer::play_game(SearchEngine& black, SearchEngine& white, int black_owner,
-                          bool* played) {
+                          const std::vector<Move>& opening, bool* played) {
     SelfPlayConfig settings;
     settings.max_depth = config_.search_depth;
     settings.timeout_ms = config_.timeout_ms;
@@ -66,7 +66,7 @@ double Trainer::play_game(SearchEngine& black, SearchEngine& white, int black_ow
     settings.max_moves = config_.max_moves;
 
     SelfPlay play(black, white, settings);
-    GameRecord record = play.run(std::vector<Move>(), nullptr, nullptr);
+    GameRecord record = play.run(opening, nullptr, nullptr);
     const bool valid = record.reason != GameEndReason::INVALID;
     if (played) *played = valid;
     // Same yardstick as the data side: an INVALID game is discarded, so it
@@ -126,15 +126,25 @@ MatchOutcome Trainer::score_match(const ThreatCoefficients& candidate,
     double score = 0.0;
     int played_games = 0;
     for (int i = 0; i < pairs; ++i) {
+        // One position per pair, replayed identically for both colours: the pair
+        // then measures the same opening once from each side, so what that opening
+        // gives the first mover cancels inside the pair instead of deciding it.
+        // Rotating the position by round and pair index is what stops every match
+        // of a run from asking the same question about the same two stones
+        // (design doc 2.8 #4).
+        const std::vector<Move> opening =
+            match_opening_line(rounds_completed_ + i, config_.match_opening_plies);
         bool valid = false;
-        const double first = play_game(candidate_engine, reference_engine, 1, &valid);
+        const double first =
+            play_game(candidate_engine, reference_engine, 1, opening, &valid);
         if (valid) {
             score += first;
             ++played_games;
             test.add_game(first);
         }
         valid = false;
-        const double second = play_game(reference_engine, candidate_engine, 2, &valid);
+        const double second =
+            play_game(reference_engine, candidate_engine, 2, opening, &valid);
         if (valid) {
             score += second;
             ++played_games;
@@ -193,6 +203,17 @@ std::vector<Move> Trainer::random_opening_line(int plies, uint64_t seed) {
     }
 
     return line;
+}
+
+std::vector<Move> Trainer::match_opening_line(int index, int plies) {
+    if (plies <= 0) return {};
+    // Fixed by index, not by --seed: two candidates measured in the same round have
+    // to be handed the same positions, and a set that moved with the run's seed
+    // would make the pairing depend on a number the optimiser does not care about.
+    // Wrapping is what makes this a set at all - past kMatchOpeningSet the rotation
+    // reuses the same lines instead of inventing an unbounded number of them.
+    const int wrapped = ((index % kMatchOpeningSet) + kMatchOpeningSet) % kMatchOpeningSet;
+    return random_opening_line(plies, static_cast<uint64_t>(wrapped) + 1);
 }
 
 int Trainer::generate_data_games(int games, int threads) {

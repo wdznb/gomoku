@@ -55,6 +55,17 @@ void print_usage(const char* program) {
         "                              side can also finish early, so a smaller one mostly\n"
         "                              just plays every pair (300; 0 turns the test off,\n"
         "                              which --no-sprt also does)\n"
+        "  --match-opening-plies N     Plies of the fixed opening every match pair\n"
+        "                              replays, then plays once with each colour, so a\n"
+        "                              position's first-move advantage cancels inside\n"
+        "                              the pair (design doc 2.8 #4). Two plies cannot\n"
+        "                              diversify - one centre stone leaves five reply\n"
+        "                              classes, fewer than the set has slots - hence\n"
+        "                              four when armed. Off by default (0), because a\n"
+        "                              mirror screen of 48 such lines at depth 4 found\n"
+        "                              45 already won by one colour: the swap then turns\n"
+        "                              the forced win into a 0.5 pair, not into a test\n"
+        "                              of the coefficients\n"
         "  --data-games N              Self-play games kept as training data (4)\n"
         "  --threads N                 Parallel data-collection workers (2)\n"
         "  --shared-tt N               Slots in the one transposition table the\n"
@@ -247,6 +258,11 @@ int main(int argc, char** argv) {
                 config.sprt_elo = require_int("--sprt-elo", i, argc, argv, 0);
             } else if (flag == "--no-sprt") {
                 config.sprt_elo = 0;
+            } else if (flag == "--match-opening-plies") {
+                // Zero is a real answer here too - "no opening, empty board" - so
+                // negatives alone are refused; the ceiling is the --max-moves guard.
+                config.match_opening_plies =
+                    require_int("--match-opening-plies", i, argc, argv, 0);
             } else if (flag == "--data-games") {
                 config.data_games = require_int("--data-games", i, argc, argv);
             } else if (flag == "--threads") {
@@ -311,6 +327,17 @@ int main(int argc, char** argv) {
         std::cerr << "Error: --shared-tt must be at most 4194304 slots (~117MB), got "
                   << config.shared_tt_entries << " (0 gives each worker its own table)"
                   << std::endl;
+        return 1;
+    }
+    // A match replays the opening and then plays out from that position, so a count
+    // that reaches the ply cap leaves no searched ply in the game: both colours of
+    // every pair would be the same two replayed stones and the score would measure
+    // nothing. Refuse the combination instead of quietly truncating it -- pass
+    // --match-opening-plies 0 to play a truncated game on purpose.
+    if (config.match_opening_plies >= config.max_moves) {
+        std::cerr << "Error: --match-opening-plies must stay below --max-moves, got "
+                  << config.match_opening_plies << " with --max-moves "
+                  << config.max_moves << " (0 plays from an empty board)" << std::endl;
         return 1;
     }
 

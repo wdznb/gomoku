@@ -59,6 +59,29 @@ struct TrainingConfig {
     // the counts ask for, which is what both flags meant before. sprt.h carries
     // the arithmetic that makes 300 the smallest default the ceiling can reach.
     int sprt_elo = 300;
+    // Plies of a fixed opening every match pair replays before it starts thinking
+    // (design doc 2.8 #4). Each pair takes one position from a fixed set and plays it
+    // once with each colour, which cancels that position's first-move advantage inside
+    // the pair and lets different pairs probe different positions.
+    //
+    // The shipped default is 0 - the mechanism is armed but off - because the doc's
+    // promise ("let the coefficients, not the first move, decide") measures backwards
+    // on this engine. Screened at depth 4 / 400 ms with both engines holding the same
+    // coefficients, 45 of the first 48 four-ply lines end with one colour winning every
+    // game: at that strength a four-stone position is usually already a forced win, so
+    // the colour swap does not turn the pair into a coefficient test, it turns the
+    // forced win into a pair that scores exactly 0.5 whoever is better. The full run
+    // agrees - plies 4 raised the share of fitness matches pinned at 0.5 from the
+    // control's 32.5 % to 38.8 % and the colour-decided pair share to 66.9 %. 0 is the
+    // pre-#4 contract and the arm those readings are compared against; a named count is
+    // the way to probe a position class the screen has not ruled out yet.
+    //
+    // When it is armed, four plies is the floor, not a guess: legal_moves() walks only
+    // the cells near a stone, so with BLACK on the centre the reply is 24 neighbourhood
+    // cells folded into 5 symmetry classes - the generator's whole 2-ply vocabulary -
+    // and the eight set indices in fact land on 4 of them. At four plies the eight
+    // indices give eight positions that stay distinct after folding the symmetries.
+    int match_opening_plies = 0;
 
     // Self-play games generated per round purely to collect training data.
     int data_games = 4;
@@ -152,6 +175,21 @@ public:
     // A short random opening so parallel workers do not all replay one line.
     static std::vector<Move> random_opening_line(int plies, uint64_t seed);
 
+    // How many distinct openings a match rotates through. Pairs index into the set
+    // by (round + pair), so a candidate measured in the same round as the champion
+    // is measured on the same positions, and the four pairs a
+    // --verification-games 8 match plays each get a different opening. Eight is a
+    // budget, not a ceiling: at four plies the generator keeps producing new
+    // positions well past it (16 indices land on 16 classes even after folding the
+    // symmetries). A small set is chosen so a long run comes back to positions it
+    // has already measured instead of never measuring one twice.
+    static constexpr int kMatchOpeningSet = 8;
+
+    // The opening one match pair is played from, fixed by its index in that set:
+    // legal by construction (it is generated move by move out of the same
+    // legal_moves() the replay validates against) and identical for every run.
+    static std::vector<Move> match_opening_line(int index, int plies);
+
     bool save_checkpoint(const std::string& path, std::string& error) const;
     bool load_checkpoint(const std::string& path, std::string& error);
 
@@ -164,8 +202,9 @@ private:
     // Score for whoever holds the stones passed as `black_owner` (1 = the
     // candidate, 2 = the reference). `played` says whether the game happened at
     // all: a discarded INVALID one is not a draw and leaves the denominator.
+    // Both games of a pair get the same `opening`, once with each colour.
     double play_game(SearchEngine& black, SearchEngine& white, int black_owner,
-                     bool* played = nullptr);
+                     const std::vector<Move>& opening, bool* played = nullptr);
     SearchEngine& prepare(SearchEngine& engine) const;
     int generate_data_games(int games, int threads);
 

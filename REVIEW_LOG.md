@@ -1979,6 +1979,81 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次129 引擎重构 D-4：开局多样化第一次能做，而镜像筛查证明它在这个强度上是反的 — engine redesign stage D4, match openings and the mirror screen that turned the default off
+
+规格 `docs/ENGINE_REDESIGN.md` `:436`（§2.8 `#4`「开局多样化：从开局库按权重采样不同开局（当前训练期开局库被完全关闭，导致"颜色通吃"）。改为『固定一组多样化开局 + 交换黑白』，让胜负由系数而非先手决定」）。落地清单只把这一件记了一处：`:590` 的 `src/training/self_play.cpp` 行「节点预算；共享 TT；开局多样化」——`:591` 的 `trainer.cpp` 行没有它（那行是「SPRT 自适应对局数；共享 TT；引擎复用」），`:592` 是 `main_trainer.cpp`。验收仍是 `:550` 那一行的三个读数（单轮耗时 −40 %、内存峰值与并发局数解耦、`--fitness-games 2` 下 fitness 不再只有三档）。本轮把这一件的**机制**做完并留在树上，然后把**缺省关掉**（`--match-opening-plies 0`）：一个树外仪表、一次镜像筛查、一轮两局的轮换见证，三个读数指向同一个结论——在深度 4 / 400 ms 这个强度上，先重放一条固定开局不会让胜负「由系数而非先手决定」，它把一个本来就是必胜的局面钉成 0.5 的一对。`:550` 的三个读数本轮一个都没动：机制改的是**配对打什么局面**，不是成本模型。
+
+### 实现：一对钉一个局面，索引是「轮次 + 对序」，与 `--seed` 无关
+
+- `Trainer::play_game()`（`src/training/trainer.cpp:60-61`）多收一个 `const std::vector<Move>& opening`，原样交给 `SelfPlay::run()`（`:69`；改前那句是 `play.run(std::vector<Move>(), ...)`，所以空 vector 就是老契约）。**`src/training/self_play.cpp` 一个字没改**：`:590` 把这一件记在对弈层，但重放前缀的通道（`entry.method = "replay"`，`self_play.cpp:53`）D-1 就铺好了，本轮缺的是「谁决定这一对打哪个局面」，那句话属于匹配层而不是对弈层。这是本轮相对落地清单的一处有意偏离，写在这里而不是藏在 diff 里。
+- `Trainer::match_opening_line(index, plies)`（`src/training/trainer.cpp:208`）：`plies <= 0` 直接返回空，否则取 `random_opening_line(plies, wrapped + 1)`，`wrapped` 把 `index` 折进 `[0, kMatchOpeningSet)`（负索引同样折进来）。固定的是**索引 → 开局**这张表，不是 `--seed`：同一轮里候选和冠军必须拿到同一批局面，而一张跟着 run 的 seed 走的表会让「配对是否公平」取决于优化器根本不关心的那个数。
+- `score_match()`（`src/training/trainer.cpp:92`，配对循环 `:128-150`）每对先算一条 `match_opening_line(rounds_completed_ + i, config_.match_opening_plies)`（`:136`），**同一条 opening 交给他两局**——`:139` 候选执黑、`:147` 候选执白——序贯检验仍旧只在 `end_pair()` 读界（`:157`，口径与轮次128 一致）。
+- 配置 `TrainingConfig::match_opening_plies`（`src/training/trainer.h:84`）缺省 **0**，`Trainer::kMatchOpeningSet = 8`（`:186`），声明在 `:191`。CLI `--match-opening-plies N`：帮助 `src/training/main_trainer.cpp:58-68`，解析 `:261-265`（`require_int` 下界 0），加一条启动守卫 `:337-341`——`--match-opening-plies >= --max-moves` 立刻退出 1，因为那样一整局从头到尾都是重放、没有一手是搜出来的，验证赛的分母就空了。
+- README 表**没有新增行**：新旗标并进 `--accept-score / --sprt-elo / --no-sprt` 那一行（`README.md:199`），另两处正文行内改（`:211`、`:213`），**658 行不变**。这不是洁癖：`tests/readme_anchor_check.js` 的引用按行号寻址，多加一行表就把 `web/app.js:342 -> README:580` 那批引用推到空行上——本轮中途就实测崩出 **21 条 PROBLEM**（`gates_anchor.log`），并回原行以后 120 citations / 0 problems（`gates_anchor_final.log`）。
+- 测试四条（`tests/test_training.cpp`，注册在 `test_trainer_cli_sprt_probes()` 之后，`:5301-5304`）：`test_match_opening_set_is_fixed_and_diverse()`（缺省 0 `:4958`、`plies=0` 的老契约、8 个索引在 4 手上折完 8 个对称仍是 8 个不同局面 `:4984`、**同样 8 个索引在 2 手上只到 4 个** `:5000`（读数打印出来，不断言相等）、越界回绕 `:5005`、重复询问同答、6 手仍然合法）；`test_match_pair_replays_its_opening_and_discards_an_illegal_one()`（8 条开局各打一局、8 局都进分母，重复格与错色的前缀必须 INVALID 出局 `:5056` `:5067`——一条非法开局若被当成和局，它会伪装成一次成功的对局）；`test_a_match_rotates_through_the_opening_set()`（关掉检验时 8 局上限真的下满 8 局，4 手／6 手／0 手三个臂同样下满）；`test_trainer_cli_match_opening_probes()`（1 手收、2 手在 `--max-moves 2` 下拒 `:5176`、0 收、**不点名也收**，加上 `-1`／缺值／`1e1`／空串四个拒绝臂与 `--help` 行）。
+
+### 读数 1：三条臂，同一命令同一 seed，只有旗标不同
+
+仪表在树外（`/tmp/d4/instrument2.py`，每局一行 `m=/tag=/pair=/owner=/winner=/reason=/want=/plies=/open=[]/pref=`；`src/training/trainer.cpp` 打完即从 `/tmp/d4/committed_trainer.cpp` 还原），串行单机。三臂同一命令 `--population 4 --generations 2 --stagnation 2 --fitness-games 4 --verification-games 8 --no-data --sprt-elo 300 --rounds 8 --seed 20261011`（检验是开着的，`--no-data` 让三臂都不采集数据，成本全部落在对弈上）。判据是**整场钉在 0.5 的比例**，不是每对的颜色横扫率——一场的分数是各对之和，只有整场钉住才等于「这场没有排序信息」，而 `--accept-score 0.56` 要越过的正是这个平台。
+
+| 臂 | 树 / 配置 | wall / user s | maxRSS kB | 局 / 场 / 对 | 适配度场钉在 0.5 | 颜色决定的对 | 横扫方向 |
+|---|---|---|---|---|---|---|---|
+| `base` | 改前的 HEAD 树（等价 `plies 0`） | 1106.83 / 1100.18 | 27,052 | 370 / 88 / 185 | 19/80 = 23.8 % | 63/178 = 35.4 % | BLACK 30 / WHITE 33 |
+| `open0` | 本轮树，缺省即 0 | 1050.36 / 1045.41 | 27,000 | 378 / 88 / 189 | 26/80 = 32.5 % | 89/179 = 49.7 % | BLACK 61 / WHITE 28 |
+| `open4` | 本轮树，`--match-opening-plies 4` | 1034.02 / 1025.31 | 27,020 | 384 / 88 / 192 | 31/80 = **38.8 %** | 121/181 = **66.9 %** | BLACK 95 / WHITE 26 |
+
+`open0` 与 `base` 在语义上是同一棵树（`plies<=0` 返回空，`play.run({})` 就是改前那句），可它自己就移动了 14 个百分点（23.8 → 32.5）：缺省搜索受 `--timeout-ms` 约束，同一条命令在负载不同的时刻会搜到不同深度。这正是 `:550` 第一笔（−40 % 耗时、成本可预测）还没钱的原因，也是本轮**只把 `open4` 与 `open0` 相比**、不把 `open4` 与 `base` 相比的理由。同树两臂差 6.3 个百分点（32.5 → 38.8），方向更干脆：横扫里 BLACK 从 61 涨到 95、WHITE 从 28 掉到 26。耗时与内存在三臂之间没有可用信号（wall ±7 %，`maxRSS` 27.0 MB 上下 52 kB），本轮没动成本模型。两条完整性读数顺带落到仪表里：`open4` 八轮共打到 **8** 条不同开局（集合被用满，没有一局的重放中途停住——`games whose replay stopped short of the request: 0`），`open0` 的 378 局全部是空盘。
+
+### 读数 2：镜像筛查——48 条 4 手开局里 45 条被一方全吃
+
+`/tmp/d4/screen.cpp`：把 `Trainer::random_opening_line(4, i + 1)` 的索引从 0 数到 47，每条打 6 局**镜像**（双方同一套缺省系数，深度 4 / 400 ms / 60 手上限）：
+
+| 结果 | 条数 |
+|---|---|
+| BLACK 6 局全吃 | 35 |
+| WHITE 6 局全吃 | 10 |
+| 两色都拿过（5-1 与 4-2） | 2 |
+| 6 局都没打完（60 手上限） | 1 |
+
+**48 条里 45 条由颜色定死，只有 3 条不是。**缺省那 8 条（索引 0-7）又单独测了一遍（`/tmp/d4/bias.cpp`，每条 8 局镜像）：索引 2-7 六条 BLACK 8-0，索引 1 是 BLACK 7-1，索引 0 反而 WHITE 8-0；空盘对照（`plies=0`）是 WHITE 8-0——正是 `README.md:213` 记的轮次 54 现象。
+
+于是「换局面」这件事的因果要说反的方向：一对的两局各持黑白打**同一个**局面，局面若是先手必胜，两局就分别是「候选拿先手赢」和「冠军拿先手赢」，一对记 1.0，一场下来正是 `--accept-score` 必须越过的那个 0.5。颜色交换消掉的是局面偏袒在**分数**里的体现，消不掉它在**信息**里的体现。所以 `#4` 想要的「让胜负由系数而非先手决定」成立的条件是 `|局面对先手的价值| < |系数差|`，而深度 4 的四子局基本不满足这条。把缺省设成 0 是把这个读数落到代码里，而不是把一个让目标指标恶化的取值当缺省发出去；下一笔钱在别处——要么换开局形状（更厚、双方结构全等，例如把白的两子取成黑的两子的平移），要么先把搜索的确定性解决掉（`:550` 的 `--max-nodes` 那一笔），否则连一次筛查本身都要被时间噪声淹掉 14 个百分点。生成器那一侧的限制也一并量清了，它们决定了「点名 4 手」这个下界：`legal_moves()` 只走棋子周围的邻格，黑占天元时白方第二手是 **24** 个邻格、折成 **5** 个对称类（2 手的全部词汇表），而缺省 8 个索引实测只落到其中 **4** 类；4 手上 8 个索引给 8 个折完对称仍不同的局面，16 个索引给 16 个——所以 `kMatchOpeningSet = 8` 是**预算不是上限**（预算的意义在于长程运行会重访局面），4 才是武装时的下界。读数可用 `/tmp/d4/probe2.cpp`、`probe3.cpp` 与 `test_match_opening_set_is_fixed_and_diverse` 打印的那两行重做。
+
+### 变异矩阵：五条被套件打死，两条只能由仪表作证
+
+`/tmp/d4/mut_d4.sh`，串行、每臂先按名字删掉受影响的 `.o` 再重建（打印 `recompiles=4`，防这座 vmhgfs-fuse 挂载上的 epoch-1 mtime 空构建）。控制臂 `rc=0`，7 行 `[r129]`。
+
+| 变异 | 打它的断言 | 结果 |
+|---|---|---|
+| M1 集合塌成一条（`wrapped = 0`） | `tests/test_training.cpp:4984` `keys.size() == kMatchOpeningSet` | rc=134 |
+| M2 不回绕（索引 8 ≠ 索引 0） | `:5005` `match_opening_line(kMatchOpeningSet, 4) == match_opening_line(0, 4)` | rc=134 |
+| M3 `play_game` 丢掉 handed 的前缀 | `:5056` 重复格的那局不再被判 INVALID | rc=134 |
+| M5 缺省改成 4（把关掉的东西打开） | `:4958` `TrainingConfig().match_opening_plies == 0` | rc=134 |
+| M6 守卫改成 `>`（允许开局吃满手数） | `:5176` `at_cap == 1` | rc=134 |
+| M4 第二色重放**下一条**开局 | 套件看不见（对局层无法从外部区分两条合法开局） | 仪表：24/24 对的两色开局不一致；干净树 192 对里 **0** 对 |
+| M7 轮换不看轮次（`match_opening_line(i, ...)`） | 套件看不见 | 仪表：两轮口径见下 |
+
+M7 在 1 轮口径上读不出差别（一场适配度赛只用 2 对，索引 0-1 与 0-1 相同），所以 `/tmp/d4/gap_stages.sh` 把它挪到 `--rounds 2` 重测，两臂都带仪表、都点 `--match-opening-plies 4`、同 seed、`--seed 20261011`，各 96 局 22 场 48 对：
+
+| 臂 | 用到的集合索引 | 落在两条开局上的局数 | 第一轮 fit 各对的开局索引 | 第二轮 fit 各对的开局索引 |
+|---|---|---|---|---|
+| 控制（`rounds_completed_ + i`） | 0-4，共 **5** 条 | 68/96 | 对 0 → 0，对 1 → 1 | 对 0 → **1**，对 1 → **2** |
+| M7（只看 `i`） | 0-3，共 **4** 条 | 88/96 | 对 0 → 0，对 1 → 1 | 对 0 → 0，对 1 → 1 |
+
+也就是说：M7 的第二轮与第一轮**逐对相同**（`m7b.err` 里 22 场的对 0 全是索引 0、对 1 全是索引 1），控制臂的第二轮整批前移一格；把「同一对序跨轮是否换开局」当作判据，控制臂 2 个槽位换、M7 0 个。这条是仪表读数，不是套件断言——它值得的那点东西（长程运行不重访同一批局面）本来也不是一条可以从外部区分的性质。
+
+**仪表自身会打断一条既有测试**：M4／M7 两臂是「打了仪表」的树，套件在 `test_trainer_refuses_a_seed_that_a_resume_would_drop` 就中止了，失败的是那条 `--resume` 单独使用时「stderr 必须为空」的控制断言（`tests/test_training.cpp:3613` `assert(last_err.empty())`）——那条用例把 `gomoku_train` 的 stderr 捕获进 `last_err`，而仪表往同一 stderr 里印 `[r129]` 行。所以这两臂的证据只能是读数，绝不能写成「套件仍绿」；同一句话也说明仪表那 7 行 `[r129]` 不该被合进任何一条用例的断言路径。
+
+### valgrind
+
+`bash tools/valgrind_check.sh memcheck test_training gomoku_train -- --rounds 1 --population 2 --generations 1 --depth 1 --timeout-ms 2 --max-moves 6 --fitness-games 4 --verification-games 4 --no-data --seed 20261011`（`build-vg`，Debug，按计划重建 4 个 TU）：`test_training clean reports=0 invalid_read=0 invalid_write=0 uninitialised=0 definite_leak=0 306s`；同一行的 `gomoku_train` 报 `ABORTED rc=1` 且只活 3 s。包装脚本把 mktemp 里的 stderr 删了，所以本轮把这条命令行原样直跑了一遍才知道原因，而且**它不是代码缺陷**：`tools/valgrind_check.sh:129-130` 把任何以 `--` 开头的参数当作 extra 分隔符，**并把这个 `--` 本身也塞进 `extra`**，于是二进制收到的第一个参数就是一个孤零零的 `--`；在当前树上 `./build-vg/gomoku_train -- --rounds 1 --population 2` 打印 `Error: unknown option --` / rc=1，秒级退出。测试二进制不解析 argv，所以同一轮只有 `gomoku_train` 中枪。去掉那个分隔符、其余参数一字不动：`rc=0`、1 s、stderr 空。
+
+带 `--log-file` 并保留 stderr 的明细臂（`/tmp/d4/vg_detail/`）：`test_training` rc=0 / `ERROR SUMMARY: 0 errors from 0 contexts`（155 s，`All training tests passed`）；`gomoku_train` rc=0 / `in use at exit: 0 bytes in 0 blocks` / `6,533 allocs, 6,533 frees, 59,682,007 bytes` / `ERROR SUMMARY: 0`。**这一臂重放的是空开局**（缺省 0），所以它没有检查本轮新增的任何代码，`gap_stages.sh` 于是补了一臂 `--match-opening-plies 4`：rc=0 / `in use at exit: 0 bytes` / `10,757 allocs, 10,757 frees, 59,507,235 bytes` / `ERROR SUMMARY: 0 errors from 0 contexts`，收尾一行 `Training finished: rounds=1 versions=2 champion=v0 games=16 samples=0`——`games` 与关掉旗标那一臂**同为 16**，说明 8 条前缀是被接受、被重放，而不是被丢成 INVALID（INVALID 会把该局从分母里剔掉，`games` 会掉）。`test_search` 依旧不进 memcheck：它那条 10 ms 墙钟断言（`tests/test_search.cpp:3973`）在 valgrind 的时间尺度下必死，轮次124 已经把这句话落在日志里。
+
+### 门禁与没动的账
+
+`ctest` 8/8、457.63 s（`test_search` 425.69 s、`test_training` 13.62 s），`node tests/web_frontend_check.js` 105/105，`node tests/readme_anchor_check.js` 120 citations / 0 problems，README **658 行**、REVIEW_LOG 6739 行——这三条全部重跑在**改完数字之后的树**上（`/tmp/d4/final_gate.log`，串行一条流水线，00:51:29 起 11 分 17 秒）。memcheck 明细臂同样重取：`build-vg` 按计划重建 4 个 TU，`test_training` rc=0 / `in use at exit: 0 bytes` / `432,790 allocs, 432,790 frees` / `ERROR SUMMARY: 0 errors from 0 contexts`（153 s，`All training tests passed`），`gomoku_train --match-opening-plies 4` rc=0 / `10,757 allocs, 10,757 frees` / `ERROR SUMMARY: 0` / `games=16`，与上面那一臂逐字相同——47→45 改的是一条注释、一个帮助字符串和 README 两处，没有运行路径，这一点由重跑而不是由话说服。三处更正在出厂二进制上也核过：`gomoku_train --help` 里 45 那行在（`help_lines_with_45=1`），`src` 与 `README.md` 里已经搜不到「47 条 / 47 of the first 48」。`test_search` 依旧不进 memcheck：它那条 10 ms 墙钟断言（`tests/test_search.cpp:3973`）在 valgrind 的时间尺度下必死，轮次124 已经把这句话落在日志里。变异矩阵跑完之后树是从 `/tmp/d4/clean_trainer.cpp` 还原的（`final build rc=0 recompiles=4`、`test_training rc=0`，`mut_r129_final.log` 末尾四行 `same as the control`），提交前这一份又与 `git diff` 逐字核过一遍。没提交的东西：仪表与探针（`/tmp/d4/instrument2.py`、`screen.cpp`、`bias.cpp`、`probe2/3.cpp`、`parse.py`、三个 stage 脚本）都留在树外，压测/仪表代码不混进生产提交；`docs/2026-10-17.md`、`docs/PROMPT_STRESS_TEST.md`、`docs/STRESS_TEST_RULES.md` 仍未跟踪，等用户发话。`:550` 三笔账本轮一笔没付：−40 % 单轮耗时要求先把 VCF／must_block 那些提前退出的手计入预算（轮次125 已记下 `nodes_searched` 为 0 不等于便宜），内存与并发解耦在 D-2 已由共享表付掉一半、本轮无新增，「fitness 不再只有三档」本轮给出的是**反面证据**——换局面这条路让 0.5 平台更厚，而档数本身是 `pairs = max(1, (games+1)/2)` 的算术。D 阶段剩下的 `#5`（`SearchController::search_worker` 去掉多余的 Board 复制，`src/search/controller.cpp:36`、`controller.h:50`、`alphabeta.cpp:601`）不在本轮动作范围内，继续按顺序做。
+
 ## 轮次128 引擎重构 D-3：验证赛第一次由序贯检验决定它要打几局，而「三档」那笔账本来就是算术 — engine redesign stage D3, SPRT-adaptive match length
 
 规格 `docs/ENGINE_REDESIGN.md` `:435`（§2.8 `#3`「SPRT 自适应对局数：验证赛改为序贯检验（Sequential Probability Ratio Test），在统计显著时提前终止，而不是固定 8 局。解决 README 记录的『fitness 只有 0/0.5/1 三档』问题的一半（另一半靠评估函数的位置项修复）」），落地清单 `:591` 认的实现位置是 `src/training/trainer.cpp`，`:596` 认的测试是「`tests/test_training.cpp` 新增：节点预算、共享 TT 并发安全、SPRT 终止」，验收仍在 `:550`。本轮付掉「序贯检验」这一件，并在读数 2 里把「三档」那一半交回去：它不是棋力，是 `pairs` 的算术，而 SPRT 一点分辨率也不加——`--fitness-games 2` 这一档上，检验一条界都碰不到。
