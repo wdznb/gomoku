@@ -202,6 +202,21 @@ int Trainer::generate_data_games(int games, int threads) {
     DataCollector collector;
     const ThreatCoefficients current_champion = champion();
 
+    // Design doc 2.8 #1. Built here rather than in the constructor so a --no-data run
+    // never pays for a table it would not touch, and filled before any worker exists so
+    // the shared flag is never written once threads are running.
+    if (config_.shared_tt_entries > 0 && !shared_tt_) {
+        shared_tt_ = std::make_unique<TranspositionTable>(
+            static_cast<size_t>(config_.shared_tt_entries), true);
+    }
+    // The 失效口径 the round before this one asked for: a record is a score computed
+    // under the coefficients that were active when it was written, and the champion may
+    // have been replaced since the last batch. Emptying the table at the head of each
+    // batch is the one rule that needs no stamp on the entry and no comparison of
+    // coefficient sets - and it is cheap, because a batch is a round and the table is
+    // 7.3MB.
+    if (shared_tt_) shared_tt_->clear();
+
     for (int t = 0; t < worker_count; ++t) {
         // t is captured by value: the loop advances while the workers are already
         // running, so a reference capture would hand several workers the same
@@ -212,7 +227,15 @@ int Trainer::generate_data_games(int games, int threads) {
                                   (0x9E3779B97F4A7C15ull *
                                    (static_cast<uint64_t>(rounds_completed_ + 1) * 131 + t + 1));
 
-            SearchEngine engine(current_champion);
+            // Every worker of this batch prices positions with current_champion, so one
+            // table between them is the same information each of them would have paid
+            // 7.3MB to hold on its own. It is named on the constructor rather than set
+            // afterwards, because a worker that allocated its own table first would
+            // still have allocated it - see SearchEngine's note on the peak. The
+            // fitness side (play_match) keeps per-engine tables on purpose: there the
+            // two sides hold two different coefficient sets at once, and sharing that
+            // would score a candidate with the reference's numbers.
+            SearchEngine engine(current_champion, shared_tt_.get());
             prepare(engine);
 
             SelfPlayConfig settings;

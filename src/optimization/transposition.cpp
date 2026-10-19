@@ -16,10 +16,54 @@ size_t bucket_bits_for(size_t num_entries) {
     return bits;
 }
 
+// Holds one shard's lock, or nothing at all. The unshared case has to cost nothing
+// rather than "the price of an uncontended mutex", because a session's search does
+// this on every node of the tree and the table it touches is its own; C2/C3 measured
+// that path down to the nanosecond per node and a lock would show up there.
+class ShardLock {
+public:
+    explicit ShardLock(std::mutex* mutex) : mutex_(mutex) {
+        if (mutex_) mutex_->lock();
+    }
+    ~ShardLock() {
+        if (mutex_) mutex_->unlock();
+    }
+
+    ShardLock(const ShardLock&) = delete;
+    ShardLock& operator=(const ShardLock&) = delete;
+
+private:
+    std::mutex* mutex_;
+};
+
+// Locks every shard of a shared table - the two whole-table walks, clear() and
+// hashfull() - and nothing at all for a table with one owner. Shards are always taken
+// in index order, so two threads clearing at once cannot deadlock against each other.
+class AllShardLock {
+public:
+    AllShardLock(std::mutex* shards, size_t count, bool shared)
+        : shards_(shared ? shards : nullptr), count_(shared ? count : 0) {
+        for (size_t i = 0; i < count_; ++i) shards_[i].lock();
+    }
+    ~AllShardLock() {
+        for (size_t i = 0; i < count_; ++i) shards_[i].unlock();
+    }
+
+    AllShardLock(const AllShardLock&) = delete;
+    AllShardLock& operator=(const AllShardLock&) = delete;
+
+private:
+    std::mutex* shards_;
+    const size_t count_;
+};
+
 }
 
-TranspositionTable::TranspositionTable(size_t num_entries)
-    : bucket_bits_(bucket_bits_for(num_entries)), generation_(0) {
+TranspositionTable::TranspositionTable(size_t num_entries, bool shared)
+    : bucket_bits_(bucket_bits_for(num_entries)),
+      shard_shift_(bucket_bits_ > 4 ? bucket_bits_ - 4 : 0),
+      generation_(0),
+      shared_(shared) {
     buckets_.resize(static_cast<size_t>(1) << bucket_bits_);
 }
 
@@ -27,8 +71,11 @@ void TranspositionTable::store(uint64_t hash, int depth, int value, Move best_mo
                                TTFlag flag, int ply, int32_t static_eval) {
     if (flag == TTFlag::NONE) return;
 
-    Bucket& bucket = buckets_[index_for(hash)];
+    const size_t bucket_index = index_for(hash);
+    ShardLock lock(shared_ ? &shard_for(bucket_index) : nullptr);
+    Bucket& bucket = buckets_[bucket_index];
     const uint32_t key = key_for(hash);
+    const uint8_t generation = generation_.load(std::memory_order_relaxed);
 
     uint8_t victim = 0;
     bool own_entry = false;
@@ -83,12 +130,14 @@ void TranspositionTable::store(uint64_t hash, int depth, int value, Move best_mo
     slot.static_eval = static_eval;
     slot.depth = static_cast<int16_t>(depth);
     slot.flag = flag;
-    slot.age = generation_;
+    slot.age = generation;
     slot.best_move = best_move;
 }
 
 bool TranspositionTable::probe(uint64_t hash, TTEntry& out, int ply) const {
-    const Bucket& bucket = buckets_[index_for(hash)];
+    const size_t bucket_index = index_for(hash);
+    ShardLock lock(shared_ ? &shard_for(bucket_index) : nullptr);
+    const Bucket& bucket = buckets_[bucket_index];
     const uint32_t key = key_for(hash);
 
     for (uint8_t i = 0; i < kBucketWays; ++i) {
@@ -102,7 +151,9 @@ bool TranspositionTable::probe(uint64_t hash, TTEntry& out, int ply) const {
 }
 
 int32_t TranspositionTable::static_eval_of(uint64_t hash) const {
-    const Bucket& bucket = buckets_[index_for(hash)];
+    const size_t bucket_index = index_for(hash);
+    ShardLock lock(shared_ ? &shard_for(bucket_index) : nullptr);
+    const Bucket& bucket = buckets_[bucket_index];
     const uint32_t key = key_for(hash);
 
     int eval_only = -1;
@@ -119,7 +170,9 @@ int32_t TranspositionTable::static_eval_of(uint64_t hash) const {
 }
 
 bool TranspositionTable::put_static_eval(uint64_t hash, int32_t static_eval) {
-    Bucket& bucket = buckets_[index_for(hash)];
+    const size_t bucket_index = index_for(hash);
+    ShardLock lock(shared_ ? &shard_for(bucket_index) : nullptr);
+    Bucket& bucket = buckets_[bucket_index];
     const uint32_t key = key_for(hash);
 
     int spare = -1;
@@ -150,27 +203,35 @@ bool TranspositionTable::put_static_eval(uint64_t hash, int32_t static_eval) {
 }
 
 void TranspositionTable::advance_generation() {
-    ++generation_;
+    // Wraps at 256 exactly as the plain counter did; age_older() reads the ring.
+    generation_.fetch_add(1, std::memory_order_relaxed);
 }
 
 void TranspositionTable::clear() {
+    // All of the locks, not the one this bucket would use: a clear is the one
+    // operation that touches every shard, and on a shared table another thread is
+    // entitled to be storing into some other shard while it happens.
+    const AllShardLock guards(shards_.data(), kShards, shared_);
     for (auto& bucket : buckets_) {
         for (auto& slot : bucket.slots) {
             slot = TTEntry{};
         }
     }
-    generation_ = 0;
+    generation_.store(0, std::memory_order_relaxed);
 }
 
 int TranspositionTable::hashfull() const {
     // Per mille of the sampled table holding this generation's records, so a caller
     // can see the table filling up without walking every bucket.
     const size_t sample = std::min<size_t>(100, buckets_.size());
+    // The sample is the table's first hundred buckets, which can straddle shards.
+    const AllShardLock guards(shards_.data(), kShards, shared_);
+    const uint8_t generation = generation_.load(std::memory_order_relaxed);
     int count = 0;
     for (size_t i = 0; i < sample; ++i) {
         const Bucket& bucket = buckets_[i];
         for (uint8_t j = 0; j < kBucketWays; ++j) {
-            if (bucket.slots[j].flag != TTFlag::NONE && bucket.slots[j].age == generation_) {
+            if (bucket.slots[j].flag != TTFlag::NONE && bucket.slots[j].age == generation) {
                 ++count;
             }
         }

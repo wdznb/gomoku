@@ -20,13 +20,17 @@ constexpr int kVctBudgetPercent = 30;
 }
 
 SearchEngine::SearchEngine()
-    : book_enabled_(true),
+    : owned_tt_(std::make_unique<TranspositionTable>()),
+      tt_alphabeta_(owned_tt_.get()),
+      book_enabled_(true),
       vcf_enabled_(true), vct_enabled_(true), alphabeta_enabled_(true),
       vcf_max_depth_(20), vct_max_depth_(12), alphabeta_max_depth_(8),
       resign_detection_(true), resign_node_limit_(400000) {}
 
-SearchEngine::SearchEngine(const ThreatCoefficients& coeffs)
+SearchEngine::SearchEngine(const ThreatCoefficients& coeffs, TranspositionTable* table)
     : evaluator_(coeffs), greedy_(coeffs),
+      owned_tt_(table ? nullptr : std::make_unique<TranspositionTable>()),
+      tt_alphabeta_(table ? table : owned_tt_.get()),
       book_enabled_(true),
       vcf_enabled_(true), vct_enabled_(true), alphabeta_enabled_(true),
       vcf_max_depth_(20), vct_max_depth_(12), alphabeta_max_depth_(8),
@@ -210,7 +214,7 @@ SearchResult SearchEngine::search(const Board& board, int color,
     const ThreatProbe probe = threat_probe(board, color);
 
     if (vcf_enabled_ && probe.own_four && !stop_flag.load()) {
-        VCFSearch vcf(evaluator_, tt_alphabeta_);
+        VCFSearch vcf(evaluator_, *tt_alphabeta_);
         if (has_deadline) {
             vcf.set_deadline(search_start + std::chrono::milliseconds(
                 static_cast<long long>(time_limit_ms) * kVcfBudgetPercent / 100));
@@ -232,7 +236,7 @@ SearchResult SearchEngine::search(const Board& board, int color,
     }
 
     if (vct_enabled_ && probe.own_three && !stop_flag.load()) {
-        VCTSearch vct(evaluator_, tt_alphabeta_);
+        VCTSearch vct(evaluator_, *tt_alphabeta_);
         if (has_deadline) {
             vct.set_deadline(search_start + std::chrono::milliseconds(
                 static_cast<long long>(time_limit_ms) * kVctBudgetPercent / 100));
@@ -249,7 +253,7 @@ SearchResult SearchEngine::search(const Board& board, int color,
     }
 
     if (alphabeta_enabled_ && !stop_flag.load()) {
-        AlphaBetaSearch ab(evaluator_, tt_alphabeta_);
+        AlphaBetaSearch ab(evaluator_, *tt_alphabeta_);
         // The absolute end-of-move deadline, not a slice: remaining_time below
         // is only this phase's share of the budget, so on its own it lets the
         // move overshoot by that whole share once the tactics phases spent it.
@@ -384,7 +388,7 @@ SearchResult SearchEngine::search(const Board& board, int color,
                 int probe_nodes = static_cast<int>(
                     std::min<long long>(resign_node_limit_, time_scaled_nodes));
 
-                VCFSearch loss_probe(evaluator_, tt_alphabeta_);
+                VCFSearch loss_probe(evaluator_, *tt_alphabeta_);
                 loss_probe.set_node_limit(probe_nodes);
                 if (has_deadline) loss_probe.set_deadline(search_deadline);
 

@@ -47,6 +47,11 @@ void print_usage(const char* program) {
         "  --accept-score X            Promotion threshold, >0.5 and <=1.0 (0.56)\n"
         "  --data-games N              Self-play games kept as training data (4)\n"
         "  --threads N                 Parallel data-collection workers (2)\n"
+        "  --shared-tt N               Slots in the one transposition table the\n"
+        "                              data workers share; the table is this size\n"
+        "                              whatever --threads says. 0 gives every worker\n"
+        "                              a table of its own (design doc 2.8 #1's\n"
+        "                              N x 7.3MB layout) (262144)\n"
         "  --no-data                   Collect no self-play data (search only)\n"
         "  --no-resign                 Never resign during training games\n"
         "  --seed N                    RNG seed (20261011)\n"
@@ -227,6 +232,10 @@ int main(int argc, char** argv) {
                 config.data_games = require_int("--data-games", i, argc, argv);
             } else if (flag == "--threads") {
                 config.data_threads = require_int("--threads", i, argc, argv);
+            } else if (flag == "--shared-tt") {
+                // Zero is a real answer here - "no shared table" - so only negatives are
+                // refused, and the size ceiling is checked with the other guards below.
+                config.shared_tt_entries = require_int("--shared-tt", i, argc, argv, 0);
             } else if (flag == "--no-data") {
                 config.collect_data = false;
             } else if (flag == "--no-resign") {
@@ -272,6 +281,17 @@ int main(int argc, char** argv) {
     if (config.search_depth < 1 || config.timeout_ms < 1 || config.max_moves < 2) {
         std::cerr << "Error: --depth, --timeout-ms and --max-moves must be positive"
                   << " (--max-moves at least 2)" << std::endl;
+        return 1;
+    }
+    // An entry is 28 bytes, so 2^22 slots is the ~117MB table design doc 2.8 #1 names
+    // as its own example, and it is already larger than the N per-engine tables this
+    // flag replaces at any --threads this box runs (N x 7.3MB). Asking for more does not
+    // buy reuse, it asks the process to allocate a table no search will fill - and past
+    // a point that allocation is what ends the run, since nothing here catches it.
+    if (config.shared_tt_entries > (1 << 22)) {
+        std::cerr << "Error: --shared-tt must be at most 4194304 slots (~117MB), got "
+                  << config.shared_tt_entries << " (0 gives each worker its own table)"
+                  << std::endl;
         return 1;
     }
 

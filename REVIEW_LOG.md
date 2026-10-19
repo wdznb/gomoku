@@ -1979,6 +1979,98 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次127 引擎重构 D-2：N 个采集 worker 第一次共用一张表，而那棵树的节点一个也没多 — engine redesign stage D2, process-level shared TT
+
+规格 `docs/ENGINE_REDESIGN.md` `:433`（§2.8 `#1`「进程级共享只读 TT：自对弈的所有引擎共享一张大表（如 2^22 槽 ≈ 96MB），分片加锁或 lock-free；内存与并发局数**解耦**。当前是『每引擎一张 8.4MB 表』，N 个并发 → N × 8.4MB」），落地清单 `:596` 认的测试是「`tests/test_training.cpp` 新增：节点预算、共享 TT 并发安全、SPRT 终止」，风险表 `:569` 给的路线是「先分片加锁（16 片），再考虑 lock-free；训练侧先单线程验证正确性」，验收仍在 `:550`（单轮耗时 −≥40 %、峰值内存与并发解耦、`--fitness-games 2` 不再三档）。轮次125 把这张表定价为 7.3 MB/worker（不是 `:434` 还写着的 8.4 MB），轮次126 付掉了耗时那一半；本轮只付内存那一半，并把耗时那一半没有再动这件事写在读数 3。
+
+### 实现：`shared` 是构造时的事实；分片切桶索引的高位，所以记录不动
+
+- `TranspositionTable(size_t num_entries = 1 << 18, bool shared = false)`（`src/optimization/transposition.h:74`），拷贝与赋值 `= delete`（`:78`），`is_shared()`（`:81`），`kShards = 16`（`:153`），`shard_for()`（`:173`），成员 `shard_shift_`（`:212`）、`std::atomic<uint8_t> generation_`（`:215`）、`mutable std::array<std::mutex, kShards> shards_`（`:216`）、`const bool shared_`（`:217`）。
+- **为什么 `shared` 不是开关**：那个 flag 每次 probe/store 都要读，线程起来之后再写它，本身就是这把锁要防的那个竞态；所以它是构造时决定、`const` 成员。不共享的表一次锁都不取（`src/optimization/transposition.cpp:20-37` 的 `ShardLock` 拿到 `nullptr` 就是个空对象）——会话搜索每个节点都走这条路，C2/C3 把它量到纳秒，为一个没人用的互斥量付钱不可接受。
+- **为什么按桶索引的高位切**：`index_for()` 一个字节没改，于是一个桶里仍是那四条记录、一次 store 仍淘汰同一条记录。分片只挪锁，不挪记录；桶数不足 16 时 `shard_shift_ = 0`，退化成每桶一把锁，仍然正确。
+- 取锁的入口四个：`store()` `transposition.cpp:75`、`probe()` `:139`、`static_eval_of()` `:155`、`put_static_eval()` `:174`。全表走查的两个用 `AllShardLock`：`clear()` `:210`、`hashfull()` `:223`（`hashfull` 只看前 100 桶，那 100 桶可以跨片，所以整表取锁）；锁一律按索引顺序拿，两个同时 `clear()` 的线程不会互锁。
+- **代龄这本账换了主人**：`advance_generation()`（`:205`）在共享表上是整批的时钟——一个 worker 落一子就把所有记录往前推一格。这是「内存与并发局数解耦」的诚实代价，写在 `src/optimization/transposition.h:131-137`；替代方案（每局一个年龄）要么加宽表项要么给线程各自一份状态，两者都把这一行省下的东西再花回去。
+- `SearchEngine` 侧只有一个注入口：`SearchEngine(const ThreatCoefficients&, TranspositionTable* table = nullptr)`（`src/search/search_engine.h:65`，实现 `src/search/search_engine.cpp:22-35`），表由 `owned_tt_` + `tt_alphabeta_` 两个成员表示（`search_engine.h:138-139`，`transposition_table()` 仍在 `:127`）。**这里换过一次方案，换的原因是峰值**：先写的是 setter（引擎先建自己的表、再把表交出去），同一把尺子量到 t=4 只比独立表低 796 kB（48,700 对 49,496 kB，`/tmp/d2/rss_post.log`）——一块 7.3 MB 的 vector 在 worker 线程自己的 arena 里释放并不还给内核，于是「共享」把钱花了，却没把省下的地方腾出来。改成构造注入后 worker 从不分配，斜率才跟着 `--threads` 脱钩（读数 2）。副作用一条：`SearchEngine` 不再可拷贝（`unique_ptr` 成员）；全树没有拷贝调用点，整树 `cmake --build` rc=0 就是这条的证据。
+- 训练侧两处：批次头建表并清空（`src/training/trainer.cpp:205-218`），worker 的引擎走注入（`:238`）。批首那次 `clear()` 就是轮次125 要的失效口径——记录是「写它时那套系数」的分数，而冠军可能已经换了；打系数戳要加宽表项，比较系数集要在每次 probe 前比一整套数，清空两条都不需要，而且一批就是一轮、一张 7.3 MB 的表清空不花钱。**适配度赛刻意不共享**（`play_match` 两侧同时握着两套系数，共享等于拿对手的数给自己的位置打分）。
+- CLI：`--shared-tt N`（帮助 `src/training/main_trainer.cpp:50-54`，解析 `:235-238`，`require_int` 的下界给 0 因为 0 是「不要共享」这个答案本身），上限在 `:291-296` 卡在 2^22 = 4,194,304 槽（28 B/槽 ≈ 117 MB，正是 `:433` 自己举的量级）——再大不是买复用，是买一张没人填得满的表，而这条路径不接 `bad_alloc`。缺省 `1 << 18`（`src/training/trainer.h:67`）＝一个 worker 原本的表大小：先让「解耦」成立，再谈要不要一张大表。观测口 `shared_transposition_table()`（`:121`）、成员 `shared_tt_`（`:152`）。README `:200` 行内改，658 行不变。
+
+### 读数 1：`:433` 的「只读语义不变」——同一棵树，221,774 一个不差
+
+新增用例 `tests/test_search.cpp:8479-8565`（注册 `:8745`）：同一个 quiet 局面、同一套系数（`b1_evaluator(24, 8)`）、深度 6、无时钟无节点预算，两臂各自新建一张表跑一次搜索。
+
+| 表 | BLACK 节点 | WHITE 节点 | qnodes | 分数 | 落子 | 完成深度 | seldepth |
+|---|---|---|---|---|---|---|---|
+| 不共享（无锁） | 221,774 | 156,428 | 与套件既有断言逐字相同 | 全等 | 全等 | 6 | 6 |
+| 共享（16 把锁） | 221,774 | 156,428 | 全等 | 全等 | 全等 | 6 | 6 |
+
+221,774 与 156,428 不是本轮现取的数：它们早被 `tests/test_search.cpp:5578`、`:6243`、`:6448` 三条既有断言钉着（B3 那次从 221,380 改到 221,774 的记录在 `:5569`）。共享臂与这些常数相等，才是「分片挪锁不挪记录」的证据而不是修辞。同一颗用例还跑退化表（64 槽＝16 桶＝16 把锁）：自己写的记录自己读得回、`hashfull()` 在 0..1000 之间、`clear()` 后读不回且 `generation()` 回到 0。
+
+### 读数 2：`:550` 的第二条——峰值 RSS 的斜率换了主人
+
+`/usr/bin/time` 的峰值 RSS，串行、空闲机，`--shared-tt 0` 是「每 worker 一张」的对照臂，产物只落 `/tmp/d2/`。三把尺子（8 局阶梯 = `rss_post.sh` 的 `--data-games 8 --timeout-ms 400`；40/8 局两臂 = `arms2.sh`；节点预算两臂 = `nb_arms.sh` 在 `--max-nodes 3000` 下）：
+
+| 尺子 | worker | 每 worker 一张 | 共用一张 | Δ |
+|---|---|---|---|---|
+| `--no-data`（两张表都不建，对照） | 1 | 19,860 kB | 19,764 kB | −96 kB |
+| 8 局 · ms 400 阶梯 | 1 | 27,444 kB | 20,448 kB | −25.5 % |
+| 8 局 · ms 400 阶梯 | 2 | 34,556 kB | 20,404 kB | −40.9 % |
+| 8 局 · ms 400 阶梯 | 4 | 49,296 kB | 20,816 kB | −57.8 % |
+| 40 局 · ms 400 | 4 | 49,416 kB | 20,776 kB | −58.0 % |
+| 8 局 · ms 400 | 8 | 79,008 kB | 21,496 kB | −72.8 % |
+| 40 局 · `--max-nodes 3000` | 4 | 50,024 kB | 21,132 kB | −57.8 % |
+| 8 局 · `--max-nodes 3000` | 8 | 79,568 kB | 21,416 kB | −73.1 % |
+
+斜率才是这一行规格要说的事：4→8 个 worker，独立表 +29,592 kB（ms）与 +29,544 kB（节点预算）＝ **+7,398 / +7,386 kB 每 worker**；共享表 +720 与 +284 kB ＝ **+180 / +71 kB 每 worker**；8 局阶梯上 t=1→4 是 +7,284 kB/worker 对 +123 kB/worker。7,398 kB 对 `transposition.h:64` 自己写的 2^18 × 28 B = 7,340,032 B = 7,168 kB 是同一量级（多出的 230 kB 本轮没拆开归因，只能说它是每引擎除表以外的常驻状态），这就是「降下来的那一块确实是表」的归因仪器。共享臂自身 t=1/2/4/8 = 20,448 / 20,404 / 20,816 / 21,496 kB，四点平坦。
+
+### 读数 3：耗时那一半本轮没有再来一次（照 `:550` 报缺口）
+
+墙钟：8 局阶梯 t=1/2/4 是 29.56/29.82/30.14 对 29.81/28.77/29.56 s；`arms2` 的 t=4 是 30.33 → 30.16 s、t=8 是 31.26 → 30.64 s；`nb_arms` 的 t=4 是 8.44 → 8.74 s、t=8 是 8.37 → 7.01 s。这六个读数里有两个的**样本数不同**，所以它们不是同一盘棋的两个计时，不能当成本读（见下一节）。原因是轮次125 量到的结构：一轮约 28 s 在串行的适配度赛，采集不在关键路径上，一张共享表改的是采集的内存，不改那条串行的路。`:550` 的「−≥40 %」是轮次126 用 `--max-nodes` 付的（−71.5 % @默认量级），本轮对它的贡献是 **0**。
+
+### 共享真正改变的东西：一批局里的信息，不只是成本
+
+样本数：8 局阶梯（t=1/2/4）两臂都是 112/224/496，`arms2` 的 40 局 t=4 两臂都是 496——这四个读数证明「同尺度下批量不变」；但 8 局 t=8 是 952 → 1,000，节点预算 40 局 t=4 是 1,152 → 1,008，节点预算 8 局 t=8 是 1,600 → 848。这不是漏账：一张表意味着 A worker 写的记录可能被 B worker 命中，而 B 的 root 是 A 永远走不到的位置。同批共享的前提正是「所有 worker 用同一套 `current_champion` 系数」（`trainer.cpp:203`），跨批靠批首 `clear()`。年龄/标签方案本来就吃这种记录（键不同就不算同一条），但读数 1 只证明了**一棵树**不变，没有证明**一批局**不变。
+
+### 变异矩阵：六条各破一句，最后一条是给仪器本身
+
+对照臂是未变异的树用同一命令跑：`./test_training` rc=0 / 11 s。
+
+| 变异 | 改动 | 结果 |
+|---|---|---|
+| M1 | `store()` 不取片锁（`transposition.cpp:75` 整行去掉） | rc=134，`tests/test_training.cpp:4479: Assertion 'torn == 0' failed`，读数行自己印 80,000 写/80,000 读里 **torn=140** |
+| M2 | `probe()` 不取片锁（`:139`） | rc=134，同一行 `:4479`，**torn=87** |
+| M3 | 共享臂按 `num_entries / 4` 建表（分片连记录一起挪） | rc=134 / 426 s，`tests/test_search.cpp:8509` 的 `tt.size() == entries` 先炸——尺寸断言排在节点断言前面 |
+| M3b | 只改淘汰：共享表上同键不更新（`if (slot.key != key \|\| shared_) continue;`），表大小不变 | rc=134 / 428 s，`tests/test_search.cpp:8520: Assertion 'shard.nodes == plain.nodes' failed`——节点等式对「记录被动了」确实敏感，这一条才是读数 1 背后的仪器 |
+| M4 | 删掉批首 `clear()`（`trainer.cpp:218`） | rc=134，`:4364: Assertion '!survived' failed`，读数行印 `sentinel after the next batch: STILL THERE, generation back to 8` |
+| M5 | 删掉注入实参（`trainer.cpp:238` 改传 `nullptr`） | rc=134，`:4333: Assertion 'games_with_hits == games' failed`，读数行印 `games answered by the table=0 generation=0` |
+
+**harness 自己的一条缺陷，记下来**：M3b 第一版的锚点写成裸的一行 `if (slot.key != key) continue;`，而这行在 `store()`／`probe()`／`put_static_eval()` 里出现 **3 次**；python 的 `count == 1` 断言先炸，脚本却没有停，于是 build 了一颗没变异的树并「测」出 rc=0。第二版把锚点扩到带后随注释的两行、并在 patch 失败处 `exit 1`，才拿到上面那条红。这与轮次124 的「零计数来自一棵没建起来的树」、轮次126 的「`--target test_training` 不重建 `gomoku_train`」是同一面墙的第三次撞法，代价是一次 428 s 的白跑。
+
+### 门禁（跑在最后那次改动的那棵树上）
+
+`ctest` **8/8 / 463.62 s**（`test_search` 432.25 s ＝ 套件的 93.2 %，`test_training` 11.81 s，`test_position` 8.58 s，`test_server` 9.88 s）；`node tests/web_frontend_check.js` **105/105**；`node tests/readme_anchor_check.js` **120 citations / 0 problems**；README **658 行**。门禁之后 `cmp` 过 `src/optimization/transposition.cpp` 与 `src/training/trainer.cpp` 对门禁快照逐字节相同——TSan 活性对照那次临时去锁没有留在树里。
+
+引用重钉：本轮 `trainer.cpp` +24/−1、`search_engine.cpp` +10/−6，后面的行整体下移 23 / 4 行，跟着重钉 9 条注释锚点（`tests/test_training.cpp:439`→`trainer.cpp:371`、`:2105`→`:291`、`:3398`→`:347`、`:3500-3501`→`trainer.cpp:586`/`:444`、`:4025`→`search_engine.cpp:295`/`:260`；`tests/test_search.cpp:3907`→`search_engine.cpp:290-291`、`:5757` 与 `:6214`→`:357`）。全部是行内替换，两个测试文件行数不变（8749 / 4647）：`assert(result.resigned)` 仍在 `:2591`、10 ms 那一臂仍在 `:3973`、`assert(completed.method == "alphabeta")` 仍在 `:3986`；这两个文件里被删掉的行**只有**这 9 条注释，没有一条断言被改。`CMakeLists.txt`、`web/`、`tools/` 一字未动。`docs/ENGINE_REDESIGN.md` 指向代码的锚点（`:108` 的 `search_engine.h:77`、`:84` 的 `transposition.cpp:37-39`）不动：那是重设计文档在 phase-5 开工前的现状快照，按当前树改写等于抹掉需求文档自己的历史前提。
+
+### Valgrind / TSan
+
+| 臂 | 结果 |
+|---|---|
+| memcheck `build-vg/test_training`（`--leak-check=full --show-leak-kinds=all --track-origins=yes`，不带 `-q`，`--log-file` 把 stderr 全留在盘上） | rc=0 / 254 s，`ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)`，`in use at exit: 0 bytes in 0 blocks` ＋ `All heap blocks were freed — no leaks are possible`，328,336 allocs = 328,336 frees / 438,809,255 B；七条 `[r127]` 读数与并发用例都在这一臂里跑过 |
+| memcheck 共享表驱动（`/tmp/d2/driver_shared_vg.cpp`：一张共享表跑一次真实搜索 + 退化 16 桶表 + 4 写线程 1 走查线程） | rc=0 / 2 s，`ERROR SUMMARY: 0 errors from 0 contexts`，7,961 allocs = 7,961 frees / 15,962,780 B（两张 7.3 MB 表），depth-3 quiet 无锁 2,515 节点 ＝ 共享 2,515 节点，退化表 40 写 38 命中、`hashfull 593`、清空后读不回 |
+| TSan `build-tsan/test_training`（`-fsanitize=thread -g -O1 -fno-omit-frame-pointer`，离线 json pin） | rc=0 / 32 s，`WARNING: ThreadSanitizer: data race` **0 条**，七条 `[r127]` 读数齐（`torn reads=0`、`generation=208`），`All training tests passed` |
+| TSan 活性对照：把 M1（`store()` 去锁）装进同一颗 TSan 树重跑 | rc=134，**59 条** data race，栈里点名 `TranspositionTable::store()` 与 `probe()` 的表项读写（`transposition.cpp:131`／`:144`——那是 M1 那颗树的行号，去掉锁行之后本体上移了）——所以上面那个 0 是一次读数，不是一台没接上的仪器 |
+
+三处如实报：驱动那臂印 `generation 0`，因为 memcheck 的时间尺度下四个写线程先跑完、走查线程一次都没轮到自己，所以「负载下的 `clear()`/`hashfull()`」由 `test_training` 用例与 TSan 臂承担，驱动只证明这两条路径本身干净；memcheck 不追子进程，`test_trainer_cli_shared_tt_probes` 的六条 CLI 探臂 exec 的是 `build-vg/gomoku_train` 本体，不在 memcheck 之下；TSan 那颗树另有两条与本轮无关的 skip（`CLI --params probes`、`--no-sessions conflict probes`，因为没在那颗树里建 `gomoku_server`）。`test_search` 不在 memcheck/TSan 下重跑：`tests/test_search.cpp:3973` 的 10 ms 臂在任何非本机时间尺度上都会炸（轮次124 已把断言文本量到并记在案），而本轮新增的唯一并发对象在 `test_training` 里。
+
+### 缺口（写给下一轮的字）
+
+- `:550` 三条：本轮推进第二条（解耦，斜率 +7,386 → +71 kB/worker），第一条贡献 0（读数 3），第三条（`--fitness-games 2` 不再三档）归 D-3 的 SPRT。
+- `:433` 举的例子是 2^22 ≈ 96 MB，本轮缺省只到 2^18。顺序是「先把解耦做实，再决定要不要一张大表」：表越大被跨 worker 命中的记录越多，而命中率对训练数据质量的影响本轮没有量——`--shared-tt` 的扫描（2^18/2^20/2^22 × 同一 seed 的样本数与验证分）欠着。
+- `:569` 的第二半「再考虑 lock-free」没动。
+- 读数 1 只覆盖一棵树（quiet 局面、深度 6、`b1_evaluator(24, 8)`）；中局/残局、以及 2^22 大表下的树等价性没有断言。
+- 共享改变了一批局的样本数（上面单列）——这是这行规格的物理后果，不是被证明无害的东西。
+- VCF／VCT／认输探测仍按 ms 切片（轮次126 记的同一笔）。
+
 ## 轮次126 引擎重构 D-1：一手棋第一次可以按节点出价，而时钟留在原地 — engine redesign stage D1, --max-nodes
 
 规格 `docs/ENGINE_REDESIGN.md` `:434`（§2.8 `#2`「节点预算替代时间预算：训练配置从 `--timeout-ms` 改为 `--max-nodes`（保留 `--timeout-ms` 作为安全兜底）。每盘成本可预测，训练时长可控，且不受机器负载影响」），落地清单 `:592` 认的接口是「`src/training/main_trainer.cpp` 新增 `--max-nodes`；保留 `--timeout-ms` 为兜底」，验收仍在 `:550`：「单轮训练耗时下降 ≥ 40 %；内存峰值与并发局数解耦；`--fitness-games 2` 下 fitness 不再只有三档」。轮次125 把尺子交出来，本轮按那把尺子复测。

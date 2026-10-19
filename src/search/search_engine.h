@@ -10,6 +10,7 @@
 #include "../optimization/transposition.h"
 #include "../optimization/opening_book.h"
 #include <atomic>
+#include <memory>
 #include <string>
 #include <functional>
 
@@ -51,7 +52,18 @@ using ProgressCallback = std::function<void(const SearchStats&)>;
 class SearchEngine {
 public:
     SearchEngine();
-    explicit SearchEngine(const ThreatCoefficients& coeffs);
+    // `table` hands the whole engine a transposition table it does not own (design doc
+    // 2.8 #1). It belongs on the constructor rather than as a setter because of what
+    // the worker that shares one would otherwise do: allocate 7.3MB for itself, then
+    // hand it back a moment later - and a block that size freed inside a thread's own
+    // arena stays resident there, so the peak never drops and the decoupling this row
+    // is about does not happen. nullptr (the default, and every caller that never
+    // thought about it) keeps a table of its own, exactly as before.
+    // The table must outlive the engine, and it must have been constructed `shared`
+    // before more than one thread reaches it - that flag is what decides whether a
+    // probe takes a lock.
+    explicit SearchEngine(const ThreatCoefficients& coeffs,
+                          TranspositionTable* table = nullptr);
 
     SearchResult search(const Board& board, int color,
                         int max_depth, int time_limit_ms,
@@ -112,15 +124,19 @@ public:
     void set_resign_detection(bool v) { resign_detection_ = v; }
     void set_resign_node_limit(int n) { resign_node_limit_ = n; }
 
-    TranspositionTable& transposition_table() { return tt_alphabeta_; }
+    TranspositionTable& transposition_table() { return *tt_alphabeta_; }
 
 private:
     Evaluator evaluator_;
     GreedySearch greedy_;
-    // VCF and VCT receive this table by reference but never read or write it;
-    // keeping a single instance avoids allocating ~64 MB per session that is
-    // never touched.
-    TranspositionTable tt_alphabeta_;
+    // Null exactly when tt_alphabeta_ points at a table somebody else owns.
+    // VCF and VCT receive that pointer by reference but never read or write it;
+    // keeping a single instance avoids allocating the extra tables a per-phase
+    // instance would cost - 7.3MB each at this size - that are never touched.
+    // It is heap-held because a worker that shares the trainer's table has no use
+    // for its own copy, and a member object could not be given back.
+    std::unique_ptr<TranspositionTable> owned_tt_;
+    TranspositionTable* tt_alphabeta_;
     const OpeningBook* book_ = nullptr;
 
     // The last hint handed in by the session owner, read once per think into the

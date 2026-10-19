@@ -3904,7 +3904,7 @@ void test_greedy_drops_the_defense_price_of_a_black_forbidden_point() {
 // The construction is unchanged and still needed: the position below is a 24-stone
 // midgame whose *whole first layer* costs 4858 nodes (about 433 ms in this suite's
 // unoptimised build). The engine's smallest node budget is remaining_time * 200
-// (search_engine.cpp:263) with remaining_time floored at 100 ms, i.e. 20000 nodes,
+// (search_engine.cpp:290-291) with remaining_time floored at 100 ms, i.e. 20000 nodes,
 // so no node cap can cut a layer that cheap - the interrupt has to come from the
 // absolute deadline. A 10 ms budget is therefore ~43x inside the layer rather than
 // past it, which is what makes the interrupted layer constructible instead of a race.
@@ -5754,7 +5754,7 @@ void test_killers_are_recorded_by_the_tree_not_by_the_root_or_quiescence() {
 //
 // Production is alphabeta.cpp's `search_child_pvs()`, the `pv_` writes in
 // `alphabeta()` / `search_root_layer()`, the one commit-point `copy_out` in the
-// `layer_complete && layer.sound` branch, and `search_engine.cpp:339`'s
+// `layer_complete && layer.sound` branch, and `search_engine.cpp:357`'s
 // `result.principal_variation = info.principal_variation;`.
 //
 // PROVENANCE OF EVERY NUMBER PINED BELOW - and what this block deliberately does
@@ -6211,7 +6211,7 @@ void test_pv_table_refuses_every_ply_and_index_outside_its_slots() {
 // The quiet pose (four stones, no threat, widths 24/8, fresh table, no budget of
 // any kind) is the pose the cost pin in test_three_stage_ordering... runs on, so
 // the same think answers the same 8,7 / 71992 here and the line that goes with
-// it. The depth-4 arm is the SearchEngine field half: search_engine.cpp:339 is
+// it. The depth-4 arm is the SearchEngine field half: search_engine.cpp:357 is
 // the writer the design doc's 2.4.4 asks for, and a field only AlphaBetaSearch
 // could read would not be a deliverable.
 void test_committed_layer_reports_its_principal_variation() {
@@ -8464,6 +8464,106 @@ void test_the_cap_bounds_every_arm_of_the_census_and_is_inert_where_there_is_no_
               << std::endl;
 }
 
+// ---------------------------------------------------------------------------
+// D2 - 进程级共享 TT 的分片口径 (design doc 2.8 #1 :433 「分片加锁或 lock-free」, 风险表 :569
+// 「先分片加锁（16 片）」).
+//
+// The 16 locks are chosen by the TOP bits of the bucket index, so the split moves locks
+// and not entries: which four records share a bucket - and therefore which record a
+// store evicts - is index_for()'s business alone. That is the claim this case exists to
+// keep, because the other reading of 「分片」 (cut the hash space into 16 sub-tables) is
+// the smaller edit to the file and a different search tree, and every node literal this
+// suite has carried since B3 would have had to move with it. So the assertion is
+// equality with the unshared arm down to the score and the move, on a pose whose cost
+// those literals already pin.
+void test_a_sharded_table_searches_the_tree_an_unshared_one_searches() {
+    struct Arm {
+        uint64_t nodes = 0;
+        uint64_t qnodes = 0;
+        int score = 0;
+        int completed_depth = 0;
+        int seldepth = 0;
+        Move best;
+    };
+    auto run = [](bool shared, size_t entries, const Board& board, int color) {
+        const Evaluator evaluator = b1_evaluator(24, 8);
+        TranspositionTable tt(entries, shared);
+        AlphaBetaSearch search(evaluator, tt);
+        std::atomic<bool> stop(false);
+
+        SearchLimits limits;
+        limits.max_depth = 6;
+        limits.hard_time_ms = 0;
+        limits.soft_time_ms = 0;
+        limits.max_nodes = 0;
+
+        Arm out;
+        out.best = search.search(board, color, limits, stop);
+        const SearchStats& stats = search.last_stats();
+        out.nodes = stats.nodes;
+        out.qnodes = stats.qnodes;
+        out.score = stats.score;
+        out.completed_depth = stats.completed_depth;
+        out.seldepth = stats.seldepth;
+        assert(tt.is_shared() == shared);
+        assert(static_cast<int>(tt.size()) == static_cast<int>(entries));
+        return out;
+    };
+
+    const Board quiet = b1_quiet();
+    for (const int color : {BLACK, WHITE}) {
+        const Arm plain = run(false, 1 << 18, quiet, color);
+        const Arm shard = run(true, 1 << 18, quiet, color);
+        // The suite's own literals, re-read here so the arm that is supposed to be
+        // unchanged is proved unchanged against the number, not just against its twin.
+        assert(plain.nodes == (color == BLACK ? 221774ull : 156428ull));
+        assert(shard.nodes == plain.nodes);
+        assert(shard.qnodes == plain.qnodes);
+        assert(shard.score == plain.score);
+        assert(shard.best.pos == plain.best.pos);
+        assert(shard.completed_depth == plain.completed_depth && shard.completed_depth == 6);
+        assert(shard.seldepth == plain.seldepth && shard.seldepth == 6);
+    }
+
+    // The degenerate split: fewer buckets than locks, where shard_shift_ is 0 and
+    // bucket >> 0 & 15 is the bucket itself, so every bucket holds its own lock. No
+    // search runs on a table this size (it would be all evictions); what is being
+    // checked is that the degenerate index still routes a record to the bucket a probe
+    // reads back, and that the whole-table walks work there.
+    {
+        TranspositionTable tiny(64, true);           // 16 buckets == 16 locks
+        assert(tiny.size() == 64);
+        uint64_t hash = 0;
+        int stored = 0;
+        for (int i = 1; i <= 40; ++i) {
+            hash = ZobristHash::update_hash(hash, i, BLACK);
+            tiny.store(hash, 4, i * 100, Move(7, 7, BLACK), TTFlag::EXACT, 0);
+            ++stored;
+        }
+        TTEntry entry;
+        int hits = 0;
+        uint64_t probe_hash = 0;
+        for (int i = 1; i <= 40; ++i) {
+            probe_hash = ZobristHash::update_hash(probe_hash, i, BLACK);
+            if (tiny.probe(probe_hash, entry, 0) && entry.value == i * 100) ++hits;
+        }
+        assert(hits > 0 && hits <= stored);
+        assert(tiny.hashfull() >= 0 && tiny.hashfull() <= 1000);
+        tiny.clear();
+        assert(!tiny.probe(hash, entry, 0));
+        assert(tiny.hashfull() == 0);
+        assert(tiny.generation() == 0);
+    }
+
+    std::cout << "test_a_sharded_table_searches_the_tree_an_unshared_one_searches passed ("
+                 "quiet BLACK 221,774 / WHITE 156,428 nodes answered identically by a "
+                 "16-lock table and a lock-free one, score, move, depth and seldepth "
+                 "included; the 16-bucket degenerate split - one lock per bucket - "
+                 "answered its own probes, walked all sixteen locks to clear, and came "
+                 "back empty)"
+              << std::endl;
+}
+
 int main() {
     std::cout << "Running search tests..." << std::endl;
 
@@ -8640,6 +8740,9 @@ int main() {
     test_a_think_that_runs_into_the_cap_reports_the_cap_and_the_same_answer();
     test_a_capped_tail_can_pay_back_nodes_it_did_not_save();
     test_the_cap_bounds_every_arm_of_the_census_and_is_inert_where_there_is_no_tail();
+
+    // D2: the shard split on the quiet pose, against the arms B3 already pinned.
+    test_a_sharded_table_searches_the_tree_an_unshared_one_searches();
 
     std::cout << "All search tests passed!" << std::endl;
     return 0;

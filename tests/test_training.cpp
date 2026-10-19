@@ -11,6 +11,7 @@
 #include "training/genetic.h"
 #include "training/hill_climbing.h"
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cctype>
 #include <cmath>
@@ -24,6 +25,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #ifndef _WIN32
@@ -434,7 +436,7 @@ void test_elo_system() {
 
 // Round 101 FF1: the bracket behind the rating table disagreed with the promotion
 // rule it sits next to. README:198 makes a verification match 8 games, so a 5-3
-// candidate scores 0.625, which trainer.cpp:348 promotes (>= the 0.56 accept score)
+// candidate scores 0.625, which trainer.cpp:371 promotes (>= the 0.56 accept score)
 // while the old `>= 0.75 / <= 0.25` test booked *both* sides a draw - the table
 // printed a match somebody had clearly taken as nobody winning. The bracket now
 // follows what a match score means: above half is a win, below half a loss, exactly
@@ -2100,7 +2102,7 @@ void test_data_game_ids_unique_across_batches() {
 }
 
 // Round 112 PP1: the id a data game got used to be games_played_ + 1 + t * 1000, i.e. a
-// fixed offset off a counter every round advances (trainer.cpp:74 and :268 add each
+// fixed offset off a counter every round advances (trainer.cpp:74 and :291 add each
 // merged record, plus the fitness and verification games). A long run therefore
 // re-reaches the offset legitimately: on the round where games_played_ is 1000, worker
 // 0's base is exactly the base worker 1 used on the games_played_ = 0 round, so two
@@ -3393,7 +3395,7 @@ void test_trainer_refuses_an_empty_flag_value() {
 // Round 99 DD6, labelled as what it is: a help-text assert. Only the usage
 // entries for --stagnation and --hill-iterations were rewritten, and the two
 // claims they now make are the code's existing behaviour - the 3x probe budget is
-// trainer.cpp:324 and the N+1 ceiling is hill_climbing.cpp skipping a step whose
+// trainer.cpp:347 and the N+1 ceiling is hill_climbing.cpp skipping a step whose
 // neighbour is identical. No call path changes, so there is nothing else to pin.
 void test_trainer_help_states_the_probe_budget() {
 #ifndef _WIN32
@@ -3495,8 +3497,8 @@ void test_server_refuses_no_sessions_with_a_stated_path() {
 }
 
 // Round 101 FF2: `--resume CK --seed N` used to start, parse N, and then let the
-// resume overwrite it (trainer.cpp:563 assigns the seed the checkpoint recorded, and
-// trainer.cpp:421 always writes one), so the reproducibility the caller asked for was
+// resume overwrite it (trainer.cpp:586 assigns the seed the checkpoint recorded, and
+// trainer.cpp:444 always writes one), so the reproducibility the caller asked for was
 // not the run that actually happened. The parser now refuses the pair, the same class
 // as the --params/--resume contradiction it sits next to.
 //
@@ -4020,7 +4022,7 @@ void test_self_play_node_budget_bounds_every_think() {
 // the soft/hard slice of a MoveBudget that no production caller reads - allocate() is
 // only ever called from the A1 scaffolding tests - and SearchEngine arms the clock
 // twice over, through limits.hard_time_ms and through ab.set_deadline
-// (search_engine.cpp:291, :256).
+// (search_engine.cpp:295, :260).
 void test_self_play_ms_budget_backs_up_a_generous_node_ceiling() {
     SearchEngine black;
     SearchEngine white;
@@ -4258,6 +4260,303 @@ void test_trainer_cli_max_nodes_probes() {
 #endif
 }
 
+// ---------------------------------------------------------------------------
+// D2 - 进程级共享 TT (design doc 2.8 #1 :433 「自对弈的所有引擎共享一张大表…分片加锁…内存与
+// 并发局数**解耦**」, 测试表 :596 「共享 TT 并发安全」).
+//
+// What the batch does with the one table is the whole claim, and it splits three ways:
+// every worker reaches it (not just the first), a record left in it does not survive into
+// the next batch (the coefficients a score was computed under get replaced between them),
+// and a thread reading what another thread wrote reads a whole record. The memory half is
+// not asserted here - it is a resident-set measurement, and the round's log carries it.
+
+TrainingConfig d2_data_config(const std::string& tag, int games, int threads) {
+    TrainingConfig config = fast_training_config();
+    config.search_depth = 4;
+    config.timeout_ms = 400;
+    config.max_nodes = 4000;
+    config.max_moves = 6;
+    config.collect_data = true;
+    config.data_games = games;
+    config.data_threads = threads;
+    config.data_opening_plies = 2;
+    config.seed = 4242;
+    config.records_path = temp_path(tag + "_records.jsonl").string();
+    config.samples_path.clear();
+    return config;
+}
+
+// 一 worker 一盘 makes the attribution arithmetic close: one engine alone cannot have
+// advanced the table past its own game, so a generation above the longest single game
+// says a second worker wrote here too. The hits say the same thing from the content side
+// - a worker left on its own table leaves its positions absent from the one the trainer
+// can see.
+void test_one_shared_table_serves_every_worker_of_a_batch() {
+    TrainingConfig config = d2_data_config("r127_shared", 4, 4);
+    Trainer trainer(ThreatCoefficients(), config);
+    assert(trainer.shared_transposition_table() == nullptr);  // built at the batch head
+    const int samples = trainer.generate_data_games(4, 4);
+    TranspositionTable* tt = trainer.shared_transposition_table();
+    assert(tt != nullptr);
+    assert(tt->is_shared());
+    assert(tt->size() == static_cast<size_t>(1 << 18));
+    assert(samples > 0);
+
+    std::ifstream file(config.records_path);
+    std::string line;
+    int games = 0, games_with_hits = 0, max_thought = 0, total_thought = 0;
+    while (std::getline(file, line)) {
+        if (line.empty()) continue;
+        GameRecord record;
+        std::string error;
+        assert(GameRecord::from_json(line, record, error));
+        ++games;
+        Board board;
+        int thought = 0, hits = 0;
+        for (const auto& entry : record.moves) {
+            board.place_stone(entry.move.pos.row, entry.move.pos.col, entry.move.color);
+            // The replayed opening plies were never thought, so no node stored them.
+            if (entry.method == "replay") continue;
+            ++thought;
+            TTEntry found;
+            if (tt->probe(board.zobrist_hash(), found, 0)) ++hits;
+        }
+        if (hits > 0) ++games_with_hits;
+        max_thought = std::max(max_thought, thought);
+        total_thought += thought;
+    }
+    std::cout << "  [r127] games=" << games << " thought plies=" << total_thought
+              << " longest game=" << max_thought << " games answered by the table="
+              << games_with_hits << " generation=" << static_cast<int>(tt->generation())
+              << std::endl;
+    assert(games == 4);
+    assert(games_with_hits == games);
+    assert(static_cast<int>(tt->generation()) > max_thought);
+
+    std::error_code ec;
+    std::filesystem::remove(config.records_path, ec);
+    std::cout << "test_one_shared_table_serves_every_worker_of_a_batch passed" << std::endl;
+}
+
+// A record is a score computed under the coefficients that were live when it was written,
+// and the champion can be replaced between batches, so the batch head empties the table
+// (design doc 轮次126's 失效口径). depth 30 is deeper than anything a --depth 4 search
+// writes, so the replacement policy cannot be what removes this record: only the clear can.
+void test_the_next_batch_clears_the_shared_table() {
+    TrainingConfig config = d2_data_config("r127_clear", 1, 1);
+    config.max_nodes = 2000;
+    Trainer trainer(ThreatCoefficients(), config);
+    assert(trainer.generate_data_games(1, 1) > 0);
+    TranspositionTable* tt = trainer.shared_transposition_table();
+    assert(tt != nullptr);
+
+    const uint64_t sentinel = 0x0123456789ABCDEFULL;
+    tt->store(sentinel, 30, 4242, Move(7, 7, BLACK), TTFlag::EXACT, 0);
+    TTEntry found;
+    assert(tt->probe(sentinel, found, 0));
+    assert(found.depth == 30 && found.value == 4242);
+
+    assert(trainer.generate_data_games(1, 1) > 0);
+    const bool survived = tt->probe(sentinel, found, 0);
+    std::cout << "  [r127] sentinel after the next batch: " << (survived ? "STILL THERE"
+                                                                         : "cleared")
+              << ", generation back to " << static_cast<int>(tt->generation()) << std::endl;
+    assert(!survived);
+    // The slot is usable again afterwards - a clear is an empty table, not a broken one.
+    tt->store(sentinel, 30, 4242, Move(7, 7, BLACK), TTFlag::EXACT, 0);
+    assert(tt->probe(sentinel, found, 0));
+
+    std::error_code ec;
+    std::filesystem::remove(config.records_path, ec);
+    std::cout << "test_the_next_batch_clears_the_shared_table passed" << std::endl;
+}
+
+// --shared-tt 0 is the doc's own layout (N workers, N tables), and the borrowed form has
+// to be able to answer a move: a worker that shares is not a worker that does not search.
+void test_sharing_off_leaves_every_engine_its_own_table() {
+    TrainingConfig config = d2_data_config("r127_off", 2, 2);
+    config.shared_tt_entries = 0;
+    Trainer trainer(ThreatCoefficients(), config);
+    assert(trainer.generate_data_games(2, 2) > 0);
+    assert(trainer.shared_transposition_table() == nullptr);
+
+    SearchEngine a;
+    SearchEngine b;
+    assert(&a.transposition_table() != &b.transposition_table());
+    assert(!a.transposition_table().is_shared());
+
+    TranspositionTable shared(1 << 12, true);
+    SearchEngine borrower(ThreatCoefficients(), &shared);
+    assert(&borrower.transposition_table() == &shared);
+    assert(borrower.transposition_table().is_shared());
+
+    Board board;
+    board.place_stone(7, 7, BLACK);
+    board.place_stone(7, 8, WHITE);
+    std::atomic<bool> stop(false);
+    const SearchResult answer = borrower.search(board, BLACK, 2, 50, stop);
+    const bool legal = answer.best_move.color != EMPTY &&
+                       board.is_empty(answer.best_move.pos.row, answer.best_move.pos.col);
+    std::cout << "  [r127] borrowed engine answered "
+              << answer.best_move.pos.row << "," << answer.best_move.pos.col
+              << " (legal: " << (legal ? "yes" : "no") << ")" << std::endl;
+    assert(legal);
+
+    std::error_code ec;
+    std::filesystem::remove(config.records_path, ec);
+    std::cout << "test_sharing_off_leaves_every_engine_its_own_table passed" << std::endl;
+}
+
+// 并发安全. Four writers on one 1024-bucket table, eight hashes they all share, so every
+// store lands in a slot somebody else is reading. A record is written from one place and
+// read from another, and the four fields the reader gets back are only mutually true if
+// the write that produced them was not interleaved with another: value V always comes with
+// static_eval 3V+7, depth 7 and the move V decodes to. Anything else is a torn record, and
+// the count has to be exactly zero. One walker takes all sixteen locks per pass
+// (hashfull()'s whole-table walk) and turns the shared generation clock while they run.
+void test_one_shared_table_survives_four_concurrent_writers() {
+    TranspositionTable tt(1 << 12, true);
+    const int kWriters = 4;
+    const int kIterations = 20000;
+    uint64_t pool[8];
+    for (int i = 0; i < 8; ++i) {
+        pool[i] = 0x9E3779B97F4A7C15ULL * (static_cast<uint64_t>(i) + 1);
+    }
+
+    struct Counters {
+        long stores = 0;
+        long hits = 0;
+        long torn = 0;
+    };
+    std::vector<Counters> counters(kWriters);
+    std::vector<std::thread> writers;
+    writers.reserve(kWriters);
+    for (int tid = 0; tid < kWriters; ++tid) {
+        writers.emplace_back([&, tid]() {
+            Counters& mine = counters[tid];
+            TTEntry found;
+            for (int i = 0; i < kIterations; ++i) {
+                const uint64_t hash = pool[i % 8];
+                const int value = tid * 10000 + (i % 10000);
+                tt.store(hash, 7, value, Move(value % 15, (value / 15) % 15, BLACK),
+                         TTFlag::EXACT, 0, value * 3 + 7);
+                ++mine.stores;
+                if (tt.probe(hash, found, 0)) {
+                    ++mine.hits;
+                    if (found.flag != TTFlag::EXACT ||
+                        found.static_eval != found.value * 3 + 7 ||
+                        found.best_move.pos.row != found.value % 15 ||
+                        found.best_move.pos.col != (found.value / 15) % 15 ||
+                        found.best_move.color != BLACK) {
+                        ++mine.torn;
+                    }
+                }
+            }
+        });
+    }
+
+    std::thread walker([&tt]() {
+        for (int i = 0; i < 2000; ++i) {
+            tt.hashfull();
+            tt.advance_generation();
+        }
+    });
+
+    for (auto& writer : writers) writer.join();
+    walker.join();
+
+    long stores = 0, hits = 0, torn = 0;
+    for (const Counters& c : counters) {
+        stores += c.stores;
+        hits += c.hits;
+        torn += c.torn;
+    }
+    std::cout << "  [r127] " << stores << " stores / " << hits << " reads on one 4096-slot "
+              << "table from " << kWriters << " threads, torn reads=" << torn
+              << ", generation=" << static_cast<int>(tt.generation()) << std::endl;
+    assert(stores == static_cast<long>(kWriters) * kIterations);
+    assert(hits > 0);
+    assert(torn == 0);
+
+    tt.clear();
+    TTEntry found;
+    assert(!tt.probe(pool[0], found, 0));
+
+    std::cout << "test_one_shared_table_survives_four_concurrent_writers passed" << std::endl;
+}
+
+// The CLI half: the flag parses, 0 is a real answer (the doc's own per-engine layout), a
+// negative and a size past the ceiling are refused before anything is allocated, and the
+// help text names it.
+void test_trainer_cli_shared_tt_probes() {
+#ifndef _WIN32
+    if (!std::filesystem::exists("gomoku_train")) {
+        std::cout << "  --shared-tt probes skipped: gomoku_train is not in the working "
+                     "directory" << std::endl;
+        std::cout << "test_trainer_cli_shared_tt_probes passed" << std::endl;
+        return;
+    }
+    const std::string base =
+        "--rounds 1 --population 2 --generations 1 --depth 1 --timeout-ms 1 --max-moves 2 "
+        "--fitness-games 1 --verification-games 2 --no-data --quiet";
+    const std::filesystem::path err = temp_path("r127_shared_tt_stderr.txt");
+    const std::filesystem::path out_path = temp_path("r127_shared_tt_out.json");
+    auto read_all = [](const std::filesystem::path& p) {
+        std::ifstream in(p);
+        std::ostringstream text;
+        text << in.rdbuf();
+        return text.str();
+    };
+    auto run = [&](const std::string& arguments) {
+        const std::string command = "./gomoku_train " + base + " --out '" + out_path.string() +
+                                    "' " + arguments + " > /dev/null 2> '" + err.string() + "'";
+        const int status = std::system(command.c_str());
+        assert(status != -1);
+        return WEXITSTATUS(status);
+    };
+
+    const int off = run("--shared-tt 0");
+    const std::string off_err = read_all(err);
+    const int named = run("--shared-tt 1024");
+    const int ceiling = run("--shared-tt 4194304");
+    std::cout << "  [r127] --shared-tt 0 => exit " << off << " (stderr "
+              << (off_err.empty() ? "empty" : "not empty") << "), 1024 => exit " << named
+              << ", 4194304 => exit " << ceiling << std::endl;
+    assert(off == 0);
+    assert(off_err.empty());
+    assert(named == 0);
+    assert(ceiling == 0);
+
+    const int negative = run("--shared-tt -1");
+    const std::string negative_err = read_all(err);
+    const int oversized = run("--shared-tt 4194305");
+    const std::string oversized_err = read_all(err);
+    std::cout << "  [r127] --shared-tt -1 => exit " << negative << ", 4194305 => exit "
+              << oversized << " ("
+              << (oversized_err.find("at most") != std::string::npos ? "names the ceiling"
+                                                                      : "does not")
+              << ")" << std::endl;
+    assert(negative == 1);
+    assert(negative_err.find("--shared-tt") != std::string::npos);
+    assert(oversized == 1);
+    assert(oversized_err.find("--shared-tt") != std::string::npos);
+
+    assert(run("--shared-tt") == 1);
+    assert(run("--shared-tt 1e3") == 1);
+
+    const std::filesystem::path usage = temp_path("r127_shared_tt_usage.txt");
+    assert(std::system(("./gomoku_train --help > '" + usage.string() + "' 2>&1").c_str()) != -1);
+    const std::string help = read_all(usage);
+    std::cout << "  [r127] --help mentions --shared-tt: "
+              << (help.find("--shared-tt") != std::string::npos ? "yes" : "no") << std::endl;
+    assert(help.find("--shared-tt") != std::string::npos);
+
+    std::error_code ec;
+    std::filesystem::remove(out_path, ec);
+    std::cout << "test_trainer_cli_shared_tt_probes passed" << std::endl;
+#endif
+}
+
 int main() {
     std::cout << "Running training tests..." << std::endl;
 
@@ -4334,6 +4633,14 @@ int main() {
     test_self_play_one_node_ceiling_still_answers_legally();
     test_trainer_config_node_budget_reaches_both_game_paths();
     test_trainer_cli_max_nodes_probes();
+
+    // D2, in the contract's order: the one table every worker reaches, the batch head that
+    // empties it, what --shared-tt 0 leaves alone, then the concurrent read.
+    test_one_shared_table_serves_every_worker_of_a_batch();
+    test_the_next_batch_clears_the_shared_table();
+    test_sharing_off_leaves_every_engine_its_own_table();
+    test_one_shared_table_survives_four_concurrent_writers();
+    test_trainer_cli_shared_tt_probes();
 
     std::cout << "All training tests passed" << std::endl;
     return 0;

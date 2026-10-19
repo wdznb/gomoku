@@ -57,6 +57,14 @@ struct TrainingConfig {
     int data_threads = 2;
     int data_opening_plies = 2;
     bool collect_data = true;
+    // Slots in the one transposition table every data worker shares (design doc 2.8
+    // #1's 进程级共享 TT；0 turns sharing off and each worker keeps its own). The
+    // default is a worker's own table size, 2^18 x 28B ~= 7.3MB, because that is what
+    // makes the claim true rather than bigger: sharing at this size costs 7.3MB once
+    // instead of 7.3MB per --threads, and the doc's 2^22 example would need 16
+    // concurrent workers before it beat the tables it replaces. Naming a larger number
+    // buys hit rate on a machine with the memory for it.
+    int shared_tt_entries = 1 << 18;
 
     uint64_t seed = 20261011;
 
@@ -107,6 +115,11 @@ public:
     int rounds_completed() const { return rounds_completed_; }
     const TrainingConfig& config() const { return config_; }
 
+    // The table the data workers are handed, or nullptr when --shared-tt 0 left each
+    // worker with its own. Reading it from outside is how a test tells a shared table
+    // from a table that merely happens to be the same size.
+    TranspositionTable* shared_transposition_table() const { return shared_tt_.get(); }
+
     // One-line progress summary, used by the CLI and by resume messages.
     std::string status_text() const;
 
@@ -134,6 +147,9 @@ private:
     EloSystem elo_;
     CoefficientFitness fitness_override_;
     LogFn log_;
+    // Built once for the whole Trainer when --shared-tt names a size, so the flag that
+    // decides whether a probe takes a shard lock is set before any worker exists.
+    std::unique_ptr<TranspositionTable> shared_tt_;
     int games_played_ = 0;
     size_t samples_collected_ = 0;
     int rounds_completed_ = 0;

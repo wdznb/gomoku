@@ -3,7 +3,9 @@
 
 #include "../core/types.h"
 #include <array>
+#include <atomic>
 #include <cstdint>
+#include <mutex>
 #include <vector>
 
 namespace gomoku {
@@ -62,7 +64,21 @@ public:
     // 2^18 x 28B ~= 7.3MB per table, down from 8.4MB. Every GameManager owns an
     // engine and its table, and sessions are unbounded: the old 2^20 default blew
     // the <100MB memory target with three concurrent games.
-    explicit TranspositionTable(size_t num_entries = 1 << 18);
+    //
+    // `shared` opts this table into shard locking (design doc 2.8 #1's 分片加锁). It is
+    // a construction-time fact rather than a switch, because the flag is read on every
+    // probe and store: a table that several threads may touch has to have been declared
+    // as such before any of them existed, and a thread that writes the flag later is
+    // itself the race the flag exists to prevent. An unshared table takes no lock at
+    // all, which is what keeps a session's search paying what it paid before.
+    explicit TranspositionTable(size_t num_entries = 1 << 18, bool shared = false);
+
+    // A table that carries locks cannot be handed out by value: copying one would copy
+    // the mutexes away from the threads already holding them.
+    TranspositionTable(const TranspositionTable&) = delete;
+    TranspositionTable& operator=(const TranspositionTable&) = delete;
+
+    bool is_shared() const { return shared_; }
 
     // `ply` is the distance from the root of the think that wrote the record: mate
     // scores are stored relative to it and read back relative to the probing node's
@@ -115,15 +131,26 @@ public:
     // is committed to a board, not when a think starts: ageing the table at the start
     // of a think is what let that think's own shallow records evict the deep ones the
     // previous move had paid for.
+    //
+    // On a shared table that clock belongs to the table, not to a game, so every
+    // worker's committed stone advances it and records age out at the rate of the
+    // whole batch. That is the honest cost of 内存与并发局数解耦: the alternative, one
+    // generation per game, would need a per-thread age and a wider entry.
     void advance_generation();
 
     void clear();
 
     size_t size() const { return buckets_.size() * kBucketWays; }
-    uint8_t generation() const { return generation_; }
+    uint8_t generation() const { return generation_.load(std::memory_order_relaxed); }
     int hashfull() const;
 
     static constexpr uint8_t kBucketWays = 4;
+    // Buckets are cut into this many contiguous ranges, each with its own lock (design
+    // doc 风险表 :569's 先分片加锁（16 片）). Sharding by the top bits of the bucket
+    // index leaves index_for() alone, so which four records share a bucket - and
+    // therefore which record a store evicts - is the same on a sharded table as on an
+    // unsharded one: the split moves locks, not entries.
+    static constexpr size_t kShards = 16;
 
 private:
     // +-100000 is the engine's mate sentinel, the same number the resign threshold
@@ -139,6 +166,12 @@ private:
         // board's own toggles change most, and a direct modulo put neighbouring
         // generations of positions in the same bucket.
         return static_cast<size_t>((hash * 0x9E3779B97F4A7C15ULL) >> (64 - bucket_bits_));
+    }
+    // The top kShardBits of a bucket index choose the lock. A table with fewer buckets
+    // than locks gives each bucket its own, which is still correct - clear() and
+    // hashfull() take all of them either way.
+    std::mutex& shard_for(size_t bucket) const {
+        return shards_[(bucket >> shard_shift_) & (kShards - 1)];
     }
     // The verification tag is the hash's own high half. bucket_bits_ is at least 1,
     // so the shift above is never the undefined 64-bit one.
@@ -175,7 +208,13 @@ private:
     std::vector<Bucket> buckets_;
     // Set by every constructor through bucket_bits_for(), which never returns 0.
     size_t bucket_bits_;
-    uint8_t generation_;
+    // bucket_bits_ - 4, or 0 for a table smaller than one bucket per lock.
+    size_t shard_shift_;
+    // Advanced by every committed stone of every thread sharing the table and read by
+    // every store's age stamp, so it is atomic even where nothing else is.
+    std::atomic<uint8_t> generation_;
+    mutable std::array<std::mutex, kShards> shards_;
+    const bool shared_;
 };
 
 }
