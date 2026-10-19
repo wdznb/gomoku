@@ -292,6 +292,37 @@ public:
         return found == nullptr ? 0 : found->side_value(color);
     }
 
+    // Design doc 2.6 step 3's whole-board sum, read off the records step 2 keeps:
+    // the same arithmetic `evaluate_board` runs, square for square, with each
+    // square's four directions taken from the record that already holds them instead
+    // of from a fresh pass. Only a square that shares a line with the stone just
+    // placed has a stale record, so this is the 「上一手所在 4 条线」 the doc asks for -
+    // arrived at by the entry's own staleness test rather than by a dirty set the
+    // board would have to maintain, which README:624 records as costing as much as
+    // the scan it saved. Nothing here is a delta of a *different* evaluation: both
+    // halves of the sum live in `Evaluator::board_pair_value` and
+    // `evaluate_board_from`, which `evaluate_board` now calls the same way, so the
+    // number this returns is the number the scan returns and no read of a static
+    // score has to fall back on anything.
+    int board_score(const Board& board, int my_color) {
+        const bool black_is_mine = my_color == BLACK;
+        long long total = 0;
+        for (const Position& pos : board.active_empty()) {
+            // `cell()` only answers null for a square a stone stands on, and the
+            // candidate list is maintained to hold none - so this is the same
+            // `found == nullptr ? 0` shape `pair_score` and `side_score` use, not a
+            // read that expects to miss.
+            const Cell* found = cell(board, pos.row, pos.col);
+            if (found == nullptr) continue;
+            // One record carries both colours, so the reader picks its own side the
+            // way `generate()` does.
+            const PositionPattern& mine = black_is_mine ? found->black : found->white;
+            const PositionPattern& theirs = black_is_mine ? found->white : found->black;
+            total += evaluator_.board_pair_value(mine, theirs, pos.row, pos.col, black_is_mine);
+        }
+        return evaluator_.evaluate_board_from(total, board, my_color);
+    }
+
     // Step 2's own ledger, in the same shape as step 1's: `hits + recomputes ==
     // probes` is what says no read was answered twice or not at all.
     uint64_t probes() const { return probes_; }

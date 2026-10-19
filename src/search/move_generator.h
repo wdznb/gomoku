@@ -123,6 +123,14 @@ public:
         return cache_.pair_score(board, pos.row, pos.col);
     }
 
+    // The whole-board static score over the same records: design doc 2.6 step 3's
+    // stand-pat entry. A node that asks this and then asks `generate()` recognises
+    // each square once between the two, whichever order they come in, and the number
+    // is the one `Evaluator::evaluate_board` returns for the same board.
+    int board_score(const Board& board, int color) const {
+        return cache_.board_score(board, color);
+    }
+
     // Step 2's ledger, for the cases that want to say how much of a think's
     // candidate work was shared rather than redone.
     const CandidateCache& cache() const { return cache_; }

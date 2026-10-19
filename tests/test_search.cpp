@@ -7624,8 +7624,8 @@ void test_a_quiet_think_prices_its_candidates_about_once_in_two() {
         int score;
     };
     const Row rows[] = {
-        {BLACK, 221774, 142978, 75855, 67123, 75852, 4066903, 2097434, 1969469, 71992},
-        {WHITE, 156428, 102340, 68419, 33921, 68419, 3003955, 1539956, 1463999, 97044},
+        {BLACK, 221774, 142978, 75855, 67123, 75852, 8755599, 4949934, 3805665, 71992},
+        {WHITE, 156428, 102340, 68419, 33921, 68419, 7247557, 4132247, 3115310, 97044},
     };
     const Board board = b1_quiet();
     Evaluator evaluator;
@@ -7646,9 +7646,11 @@ void test_a_quiet_think_prices_its_candidates_about_once_in_two() {
         assert(search.ctx_.eval_patches() == row.patches);
         assert(search.ctx_.eval_scans() + search.ctx_.eval_reuses() == row.qnodes);
 
-        // Step 2's ledger on the same think. The hit count is what HEAD cannot report at
-        // all: on 897ab43 every one of these 4,066,903 asks pays its own four-direction
-        // pass, and the number below is the count of asks this step answers for free.
+        // Step 2's ledger on the same think, re-taken for step 3: the tree and the scan
+        // ledger are the literals step 1 pinned and step 2 left alone, and the three
+        // numbers below grew because the whole-board sum now reads this same cache. On
+        // 897ab43 every one of these asks paid its own four-direction pass; the hit count
+        // is the asks that are answered from a record.
         const CandidateCache& cache = search.move_gen_.cache();
         assert(cache.probes() == row.probes);
         assert(cache.hits() == row.hits);
@@ -7659,8 +7661,8 @@ void test_a_quiet_think_prices_its_candidates_about_once_in_two() {
     }
 
     std::cout << "test_a_quiet_think_prices_its_candidates_about_once_in_two passed (quiet "
-                 "BLACK 4066903 candidate reads = 2097434 from a record + 1969469 priced "
-                 "here, on the 221774-node tree; WHITE 3003955 = 1539956 + 1463999 on the "
+                 "BLACK 8755599 candidate reads = 4949934 from a record + 3805665 priced "
+                 "here, on the 221774-node tree; WHITE 7247557 = 4132247 + 3115310 on the "
                  "156428-node tree; C1's 75855/67123/75852 and 68419/33921/68419 scan "
                  "ledgers unmoved)" << std::endl;
 }
@@ -7694,8 +7696,9 @@ void test_a_warm_think_buys_its_own_records_and_no_ones_from_the_first() {
     assert(second.ctx_.eval_reuses() == 1);
 
     // Its candidate work, on the other hand, is its own: 111 reads for this think, 58 of
-    // them priced here and 53 answered from records this think itself filled. None of the
-    // first think's reads carried over.
+    // them priced here and 53 answered from records this think itself filled. Step 3 did
+    // not move them, because the warm think's one static score is answered out of the
+    // table and never reaches the sum. None of the first think's reads carried over.
     assert(cache.probes() == 111);
     assert(cache.hits() == 53);
     assert(cache.recomputes() == 58);
@@ -7706,6 +7709,370 @@ void test_a_warm_think_buys_its_own_records_and_no_ones_from_the_first() {
                  "(warm repeat 187 nodes / 0 scans / 1 reuse as C1 pins it, its own 111 "
                  "candidate reads = 53 hits + 58 recomputes, the first think's "
               << first_probes << " reads left behind)" << std::endl;
+}
+
+// ---------------------------------------------------------------------------
+// C3 - 局部 stand_pat (design doc 2.6 Step 3, :409-410: 「静默搜索入口不再做全盘评估,
+// 改为「上一手所在 4 条线」的局部 delta 评估… 全盘评估只在根节点与需要精确分值的场合使用」).
+//
+// What shipped is the doc's aim by a different mechanism, and the difference is worth
+// naming before the cases: the static score is not a delta of a *different* evaluation,
+// it is the same whole-board sum read off step 2's records. Two things made that the
+// right reading. (1) C2 proved the dependency a square has on the board is its four
+// whole lines, not a ±2 footprint, so 「上一手所在 4 条线」 is exactly the set of records a
+// placement invalidates - arrived at by the entry's own key compare rather than by a
+// dirty set. (2) README:624 records a whole-board incremental evaluation being rejected
+// because the place/undo bookkeeping cost as much as the rescan it saved; reading a
+// record that already exists pays no bookkeeping at all. The consequence for :568's
+// 「Step 3（局部 stand_pat）先只用于「无威胁局面」，有威胁时回退全盘评估」 is that the
+// fallback is not needed: a read that returns the scan's own number cannot be the
+// approximate half of a two-tier evaluation, so the deviation is in the sound direction
+// and is reported that way rather than as compliance.
+//
+// Four cases, one per claim: the sum equals the scan on every board of the census the
+// method names (C3-1), every addend of that sum is the addend the scan pays, square by
+// square, with the pre-refactor arithmetic as the oracle (C3-2 - :556 #3's 逐格比对 at
+// step 3's own level), a stone five cells away moves both paths by the same number and
+// undo returns both to it while invalidating only the line-sharers (C3-3), and one set
+// of records answers the sum for either colour, which is the reason a record carries both
+// sides (C3-4). The think-level cost is the ledger C2-4 re-took.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// The read step 3 wired, against the read it replaced, on a generator of its own so the
+// caller's ledger is untouched. The cold-list assertions are also the evidence that the
+// candidate list holds no occupied square - the one premise that lets `board_score` read
+// records instead of recognising.
+int c3_sum_equals_scan(const Board& board, int color, const Evaluator& evaluator) {
+    MoveGenerator gen(evaluator);
+    const CandidateCache& cache = gen.cache();
+    const long long list_size = static_cast<long long>(board.active_empty().size());
+    const int cached = gen.board_score(board, color);
+    assert(static_cast<long long>(cache.probes()) == list_size);
+    assert(static_cast<long long>(cache.recomputes()) == list_size);
+    assert(cache.hits() == 0);
+    assert(cached == evaluator.evaluate_board(board, color));
+    return cached;
+}
+
+// One square's addend, read two ways: from the record step 2 keeps and from a fresh
+// four-direction pass. `pattern_score` is private to `Evaluator` and this TU's
+// `#define private public` block covers only the alpha-beta headers, so the arithmetic
+// itself is not re-derived here - test_evaluator.cpp does that against `naive_board_total`
+// and a dozen absolute literals, in the same gate. What this helper pins is the two things
+// step 3 can get wrong on its own: which side of the record it reads, and whether the two
+// branches of the per-side forbidden rule still cancel out (the antisymmetry it asserts is
+// exactly `board_pair_value`'s contract - BLACK's term added, WHITE's subtracted, each
+// judged on its own shape).
+long long c3_addend_truth(const Evaluator& evaluator, const CandidateCache::Cell& found,
+                          const PositionPattern& fresh_black,
+                          const PositionPattern& fresh_white, int row, int col, int color) {
+    const bool black_is_mine = (color == BLACK);
+    const long long from_record = evaluator.board_pair_value(
+        black_is_mine ? found.black : found.white, black_is_mine ? found.white : found.black,
+        row, col, black_is_mine);
+    const long long from_pass =
+        evaluator.board_pair_value(black_is_mine ? fresh_black : fresh_white,
+                                   black_is_mine ? fresh_white : fresh_black, row, col,
+                                   black_is_mine);
+    assert(from_record == from_pass);
+    // The same square asked by the other colour is the same number with its sign moved -
+    // and a record that answered the writer's side rather than the reader's would break
+    // here rather than at the sum, where the cap could hide it.
+    const long long other_side =
+        evaluator.board_pair_value(black_is_mine ? fresh_white : fresh_black,
+                                   black_is_mine ? fresh_black : fresh_white, row, col,
+                                   !black_is_mine);
+    assert(other_side == -from_pass);
+    return from_pass;
+}
+
+}  // namespace
+
+// Every board of the census, both colours: the number the search now reads at a stand-pat
+// is the number the scan returns, and it arrives by reading each candidate's record exactly
+// once - no square twice, no square not at all.
+void test_the_record_sum_is_the_whole_board_scan_on_every_board() {
+    const std::vector<Board> boards = c2_census_boards();
+    assert(boards.size() == 42);
+    Evaluator evaluator;
+    int compared = 0;
+    long long listed = 0, occupied = 0;
+
+    for (const Board& board : boards) {
+        for (const Position& pos : board.active_empty()) {
+            ++listed;
+            if (!board.is_empty(pos.row, pos.col)) ++occupied;
+        }
+
+        for (const int color : {BLACK, WHITE}) {
+            MoveGenerator gen(evaluator);
+            const CandidateCache& cache = gen.cache();
+            const long long list_size = static_cast<long long>(board.active_empty().size());
+
+            const int cold = gen.board_score(board, color);
+            const int direct = evaluator.evaluate_board(board, color);
+            assert(cold == direct);
+            assert(static_cast<long long>(cache.probes()) == list_size);
+            assert(static_cast<long long>(cache.recomputes()) == list_size);
+            assert(cache.hits() == 0);
+
+            // The same read again: every addend comes out of a record, so the ledger moves
+            // by the list size on the hit side and not at all on the recompute side.
+            const int warm = gen.board_score(board, color);
+            assert(warm == direct);
+            assert(static_cast<long long>(cache.probes()) == 2 * list_size);
+            assert(static_cast<long long>(cache.hits()) == list_size);
+            assert(static_cast<long long>(cache.recomputes()) == list_size);
+            ++compared;
+        }
+    }
+
+    // The premise the cold-read ledger above rests on: no stone sits in the candidate list.
+    assert(occupied == 0);
+    assert(compared == 84);
+    assert(listed > 0);
+
+    std::cout << "test_the_record_sum_is_the_whole_board_scan_on_every_board passed (42 boards "
+                 "x two colours = 84 sums equal to the scan, read over "
+              << listed
+              << " candidate squares with none of them occupied; cold read = list probes "
+                 "and list recomputes, warm read = list hits)"
+              << std::endl;
+}
+
+// :556 #3's 逐格比对 for step 3, at the level step 3 works on: the whole-board sum is the
+// sum of its addends, and this checks the chain link by link rather than only at its ends -
+// the record's four directions against the fresh pass, the addend read off the record
+// against the addend read off the pass, both sides' addends against each other, and the
+// addends run through the second half of the split against the scan. The split's own
+// arithmetic is not re-derived here (test_evaluator.cpp pins it against `naive_board_total`
+// and against absolute literals); what this case can catch that those cannot is a cached
+// read answering the wrong side, or answering from a shape the pass no longer sees.
+void test_every_addend_of_the_record_sum_is_the_addend_the_scan_pays() {
+    const std::vector<Board> boards = c2_census_boards();
+    Evaluator evaluator;
+    long long squares = 0;
+    int boards_checked = 0, sums = 0;
+
+    for (const Board& board : boards) {
+        ++boards_checked;
+        CandidateCache cache(evaluator);
+
+        for (const int color : {BLACK, WHITE}) {
+            long long truth_total = 0;
+
+            for (const Position& pos : board.active_empty()) {
+                const PositionPattern fresh_black = PatternRecognizer::recognize_position(
+                    board, pos.row, pos.col, BLACK);
+                const PositionPattern fresh_white = PatternRecognizer::recognize_position(
+                    board, pos.row, pos.col, WHITE);
+                const CandidateCache::Cell* found = cache.cell(board, pos.row, pos.col);
+                assert(found != nullptr);
+                assert(c2_patterns_equal(found->black, fresh_black));
+                assert(c2_patterns_equal(found->white, fresh_white));
+
+                truth_total += c3_addend_truth(evaluator, *found, fresh_black, fresh_white,
+                                                pos.row, pos.col, color);
+                ++squares;
+            }
+
+            // And the closed chain: the addends the pass pays, run through the other half
+            // of the split, are the number the scan returns.
+            const int rebuilt = evaluator.evaluate_board_from(truth_total, board, color);
+            assert(rebuilt == evaluator.evaluate_board(board, color));
+            assert(rebuilt == c3_sum_equals_scan(board, color, evaluator));
+            ++sums;
+        }
+    }
+
+    assert(boards_checked == 42);
+    assert(sums == 84);
+    assert(squares > 84);
+
+    std::cout << "test_every_addend_of_the_record_sum_is_the_addend_the_scan_pays passed ("
+              << squares << " square-addends over 42 boards x two colours, each record's four "
+                 "directions equal to the fresh pass and each addend read off the record equal "
+                 "to the one read off the pass and to the other colour's with its sign moved; "
+                 "84 rebuilt sums equal to the scan)"
+              << std::endl;
+}
+
+// The sum on the make/unmake path. C2-2 proved the record-level fact - a stone five cells
+// away is inside (7,7)'s dependency, and undo does not hand the old record back but makes
+// the next read recompute the number that was there before; step 3 puts that under the
+// whole-board sum: both paths move by the same amount and both come back to the same
+// number, while the read after the placement recomputes only the squares that share a line
+// with the new stone. That last clause is the 「只更新受影响格」 the doc asks of a
+// placement, measured as reads rather than as bookkeeping.
+void test_a_far_stone_moves_both_sums_alike_and_undo_brings_both_back() {
+    const Board before = c2_far_reach_board();
+    Evaluator evaluator;
+    MoveGenerator gen(evaluator);
+    const CandidateCache& cache = gen.cache();
+
+    const int cold = c3_sum_equals_scan(before, BLACK, evaluator);
+    const int first = gen.board_score(before, BLACK);
+    assert(first == cold);
+    // The whole list answered from records the first read just filled: nothing to
+    // recompute, and the ledger below is taken from here so each clause counts one read.
+    assert(gen.board_score(before, BLACK) == cold);
+    const long long probes_before = static_cast<long long>(cache.probes());
+    const long long recomputes_before = static_cast<long long>(cache.recomputes());
+    assert(probes_before == 2 * static_cast<long long>(before.active_empty().size()));
+    assert(static_cast<long long>(cache.recomputes()) ==
+           static_cast<long long>(before.active_empty().size()));
+
+    Board after = before;
+    assert(after.place_stone(7, 12, BLACK));
+    const long long list_after = static_cast<long long>(after.active_empty().size());
+    const int placed = gen.board_score(after, BLACK);
+    const long long stale = static_cast<long long>(cache.recomputes()) - recomputes_before;
+    assert(placed == c3_sum_equals_scan(after, BLACK, evaluator));
+    assert(placed != cold);
+    // The placement spends probes for every square it reads and recomputes for only the
+    // ones whose line words it changed.
+    assert(static_cast<long long>(cache.probes()) == probes_before + list_after);
+    assert(stale > 0);
+    assert(stale < list_after);
+    // The other colour reads the same records at the same position.
+    assert(gen.board_score(after, WHITE) == evaluator.evaluate_board(after, WHITE));
+
+    const long long probes_after_place = static_cast<long long>(cache.probes());
+    const long long recomputes_after_place = static_cast<long long>(cache.recomputes());
+    Board undone = after;
+    undone.undo_last_move();
+    assert(undone.active_empty().size() == before.active_empty().size());
+    const int restored = gen.board_score(undone, BLACK);
+    assert(restored == cold);
+    assert(restored == c3_sum_equals_scan(undone, BLACK, evaluator));
+    const long long restale =
+        static_cast<long long>(cache.recomputes()) - recomputes_after_place;
+    assert(static_cast<long long>(cache.probes()) ==
+           probes_after_place + static_cast<long long>(undone.active_empty().size()));
+    assert(restale > 0);
+    assert(restale < static_cast<long long>(undone.active_empty().size()));
+
+    std::cout << "test_a_far_stone_moves_both_sums_alike_and_undo_brings_both_back passed "
+                 "(quiet four + (7,9)(7,10)(7,11): sum "
+              << cold << " -> " << placed << " when BLACK plays (7,12), back to " << restored
+              << " on undo, both paths at every step; the placement recomputed " << stale
+              << " of " << list_after << " squares and the undo " << restale << ")" << std::endl;
+}
+
+// One record, two callers. The sum is the quantity that gets stored in the table and read
+// back by whichever colour is to move, so the reader's side has to be picked from a record
+// that carries both - which is the same claim C2-3 proves for the tiers, at step 3's level.
+// Asked in either order, on one set of records, each colour gets its own scan's number and
+// the second ask is answered entirely by hits.
+void test_one_set_of_records_answers_the_sum_for_either_colour() {
+    const std::vector<Board> boards = c2_census_boards();
+    Evaluator evaluator;
+    int pairs = 0;
+
+    for (const Board& board : boards) {
+        const long long list_size = static_cast<long long>(board.active_empty().size());
+        const int black_sum = evaluator.evaluate_board(board, BLACK);
+        const int white_sum = evaluator.evaluate_board(board, WHITE);
+
+        // The two orders are the two things a record can get wrong: it can answer the
+        // colour that wrote it rather than the colour that asks, and it can answer the
+        // second reader out of a slot the first reader left half-filled.
+        const int orders[2][2] = {{BLACK, WHITE}, {WHITE, BLACK}};
+        for (int order = 0; order < 2; ++order) {
+            MoveGenerator gen(evaluator);
+            const CandidateCache& cache = gen.cache();
+            const int colors[2] = {orders[order][0], orders[order][1]};
+            const int expected[2] = {colors[0] == BLACK ? black_sum : white_sum,
+                                     colors[1] == BLACK ? black_sum : white_sum};
+
+            assert(gen.board_score(board, colors[0]) == expected[0]);
+            assert(static_cast<long long>(cache.probes()) == list_size);
+            assert(static_cast<long long>(cache.recomputes()) == list_size);
+            assert(cache.hits() == 0);
+
+            assert(gen.board_score(board, colors[1]) == expected[1]);
+            assert(static_cast<long long>(cache.probes()) == 2 * list_size);
+            assert(static_cast<long long>(cache.hits()) == list_size);
+            assert(static_cast<long long>(cache.recomputes()) == list_size);
+            ++pairs;
+        }
+    }
+
+    assert(pairs == 84);
+
+    std::cout << "test_one_set_of_records_answers_the_sum_for_either_colour passed (42 boards, "
+                 "both read orders: the writer's colour and the reader's colour each get their "
+                 "own scan's number, and the second read is list_size hits and no recompute)"
+              << std::endl;
+}
+
+// The branch every aborted node of a cut think takes. `alphabeta()`
+// (src/search/alphabeta.cpp:308) returns this node's own static score from its stop test
+// (:334) *without* consulting the table: the hash and the reuse would both have to move
+// above that test, and a cut think's frames are the reason they must not - the comment at
+// `:327-333` states the choice and what step 3 gave this branch instead. What that read
+// costs is the claim this case pins: the sum comes out of the same records, so the nodes a
+// budget kills stopped each paying a whole-board pass. The pin is a think that really is
+// cut, by node budget only, so nothing here depends on a wall clock.
+void test_the_nodes_a_cut_kills_pay_the_sum_out_of_the_records() {
+    const Board board = b1_quiet();
+    Evaluator evaluator;
+    std::atomic<bool> stop(false);
+
+    // The whole first layer, measured so the budget lands inside the second one, the same
+    // shape the A4 cut case uses.
+    uint64_t layer_one_nodes = 0;
+    {
+        TranspositionTable scratch;
+        AlphaBetaSearch measure(evaluator, scratch);
+        measure.set_node_limit(2000000);
+        measure.search(board, BLACK, 1, 600000, stop);
+        layer_one_nodes = static_cast<uint64_t>(measure.last_search_info().nodes_searched);
+    }
+    assert(layer_one_nodes > 0);
+
+    TranspositionTable tt;
+    AlphaBetaSearch cut(evaluator, tt);
+    cut.set_node_limit(static_cast<int>(layer_one_nodes + 1));
+    cut.search(board, BLACK, 4, 600000, stop);
+    const SearchInfo info = cut.last_search_info();
+    const CandidateCache& cache = cut.move_gen_.cache();
+
+    // The budget is spent inside the second layer, so this think really does abort: one
+    // committed layer, one interrupted, no candidate of layer two finished.
+    assert(info.stopped == StopReason::NODES);
+    assert(info.depth == 1);
+    assert(info.partial_depth == 2);
+    assert(info.root_moves_done == 0);
+    assert(info.root_moves_total == 31);
+    assert(info.nodes_searched == 63);
+
+    // 31 of those 63 nodes reached `static_score`, and all 31 are quiescence nodes - which
+    // is why this case reads the cache ledger instead of the evaluation one. The rest
+    // answered from the stop test, a branch that has no counter of its own; what it has
+    // since step 3 is the read, and a read is a probe.
+    assert(cut.stats_.qnodes == 31);
+    assert(cut.ctx_.eval_scans() == 31);
+    assert(cut.ctx_.eval_reuses() == 0);
+    assert(cut.ctx_.eval_scans() == static_cast<uint64_t>(cut.stats_.qnodes));
+
+    assert(cache.probes() == 1643);
+    assert(cache.hits() == 587);
+    assert(cache.recomputes() == 1056);
+    assert(cache.hits() + cache.recomputes() == cache.probes());
+    // 1643 asks for 63 nodes: each aborted visit still wants the whole candidate list, so
+    // the ledger scales with the list, not with the nodes that reached the table. Take the
+    // read out of that branch - mutation M5 - and this line loses their share.
+    assert(cache.probes() > 20ULL * static_cast<uint64_t>(info.nodes_searched));
+
+    std::cout << "test_the_nodes_a_cut_kills_pay_the_sum_out_of_the_records passed (cut think: "
+                 "63 nodes / 31 root candidates / stopped at the node budget inside layer 2; "
+                 "the evaluation ledger sees only the 31 quiescence nodes (scans 31 / reuses "
+                 "0), while the cache answered 1643 reads = 587 hits + 1056 recomputes, the "
+                 "aborted nodes' sums included)"
+              << std::endl;
 }
 
 int main() {
@@ -7865,6 +8232,16 @@ int main() {
     test_the_tiers_and_the_ordering_read_the_same_record_the_pass_wrote();
     test_a_quiet_think_prices_its_candidates_about_once_in_two();
     test_a_warm_think_buys_its_own_records_and_no_ones_from_the_first();
+
+    // C3, in the contract's order: the sum against the scan on every board, the sum's
+    // addends against the pre-split arithmetic square by square, the sum on the make/unmake
+    // path, the one set of records answering either colour's ask, and the read the aborted
+    // nodes of a cut think pay.
+    test_the_record_sum_is_the_whole_board_scan_on_every_board();
+    test_every_addend_of_the_record_sum_is_the_addend_the_scan_pays();
+    test_a_far_stone_moves_both_sums_alike_and_undo_brings_both_back();
+    test_one_set_of_records_answers_the_sum_for_either_colour();
+    test_the_nodes_a_cut_kills_pay_the_sum_out_of_the_records();
 
     std::cout << "All search tests passed!" << std::endl;
     return 0;

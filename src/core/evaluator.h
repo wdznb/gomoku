@@ -82,6 +82,22 @@ public:
                              int row, int col, int color) const;
     
     int evaluate_board(const Board& board, int my_color) const;
+
+    // The two halves of `evaluate_board`, split at the one call it makes per
+    // candidate square (design doc 2.6 step 3). A reader that already holds both
+    // shapes at a square adds `board_pair_value` for it and finishes with
+    // `evaluate_board_from`; `evaluate_board` itself is that same pair of calls with
+    // a fresh four-direction pass between them. Neither half is a different
+    // evaluation: the loop body, the stone terms and the cap live here and only here,
+    // so a cached pass cannot drift from the scan it replaces.
+    //
+    // Not `candidate_pair_value`, which is the ordering price: that folds in the
+    // square's centre weight and pays a flat `coeffs_.five` for a five, while the
+    // board sum adds pattern scores - each side judged by the forbidden rule
+    // evaluated on its own pattern - and is the number that gets capped.
+    int board_pair_value(const PositionPattern& my_pattern, const PositionPattern& opp_pattern,
+                         int row, int col, bool black_is_mine) const;
+    int evaluate_board_from(long long pattern_total, const Board& board, int my_color) const;
     
     int get_position_weight(int row, int col) const;
     

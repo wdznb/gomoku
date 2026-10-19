@@ -232,33 +232,27 @@ int Evaluator::edge_penalty_term(const Board& board, int color) const {
     return static_cast<int>(total * coeffs_.edge_penalty);
 }
 
-int Evaluator::evaluate_board(const Board& board, int my_color) const {
-    long long my_total = 0;
-    long long opp_total = 0;
-    
-    const auto& candidates = board.active_empty();
-    const bool black_is_mine = (my_color == BLACK);
+int Evaluator::board_pair_value(const PositionPattern& my_pattern,
+                                const PositionPattern& opp_pattern, int row, int col,
+                                bool black_is_mine) const {
+    long long total = 0;
 
-    for (const auto& pos : candidates) {
-        // One shared pass over the four directions yields both colours; two
-        // recognize_position calls read the same two bitboard lines again.
-        PositionPattern my_pattern, opp_pattern;
-        PatternRecognizer::recognize_position_both(board, pos.row, pos.col, my_color,
-                                                  my_pattern, opp_pattern);
-
-        // pattern_score pays out double_four / double_three / four_three, so a
-        // shape BLACK can never legally play would bank points for a stone the
-        // move generator refuses to place. Each side is judged on its own pattern:
-        // the square may be forbidden for BLACK and a live four for WHITE.
-        if (!black_is_mine || !PatternRecognizer::is_forbidden_from_pattern(my_pattern)) {
-            my_total += pattern_score(my_pattern, pos.row, pos.col);
-        }
-        if (black_is_mine || !PatternRecognizer::is_forbidden_from_pattern(opp_pattern)) {
-            opp_total += pattern_score(opp_pattern, pos.row, pos.col);
-        }
+    // pattern_score pays out double_four / double_three / four_three, so a
+    // shape BLACK can never legally play would bank points for a stone the
+    // move generator refuses to place. Each side is judged on its own pattern:
+    // the square may be forbidden for BLACK and a live four for WHITE.
+    if (!black_is_mine || !PatternRecognizer::is_forbidden_from_pattern(my_pattern)) {
+        total += pattern_score(my_pattern, row, col);
     }
+    if (black_is_mine || !PatternRecognizer::is_forbidden_from_pattern(opp_pattern)) {
+        total -= pattern_score(opp_pattern, row, col);
+    }
+    return static_cast<int>(total);
+}
 
-    long long diff = my_total - opp_total;
+int Evaluator::evaluate_board_from(long long pattern_total, const Board& board,
+                                   int my_color) const {
+    long long diff = pattern_total;
     // Where the stones stand. The pattern sum only ever speaks about threats a
     // player could still build, so an otherwise quiet board reads as 0 no matter
     // whether the army sits on the centre lines or along the rim - which is why a
@@ -277,6 +271,25 @@ int Evaluator::evaluate_board(const Board& board, int my_color) const {
     if (diff > cap) diff = cap;
     if (diff < -cap) diff = -cap;
     return static_cast<int>(diff);
+}
+
+int Evaluator::evaluate_board(const Board& board, int my_color) const {
+    long long my_total = 0;
+
+    const auto& candidates = board.active_empty();
+    const bool black_is_mine = (my_color == BLACK);
+
+    for (const auto& pos : candidates) {
+        // One shared pass over the four directions yields both colours; two
+        // recognize_position calls read the same two bitboard lines again.
+        PositionPattern my_pattern, opp_pattern;
+        PatternRecognizer::recognize_position_both(board, pos.row, pos.col, my_color,
+                                                  my_pattern, opp_pattern);
+
+        my_total += board_pair_value(my_pattern, opp_pattern, pos.row, pos.col, black_is_mine);
+    }
+
+    return evaluate_board_from(my_total, board, my_color);
 }
 
 }

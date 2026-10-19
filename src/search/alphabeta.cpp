@@ -150,7 +150,13 @@ int AlphaBetaSearch::static_score(const Board& board, int color, uint64_t hash,
         return color == BLACK ? stored : -stored;
     }
     ctx_.count_eval_scan();
-    const int score = evaluator_.evaluate_board(board, color);
+    // Design doc 2.6 step 3: the scan reads the shapes step 2's records already
+    // hold, so a node pays for the squares that share a line with the stone just
+    // placed and nothing else - and the number is still the one
+    // `evaluate_board(board, color)` returns, because both passes go through the
+    // same two halves of that function. The counter keeps its old name because it
+    // counts the same event: an evaluation this node could not answer from the table.
+    const int score = move_gen_.board_score(board, color);
     // The scan is kept, whether or not this position has a record yet - put_static_eval
     // writes onto the record if there is one and otherwise holds the number in a slot
     // of the same bucket that every bound-facing reader of the table calls empty.
@@ -322,7 +328,10 @@ NodeResult AlphaBetaSearch::alphabeta(Board& board, int depth, int alpha, int be
         // inside the path every aborted node of a cut think takes, which is a change
         // to the frames that think reports. Quiescence's abort branch does reuse,
         // because that node has its hash and its cached score in hand already.
-        return {evaluator_.evaluate_board(board, color), false};
+        // What this branch does share, from step 3 on, is the records: the scan
+        // itself costs the squares whose lines changed and nothing else, which is
+        // what makes it safe to leave in a path every aborted node takes.
+        return {move_gen_.board_score(board, color), false};
     }
 
     uint64_t hash = board.zobrist_hash();

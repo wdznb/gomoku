@@ -1979,6 +1979,258 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次123 引擎重构 C3：静默节点的那一次全盘扫描，第一次由 step 2 的记录代答 — engine redesign stage C3
+
+规格 `docs/ENGINE_REDESIGN.md` `:409-410` §2.6 **Step 3**「局部 stand_pat」：「静默搜索入口不再做全盘评估，
+改为「上一手所在 4 条线」的局部 delta 评估（`last_move` 的 4 条线位棋盘已在 `board.lines_` 中，读取成本极低）。
+全盘评估只在根节点与需要精确分值的场合使用」；它的靶子是 C2 段自己留在收益段的那一句「省下的不是还没省的那一半」
+（`qnodes` 占 `nodes` 的 64.5 %，每个静默节点仍付一次全盘 `evaluate_board`），上游同样是 `:106` 的 P4，
+只是 `:106` 数的是排序路径、`:409` 数的是这一条；再加 `:415` 的预期行「Step 3 使**静默节点成本**下降 ~80 %」、
+`:549` 的 C 阶段验收（单线程 ≥1M nps、depth 8 在 4 s 内完成）、`:556` 回归保障第 3 条
+（「评估函数改动（位置项、**增量缓存**）必须与旧实现逐格比对」，点名的方法仍是
+「全 225 格 × 两色 × 42 棋盘一致」那三个数字），`:568` 风险行的后半句
+「Step 3（局部 stand_pat）先只用于「无威胁局面」，有威胁时回退全盘评估」，以及 **README:624-626** 那条否决记录
+（「增量式全盘评估做过量化评估后放弃：一手棋影响 4 条线上 ±4 格共约 15 个候选格……落子+撤销的代价与节点上那次
+全量重扫基本持平」）。`:582` 的文件清单没有为 Step 3 单列新文件——要动的三处（`evaluator`、`search_state.h` 的
+缓存、`alphabeta.cpp` 的读者）前两处是 Step 1/2 已经在的文件，本轮把最后一处的读者接上。
+
+### 落地的三件事
+
+1. **`Evaluator::evaluate_board` 拆成两半**（`src/core/evaluator.cpp:235` `board_pair_value`、
+   `:253` `evaluate_board_from`、`:276` `evaluate_board`）。前半是**逐格**的那一步：两色形状各自过禁手门、
+   各自计价、返回这一格的代数值；后半是**全盘**的那一步：石头项（位置权与边界惩罚各按颜色取差）加进代数和，
+   最后在 `coeffs_.five - 1` 处封顶。`evaluate_board` 自己按「逐格累加 → 交给后半」的同一顺序调用两者，
+   所以**算术一字未改**，改的只是它现在有两个可以被单独调用的入口。两半都不是 `candidate_pair_value`：
+   后者把中心权折进单格、并为一枚成五付整 `coeffs_.five`，语义不同（`evaluator.h` 的注释把这句写在原地）。
+2. **`CandidateCache::board_score(board, my_color)`**（`src/search/search_state.h:307-326`）：遍历
+   `board.active_empty()`，逐格 `cell()` 取那条**已经存在**的记录，按读者的颜色挑 `mine/theirs`，
+   把 `board_pair_value` 的返回值累加起来，最后一次 `evaluate_board_from`。`MoveGenerator::board_score`
+   （`move_generator.h:130-132`）只是它的转发，好让搜索侧只认识一个 `move_gen_`。
+3. **两处读者接上**（`src/search/alphabeta.cpp`）：`static_score` 的求值支 `:159`，以及 `alphabeta()`
+   停止测试里那条被预算杀掉的节点走的支 `:334`。后者是本轮唯一一处「读法换了、记账没换」的地方——
+   它不进置换表、不记 `eval_scans`，所以只有缓存自己的账本看得见它（C3-5 因此存在，见「反证」段）。
+
+### 与文档措辞的偏离：不是 delta，是「同一次求和换一次读法」
+
+文档给的是三句话，本轮一句都没照字面做，理由只有一个：**读出来的数就是扫描的数，不是它的近似**。
+
+- 「局部 **delta** 评估」：delta 需要两个真值相减。C2 已经量出一条记录的真实依赖是它自己的四条线
+  （不是 ±2 footprint，也不是 ±4），所以一次落子失效的正好是「与上一手共线的那些格」——这个集合由 entry
+  自己的四个 `uint64` 线字**比对**得出，不需要一个 `Board` 要维持的 dirty set，也不需要留住「4 条线之外」的旧值来减。
+  于是文档要的「只算变化的格」是这一版的**读侧性质**（只有线变了的格会重识别），不是它的实现手段。
+- 「全盘评估只在根节点与需要精确分值的场合使用」：落到的比它更空——搜索树里现在**一次全盘扫描都不发生**
+  （18 臂的 `evaluate_board` 内识别计数 549,776,489 → **0**），而每一次的**数**都没变。附带一句本轮的观察：
+  `Evaluator::evaluate_board` 在生产代码里已经没有读者（`grep -rn evaluate_board src/` 剩下的全是注释），
+  它现在的身份是差分测试的裁判（C3-1/C3-2/C3-4 与 `tests/test_evaluator.cpp` 都调它）。本轮不删它，
+  也不给它加「仅测试用」的措辞：它是 `Evaluator` 的公开 API，是 `:549` 说的精确分值场合，也是这一轮唯一的对照物。
+- `:568` 的「有威胁时回退全盘评估」：**没有必要**。回退是给近似读法准备的保险；一次返回扫描自己的数的读法
+  不可能是「近似的那一半」，也就没有「换回精确的那一半」可换。这一条按**偏离**上报，方向是安全的，不算遵守。
+- 与 README:624-626 那次否决的关系：那次死掉的是**靠落子/撤销记账维持**的全盘增量评估（代价与重扫持平）。
+  本轮不做记账：写侧仍是每格一次识别，省下的全在读侧——读一条已经在的缓存是四个字的比较。
+  C3-3 量的正是这件事：一次落子只让 **26 / 132** 个格重识别，撤销 **21 / 128**。
+
+### 中性：树、分数、深度、原因都不许动
+
+- **18 臂逐行比对**（同一板、新表、节点不 binding 于时限，`/tmp/r123_c3/counted_final.txt` 对
+  `/tmp/r122_c2/c3_control.txt`）：`nodes / qnodes / tt_hits / score / completed / best / stopped`
+  **七列一字不差**，脚本比对 18/18 无差异（`BAD: []`）；节点合计 11,365,496 两棵树相同。
+- **求和的两半不许互相说瞎话**：`c3_sum_equals_scan`（`:7747`）用一个**自带**缓存的 `MoveGenerator`
+  做冷读，并断言冷读本身就是「每格一次重算」——这样「读法」与「扫描」在任何一格上都不是同一个调用。
+- **两把尺子互相咬合**：`quiet` BLACK d6 一臂本轮剩下的识别总数是 **3,805,665**，与缓存账本在这一臂的
+  `recomputes = 3,805,665` **逐字相等**；WHITE 臂 3,115,310 对 3,115,310 同样相等
+  （`/tmp/r123_c3/probe.out` PART1 对 `counted_final.txt`）。读法换了之后，这台机器上每一次四向识别
+  都恰好是一次记录重填，没有第二次、也没有漏记的一次。
+
+### 收益：静默节点的全盘 pass 清空，合计识别 −58.5 %，每节点墙钟 −10.4 %
+
+18 臂合计（`-O2`，同一份驱动）：
+
+| 读数 | 控制树 e2e9705 | 本轮树 | |
+| --- | --- | --- | --- |
+| 静默节点全盘 pass 的识别 | 549,776,489 | **0** | −100 % |
+| 合计 recognition | 711,190,161 | **295,049,491** | **−58.5 %** |
+| 逐臂 recognition | — | 18/18 全降 | −42.8 % ~ −64.4 % |
+| 节点数（18 臂） | 11,365,496 | 11,365,496 | 0 % |
+| `ns_per_node` | 7900.2 | **7075.3** | −10.4 % |
+| `knps` | 126.6 | **141.3** | +11.6 % |
+| `quiet` BLACK d6 缓存读 | 4,066,903 = 2,097,434 + 1,969,469 | **8,755,599 = 4,949,934 + 3,805,665** | 读 2.15×、命中 51.6 % → 56.5 % |
+
+- **`:415` 的「~80 %」没有达到，两个口径都没达到**：识别口径上，静默节点那一次 pass 是 100 % 清空，
+  但它换回来的读法与排序**共用同一条缓存**，所以合计只降到 −58.5 %（最差的单臂 −42.8 %）；
+  墙钟口径上每节点 −10.4 %。从本轮起「静默节点的成本」这一段与「排序路径的成本」这一段**不再是两把可以分别
+  度量的尺子**——一次记录重填同时喂两处，`recognise` 的计数器也分不开它们。C2 段那句「剩下那 161,413,672 次是
+  同一格换了一条线之后必须重算的部分」因此被本轮改写成：剩下的 295,049,491 次是**所有**必须重算的格，
+  两条读法共同的那一份。
+- **墙钟为什么只有 −10.4 %**：一个静默节点仍要**逐格**读——`quiet` BLACK d6 每节点的缓存读从 18.3 次涨到
+  39.5 次（8,755,599 / 221,774），一次读是四个 `uint64` 的比较加一次逐格两色求和，便宜但不是免费；
+  而兄弟分支之间互相把对方的记录弄脏，是剩下的 2.95 亿次识别的来源。`depth 8` 一臂最明显：
+  `scattered` WHITE 从 322,682,866 次识别降到 122,716,340，仍是一次思考 1.2 亿次。
+- **`:549` 本轮仍未达成，报实测**：单线程 **14.1 万节点/秒**，距 ≥1M nps 差约 7 倍；
+  `depth 8` 在 4 s 内两色都完成（`quiet` 1,408,083 / 2,131,525 节点，`scattered` 2,830,250 / 4,182,936 节点，
+  本轮树上分别 80,414,278 µs 对 89,789,920 µs 的 18 臂总耗时），所以 C 阶段验收的**时间那一半是过的**，
+  吞吐那一半不是。Step 4（`MAX_QDEPTH` + `seldepth`）是这一段剩下的最后一件成本改动。
+
+### 用例（`tests/test_search.cpp` 五条，定义落在 `:7715-8076`，注册落在 `main()` 的 `:8240-8244`）
+
+段首注释（`:7715-7745`）自己交代了三件事：delta 换成读法的那处偏离、README:624 的否决记录为什么不适用于本轮、
+以及 `:568` 的回退为什么没有必要。夹具两个：`c3_sum_equals_scan`（`:7747`，自带缓存的冷读 + 冷读账本自证）、
+`c3_addend_truth`（`:7768`，同一格「记录喂的代数值」对「新识别喂的代数值」，再对另一侧取反）。
+
+- **C3-1 `test_the_record_sum_is_the_whole_board_scan_on_every_board`**（`:7796`）：`:556` #3 的普查规模
+  （`c2_census_boards()` 的 42 盘）× 两色 = **84 次求和**逐次等于 `evaluate_board`，读经 **6697** 个候选格；
+  每盘先证「候选表里没有占用格」（`occupied == 0`）——那是 `board_score` 敢读记录而不识别的前提；
+  再证冷读 = `list_size` 次 probes 与 recomputes、0 次 hits，热读 = `list_size` 次 hits。
+  红点：`:7816` `cold == direct`。
+- **C3-2 `test_every_addend_of_the_record_sum_is_the_addend_the_scan_pays`**（`:7853`）：把「逐格比对」做到
+  **代数值**这一层，而不是只求和相等：**13,394** 个格-色代数值，每个先比记录里的两色四向形状
+  （`c2_patterns_equal`）与新识别相等，再比「记录喂的 `board_pair_value`」=「新识别喂的 `board_pair_value`」
+  =「另一侧的代数值取反」；最后闭环——把这 13,394 个代数值重新喂给后半，**84** 次重建的和等于扫描
+  （`:7884`/`:7885`）。这也就是本轮对「拆分本身有没有算错」的回答：拆分的算术由 `tests/test_evaluator.cpp`
+  的 `naive_board_total` 与它的绝对字面量守（−7700 那一类），逐格的等价由这一条守。
+- **C3-3 `test_a_far_stone_moves_both_sums_alike_and_undo_brings_both_back`**（`:7909`）：make/unmake 路径上的求和。
+  23164 → BLACK 落 (7,12) → **99999**（撞到 `coeffs_.five - 1` 封顶，两条读法一起撞）→ 撤销回到 23164，
+  每一步两路相等，另一色同处也相等；落子只重算 **26 / 132** 格、撤销 **21 / 128** 格——文档那句「只更新受影响格」
+  在这里以**读**而不是以记账度量。红点：`:7932`。
+- **C3-4 `test_one_set_of_records_answers_the_sum_for_either_colour`**（`:7969`）：一条记录两个读者。42 盘、
+  两种问序，先问的颜色拿到自己扫描的数、后问的颜色拿到它自己扫描的数，第二次问是 `list_size` 次 **hits** 且
+  **0 次 recompute**（`:7990`）。这是「记录必须两侧都带」在求和层的版本。
+- **C3-5 `test_the_nodes_a_cut_kills_pay_the_sum_out_of_the_records`**（`:8019`）：本轮新增的第五条，
+  因为它最初**没有反证对象**（见「反证」段的 M5）。一次真的被节点预算砍断的思考（先量第一层用掉多少节点，
+  预算设成那个数 +1，与 A4 那一条同形；时限 600 s，所以不依赖墙钟）：`stopped == NODES`、
+  `depth 1 / partial 2 / root_moves_done 0 / 31`、`nodes_searched 63`、`qnodes 31`、
+  评估账本 `scans 31 / reuses 0`——**这 63 个节点里只有 31 个进了 `static_score`**，另外的走 `:334`，
+  而那条支既不进表也不记 `eval_scans`，所以只有缓存账本看得见它：`probes 1643 = hits 587 + recomputes 1056`
+  （`:8061`），并加一条 `probes > 20 × nodes` 的形状断言，说明这个账是按**候选表长度**而不是按节点数长的。
+
+### 反证申报：无 HEAD 反证，以六枚 mutation 加一张逐用例矩阵代替
+
+`CandidateCache::board_score` 与 `Evaluator` 的两半在 `e2e9705` 上都不存在，这五条用例在那棵树上连编译都过不去——
+本轮申报**无 HEAD 反证**，理由与 C1/C2 同构（结构性，不是没做）。代替它的是六枚变异，各破 Step 3 的一句话
+（`/tmp/r123_c3/c3_mut.sh` 与 `/tmp/r123_c3/c3_arm.sh`；被改的永远是 `/tmp/r123_c3/mut123_c3/<arm>/src` 的副本，
+仓库树未动；每臂只重编读该文件的四个 TU，其余替套件已建的 13 个 `.o`）。
+**矩阵是本轮的证据形状**：整套用例一起跑时，第一个红点会盖住后面的，所以每臂另用
+`/tmp/r123_c3/c3_sel_main.cpp` 一条一条起进程跑（`/tmp/r123_c3/matrix_out.txt`）。
+
+| 变异 | 破掉的那句话 | 逐用例矩阵（1=C3-1 2=C3-2 3=C3-3 4=C3-4 5=C2-4 6=C2-5 7=C3-5） |
+| --- | --- | --- |
+| M1 `board_score` 取反两侧 | 一条记录两侧各自的答案 | 红 1(`:7816`)/2/3/4(`:7990`)/5(`:7641`)/7(`:8061`)，绿 6 |
+| M2 `evaluate_board_from` 两色石头项互换符号 | 求和的后一半的语义 | **1/2/3/4 全绿**，红 5(`:7641` 的树)，绿 6/7；`test_evaluator.cpp:240` `after_black == 7700` 红 |
+| M3 `board_score` 不把和交给后半 | 「仍是一次全盘求和」 | 红 1(`:7816`)/2/3/4(`:7990`)/5，绿 6/7 |
+| M4 `static_score` 的求值支退回 `evaluate_board` | 「静默搜索入口不再做全盘评估」 | **1/2/3/4 全绿**，红 5(`:7655` `cache.probes() == row.probes`)、红 7(`:8061`) |
+| M5 `alphabeta()` 停止支 `:334` 退回 `evaluate_board` | 被预算砍断的节点也读记录 | **只有 7 红**（`:8061`）——第一轮这枚变异**全绿**，C3-5 因此写出来 |
+| M6 线 key 少比一条（丢 d=0） | 一次落子的失效集 | 四条差分之一里**只有 3 红**（`:7932`），另红 5(`:7641`)/6(`:7694`)/7(`:8061`)，绿 1/2/4 |
+
+三条从矩阵里读出来的话，比表格本身重要：
+
+1. **差分用例看不见共用的算术**（M2）。C3-1~C3-4 比的是「读法」对「扫描」，两者从 step 3 起调用**同一段**
+   求和代码，所以任何一段共用算术被改坏，四条全绿。守住 M2 的是另外两件东西：`tests/test_evaluator.cpp` 的
+   绝对字面量（`7700`、`4924`、`1708`、`38700`、`five - 1` 封顶那一类）与 C2-4 钉住的那棵树（分数换了，
+   节点数就换）。本轮把这一条写进用例注释，而不是假装差分是全覆盖。
+2. **一条用例为了一枚变异而存在**（M5→C3-5）。第一轮跑矩阵时 M5 在七条用例上全绿：那条支既不进表、
+   也不记 `eval_scans`，`scans == qnodes` 的恒等式看不见它，思考层的账本又只覆盖不中断的臂。
+   补的 C3-5 用节点预算把这条支走实，于是它成为 M5 的**唯一**反证；这也是本轮唯一一处「先有变异、后有断言」。
+3. **不是每条用例都有独占的反证**（C3-2）。六枚变异里没有一枚只被 C3-2 抓到——它对 M1/M3 是冗余的一层。
+   本轮不为它编一个独占理由：它的内容是 `:556` #3 要求的**逐格**比对比到代数值这一层（而不是比到和），
+   以及唯一一处「另一侧取反」在格级被检查的地方。这是这套反证的**边界**，写下来而不是略过。
+
+控制臂（提交前的工作树）：H1 七条一次跑完 rc=0 / `seconds=7.78`，H2 `test_evaluator` rc=0；
+被改臂各红一处以上，见上表与 `/tmp/r123_c3/mut_out2.txt`。
+
+### 门禁
+
+四段跑的都是提交树，段与段之间无并发负载（`/tmp/r123_c3/gate.log`：构建 → 60 s 静置 → ctest → web → anchor → README）。
+`ctest` **8/8 / 413.16 s**（`test_search` **383.30 s**；C2 段在同一台机器上记的是 440.30 s / 407.59 s，
+本步把 `test_search` 的墙钟降了 **6.0 %**，与每节点成本 −10.4 % 同向、幅度更小——八支里只有 `test_search`
+的大半时间在搜索树上，其余是夹具与固定断言），其余七支最慢 **12.77 s**（`test_server`）、次慢 8.23 s
+（`test_position`）；`node tests/web_frontend_check.js` **105/105**；
+`node tests/readme_anchor_check.js` **120 引用 / 0 problems**（C2 段是 118，多的两条正是本轮新写的两处
+`README:624` 引用：`src/search/search_state.h:301` 与 `tests/test_search.cpp:7724`；前者带一条 **HINT**——
+那句否决横跨 README:624-626，检查器只在被点名的行上找短语，所以报「first line carrying one is README:643」。
+HINT 不是 PROBLEM，套件里本来另有六条同类，本轮不为它改 README 的措辞）；`README.md` **658 行**。
+
+行号与清单要说清楚。本轮对 `tests/test_search.cpp` 的写入 **+386/−9**，文件从 **7871** 行走到 **8248** 行；
+三条受保护断言的**内容与行号一字未动**：`assert(result.resigned)` 仍在 **`:2591`**、
+memcheck 会死在那里的 10 ms 臂 `assert(interrupted.partial_depth == 1)` 仍在 **`:3973`**、
+`assert(completed.method == "alphabeta")` 仍在 **`:3986`**（本轮全部新增都落在 `:7715` 之后）。
+那 9 行删除**全部在 C2 段**：C2-4 的两行成本字面量、它自己的两行注释、消息里的三行，加 C2-5 注释里的两行。
+`src/` 一侧五个文件 **+103/−26**（`core/evaluator.cpp` 37/24、`core/evaluator.h` 16/0、`search/alphabeta.cpp` 11/2、
+`search/move_generator.h` 8/0、`search/search_state.h` 31/0），删掉的是拆分前 `evaluate_board` 里那一段
+就地累加的两色循环体和 `opp_total` 这个累加器，以及 `alphabeta.cpp` 里两处旧读法的注释块。
+`CMakeLists.txt`、`README.md`、`web/`、`tools/` 一字未动。
+
+### Valgrind
+
+五臂串行、机器整段空闲，构建与 ctest 都排在它前面，任何一条 memcheck 臂都没有和构建或另一支同时跑
+（脚本 `/tmp/r123_c3/vg_r123_c3.sh`，`--tool=memcheck -q --error-exitcode=9 --leak-check=full
+--show-leak-kinds=definite --errors-for-leak-kinds=definite --track-origins=yes --num-callers=16`；
+`build-vg/` 用的是 C2 段修好的那两条离线 pin `-DFETCHCONTENT_SOURCE_DIR_JSON=… -DFETCHCONTENT_FULLY_DISCONNECTED=ON`，
+本轮没有再动门禁环境，`tools/valgrind_check.sh` 一字未动）。
+
+- **先声明我自己这台尺子上的一处假读数**：包装脚本的 `uninitialised` 列是 `grep -c uninitialised` 数 stderr 文件，
+而 `valgrind_check.sh` 会把**它自己的汇总行**（里面就带 `uninitialised=0` 这个词）写进同一个文件，所以后四臂
+`ARM … uninitialised=1`（NEG 臂 2，因为它一趟跑两支）是**汇总行被数进去了**，不是内存报告。
+被数的真实对象是 `valgrind_check.sh` 打印的那一行，本轮五臂它的每一行都是
+`reports=0 invalid_read=0 invalid_write=0 uninitialised=0 definite_leak=0`；
+只有第一臂（C3 驱动）直接数 valgrind 的空 stderr，读到的 `uninitialised=0` 是真的 0。
+这不影响任何结论，但它是本轮量出来的、必须写在表旁边的一句话。
+- **新代码自己**（`-std=gnu++17 -O0 -g -UNDEBUG` 的 C3 驱动：七条用例，即 C3-1~C3-5 加 C2-4、C2-5 两枚账本钉）：
+  **rc=0 / 1351 s / 五列全 0**，`/tmp/r123_c3/vg123_c3/driver.err` 是**空文件**（0 字节），`driver.out` 七行 `passed`
+  加一句 `C3 block + C2 pins green`。被 valgrind 套住的工程量按用例自己钉住的读数算：思考路径
+  **600,226** 个节点（221774 + 156428 + 221774 + 187 + 63，最后那 63 是 C3-5 被节点预算砍断的一支）、
+  **24,760,509** 次候选格读 = **14,032,755** 次从记录里读回 + **10,727,754** 次就地重填
+  （reads 8755599 + 7247557 + 8755599 + 111 + 1643；hits 4949934 + 4132247 + 4949934 + 53 + 587。
+  第三组 8755599 是 C2-5 的冷思考，与 C2-4 的 BLACK 臂同一盘，所以它的拆分是同一份读数而不是第三次量出来的数；
+  C2-5 自己钉的是 warm 那 111 = 53 + 58。）
+  这 2476 万次走的正是本轮新写的那条读法：`Entry entries_[225]` 数组加 `board_score` 的
+  `active_empty()` 逐格循环，其中 `cell()` 在四键比较上有一条 `d < kLineWords` 的边界和一处 `is_empty` 前门，
+  一次越界、一次读未初始化都没有。普查那三条（C3-1/C3-2/C3-4 的 42 盘 × 两色、84 次求和、13,394 个代数值）
+  也跑在同一臂里，它们贡献读而不贡献思考节点。
+- **`test_training`**（`build-vg/`，Debug `-UNDEBUG`）：**clean / 146 s / 0 / 0 / 0 / 0 / 0**（包装层 322 s，多出来的是构建）。
+- **`test_search`**（装着本轮五条 C3 用例的那套）：内层 **ABORTED rc=134 / 257 s / 0 / 0 / 0 / 0 / 0**，
+外层 `valgrind_check.sh` 因此退 **1**。stderr 里最后一条是
+`test_engine_reports_the_interrupted_alphabeta_layer measured (interrupted: alphabeta d0+partial 0/n0 time_hard, last frame d0/n0, control: alphabeta d1+partial 2/n5019 time_hard)`，
+它死在本轮行号未动的那一句 `assert(interrupted.partial_depth == 1)`（`tests/test_search.cpp:3973`，A2/A7 的 **10 ms 臂**）；
+它前一条 `test_engine_progress_frames_share_the_search_clock` 是**过的**（pre-search 647 ms / first frame 851 ms / 3 frames）。
+同一套不套 valgrind 时全绿（门禁段）。
+- **`test_server`：本轮 clean（47 s / rc=0），与 C2 段那行相反。** C2 记的是 `Assertion 'hint_results == 0' failed`
+（`tests/test_server.cpp:1710`，`test_hint_answer_for_a_superseded_position`）rc=134 / 25 s；本轮**提交树和 e2e9705
+对照树上这一臂都没再 abort**（47 s 与 40 s，五列同样全 0）。所以本轮能说的只有一句：`:1710` 那条在 memcheck 时间尺度下
+是**会翻脸的旧脆弱**，它上一轮红、这一轮绿，而本轮**没有碰 `src/server/`，也没有碰 `tests/test_server.cpp`**——
+既不能把它记成本轮修好的，也不能记成本轮弄坏的。`:3973` 那一条不是这种：它在两棵树上逐字复现，见下。
+- 口径照 2026-10-17 的约定：`reports` 是 valgrind 自己的 `==NNNN==` 行数，另四列是
+`Invalid read of size` / `Invalid write of size` / `uninitialised` / `definitely lost` 的计数，构建目录与 `-UNDEBUG`
+都在每条里点名。**本轮唯一一处 rc=134 是断言，不是内存错误**：五列读数在这条臂上都是 0。
+- **那一处 rc=134 在改动前的树上重测，并且逐字复现**（`/tmp/r123_c3/vg123_c3/neg.log`；树
+`/tmp/r123_c3/vg123_c3/neg123_c3` = `git archive e2e9705` + 它自己的一份 `build-vg`；跑之前先证明这棵树里
+**没有 step 3**：`grep -c 'int board_score' src/search/search_state.h` = **0**）：
+`NEG test_search rc=134 / 260 s / 0 / 0 / 0 / 0 / 0`，死的用例名、`measured` 那行的形状
+（`interrupted: alphabeta d0+partial 0/n0 time_hard`，控制支 `d0+partial 1/n4001`）、断言的文件与行号都与提交树同一处；
+`NEG test_server clean / 40 s / 0 / 0 / 0 / 0 / 0`。包装层两臂合计 415 s（含 NEG 树的构建）。
+- 一个与 C2 段同向的对照：同一根 10 ms 臂的 memcheck 墙钟 **260 s（e2e9705）→ 257 s（本轮）**，**平的**。
+本轮省下的是每格四向识别，而这条臂的时间主体在夹具与 valgrind 自己。**本轮的收益不在 valgrind 的时间尺度上显现，
+只在计数器和每节点成本上显现**（收益段：静默 pass −100 %、合计识别 −58.5 %、`ns_per_node` −10.4 %）。
+控制支那两行读数（本轮 `d1/n5019` 对对照树 `d0/n4001`）**不当作成本证据**：两条都是「时限落在层中间」，
+在 memcheck 的倍率下落在哪一层不是本轮合约的内容。
+- **TSan / DRD 本轮不跑**，理由说清楚：step 3 只增加**读者**——`CandidateCache::board_score` 读的还是 C2 段
+那个 `MoveGenerator` 的 `mutable cache_`，而 `MoveGenerator` 属于一次 `AlphaBetaSearch`，一次思考一个线程；
+本轮没有新增任何可变状态，也没有把任何状态跨出思考边界（C2-5 在 memcheck 臂里又跑了一遍，`187 / 0 / 1` 与
+`111 = 53 + 58` 一字未动，就是这句话的凭据）。本轮唯一新读的分支 `alphabeta.cpp:334` 也在同一对象、同一线程内。
+B3 量出的那一条真竞态（`GameManager::undo` 写 `board_` 对上 `request_hint` 的读）仍是服务端旧代码，排在 bugfix 批次，
+不属于一条引擎成本改动。
+
+**合约过期申报（本轮有，且只有 C2-4 一处）**：`test_a_quiet_think_prices_its_candidates_about_once_in_two`
+的缓存三列换了数字——`BLACK 4,066,903 / 2,097,434 / 1,969,469` → **8,755,599 / 4,949,934 / 3,805,665**，
+`WHITE 3,003,955 / 1,539,956 / 1,463,999` → **7,247,557 / 4,132,247 / 3,115,310**。原因是契约本身变了：
+step 3 之前求和不读缓存，读缓存的只有排序；现在静默节点的求和也走同一条缓存，一次思考的**候选读次数**
+不再等于排序的问数，而是等于「排序 + 每节点求和」的问数（用例名那句「about once in two」仍然成立，
+命中率从 51.6 % 走到 56.5 %）。同一行断言里 C1 钉住的那一半（`221774 / 142978 / 75855 / 67123 / 75852 / 71992`
+与 `WHITE 156428 / 102340 / 68419 / 33921 / 68419 / 97044`）**一字未动**，所以「树与评估本体没变」这件事
+仍然是被断言守着的，而不是被打印出来的。C2-5 的 `187 / 0 / 1` 与 `111 / 53 / 58` **没动**，
+理由写在它自己的注释里：那一次 warm 思考的求和被置换表回答，走不到求和，所以 step 3 不改它的账。
+上报帧不变：求和不改变任何一次答案，没有新字段、README 没有新行。
+
+
+
 ## 轮次122 引擎重构 C2：一条线的四个字第一次替每个节点记住候选格的形状与价格 — engine redesign stage C2
 
 规格 `docs/ENGINE_REDESIGN.md` `:406-407` §2.6 **Step 2**「候选格分数缓存」：「每个候选格缓存
