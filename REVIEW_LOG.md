@@ -1979,6 +1979,53 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次125 D 阶段基线：一轮训练的成本几乎全在串行的适配度赛，而并发的那张表第一次量到 7.3 MB — engine redesign stage D, baseline measurement
+
+规格 `docs/ENGINE_REDESIGN.md` `:433-437` §2.8 列了五件事，验收在 `:550`：「单轮训练耗时下降 ≥ 40 %；内存峰值与并发局数解耦；`--fitness-games 2` 下 fitness 不再只有三档」。本轮**不动一行代码**，只做一件事——把「一轮训练的成本到底花在哪」量出来。这个必须先量，因为按文档给的数去改会改错地方：文档 `:434` 说「当前是每引擎一张 8.4MB 表，N 个并发 → N × 8.4MB」，而 `:437` 的 `#5` 说 `Board` 是「传参一次 + 每层一次」；两条都不是这棵树现在的形状，量完发现真正吃掉一轮的是**另一件事**。
+
+### 测量条件（全部产物只落 `/tmp/d21/`，仓库树一字未动）
+
+- 被测树 `23e6453`；`build/gomoku_train` 与 HEAD 的 `src/` 同步（`find src tests -newer build/gomoku_train` 只报 `tests/test_search.cpp`，训练二进制不链它）。
+- 固定尺子：`--depth 4 --timeout-ms 400 --max-moves 60 --seed 20261011 --rounds 1`，`/usr/bin/time` 取墙钟与峰值 RSS。
+- 机器 6 核，每臂**串行**，跑前 `pgrep -c valgrind` = 0（`assert_text.sh` 的两臂已在 14:44:32 收完）。
+
+### 读数
+
+| 臂 | 配置 | 墙钟 | user | 峰值 RSS | 记录/样本 |
+| --- | --- | --- | --- | --- | --- |
+| A | population 2 × generations 1，`--no-data` | 27.97 s | 27.88 s | 27,112 kB | 8 盘（3 评估 + 验证） |
+| B1/B2/B4 | 同 A，`--threads 1/2/4` | 57.06 / 56.32 / 56.51 s | 56.50 / 55.94 / 55.92 s | 27,040 / 27,184 / 27,252 kB | 22 盘 |
+| C1/C2/C4 | population 2 × gen 1 + `--data-games 8`，`--threads 1/2/4` | 29.96 / 30.03 / 30.00 s | 29.45 / 30.86 / 33.59 s | 34,696 / 41,844 / 56,548 kB | 8 盘 / 112 / 224 / 496 样本 |
+| D | **默认量级**：population 8 × generations 4、`--verification-games 8`、`--data-games 4 --threads 2` | **182.91 s** | 189.08 s | 42,264 kB | 70 盘（29 评估，genetic 因停滞只跑 3 代）/ 4 盘记录 / 704 样本 |
+
+### 五条「文档说的与树里有的不一样」，它们决定 D 阶段怎么排
+
+1. **`--threads` 在没有数据采集时是完全惰性的**（B 臂三行）：`user ≈ wall`（56.50 对 57.06），RSS 三行只差 212 kB。`--threads` 的定义就是「Parallel **data-collection** workers」（`main_trainer.cpp:45`），适配度赛与验证赛一个线程都不开。所以 §2.8 `#1`（共享 TT）与 `#5`（去拷贝）按构造**碰不到** `:550` 的耗时那一半。
+2. **一轮 ~30 s 里约 28 s 是串行的 optimise + verification**：`Trainer::run_round` 的先优化再验证（`trainer.cpp:289-346`）跑在 `generate_data_games`（`:369`）**之前**；C 臂把采集加进来只多 1.99 s（1 worker），到 4 worker 连这 2 s 都被并行吸收（30.00 对 29.96，噪声内）。于是 `:550` 的「单轮 −≥40 %」只有两个来源：**让每次思考更便宜或更少**——即 `#2`（`--max-nodes`）与 `#3`（SPRT 少下几局）。这一点不量出来，D 阶段会先去动那 6.7 %。
+3. **并发内存 = 每 worker 一张表，实测就是表的尺寸**：1→2 worker `+7,148 kB`，2→4 `+14,704 kB`（均摊 `+7,352 kB`/worker），对上 `transposition.h:62` 自己记的「2^18 × 28B ≈ 7.3MB per table, **down from 8.4MB**」。`:434` 的 8.4 MB 是这张表被改小**之前**的数；`#1` 的收益应按 7.3 MB/worker 结算，而不是 8.4。
+4. **「每盘成本可预测」现在连仪器都没有**：C 臂 8 盘里只有 1 盘真搜索（game 0：2 着 replay + 19 着搜索，整盘 154,953 节点，单着最高 30,287 节点 / 336 ms），其余 7 盘是悔棋续战（`RetryExplorer::rewind_to_next_branch`，`self_play.cpp:202-224`，把上一盘的前缀重放到第一个未试分支），每盘只剩 1 着要想要，而那一着走的是 `vcf` / `must_block` 早退——**这两个 method 的 `nodes_searched` 按定义是 0**（`search_engine.cpp:338-340` 只有 alphabeta 填，`search_engine.h:23` 明写「depth and nodes_searched stay 0 outside AlphaBeta」）。所以 records 里那些 0 不代表便宜，代表这次回答根本没进 alphabeta；`#2` 落地时要一并说清节点预算**计不计**战术早退，否则「可预测」是拿一个不存在的数在预测。
+5. **fitness 只有三档是算术，不是棋力**：`trainer.cpp:108` `pairs = max(1, (games+1)/2)`，`:128` `score / played_games`，`--fitness-games 2` ⇒ `pairs = 1` ⇒ 值域恰好 `{0, 0.5, 1}`。README `:213` 记的 0.56 门槛正是为了让**只有 1.0 能晋升**。`#3` 要动的是 `pairs` 这条（序贯到显著即停），而不是分母；文档说它「解决三档问题的一半」是准确的，另一半是 `:435` 没写的位置项。
+
+另外两条在实现时会硌到：
+
+- **训练数据只覆盖 alphabeta 决策**：`DataCollector::min_search_depth_ = 1`（`data_collector.h:74`）从未被覆盖（`trainer.cpp:201` 裸构造），配合上面第 4 条，`vcf`/`must_block` 的着法一律不进样本——样本数正好等于 alphabeta 着数 × 8 个对称（14/28/62 → 112/224/496，`data_collector.cpp:128-131` 的 `engine_chose` 门与 `transforms.h:12` 的 `SYMMETRY_COUNT = 8`）。同一件事也解释了「同样 8 盘记录，样本数随 worker 涨」：`trainer.cpp:180-181` 把局数均分给每个 worker，而**每个 worker 都有自己的昂贵第一盘**（`:222-223` 各自 `set_start_line(random_opening_line(config_.data_opening_plies, seed))`，`data_opening_plies = 2` 在 `trainer.h:53`）。
+- **开局库不是「被关掉」，是无处可开**：`trainer.cpp:55` 确实 `set_book_enabled(false)`，但 `book_` 默认 `nullptr`（`search_engine.h:121`）且只有 `server.cpp:1222` 会挂表，所以训练里那个分支本来就到不了——`#4`「按权重采样开局」需要一条新的数据通路，翻开关不够。
+- **`#5` 的两处拷贝按树里读是「传参一次 + 每次思考一次」**：`controller.cpp:36` 把 `board` 按值带进线程（`search_worker(Board board, ...)`，`controller.h:50`），`alphabeta.cpp:601` 的 `Board work_board = board;` 在 `:604` 的深度循环**之前**，所以是每次思考一次，不是每层一次。`:437` 的措辞要按这个改。
+
+### D 阶段因此这样排
+
+`#2`（`--max-nodes`）先做，因为它同时是 `:550` 耗时那一半和上面第 4 条「成本可预测」的唯一入口；再 `#3`（SPRT，减验证局数，和 `#2` 一起才可能凑出 −40 %）。`#1`（分片共享 TT）按 7.3 MB/worker 定价，并且必须先给 `#2` 留一个失效口径——`trainer.cpp:96-99` 的注释写着为什么现在每候选换一张新表（表里的分数是**换掉的系数**算出来的），共享之后这条失效要显式建，否则 `#1` 是用正确性换 7 MB。`#4` 依赖 book 数据通路，`#5` 是两处一次性拷贝、收益最小。
+
+### 门禁
+
+本轮没有代码、没有测试、没有 `tools/` 与 `web/` 改动：`git status` 只有 `REVIEW_LOG.md`。跑 `readme_anchor_check`（120 citations / 0 problems）；不跑 ctest 的理由写清楚——`src/` 与上一次 ctest 通过的 `a1a3652` 一字不差（本轮只写日志），所以没有可回归的东西；Valgrind 同理不适用。
+
+### 未完成
+
+`:550` 三条**一条都还没开始动**；本轮交的是让这三条可被验证的那把尺子（配置、表、以及每条读数对应的文件行）。D-1 `#2` 的实施下一步开始，做完按同样这把尺子复测（同一 seed、同一 depth、同一 `--max-moves`，只换预算口径），否则 −40 % 又是一个没有对照的数。
+
+D 臂两件事值得单独写：`user 189.08 ≈ wall 182.91` 即使开着 2 个采集线程也几乎是**单线程的 CPU**，所以「多开线程让一轮变快」在默认量级上同样不成立；README `:186` 记的 `--rounds 20` 按这把尺子是 **≈ 61 分钟**（20 × 182.91 s），`:550` 要的 −40 % 就是从这 61 分钟里减，而不是从采集那 2 秒里减。D 臂的 4 盘记录里 `replay 120 / alphabeta 88 / must_block 24 / vcf 4`，四盘 `total_nodes` 是 22,687、22,687、899,878、903,564——两个 worker 各自的第一盘重（~90 万节点），各自的第二盘轻（2.3 万），这正是上面第 4 条的形状，也是它为什么不能用「平均节点」来定价。
+
 ## 轮次124 引擎重构 C4：静默搜索的长尾第一次有了上限，而账本早就在树里 — engine redesign stage C4
 
 规格 `docs/ENGINE_REDESIGN.md` `:413` §2.6 **Step 4**「quiescence 深度上限」：「当前 `quiescence`
