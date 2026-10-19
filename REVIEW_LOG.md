@@ -2247,7 +2247,11 @@ memcheck 的时间尺度上本来就活不下来，所以这一层不能和第�
   `rc != 0` 时 `tail -2 "$log.out"`（stdout），所以 `Assertion 'xxx' failed` 那一行从来不落盘；
   上面两条内层行就是全部幸存者。为取文本而跑的重跑（`/tmp/r124_c4/assert_text.sh`，两棵树的
   `build-vg/test_search` 各一遍、stderr 落盘）在提交时仍在跑（每臂约 255 s），读数写进
-  `/tmp/r124_c4/assert_arms.txt`，本轮不预写成结论。
+  `/tmp/r124_c4/assert_arms.txt`，本轮不预写成结论。**提交之后本轮预算用尽，这次重跑已停止**（第一臂
+  走到 3 分 48 秒，未及 255 s 的中止点），因为留一个还在吃 CPU 的 valgrind 过夜，正是 D 阶段第一件事
+  ——训练基线计时——要避开的那种负载；脚本原样留在 `/tmp/r124_c4/assert_text.sh`（两臂串行、stderr
+  落盘、直接打印真实的 `uninitialised value` / `definitely lost` 计数），D 开跑前先把它跑完，
+  这一句才有下文。
 - **同一处中止在负树上逐字复现**：`7e1b8c7`（`kMaxQdepth` 在那棵树上 0 命中）的
   `build-vg/test_search` 报出**同一行** `test_search ABORTED rc=134  reports=0
   invalid_read=0 invalid_write=0 uninitialised=0 definite_leak=0  255s`，stdout 尾两行是
