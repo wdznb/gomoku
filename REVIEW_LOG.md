@@ -2242,22 +2242,36 @@ memcheck 的时间尺度上本来就活不下来，所以这一层不能和第�
   0/n0 time_hard, last frame d0/n0, control: alphabeta d1+partial 2/n4515 time_hard)`，后一行是
   那条 10 ms 臂**自己**在断言之前打的读数，所以中止就在它紧随其后的那组断言里
   （`:3968-3980`，`:3973` 正是本节开头点名的那一条）。
-- **本轮够不到的一条证据，按够不到的样子写**：那组断言里**具体哪一条**先红，文本没有取到。
+- **当时够不到、事后补到的那条证据**：那组断言里**具体哪一条**先红，在 `a1a3652` 落盘时还没有文本。
   `tools/valgrind_check.sh:166` 把 stderr 打进 `mktemp`、`:250` 在出结果后 `rm -f`，只在
   `rc != 0` 时 `tail -2 "$log.out"`（stdout），所以 `Assertion 'xxx' failed` 那一行从来不落盘；
-  上面两条内层行就是全部幸存者。为取文本而跑的重跑（`/tmp/r124_c4/assert_text.sh`，两棵树的
-  `build-vg/test_search` 各一遍、stderr 落盘）在提交时仍在跑（每臂约 255 s），读数写进
-  `/tmp/r124_c4/assert_arms.txt`，本轮不预写成结论。**提交之后本轮预算用尽，这次重跑已停止**（第一臂
-  走到 3 分 48 秒，未及 255 s 的中止点），因为留一个还在吃 CPU 的 valgrind 过夜，正是 D 阶段第一件事
-  ——训练基线计时——要避开的那种负载；脚本原样留在 `/tmp/r124_c4/assert_text.sh`（两臂串行、stderr
-  落盘、直接打印真实的 `uninitialised value` / `definitely lost` 计数），D 开跑前先把它跑完，
-  这一句才有下文。
+  两条内层行是当时全部幸存者。为取文本写的重跑（`/tmp/r124_c4/assert_text.sh`，两棵树的
+  `build-vg/test_search` 各一遍、串行、stderr 落盘、直接打印真实四类计数）在提交时只跑到第一臂
+  3 分 48 秒，随本轮预算边界**停止**——留一个还在吃 CPU 的 valgrind 过夜，正是 D 阶段第一件事
+  （训练基线计时）要避开的那种负载。恢复后重跑，14:36:07 起、14:44:32 全部落盘
+  （`/tmp/r124_c4/assert_arms.txt`），文本是：
+
+  ```
+  test_search: …/tests/test_search.cpp:3973: void
+  test_engine_reports_the_interrupted_alphabeta_layer(): Assertion `interrupted.partial_depth == 1' failed.
+  ```
+
+  两棵树**同一行号、同一句文本**，只差路径前缀（工作树 `…/gomoku/tests/…`，负树
+  `…/neg124_c4/tests/…`）；`ARM working rc=134 seconds=253`、`ARM negative rc=134 seconds=252`，
+  两臂 `valgrind report lines=0`、`uninit=0 leak=0`。也就是说本轮被 memcheck 拦住的那一条，正是
+  本节开头点名过、并且**内容行号一字未动**的那一条 10 ms 墙钟臂，而它同样死在没有上限支的
+  `7e1b8c7` 上。上面包装器缺陷那段的「真实计数」也由此从推断变成实测：两臂 stderr 上的
+  `uninitialised value` 与 `definitely lost` 各 **0**。
+- **顺带把「随时间浮动」这四个字钉住了**：同一个二进制（工作树 `build-vg/test_search`）两次跑，
+  `control: alphabeta d1+partial 2/n4515` 与 `2/n5019` 都出现过，负树也是 `n5019`——这一臂的
+  control 走的是 `time_hard`（按墙钟截断），所以节点数本来就是时间的函数而不是树的函数。于是
+  先前拿 `n4515` 对 `n5019` 当「两棵树只差浮动」的读数是**成立的、但成立的原因要写对**：那两个数
+  的差在同一棵树上就能复现，它不能用来区分任何两棵树。
 - **同一处中止在负树上逐字复现**：`7e1b8c7`（`kMaxQdepth` 在那棵树上 0 命中）的
   `build-vg/test_search` 报出**同一行** `test_search ABORTED rc=134  reports=0
   invalid_read=0 invalid_write=0 uninitialised=0 definite_leak=0  255s`，stdout 尾两行是
-  同一对用例名，只有毫秒与节点数随时间浮动（642/852/2948 ms 对 643/850/2964 ms，`n4515`
-  对 `n5019`）。`test_server` 两棵树同一行读数、只差一秒（工作树 `clean 四类全 0 / 40s`，负树
-  `/ 41s`）。所以这一行是**既存的
+  同一对用例名，只有毫秒随时间浮动（642/852/2948 ms 对 643/850/2964 ms）。`test_server` 两棵树
+  同一行读数、只差一秒（工作树 `clean 四类全 0 / 40s`，负树 `/ 41s`）。所以这一行是**既存的
   墙钟脆弱**，本轮既没有把它写成通过，也没有为了它改 `tools/`。
 
 **压测包装器自己的读数缺陷，按原样申报而不是当发现交出去**：`vg_rows.txt` 的四行印
