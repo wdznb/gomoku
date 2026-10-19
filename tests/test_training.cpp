@@ -10,6 +10,7 @@
 #include "training/data_collector.h"
 #include "training/genetic.h"
 #include "training/hill_climbing.h"
+#include "training/sprt.h"
 #include <algorithm>
 #include <atomic>
 #include <cassert>
@@ -436,7 +437,7 @@ void test_elo_system() {
 
 // Round 101 FF1: the bracket behind the rating table disagreed with the promotion
 // rule it sits next to. README:198 makes a verification match 8 games, so a 5-3
-// candidate scores 0.625, which trainer.cpp:371 promotes (>= the 0.56 accept score)
+// candidate scores 0.625, which trainer.cpp:408 promotes (>= the 0.56 bar, open match)
 // while the old `>= 0.75 / <= 0.25` test booked *both* sides a draw - the table
 // printed a match somebody had clearly taken as nobody winning. The bracket now
 // follows what a match score means: above half is a win, below half a loss, exactly
@@ -2102,7 +2103,7 @@ void test_data_game_ids_unique_across_batches() {
 }
 
 // Round 112 PP1: the id a data game got used to be games_played_ + 1 + t * 1000, i.e. a
-// fixed offset off a counter every round advances (trainer.cpp:74 and :291 add each
+// fixed offset off a counter every round advances (trainer.cpp:74 and :318 add each
 // merged record, plus the fitness and verification games). A long run therefore
 // re-reaches the offset legitimately: on the round where games_played_ is 1000, worker
 // 0's base is exactly the base worker 1 used on the games_played_ = 0 round, so two
@@ -3395,7 +3396,7 @@ void test_trainer_refuses_an_empty_flag_value() {
 // Round 99 DD6, labelled as what it is: a help-text assert. Only the usage
 // entries for --stagnation and --hill-iterations were rewritten, and the two
 // claims they now make are the code's existing behaviour - the 3x probe budget is
-// trainer.cpp:347 and the N+1 ceiling is hill_climbing.cpp skipping a step whose
+// trainer.cpp:374 and the N+1 ceiling is hill_climbing.cpp skipping a step whose
 // neighbour is identical. No call path changes, so there is nothing else to pin.
 void test_trainer_help_states_the_probe_budget() {
 #ifndef _WIN32
@@ -3497,8 +3498,8 @@ void test_server_refuses_no_sessions_with_a_stated_path() {
 }
 
 // Round 101 FF2: `--resume CK --seed N` used to start, parse N, and then let the
-// resume overwrite it (trainer.cpp:586 assigns the seed the checkpoint recorded, and
-// trainer.cpp:444 always writes one), so the reproducibility the caller asked for was
+// resume overwrite it (trainer.cpp:628 assigns the seed the checkpoint recorded, and
+// trainer.cpp:486 always writes one), so the reproducibility the caller asked for was
 // not the run that actually happened. The parser now refuses the pair, the same class
 // as the --params/--resume contradiction it sits next to.
 //
@@ -4557,6 +4558,366 @@ void test_trainer_cli_shared_tt_probes() {
 #endif
 }
 
+// Design doc 2.8 #3, the arithmetic first - pinned without a board so the numbers
+// below are the formula and nothing else. At the default effect_elo of 300 the two
+// terms are ln(p1 / 0.5) and ln((1 - p1) / 0.5) for p1 = 1/(1 + 10^-0.75) =
+// 0.8490204, which is +0.5294752 for a win and -1.1974637 for a loss, and the
+// bounds at the 5% risks are +/-ln(19) = +/-2.9444390. So six wins (+3.1768510)
+// close the test as an accept and four losses (-4.7898546) as a reject, while a
+// match that splits every pair drifts -0.6679885 a pair and -2.6719539 over the
+// shipped 8-game ceiling - short of the bound, which is what keeps a
+// colour-decided board in the hands of --accept-score. A draw scores the average
+// of the two terms (-0.3339942), so "no result" is evidence against a 300 Elo gap
+// rather than neutral, and that is the whole reason an unfinished game cannot
+// promote on the test's word alone.
+void test_sprt_closes_only_at_a_pair_boundary() {
+    SprtConfig settings;
+    assert(settings.effect_elo == 300);
+    assert(std::abs(settings.alpha - 0.05) < 1e-12);
+    assert(std::abs(settings.beta - 0.05) < 1e-12);
+
+    const double bound = 2.9444390;
+    {
+        SprtTest fresh(settings);
+        assert(std::abs(fresh.upper_bound() - bound) < 1e-6);
+        assert(std::abs(fresh.lower_bound() + bound) < 1e-6);
+        assert(fresh.verdict() == SprtVerdict::OPEN);
+        assert(!fresh.stop_requested());
+        assert(fresh.games() == 0);
+        assert(fresh.llr() == 0.0);
+    }
+
+    // One colour moved by a whole term and the test still refuses to decide: a
+    // single game measures who moved first as much as who plays better.
+    {
+        SprtTest one(settings);
+        one.add_game(1.0);
+        assert(std::abs(one.llr() - 0.5294752) < 1e-6);
+        assert(one.games() == 1);
+        assert(!one.stop_requested());
+        assert(one.verdict() == SprtVerdict::OPEN);
+        // Even past the bound on one game, end_pair is the only door: this ratio
+        // (+7.6) is above any bound, and the match is still open until both
+        // colours have been played.
+        SprtTest blown(SprtConfig{2000, 0.05, 0.05});
+        blown.add_game(0.0);
+        assert(blown.llr() < -bound);
+        assert(!blown.stop_requested());
+        assert(blown.verdict() == SprtVerdict::OPEN);
+        blown.add_game(0.0);
+        blown.end_pair();
+        assert(blown.stop_requested());
+        assert(blown.verdict() == SprtVerdict::REJECT);
+        assert(blown.games() == 2);
+    }
+
+    auto play_pair = [](SprtTest& test, double first, double second) {
+        test.add_game(first);
+        test.add_game(second);
+        test.end_pair();
+    };
+
+    {
+        SprtTest sweep(settings);
+        play_pair(sweep, 1.0, 1.0);
+        assert(std::abs(sweep.llr() - 1.0589504) < 1e-6);
+        assert(sweep.verdict() == SprtVerdict::OPEN);
+        play_pair(sweep, 1.0, 1.0);
+        assert(std::abs(sweep.llr() - 2.1179008) < 1e-6);
+        assert(!sweep.stop_requested());
+        play_pair(sweep, 1.0, 1.0);
+        assert(std::abs(sweep.llr() - 3.1768510) < 1e-6);
+        assert(sweep.verdict() == SprtVerdict::ACCEPT);
+        assert(sweep.stop_requested());
+        assert(sweep.games() == 6);
+        // A verdict, once given, is not revisited - a caller that kept playing
+        // after the close still reports the decision it stopped for.
+        play_pair(sweep, 0.0, 0.0);
+        assert(sweep.verdict() == SprtVerdict::ACCEPT);
+        assert(std::abs(sweep.llr() - 0.7819236) < 1e-6);
+        // The case that needs the latch rather than the assignment: three more
+        // losing pairs carry the ratio to -6.40, clean through the LOWER bound,
+        // and the match still reports the accept it stopped for. Without the
+        // latch the second crossing overwrites the first verdict, so a match
+        // decided at six games would turn into a rejection on its fourteenth.
+        play_pair(sweep, 0.0, 0.0);
+        play_pair(sweep, 0.0, 0.0);
+        play_pair(sweep, 0.0, 0.0);
+        assert(sweep.verdict() == SprtVerdict::ACCEPT);
+        assert(sweep.stop_requested());
+        assert(std::abs(sweep.llr() + 6.4028583) < 1e-6);
+        assert(sweep.games() == 14);
+    }
+
+    {
+        SprtTest worse(settings);
+        play_pair(worse, 0.0, 0.0);
+        assert(std::abs(worse.llr() + 2.3949273) < 1e-6);
+        assert(worse.verdict() == SprtVerdict::OPEN);
+        play_pair(worse, 0.0, 0.0);
+        assert(std::abs(worse.llr() + 4.7898546) < 1e-6);
+        assert(worse.verdict() == SprtVerdict::REJECT);
+        assert(worse.games() == 4);
+    }
+
+    {
+        SprtTest split(settings);
+        SprtTest drawn(settings);
+        for (int i = 0; i < 4; ++i) {
+            play_pair(split, 1.0, 0.0);
+            play_pair(drawn, 0.5, 0.5);
+        }
+        assert(split.verdict() == SprtVerdict::OPEN);
+        assert(!split.stop_requested());
+        assert(split.games() == 8);
+        // The identity the model is built on: a pair of halves is exactly a pair
+        // of one win and one loss.
+        assert(std::abs(split.llr() - drawn.llr()) < 1e-12);
+        assert(std::abs(split.llr() + 2.6719539) < 1e-6);
+    }
+
+    // The off switch: no terms, no bounds, no decision - only the game count, so
+    // a caller can still report how many games a match took.
+    {
+        SprtTest off(SprtConfig{0, 0.05, 0.05});
+        for (int i = 0; i < 4; ++i) play_pair(off, 0.0, 0.0);
+        assert(off.llr() == 0.0);
+        assert(off.verdict() == SprtVerdict::OPEN);
+        assert(!off.stop_requested());
+        assert(off.games() == 8);
+    }
+
+    // The clamp, not a crash: an Elo this side of ten thousand rounds p1 to
+    // exactly 1.0 in a double, and ln(0) would hand every ratio below a NaN that
+    // no bound can compare against.
+    {
+        SprtTest absurd(SprtConfig{1000000, 0.05, 0.05});
+        absurd.add_game(1.0);
+        absurd.add_game(0.0);
+        absurd.end_pair();
+        assert(std::isfinite(absurd.llr()));
+        assert(absurd.verdict() == SprtVerdict::REJECT);
+    }
+
+    std::cout << "test_sprt_closes_only_at_a_pair_boundary passed (bounds +/-ln(19) = "
+                 "+/-2.9444390, a win worth +0.5294752 and a loss -1.1974637 at the default "
+                 "300 Elo, accept at 6 games, reject at 4, an all-split 8-game match left "
+                 "open at -2.6719539, one game never deciding, and the accept still standing "
+                 "after the record crossed the other bound at -6.4028583)"
+              << std::endl;
+}
+
+// The wiring, on real games whose result is fixed by construction rather than by
+// the engine's mood: --max-moves 1 makes every game unfinished, so an eight-game
+// match is eight halves and the ratio can only be the draw term times eight.
+// Three ceilings of the same request: the shipped default plays all eight, an
+// absurd 1000 Elo gap ends it after the first pair, and --sprt-elo 0 plays all
+// eight with no ratio at all.
+void test_a_closed_sprt_ends_the_match_early() {
+    TrainingConfig config = fast_training_config();
+    config.search_depth = 1;
+    config.timeout_ms = 100;
+    config.max_moves = 1;
+    config.resign_enabled = false;
+
+    Trainer at_default(ThreatCoefficients(), config);
+    const int before_default = at_default.games_played();
+    const MatchOutcome open =
+        at_default.score_match(ThreatCoefficients(), ThreatCoefficients(), 8);
+    assert(at_default.games_played() - before_default == 8);
+    assert(open.games == 8);
+    assert(open.verdict == SprtVerdict::OPEN);
+    assert(std::abs(open.llr + 2.6719539) < 1e-6);
+    assert(std::abs(open.score - 0.5) < 1e-12);
+
+    config.sprt_elo = 1000;
+    Trainer strict(ThreatCoefficients(), config);
+    const int before_strict = strict.games_played();
+    const MatchOutcome closed =
+        strict.score_match(ThreatCoefficients(), ThreatCoefficients(), 8);
+    // Six games the ceiling allowed are never played, and the two that were are a
+    // full pair: the ratio crossed the bound on the first game of the pair, and
+    // the match still played the second colour.
+    assert(strict.games_played() - before_strict == 2);
+    assert(closed.games == 2);
+    assert(closed.verdict == SprtVerdict::REJECT);
+    assert(std::abs(closed.llr + 4.3764829) < 1e-6);
+    assert(std::abs(closed.score - 0.5) < 1e-12);
+
+    config.sprt_elo = 0;
+    Trainer fixed(ThreatCoefficients(), config);
+    const int before_fixed = fixed.games_played();
+    const MatchOutcome played =
+        fixed.score_match(ThreatCoefficients(), ThreatCoefficients(), 8);
+    assert(fixed.games_played() - before_fixed == 8);
+    assert(played.games == 8);
+    assert(played.verdict == SprtVerdict::OPEN);
+    assert(played.llr == 0.0);
+    assert(std::abs(played.score - 0.5) < 1e-12);
+
+    // play_match is the score-only door the optimisers use, and it now reports
+    // the same number the outcome's score field does - the fitness signal did not
+    // move with this change.
+    Trainer wrapper(ThreatCoefficients(), config);
+    assert(std::abs(wrapper.play_match(ThreatCoefficients(), ThreatCoefficients(), 8) -
+                     played.score) < 1e-12);
+
+    std::cout << "  [r128] one 8-game request: default 300 played 8 and stayed open, "
+              << "1000 stopped after 2 (reject), 0 played 8 with llr 0" << std::endl;
+    std::cout << "test_a_closed_sprt_ends_the_match_early passed" << std::endl;
+}
+
+// The verdict is the promotion rule whenever the test has one. An unfinished-game
+// match scores 0.5, and with --accept-score pulled below half the bar alone would
+// promote it - the sequential test says no, and the round keeps the champion.
+// With the test off the same config promotes: that difference is the whole claim,
+// and nothing else about the round is allowed to change between the two arms.
+void test_a_reject_verdict_keeps_a_candidate_the_bar_would_promote() {
+    TrainingConfig config = fast_training_config();
+    config.search_depth = 1;
+    config.timeout_ms = 100;
+    config.max_moves = 1;
+    config.resign_enabled = false;
+    config.accept_score = 0.4;
+    config.verification_games = 4;
+    config.hill_climbing_iterations = 1;
+
+    config.sprt_elo = 1000;
+    Trainer strict(ThreatCoefficients(), config);
+    const TrainerRound stopped = strict.run_round();
+    assert(stopped.round == 1);
+    assert(std::abs(stopped.verification_score - 0.5) < 1e-12);
+    assert(stopped.verification_verdict == SprtVerdict::REJECT);
+    assert(stopped.verification_match_games == 2);
+    assert(!stopped.accepted);
+    assert(strict.rounds_completed() == 1);
+    assert(CoefficientVector::to_vector(strict.champion()) ==
+           CoefficientVector::to_vector(ThreatCoefficients()));
+    assert(strict.status_text().find("champion=v0") != std::string::npos);
+
+    config.sprt_elo = 0;
+    Trainer lenient(ThreatCoefficients(), config);
+    const TrainerRound promoted = lenient.run_round();
+    assert(std::abs(promoted.verification_score - 0.5) < 1e-12);
+    assert(promoted.verification_verdict == SprtVerdict::OPEN);
+    assert(promoted.verification_match_games == 4);
+    assert(promoted.accepted);
+    assert(lenient.status_text().find("champion=v1") != std::string::npos);
+
+    std::cout << "  [r128] score 0.5 against a 0.4 bar: reject after "
+              << stopped.verification_match_games
+              << " games kept the champion, the same match open after "
+              << promoted.verification_match_games << " games promoted" << std::endl;
+    std::cout << "test_a_reject_verdict_keeps_a_candidate_the_bar_would_promote passed"
+              << std::endl;
+}
+
+// The CLI half: the flag parses, 0 is its own answer (so it is refused nowhere a
+// count would be), --no-sprt means the same thing, a negative is refused by name,
+// and the usage text carries both. NOTE for the next probe here: two of these arms
+// assert the summary line's *wording*, which every other CLI arm in this file
+// avoids - here it is the contract, because that line is the only place a run
+// shows what the test decided and how many games it needed. --max-moves 2 gives
+// each side one stone, which cannot be a five, so every game is unfinished and the
+// early stop is deterministic rather than a matter of the engine's mood.
+void test_trainer_cli_sprt_probes() {
+#ifndef _WIN32
+    if (!std::filesystem::exists("gomoku_train")) {
+        std::cout << "  --sprt-elo probes skipped: gomoku_train is not in the working "
+                     "directory" << std::endl;
+        std::cout << "test_trainer_cli_sprt_probes passed" << std::endl;
+        return;
+    }
+    const std::string base =
+        "--rounds 1 --method hill --hill-iterations 1 --depth 1 --timeout-ms 1 "
+        "--max-moves 2 --fitness-games 1 --verification-games 4 --no-data --quiet";
+    const std::filesystem::path err = temp_path("r128_sprt_stderr.txt");
+    const std::filesystem::path out_path = temp_path("r128_sprt_out.json");
+    const std::filesystem::path ck = temp_path("r128_sprt_ck.json");
+    auto read_all = [](const std::filesystem::path& p) {
+        std::ifstream in(p);
+        std::ostringstream text;
+        text << in.rdbuf();
+        return text.str();
+    };
+    auto run = [&](const std::string& arguments) {
+        const std::string command = "./gomoku_train " + base + " --out '" + out_path.string() +
+                                    "' --checkpoint '" + ck.string() + "' " + arguments +
+                                    " > /dev/null 2> '" + err.string() + "'";
+        const int status = std::system(command.c_str());
+        assert(status != -1);
+        return WEXITSTATUS(status);
+    };
+    // temp_path() deletes what it names, so the log path is taken once: reading
+    // it back through a second call would delete the run's own output first.
+    const std::filesystem::path log = temp_path("r128_sprt_stdout.txt");
+    auto stdout_of = [&](const std::string& arguments) {
+        const std::string command = "./gomoku_train " + base + " --out '" + out_path.string() +
+                                    "' --checkpoint '" + ck.string() + "' " + arguments +
+                                    " > '" + log.string() + "' 2> '" + err.string() + "'";
+        assert(std::system(command.c_str()) != -1);
+        return read_all(log);
+    };
+
+    std::error_code ec;
+    std::filesystem::remove(out_path, ec);
+    std::filesystem::remove(ck, ec);
+
+    const int off = run("--sprt-elo 0");
+    const int named = run("--sprt-elo 300");
+    const int flag_off = run("--no-sprt");
+    std::cout << "  [r128] --sprt-elo 0 => exit " << off << ", 300 => exit " << named
+              << ", --no-sprt => exit " << flag_off << std::endl;
+    assert(off == 0);
+    assert(named == 0);
+    assert(flag_off == 0);
+
+    const int negative = run("--sprt-elo -1");
+    const std::string negative_err = read_all(err);
+    std::cout << "  [r128] --sprt-elo -1 => exit " << negative << ", stderr says "
+              << (negative_err.find("--sprt-elo") != std::string::npos ? "the flag" : "nothing")
+              << std::endl;
+    assert(negative == 1);
+    assert(negative_err.find("--sprt-elo") != std::string::npos);
+    assert(run("--sprt-elo") == 1);
+    assert(run("--sprt-elo 1e3") == 1);
+    assert(run("--no-sprt 1") == 1);
+
+    // The stop itself, through the door a user runs: eight unfinished games ask
+    // for four pairs, a 1000 Elo test closes it on the first pair, and the same
+    // match with the test off plays all four.
+    const std::string stopped = stdout_of("--sprt-elo 1000");
+    const std::string whole = stdout_of("--no-sprt");
+    std::cout << "  [r128] --sprt-elo 1000 line: "
+              << (stopped.find("reject after 2 games") != std::string::npos ? "stopped early"
+                                                                            : "played everything")
+              << "; --no-sprt line: "
+              << (whole.find("open after 4 games") != std::string::npos ? "played everything"
+                                                                        : "unexpected")
+              << std::endl;
+    assert(stopped.find("reject after 2 games") != std::string::npos);
+    assert(whole.find("open after 4 games") != std::string::npos);
+    assert(whole.find("llr 0") != std::string::npos);
+
+    const std::filesystem::path usage = temp_path("r128_sprt_usage.txt");
+    assert(std::system(("./gomoku_train --help > '" + usage.string() + "' 2>&1").c_str()) != -1);
+    const std::string help = read_all(usage);
+    std::cout << "  [r128] --help mentions --sprt-elo: "
+              << (help.find("--sprt-elo") != std::string::npos ? "yes" : "no")
+              << ", --no-sprt: " << (help.find("--no-sprt") != std::string::npos ? "yes" : "no")
+              << std::endl;
+    assert(help.find("--sprt-elo") != std::string::npos);
+    assert(help.find("--no-sprt") != std::string::npos);
+
+    std::filesystem::remove(out_path, ec);
+    std::filesystem::remove(ck, ec);
+    std::filesystem::remove(temp_path("r128_sprt_stdout.txt"), ec);
+    std::filesystem::remove(temp_path("r128_sprt_stderr.txt"), ec);
+    std::filesystem::remove(temp_path("r128_sprt_usage.txt"), ec);
+    std::cout << "test_trainer_cli_sprt_probes passed" << std::endl;
+#endif
+}
+
 int main() {
     std::cout << "Running training tests..." << std::endl;
 
@@ -4641,6 +5002,14 @@ int main() {
     test_sharing_off_leaves_every_engine_its_own_table();
     test_one_shared_table_survives_four_concurrent_writers();
     test_trainer_cli_shared_tt_probes();
+
+    // D3, in the contract's order: the test's own arithmetic with no board in it,
+    // the match that stops on it, the verdict that overrides the score bar, then
+    // the flags at the CLI door.
+    test_sprt_closes_only_at_a_pair_boundary();
+    test_a_closed_sprt_ends_the_match_early();
+    test_a_reject_verdict_keeps_a_candidate_the_bar_would_promote();
+    test_trainer_cli_sprt_probes();
 
     std::cout << "All training tests passed" << std::endl;
     return 0;

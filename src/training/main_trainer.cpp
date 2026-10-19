@@ -41,10 +41,20 @@ void print_usage(const char* program) {
         "                              ply cost the same whatever the machine is\n"
         "                              doing, with --timeout-ms as the fallback (0)\n"
         "  --max-moves N               Ply cap for a training game (60)\n"
-        "  --fitness-games N           Games used to score one candidate (2)\n"
-        "  --verification-games N      Games a candidate must beat the champion\n"
-        "                              over before promotion (8)\n"
+        "  --fitness-games N           Games used to score one candidate, unless\n"
+        "                              the sequential test ends the match first (2)\n"
+        "  --verification-games N      Ceiling on the games a candidate must beat the\n"
+        "                              champion over before promotion (8)\n"
         "  --accept-score X            Promotion threshold, >0.5 and <=1.0 (0.56)\n"
+        "  --sprt-elo N                Elo gap a match's record is tested against: the\n"
+        "                              two counts above stop being fixed the moment the\n"
+        "                              log-likelihood ratio leaves +/-2.94, which at this\n"
+        "                              default needs both colours lost twice (reject at\n"
+        "                              4 games) or six games won (accept at 6) inside an\n"
+        "                              8-game ceiling. 300 is the roundest gap whose win\n"
+        "                              side can also finish early, so a smaller one mostly\n"
+        "                              just plays every pair (300; 0 turns the test off,\n"
+        "                              which --no-sprt also does)\n"
         "  --data-games N              Self-play games kept as training data (4)\n"
         "  --threads N                 Parallel data-collection workers (2)\n"
         "  --shared-tt N               Slots in the one transposition table the\n"
@@ -54,6 +64,8 @@ void print_usage(const char* program) {
         "                              N x 7.3MB layout) (262144)\n"
         "  --no-data                   Collect no self-play data (search only)\n"
         "  --no-resign                 Never resign during training games\n"
+        "  --no-sprt                   Play every pair the two counts above ask for:\n"
+        "                              turn the sequential test off (--sprt-elo 0)\n"
         "  --seed N                    RNG seed (20261011)\n"
         "  --params PATH               Starting coefficients (built-in defaults)\n"
         "                              (not together with --resume)\n"
@@ -228,6 +240,13 @@ int main(int argc, char** argv) {
                 config.verification_games = require_int("--verification-games", i, argc, argv);
             } else if (flag == "--accept-score") {
                 config.accept_score = require_double("--accept-score", i, argc, argv);
+            } else if (flag == "--sprt-elo") {
+                // Zero is this knob's own answer - "no sequential test, play every
+                // pair" - so it parses where the game counts would not, and only
+                // negatives are refused.
+                config.sprt_elo = require_int("--sprt-elo", i, argc, argv, 0);
+            } else if (flag == "--no-sprt") {
+                config.sprt_elo = 0;
             } else if (flag == "--data-games") {
                 config.data_games = require_int("--data-games", i, argc, argv);
             } else if (flag == "--threads") {
@@ -382,7 +401,10 @@ int main(int argc, char** argv) {
     std::cout << "\nTraining finished: " << trainer.status_text() << "\n";
     for (const auto& round : history) {
         std::cout << "  round " << round.round << ": score " << round.verification_score
-                  << " -> " << (round.accepted ? "promoted" : "rejected") << "\n";
+                  << " (" << sprt_verdict_name(round.verification_verdict) << " after "
+                  << round.verification_match_games << " games, llr "
+                  << round.verification_llr << ") -> "
+                  << (round.accepted ? "promoted" : "rejected") << "\n";
     }
 
     std::cout << "\nRatings:\n";

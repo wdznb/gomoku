@@ -1153,8 +1153,8 @@ eight test targets shows `-DNDEBUG` followed by `-UNDEBUG` in `flags.make`, and 
 under `-DNDEBUG -UNDEBUG` while surviving under bare `-DNDEBUG`. The external dir was deleted afterwards.
 Three rows the brief listed as expected-FAIL are expectation errors in the brief, not code defects:
 `--optimizer` is really `--method`, `--accept-score -10` is refused by the pre-existing 0.5-1.0 guard
-(`main_trainer.cpp:219`), and `--rounds 0` / `--timeout-ms 0` / `--max-moves 0` are refused by the
-downstream semantic guards at `main_trainer.cpp:213` and `:224` — which is the README-consistent
+(`main_trainer.cpp:231`), and `--rounds 0` / `--timeout-ms 0` / `--max-moves 0` are refused by the
+downstream semantic guards at `main_trainer.cpp:225` and `:236` — which is the README-consistent
 behaviour, so `require_int` deliberately leaves them to those guards. Main session re-ran the gate
 independently: plain `cmake ..` (asserts live), `make -j4` clean apart from the known `server_reason_of`
 warning, `ctest` 8/8, `node tests/web_frontend_check.js` 9/9.
@@ -1170,7 +1170,7 @@ row-col, and `position_json`'s coordinate reader all still cast. So `{"row":4294
 passed the 0-14 check at server.cpp:822 and put a stone on a square the client never named; a session
 file with `version: 4294967297` was accepted as v1; a hand-edited base stone silently moved a cell before
 being resumed as the player's own position. Second class: the write-then-rename sites
-(`trainer.cpp:396`, `params.cpp:210`) and the four plain writers (`data_collector.cpp:241`,
+(`trainer.cpp:435`, `params.cpp:210`) and the four plain writers (`data_collector.cpp:241`,
 `elo.cpp:176`, `game_record.cpp:152` and `:177`) checked `file.good()` on an unflushed stream, so a
 buffered failure that only surfaces at close was reported as success - the truncated `.tmp` then renamed
 over the good checkpoint, and a failed `append_to_jsonl` let `flush_entry` mark the game `exported`,
@@ -1346,7 +1346,7 @@ L1: `params.cpp:183` guarded `five` only from above and `forbidden_penalty` not 
 `five: 0` (making `evaluator.cpp:158-162`'s `cap = five - 1` flatten or invert the whole static
 evaluation) or `forbidden_penalty: 0` (turning a 禁手 into an incentive) or `>= 100000` (making
 `alphabeta.cpp:247/:357` read our own rule penalty as a proven mate loss and `search_engine.cpp:191`
-resign). L2: `require_double` (`main_trainer.cpp:80-88`) only checked `used != text.size()`, and `stod`
+resign). L2: `require_double` (`main_trainer.cpp:92-100`) only checked `used != text.size()`, and `stod`
 consumes `nan`/`inf` wholly, so `--accept-score nan` passed the `(0.5, 1.0]` guard at `:219` - NaN
 compares false against everything - leaving every Elo comparison false and the run silently never
 promoting. L3: `--no-sessions` cleared both persistence paths inside the parse loop (`main.cpp:27-29`), so
@@ -1415,7 +1415,7 @@ recognised, so a file of nothing but typos loaded "successfully" as pure default
 `play_match`'s denominator, i.e. a candidate that lost the board got a draw credit toward the promotion bar
 (README:190/193). M3: `GameRecord::from_json` defaulted a missing/non-string `winner` to a draw and
 `reason_from_name` mapped any typo to INVALID, silently rewriting outcomes - README:209 permits defaults for
-metadata only. M4: README:176/:201 documented `--resume` as a bare switch while `main_trainer.cpp:52` and
+metadata only. M4: README:176/:201 documented `--resume` as a bare switch while `main_trainer.cpp:62` and
 `:206-207` require a PATH. M5: `load_checkpoint` compared the elo player list and the version list by
 *length*, and `EloSystem::add_player` aliases duplicate names, so a shifted name column kept the same length
 and attributed later results to the wrong version.
@@ -1525,7 +1525,7 @@ must still be there byte for byte), `test_forced_encoding_rejects_collisions` (A
 pin calls `build_midgame`, defined lower in the file, so it is forward-declared. HEAD negative proofs were run
 in a `/tmp` copy by re-linking one test target against `git show HEAD:<file>` at a time (no fix line was deleted
 in the repo): A1 `test_search.cpp:993 Assertion '!result.resigned' failed`, A4 `test_session.cpp:184`, A5
-`test_training.cpp:1286`, A6 `test_server.cpp:888 Assertion 'exists(dir/"deadbeef.json")' failed`, A7
+`test_training.cpp:1287`, A6 `test_server.cpp:888 Assertion 'exists(dir/"deadbeef.json")' failed`, A7
 `test_position.cpp:753`, A8 `test_position.cpp:833 Assertion 'padded.ok()' failed` (`"010"` read as octal 8, the
 white stone then colliding). A2 and A3 passed at HEAD *by design*: they are behaviour-preserving pins of the
 observable set and the observable move, not fix detectors. Repo diff is 9 `src/` files plus 5 `tests/` files
@@ -1581,7 +1581,7 @@ wording, the `--resume` write-back and exit-1 rule).
 regression that motivated F1b is on record (`test_training.cpp` failed on
 `from_json_string(R"({"live_four":40000})")` before the narrowing). The test session then ran the gate:
 `ctest` **8/8**, `node tests/web_frontend_check.js` **30/30**, and the `--resume`/`--checkpoint` CLI script.
-Negative proofs against `c052f59` (`build/neg85`): F1 `test_training.cpp:2257`, F3 `test_search.cpp:552`,
+Negative proofs against `c052f59` (`build/neg85`): F1 `test_training.cpp:2258`, F3 `test_search.cpp:552`,
 G1 `test_server.cpp:1093`, G2 `:1198`, G3 `test_position.cpp:307`, G4 `test_server.cpp:1152`, H1 `:1257`,
 F1b's probe table (HEAD silently rewrote the stated values `live_two 1000→100`, `rush_four 15000→10000`,
 `sleepy_two 500→50`), F2-HEAD (the resumed checkpoint stayed at `rounds_completed:1` while the default file
@@ -1636,7 +1636,7 @@ reachable defect.
 the commit), new cases `test_rejects_non_string_envelope_fields`, `test_session_config_range_edges`,
 `test_save_session_leaves_no_tmp`, `test_sample_move_color_must_be_exact`. Negative proofs against
 `891df39` in `build/neg86`: P1 `test_session.cpp:263` (HEAD accepts `"winner": null`), P2 `:362` (HEAD
-accepts `timeout_ms: 50`), P3 `test_training.cpp:1478` (HEAD reads `"BLACK"` as WHITE and returns true).
+accepts `timeout_ms: 50`), P3 `test_training.cpp:1479` (HEAD reads `"BLACK"` as WHITE and returns true).
 P5 has **no observable difference** in these cases and was left without a negative proof on purpose: the
 branch needs a real mid-write failure (`file.good()` after the flush), which no test can provoke through
 `save_session(dir, snap, error)` - inventing one would mean opening a failure back door in `src`, and the
@@ -1649,15 +1649,15 @@ should.
 `trainer.cpp` / `main_trainer.cpp` / `game_manager.cpp` and the server's replay-restart-append paths; I
 re-read every cited line before dispatching.
 
-`trainer.cpp:166` printed `skipping data games this round: no --records or --samples output path was given`
+`trainer.cpp:193` printed `skipping data games this round: no --records or --samples output path was given`
 through `std::cout` - the only bare `std::cout` in the file, where every other progress line goes through
-`if (log_) log_(...)` (`:295 :311 :353 :358 :368`) and `main_trainer.cpp:281` installs that callback only
+`if (log_) log_(...)` (`:322 :338 :380 :385 :395`) and `main_trainer.cpp:300` installs that callback only
 when `!quiet`. README:199 makes both output paths default-empty, so a bare `gomoku_train --quiet` printed one
-line per round against `--help`'s own "Only print the final result" (`main_trainer.cpp:55`).
+line per round against `--help`'s own "Only print the final result" (`main_trainer.cpp:65`).
 
-`main_trainer.cpp:259-267` loaded `--params` fatally (a bad file exits 1), announced `Starting from <path>`,
+`main_trainer.cpp:278-286` loaded `--params` fatally (a bad file exits 1), announced `Starting from <path>`,
 passed the result as the Trainer's `base` (which `trainer.cpp:29` pushes as `versions_[0]`) - and then
-`load_checkpoint` replaced `versions_`, `elo_` and `best_version_` wholesale (`trainer.cpp:537-540`), so under
+`load_checkpoint` replaced `versions_`, `elo_` and `best_version_` wholesale (`trainer.cpp:579-582`), so under
 `--resume` the announced start point is not the one used, and a file the run will never read can still stop it
 from starting. `base` has no other use in `trainer.cpp`.
 
@@ -1680,7 +1680,7 @@ the invariants once per ply inside the emit branch, then copies them and refills
 variant. Sample counts, the `seen` dedup, the `FEATURE_*` constants and the writers are untouched.
 
 **Refuted this round.** `game_record.cpp:158-173`'s plain `ofstream(trunc)` single-record save is not a
-production writer (only `test_training.cpp:242`/`:1921` call it; the server appends through
+production writer (only `test_training.cpp:243`/`:1922` call it; the server appends through
 `append_to_jsonl`, `server.cpp:1453`) and README:561's "不会留下半个文件" describes the 10-second session
 flush, which is atomic. A 摆棋 `base`-backed record reaching `DataCollector::collect()` from an empty board
 needs someone to hand-copy a session file's `record` into a trainer path, and README:565 says exactly that
@@ -1762,7 +1762,7 @@ removes it when only the rename failed.
 **Verified.** Gate over the identical tree: `ctest` **8/8** (bare `cmake ..`; `test_genetic_seed_covers_the_whole_box`
 and `test_genetic_elite_single_evaluation` both pass in `test_training`) and `node tests/web_frontend_check.js`
 **30/30**. Negative proofs in `build/neg87r` (`git archive c14854a` + the current `tests/`): the seeding case
-aborts at `tests/test_training.cpp:1052` `Assertion 'genes[g] != bound.min_value' failed` (exit 134) with
+aborts at `tests/test_training.cpp:1053` `Assertion 'genes[g] != bound.min_value' failed` (exit 134) with
 `min_hits=23` / `31` and `double_four_above_mid=0`, while the elite case **passes** at HEAD - the rewrite is
 behaviour-neutral, only R1 is proven by it. R3 is CLI-proven both ways: on the worktree all five empty values
 exit **1** naming the flag (`Invalid --params (must not be empty)` is the log tail), legal paths and
@@ -1813,7 +1813,7 @@ filler position carries 213 stones and is already decided (`check_winner() == WH
 fives on the board), so S2's new rule rightly answers it with a resignation; the case now calls
 `set_resign_detection(false)` with the reason written in place, keeping its original board and its
 `must_block (7,8)` coverage, and the resignation itself is pinned by
-`test_search_engine_resigns_on_two_enemy_five_points`. `test_training.cpp:2107` pinned the *residue* of a failed
+`test_search_engine_resigns_on_two_enemy_five_points`. `test_training.cpp:2108` pinned the *residue* of a failed
 params write - the behaviour S8 exists to remove - so the params arm now asserts the poisoned temp is gone while
 the checkpoint arm below it keeps its old expectation (that writer was not given the cleanup).
 
@@ -1848,7 +1848,7 @@ quiescence loop, and `alphabeta.cpp:62`'s claim that `is_forbidden` re-runs `rec
 current `tests/`) - S1 `tests/test_server.cpp:1340` `hint_results == 0`, S2 `tests/test_search.cpp:1323`
 `result.resigned`, S3 `tests/test_search.cpp:1380` `result.method == "no_legal_move"`, S5
 `tests/test_server.cpp:1431` `depth == 3`, S6 `tests/test_search.cpp:2060`
-`aborted_tt.lookup(child_hash) == nullptr`, S8 `tests/test_training.cpp:2112`
+`aborted_tt.lookup(child_hash) == nullptr`, S8 `tests/test_training.cpp:2113`
 `!std::filesystem::is_symlink(params_tmp)`; HEAD's full `ctest` run fails exactly three targets
 (`test_search` / `test_server` / `test_training`) on those cases. Anti-overreach pins that stayed green on both
 trees: an empty board still opens at the centre through the normal path, round-78's 终止 handling, round-80 B8's
@@ -1932,7 +1932,7 @@ round 74's carry at `:330-331` only covers the post-hoc verification match, so e
 compared a candidate on the compiled-in baseline (`five` 100000, `forbidden_penalty` 50000 — the cap at
 `evaluator.cpp:175` and the five bonus at `:108` both move with `five`) against a champion on the parameter
 file's. Measured by `build/r90u_probe4.cpp` over one hill-climbing round: 22 objective calls, **19 of them off
-the champion's baseline** (`90000/40000` champion vs `100000/50000` candidate), only `trainer.cpp:283`'s own
+the champion's baseline** (`90000/40000` champion vs `100000/50000` candidate), only `trainer.cpp:310`'s own
 champion read and the round-end re-read on it. **U2** both `nothing_to_keep` predicates (`server.cpp:834`,
 `:1066`) counted `position_pending()` as content. `validate_position` accepts an entirely empty board, so
 摆棋→清空→确认 rotated a token per click and detached a game holding *nothing* into the 30-minute reattach
@@ -1965,7 +1965,7 @@ values, which is not an output contract.
 
 **Verified.** Gate over the identical tree: `ctest` **8/8** (bare `cmake ..`) and
 `node tests/web_frontend_check.js` **30/30**. HEAD negatives in `build/neg90u` (`git archive 0c56dbb` plus the
-current `tests/`) fail **3 out of 8** and nothing else: `tests/test_training.cpp:2704`
+current `tests/`) fail **3 out of 8** and nothing else: `tests/test_training.cpp:2705`
 `call.first == 90000`, `tests/test_server.cpp:1489` `again.get() == first.get()`, `tests/test_position.cpp:947`
 `error.find("第 3 行有 14 格") != npos`; the three aborted binaries had already printed 15 / 18 / 46 ` passed`
 lines of existing cases first. Anti-overreach pins green on both trees: `defaults.five` stays zero-change
@@ -1979,6 +1979,101 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次128 引擎重构 D-3：验证赛第一次由序贯检验决定它要打几局，而「三档」那笔账本来就是算术 — engine redesign stage D3, SPRT-adaptive match length
+
+规格 `docs/ENGINE_REDESIGN.md` `:435`（§2.8 `#3`「SPRT 自适应对局数：验证赛改为序贯检验（Sequential Probability Ratio Test），在统计显著时提前终止，而不是固定 8 局。解决 README 记录的『fitness 只有 0/0.5/1 三档』问题的一半（另一半靠评估函数的位置项修复）」），落地清单 `:591` 认的实现位置是 `src/training/trainer.cpp`，`:596` 认的测试是「`tests/test_training.cpp` 新增：节点预算、共享 TT 并发安全、SPRT 终止」，验收仍在 `:550`。本轮付掉「序贯检验」这一件，并在读数 2 里把「三档」那一半交回去：它不是棋力，是 `pairs` 的算术，而 SPRT 一点分辨率也不加——`--fitness-games 2` 这一档上，检验一条界都碰不到。
+
+### 实现：`sprt.h` 只是一张算术表，trainer 多了一个出口
+
+- 新文件 `src/training/sprt.h`（116 行，header-only，沿用 `src/search/search_limits.h`／`search_state.h` 的先例，`CMakeLists.txt` 只列 `.cpp`，所以一个字没改）：`SprtConfig{effect_elo=300, alpha=0.05, beta=0.05}`（`:30`）、`SprtVerdict{OPEN, ACCEPT, REJECT}`（`:41`）、`sprt_verdict_name()`（`:47`，`OPEN` 走 `case …: break;` 而不是 `default:`，为了 `switch` 不吞 `-Wswitch`）、`SprtTest`（`:59`）。每局增量是 `s·ln(p1/0.5) + (1−s)·ln((1−p1)/0.5)`（`:81`），`p1 = 1/(1+10^(−E/400))` 且夹在 `1 − 1e-9` 以下（`:70-72`），两界各 `±ln((1−α)/α)`（`:63-64`）。
+- **`add_game` 不算生死，`end_pair` 才算**（`:78`、`:86`）：一对手的两局之间不投票。这不是保守，是这张棋盘的现实——README `:213` 记的「颜色通吃」就是每局单看都领先、合起来正好 0.5 的那种比赛，允许在第一局后停下等于把先手优势当证据。`decided_` 一旦置位就不回头（`:87`、`:91`），所以调用方在闭合之后继续下也照样报出它当初停下来那个判断。
+- 训练侧只有一个出口：`Trainer::score_match()`（`src/training/trainer.cpp:92-157`）返回 `MatchOutcome{score, games, verdict, llr}`（`src/training/trainer.h:111`），`play_match()` 退化成 `return score_match(...).score;`（`:86-90`）——优化器看到的信号口径一字未动，这是「不改变适配度」这条约束的实现形式。`TrainingConfig::sprt_elo`（`trainer.h:61`）取 0 就是关掉检验（`SprtTest::enabled_`，`sprt.h:62`），此时 `score_match` 与改前逐句等价。
+- 每对下完取一次界（`trainer.cpp:143-148`），`pairs = max(1, (games+1)/2)`（`:125`）从「局数」变成「上限」；分数是**实际下完的局**的均值而不是上限的均值（`:153-155`），被丢弃的无效局留在分母外。
+- 晋升规则换了主人（`:402-410`）：`ACCEPT` 直接晋升，`REJECT` 直接留冠军，只有 `OPEN`（上限走完仍在两界之内）才回头看 `--accept-score`。轮次日志与收尾摘要都印出判断与局数（`:441-447`、`src/training/main_trainer.cpp:402-407`）。
+- CLI：`--sprt-elo`（帮助 `main_trainer.cpp:49-57`，解析 `:243-247`，`require_int` 的下界给 0，因为 0 是「不要检验」这个答案本身，负数才拒），`--no-sprt`（`:67-68`、`:248-249`）。README 五行行内改（流程 `:180`、表 `:197-199`、颜色通吃那段 `:213`），**658 行不变**。
+- 测试四条（注册在 `tests/test_training.cpp:5009-5012`）：`test_sprt_closes_only_at_a_pair_boundary()`（`:4573`，纯算术——两界各 `±2.9444390`、300 差下胜项 `+0.5294752` 负项 `−1.1974637`、6 局收、4 局拒、全平分的 8 局留 `−2.6719539` 而 OPEN、单局过界不算、以及补臂那段「越过另一侧界之后 accept 仍然作数」）；`test_a_closed_sprt_ends_the_match_early()`（`:4716`，`--max-moves 1` 把每一局都钉成未分胜负，于是比值只能是平局项 × 8；同一个八字上限在 300／1000／0 三个刻度上各打下几局；顺带断言 `play_match()` 报的数与 `MatchOutcome::score` 一字不差——适配度口径没动，`:4762-4763`）；`test_a_reject_verdict_keeps_a_candidate_the_bar_would_promote()`（`:4775`，`--accept-score 0.4` 之下 0.5 分本该晋升，检验给出 REJECT 就不晋升，关掉检验同一套配置就晋升——两个臂只差检验开关）；`test_trainer_cli_sprt_probes()`（`:4823`，CLI 取值与 `--help`，本轮唯一去断言收尾摘要**措辞**的用例）。
+
+### 读数 1：同一个 seed，检验关着就是改前那棵树，开着少打两局、冠军一字不差
+
+八臂同一 seed（`--rounds 1 --method genetic --population 8 --generations 4 --depth 4 --timeout-ms 400 --max-moves 60 --seed 20261011 --no-data`，只在两个局数旗标与 `--fitness-games` 上不同），串行跑在空机上；`c8`/`c2`/`cf4` 三臂是**改前**的 HEAD 树（`d534c3a`）跑的同一命令，其余五臂是工作树。
+
+| 臂 | 树 / 配置 | wall / user s | rss kB | 局数 | 那一轮的那行 |
+|---|---|---|---|---|---|
+| `c8` | HEAD 树，缺省 `--fitness-games 2 --verification-games 8` | 174.63 / 173.58 | 26,976 | 66 | score 0.875 → promoted |
+| `c2` | HEAD 树，验证上限 2 | 165.42 / 164.66 | 26,852 | 60 | score 1 → promoted |
+| `cf4` | HEAD 树，适配度 4 局 | 236.14 / 234.25 | 27,028 | 124 | score 0.875 → promoted |
+| `n8` | 新树 `--no-sprt` | 179.47 / 177.31 | 26,928 | 66 | score 0.875 (open after 8 games, llr 0) → promoted |
+| `s8` | 新树缺省 300 | 169.17 / 168.27 | 27,080 | 64 | score 1 (accept after 6 games, llr 3.17685) → promoted |
+| `e1000` | 新树 `--sprt-elo 1000` | 162.84 / 162.28 | 27,012 | 64 | score 1 (accept after 6 games, llr 4.13994) → promoted |
+| `f8s` | 新树 `--fitness-games 8`，检验开 | 295.44 / 292.70 | 27,240 | 202 | score 1 (accept after 6 games, llr 3.17685) → promoted |
+| `f8n` | 新树 `--fitness-games 8 --no-sprt` | 269.93 / 267.91 | 26,824 | 240 | score 1 (open after 8 games, llr 0) → promoted |
+
+（局数那一列不是算出来的，是各臂 `.ckpt` 里的 `games_played`，八臂分别印 66 / 60 / 124 / 66 / 64 / 64 / 202 / 240；它们与上限语义完全对得上：`29 次评估 × 适配度局数 + 验证实下局数`——60/66 = 58+2/8，64 = 58+6，124 = 116+8，240 = 232+8，`f8s` 的 202 = 196+6，即适配度那 232 局里检验替本轮跳过了 36 局。）
+
+- **`n8` 与 `c8` 的产物逐字节相同**：`cmp /tmp/d3/c8.ckpt /tmp/d3/n8.ckpt` 与 `cmp c8.json n8.json` 都无输出——`games_played` 66、两位玩家的 Elo、十个系数一字不差。这就是 `--no-sprt` 的契约：关掉检验不是「换个算法」，是回到改前的固定局数。
+- `s8` 收在 `+3.176851 = 6 × 0.5294752`，正是缺省 300 差下连胜过界那条线；`s8.json`、`n8.json`、`c8.json`、`f8s.json` 四份冠军文件互相同（晋升的是同一个候选），`s8.ckpt` 对 `c8.ckpt` 只差三行：`games_played` 66 → 64 与两个 Elo（1488/1512 → 1484/1516，账本吃的是 `1.0` 而不是 `0.875`）。**「判断没变、只是少打两局」这句话的物证就是这三行。**
+- **`s8` 与 `e1000` 是一对空臂**：300 与 1000 两个刻度在这条 seed 上都在第六局收，`cmp s8.ckpt e1000.ckpt` 逐字节相同 ⇒ 两臂做的功完全一样，而 wall 差 6.33 s、user 差 5.99 s。这就是这台机器在这一尺度上的**噪声地板**，下面那句「省了多少」必须跟它比。
+- 于是验证侧的省——`n8 − s8 = 9.04 s user / 10.30 s wall`、少打 2 局——只比噪声地板高 1.5 倍。**能立住的读数是局数（66 → 64），时间那句只能算同量级。**少掉的是那场比赛的第 7、8 局：两臂前 6 局都是六连胜（`s8` 的 `+3.176851 = 6 × 0.5294752` 就是这条），而 `c8`/`n8` 的 0.875 = 7/8 说明这两局合计只值 1 分——要么两局未分胜负，要么一胜一负，这两种记录在 SimplePay 下同一个 LLR（`−0.6679885` 对 `−0.6679884`，正是本轮第一条用例断言的那条恒等式），合到 8 局是 `+2.508863`，仍留在 `2.944439` 之内，所以 `n8` 报 OPEN 与算术自洽。单价也不守恒：这两局合 4.52 s/局，而整轮 66 局平均 2.69 s/局（`n8` 的 user ÷ 66）、`c8 − c2` 那 6 局是 1.49 s/局——同一场比赛里越往后的局越贵，所以「省 N 局 = 省 N × 均价」这条外推在这批数据上就不成立。
+- **适配度那一侧不是省钱，是换信号**（`f8s` 对 `f8n`，同一棵树、同一 seed）：检验开着的 `f8s` 少打 38 局（240 → 202，−15.8 %）却多花 24.79 s user（+9.3 %），而且晋升的**不是同一个候选**——`f8n.json` 与 `f8s.json` 从第 3 行起就分叉（`cand_width_deep` 24 对 26、`live_four` 15332 对 38123、`edge_penalty` 0 对 80…），`f8s` 那份反倒与缺省尺度的 `c8/n8/s8` 一字不差。原因写在算术里：早停只在整局整负的记录上触发，被跳过的是那类局，留下的是纠缠的长局，而 0-4 记 `0.0` 与下满 8 局记 `0.25` 给优化器看的不是同一个排序。所以本轮**不**给 `:550` 的第一条记这笔账，反过来要把「适配度侧的检验会改选出的候选」这条挂在缺口里。
+- 顺带一条刻度自检：`e1000` 的 `llr 4.139939 = 6 × 0.689990`，1000 差下连胜 5 局（3.45）已经过界，但界只在**对尾**读，所以仍是第 6 局收——这正是 `sprt.h:84-92` 那句「pair 之间不投票」要的形状。
+- 单价不守恒这件事按差分再量一遍就更大：`c8 → cf4` 是 61.51 s wall / 58 局 = **1.06 s/局**，`cf4 → f8n` 是 33.79 s / 116 局 = **0.29 s/局**，同一件「加一局」差到 3.6 倍；而 `n8 − s8` 少掉的那两局合 **4.52 s/局**。轮次125 量的 1.99 s（`REVIEW_LOG:2289`）是**采集**那一侧在另一个尺度（~30 s 的小轮）上的单价，不能拿来当系数用。所以任何「省 N 局 = N × 均价」的外推在这批数据上都不成立，`s8 → f8s` 那种把适配度每对从 2 局加到 8 局的推算尤其不能信。
+
+### 读数 2：`--fitness-games 2` 不是三档，是五档；而这一档上检验永远不闭合
+
+- 三档那句话的算术：`pairs = max(1, (games+1)/2)`（`trainer.cpp:125`）除以 `played_games`（`:155`）。`--fitness-games 2` 就是一对，两局的半分各取 `{0, 0.5, 1}`，均值集合是 `{0, 0.25, 0.5, 0.75, 1}` ——**五个值**。「0/0.5/1 三档」只在没有未分胜负局时才成立，而 `:213` 自己就写着满 60 手算和。实测（HEAD 树，`--rounds 3 --population 2 --generations 1 --verification-games 8 --seed 20261011`，`/tmp/d3/vdist.out`）：round 1 适配度 0.000000 / 验证 0.000000，round 2 适配度 **0.250000** / 验证 **0.312500**，round 3 都是 1.000000。0.25 与 0.3125 都不在那「三档」里。
+- SPRT 在这一档上一条界也碰不到：一对的 `|LLR|` 最大是两连负 `−2.3949273`，界是 `−2.9444390`。要能拒绝至少要 4 局（`−4.789855`），要能接受至少要 6 局（`+3.176851`）。所以缺省尺度的适配度赛（1 对）根本不会提前结束，`:435` 说的「解决三档问题的一半」在这一档上没有可兑现的东西：**检验自适应的是局数，不是信号的取值集合**。分辨率只有两条来路——加大 `--fitness-games`（成本线性，本轮 f8s/f8n 量的正是这条），或者按 `:435` 自己说的另一半去修评估函数的位置项。
+- 缺省 `--sprt-elo` 为什么是 300 而不是书上的 50：`sprt.h:22-29` 那段算的是同一个东西——50 差时每一项不到 0.16，8 局上限内 `|LLR|` 最大 1.23，检验永远不闭合（等于白装）；250 差时连胜要打到第 8 局才够界；300 是「4 连负即拒、6 连胜即收」都在 8 局上限内的最松一个刻度。
+
+### 变异矩阵：第一轮六臂里有一条是绿的，那条不是通过，是仪器缺了一段
+
+对照臂是未变异的工作树用同一命令跑：`./test_training` rc=0 / 12-15 s，六条 `[r128]` 读数齐。
+
+| 变异 | 改动 | 结果 |
+|---|---|---|
+| M1 | 把负局写成 `-win_term_` 而不是 `ln((1−p1)/0.5)`（`sprt.h:74`） | rc=134，`tests/test_training.cpp:4604: Assertion 'blown.llr() < -bound' failed`——2000 差下一局负不再过界 |
+| M2 | `add_game()` 自己调一次 `end_pair()`（`:81` 之后），界不再只在对尾读 | rc=134，`:4605: Assertion '!blown.stop_requested()' failed`——单局就定了生死 |
+| M3 | 去掉 `p1` 的 `1 − 1e-9` 夹逼（`:72` 改回 `raw`） | rc=134，`:4698: Assertion 'std::isfinite(absurd.llr())' failed`——1000000 差时 `ln(0)` 把比值变成非有限 |
+| M4 | 去掉 `end_pair()` 的 `decided_` 门闩（`:87`） | **第一轮 rc=0（绿）**，补臂之后 rc=134，`:4646: Assertion 'sweep.verdict() == SprtVerdict::ACCEPT' failed` |
+| M5 | 晋升只看分数：`accepted = score >= accept_score`（`trainer.cpp:408-410` 三行换成一行） | rc=134，`:4792: Assertion '!stopped.accepted' failed`——那条用例的名字就是这句话 |
+| M6 | 分数除以**上限**而不是实际局数（`trainer.cpp:155`） | rc=134 / 5 s，`:2214: Assertion 'std::abs(score - 0.5) < 1e-12' failed`，炸在轮次107 那条 `test_play_match_rounds_up_to_even` 上——它比本轮的用例排得前，先接住了这条 |
+
+- **M4 那条绿是本轮最值钱的一次读数**：读了 `end_pair()` 才明白这个变异在这套断言下是**等价**的——赋值只发生在越界那一支，所以「不回头」在「继续越同一侧的界」的续局里根本显不出来；要它显形，得让续局去越**另一侧**的界。缺省 300 下 `+3.176851` 的 accept 之后再接三对全负才做得到：`0.7819236 − 3 × 2.3949273 = −6.4028583`，干净穿过下界。补进 `tests/test_training.cpp:4638-4649`（12 行），用例收尾那句话也跟着把这一段念出来（`:4702-4706`，比原来多一行），然后**整棵树重跑六臂**——所以表里 M1/M2/M3/M5/M6 的行号是补臂之后那一轮的量。位移本身就是这段插入的物证：M3 从 `:4686` 走到 `:4698`（+12，它排在插入块之后、收尾那句话之前），M5 从 `:4779` 走到 `:4792`（+13，多出来的正是那句话的那一行）。这是轮次124「C3-5 钉住被中断那一手」、轮次127「M3b 的锚点撞三次」的同一种修法，代价是一次 20 分钟的整轮重跑。
+- M6 的红落在别人的用例上，这条要记下：`test_play_match_rounds_up_to_even`（轮次107）早就在断言「3 个上限下满 4 局、分数是实际局的比值」，所以分母一错它先炸。本轮新增的用例没有重复发明它，M6 的证据因此是**既有契约**而不是新断言。
+
+### 门禁（跑在补臂之后的那棵树上）
+
+编译这一行量了两次，因为第一次那台编译器根本没有干活。`cmake --build build -j4` 印 rc=0 / 12 s、`warning:` 0 条，可整份日志里**一行 `Building CXX` 都没有**：这个 workspace 挂在 `vmhgfs-fuse` 上（整棵树 root-owned、mode 777），`trainer.cpp`／`main_trainer.cpp`／`test_training.cpp` 三支的 mtime 被报成 `1970-01-01 08:00:01`（`stat -c %Y` 印 `1`），比任何 `.o` 都旧，make 因此判定无事可做——那个 0 是一次空读，不是「没有警告」。换 `cmake --build build -j4 -- -B` 强制全量重编：rc=0 / 329 s、**139 个 TU**、`warning:` **5 行 = 3 条**（两条各被两个 target 编到），三条都在本轮没动的文字上：`src/training/data_collector.cpp:95:62 [-Wunused-parameter]`（`side_to_move`）、`src/server/server.cpp:178:13 [-Wunused-function]`（`server_reason_of`）、`tests/test_training.cpp:3571:28 [-Wrange-loop-construct]`（`for (const std::string arguments : …)`，HEAD 里在 `:3570`，被本轮第 13 行那个新 `#include` 推下来一行）。前两支本轮一字未动（`git status` 里没有它们），第三支是上一轮留下的——本轮新写的代码与用例一条警告也没有，但那三句「没有警告」只有在全量重编里才是读数。同一支文件在 `build-vg` 里也是真重编（`[19%] Building CXX … trainer.cpp.o`、`[29%] … test_training.cpp.o`），所以 `:3571` 那条警告先在 memcheck 那一臂撞见，而不是在这条空转的增量构建里；这也意味着八臂计时读数的合法性得靠产物自己说话：`s8` 那行印的是「accept after 6 games, llr 3.17685」，这句措辞只存在于新代码里。
+
+`ctest`（跑在强制重编之后的二进制上，串行、空机）**8/8 / 461.70 s**（test_board 0.05 s test_pattern 0.39 s test_evaluator 0.02 s test_search 423.98 s test_position 7.61 s test_session 0.03 s test_server 16.78 s test_training 11.65 s）；这一臂是重跑的那一次：门禁第一轮 `ctest` 也 8/8 / 459 s，跑在变异矩阵最后一臂那次真重编出来的同一批程序上，所以两条都绿，但只有重跑这条能与上面那行编译读数放在一起讲。`node tests/web_frontend_check.js` **105/105**；`node tests/readme_anchor_check.js` **120 citations / 0 problems**；README **658 行**；门禁之后 `git status --porcelain` 只有本轮动过的六支加 `?? src/training/sprt.h`，变异矩阵的临时文件都留在 `/tmp/d3/`，没有落进树里。
+
+### Valgrind
+
+| 臂 | 结果 |
+|---|---|
+| `bash tools/valgrind_check.sh memcheck test_training`（包装） | rc=0 / 434 s，行印 `test_training  clean  reports=0  invalid_read=0 invalid_write=0 uninitialised=0 definite_leak=0  248s` |
+| memcheck 明细臂：`build-vg/test_training`，`--leak-check=full --show-leak-kinds=all --track-origins=yes --log-file=/tmp/d3/gate_vg_detail.log`（不带 `-q`，stderr 全留在盘上） | rc=0 / 257 s，`ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)`，`in use at exit: 0 bytes in 0 blocks`，`All heap blocks were freed -- no leaks are possible`，`total heap usage: 340,068 allocs, 340,068 frees, 587,851,515 bytes allocated`；六条 `[r128]` 读数与 `All training tests passed` 都在这臂的 stdout 里 |
+
+- `--log-file` 那一臂是本轮特意补的：轮次124 记的就是「`tools/valgrind_check.sh` 把 stderr 送进 mktemp（`:166`）、印完行 `rm -f`（`:250`），断言文本落不了盘」，这次明细自己留在 `/tmp/d3/gate_vg_detail.log`，下一轮想复核还能读。
+- 三条量不到的照写：`test_trainer_cli_sprt_probes` 走 `std::system()`（`tests/test_training.cpp:4847`），memcheck 默认不追子进程，那五条 CLI 探臂 exec 的是 `build-vg/gomoku_train` 本体，不在 memcheck 之下；`test_search` 不在 memcheck 下重跑，因为 `tests/test_search.cpp:3973` 的 10 ms 臂在任何非本机时间尺度上都会炸（轮次124 已把断言文本量到并记在案）；本轮没有 TSan 臂——`SprtTest` 是 `score_match()` 的栈上局部（`trainer.cpp:118`），一场比赛的两色对局在这一个调用里串行打完（`:128-148`），本轮没有新增跨线程对象，与轮次127 那张共享表不是同一类东西。
+
+### 引用重钉
+
+- `trainer.cpp` +52/−10、`trainer.h` +28/−0、`main_trainer.cpp` +26/−4、`tests/test_training.cpp` +374/−5（那 5 行全是本轮行内重钉的注释，没有一条断言被删被改；补臂那段共 13 行（`:4638-4649` 的 12 行加收尾那句话多出的 1 行），补臂之前这支文件量到 +361/−5、5003 行；引用校验器与变异矩阵六臂都是在补臂之后的最终树上重跑的）。这四个文件之外的源码一字未动。
+- `REVIEW_LOG.md` 的**重钉**改动是 87 行、行数不变（6569，门禁量到的就是它）；本节拼入之后全档 6664 行，其中本节（连同下面那条位移说明）95 行：先按 difflib 对齐逐文件算出「同一段文字的新行号」，再对每条被改动的句子读一遍原文确认——脚本 `collect.sh`/`repin_citations.py`/`repin_paths.py`/`repin_bare.py` 与位置配对校验器 `verify_repin.py` 留在 `/tmp/r128/`。校验结果：这四支文件里的引用 token 共 **99 条**，8 条数字未动且文本相同，82 条重钉后文本相同，9 条（7 个不同）是**本轮自己改了被引用那段文字**而故意留下的差异：`trainer.cpp:371→408`（晋升规则本体）、`:96-99→107-109`（「每次评估新建引擎」那段注释）、`:108→125` 两次（那句「奇数向上取整」的注释现在指向 `pairs` 这一行本身）、`main_trainer.cpp:45→46`（`--verification-games` 的帮助行改成「上限」措辞）、`tests/test_training.cpp:439→440`（新 `#include` 把整支文件往下推一行）。
+- 本节自己的拼入把 1982 以下整段推下 95 行，所以**档内**指向绝对行号的句子跟着改钉：上面那句 `:5524`／`:5637` 现在是 `:5619`／`:5732`，读数 1 里引用的轮次125 那两条从 `:2189`／`:2194` 变成 `:2284`／`:2289`。档内另有两处不是本轮写的（`:5708` 的 `REVIEW_LOG:250`、`:6197` 的 `REVIEW_LOG:1083`）指向插入点之上，位移碰不到它们；替换全是等长的数字换数字，改钉前后 `wc -l` 都是 6664。
+- 另有两条是**在 HEAD 上就已经指错**、本轮顺手钉到当前真位置的：`REVIEW_LOG.md:5619` 的 `trainer.cpp:311` 与 `:5732` 的 `:355`——HEAD 树里 `settings.max_iterations` 在 `:346`、`result.games_played` 在 `:390`，本轮之后分别是 `:373` 与 `:429`，现在两个数字都对得上文字。同一类「HEAD 就落后 27 行」的锚点（`trainer.cpp:218/238` 那批 D-2 变异表里的数字）被本轮的整体位移**恰好**推回正确位置，这条是巧合，不是本轮证明的东西，写在这是为了让下一轮别把它当已核验。
+- 工具自己的一条缺陷：`/tmp/r128/verify_citations.py` 把 `controller.cpp`／`controller.h` 映射到 `src/training/`（真路径是 `src/search/`），于是那两条读数印成「file has 0」；它按「同一个数字在 HEAD 与在工作树是否同文」判 244 条中的 72 条 DIFFERS，其中绝大多数正是本轮重钉成功的那批（数字没变回去、文字动了才叫 DIFFERS）。这个 72 不是缺陷计数，别引用它。
+
+### 缺口（写给下一轮的字）
+
+- 仪器本身的一条：这条挂载（`vmhgfs-fuse`，整树 root-owned mode 777）会把被改写过的源文件的 mtime 报成 epoch，`trainer.cpp`／`main_trainer.cpp`／`test_training.cpp` 三支本轮量到 `stat -c %Y` = 1，比任何 `.o` 都旧，于是 `cmake --build build -j4` 一行 `Building CXX` 都不印。**任何「改了 src 之后再跑增量构建」的读数都可能是在测上一棵树的二进制**——要么 `-- -B`，要么先删对应 `.o`，要么像本轮这样用一个只存在于新代码里的输出措辞反证。轮次125 那批时间是 docs-only 轮次（`src/` 与 a1a3652 相同），不受这条影响；受影响的是 D 阶段接下来每一次「训练变快了」的量法，包括 `:550` 那条 −40 % 要从 `REVIEW_LOG:2284` 那把 182.91 s/轮的尺里减的那把尺。
+
+- `:550` 第一条（单轮耗时 −≥40 %）：本轮在缺省尺度上只买到「66 局里少打 2 局」（验证赛 8 局 → 6 局，占一轮局数的 3.0 %），时间那半句因为噪声地板（5.99 s user）就在同一量级，本轮不报成收益。一轮的 88 % 局数（58/66）在适配度赛，而 `--fitness-games 2` 那一档检验永远不会闭合（读数 2），所以 −40 % 不会由 D-3 付：要么加 `--fitness-games`（`f8s` 那一臂实测反而更贵，且换了候选），要么按 `:435` 的后一半去动评估函数。第二条（内存与并发解耦）轮次127 已付。第三条（`--fitness-games 2` 不再三档）读数 2 交回去了：它本来就不是三档，而 SPRT 给不了分辨率——这一条要么改口径，要么归 `:435` 的后一半（评估函数位置项），不属于 D-3。
+- LLR 假设每局独立，训练里同一对的两局是同一套系数、同一条开局线下游打的，相关性没量过：真正的错误率（把一个 2700 分的候选当成 300 分晋升几次）需要一批已知强弱的对照局，本轮没有。
+- Elo 账本现在吃的是「played-games 分数」，早停的场次少 ⇒ 一场 6 局 1.0 与一场 8 局 1.0 记同样权重（`trainer.cpp:414` 的 `record_result`），没按局数加权。
+- `--verification-games`／`--fitness-games` 在上限语义下不再等于成本，README `:197-198` 说的是这个意思，但训练时长因此更难预估——轮次125 要的「按节点出价」把耗时那一半钉住了，局数这一半现在是弹性的，两者相乘的预算没有仪器（`nodes_searched` 在 vcf/must_block 那两手恒为 0，那笔账仍欠着）。
+- 适配度侧的提前终止会**改变优化器看到的分数**（0-4 早停记 0.0，而同一候选下满 8 局可能是 0.25）。本轮没做「早停前后适配度排序是否一致」的对照，`:435` 也没要求，但这条是 D 阶段后面任何一次「训练变快了」的读数里必须拆开的一环。
+
 ## 轮次127 引擎重构 D-2：N 个采集 worker 第一次共用一张表，而那棵树的节点一个也没多 — engine redesign stage D2, process-level shared TT
 
 规格 `docs/ENGINE_REDESIGN.md` `:433`（§2.8 `#1`「进程级共享只读 TT：自对弈的所有引擎共享一张大表（如 2^22 槽 ≈ 96MB），分片加锁或 lock-free；内存与并发局数**解耦**。当前是『每引擎一张 8.4MB 表』，N 个并发 → N × 8.4MB」），落地清单 `:596` 认的测试是「`tests/test_training.cpp` 新增：节点预算、共享 TT 并发安全、SPRT 终止」，风险表 `:569` 给的路线是「先分片加锁（16 片），再考虑 lock-free；训练侧先单线程验证正确性」，验收仍在 `:550`（单轮耗时 −≥40 %、峰值内存与并发解耦、`--fitness-games 2` 不再三档）。轮次125 把这张表定价为 7.3 MB/worker（不是 `:434` 还写着的 8.4 MB），轮次126 付掉了耗时那一半；本轮只付内存那一半，并把耗时那一半没有再动这件事写在读数 3。
@@ -1991,8 +2086,8 @@ no existing assertion was edited.
 - 取锁的入口四个：`store()` `transposition.cpp:75`、`probe()` `:139`、`static_eval_of()` `:155`、`put_static_eval()` `:174`。全表走查的两个用 `AllShardLock`：`clear()` `:210`、`hashfull()` `:223`（`hashfull` 只看前 100 桶，那 100 桶可以跨片，所以整表取锁）；锁一律按索引顺序拿，两个同时 `clear()` 的线程不会互锁。
 - **代龄这本账换了主人**：`advance_generation()`（`:205`）在共享表上是整批的时钟——一个 worker 落一子就把所有记录往前推一格。这是「内存与并发局数解耦」的诚实代价，写在 `src/optimization/transposition.h:131-137`；替代方案（每局一个年龄）要么加宽表项要么给线程各自一份状态，两者都把这一行省下的东西再花回去。
 - `SearchEngine` 侧只有一个注入口：`SearchEngine(const ThreatCoefficients&, TranspositionTable* table = nullptr)`（`src/search/search_engine.h:65`，实现 `src/search/search_engine.cpp:22-35`），表由 `owned_tt_` + `tt_alphabeta_` 两个成员表示（`search_engine.h:138-139`，`transposition_table()` 仍在 `:127`）。**这里换过一次方案，换的原因是峰值**：先写的是 setter（引擎先建自己的表、再把表交出去），同一把尺子量到 t=4 只比独立表低 796 kB（48,700 对 49,496 kB，`/tmp/d2/rss_post.log`）——一块 7.3 MB 的 vector 在 worker 线程自己的 arena 里释放并不还给内核，于是「共享」把钱花了，却没把省下的地方腾出来。改成构造注入后 worker 从不分配，斜率才跟着 `--threads` 脱钩（读数 2）。副作用一条：`SearchEngine` 不再可拷贝（`unique_ptr` 成员）；全树没有拷贝调用点，整树 `cmake --build` rc=0 就是这条的证据。
-- 训练侧两处：批次头建表并清空（`src/training/trainer.cpp:205-218`），worker 的引擎走注入（`:238`）。批首那次 `clear()` 就是轮次125 要的失效口径——记录是「写它时那套系数」的分数，而冠军可能已经换了；打系数戳要加宽表项，比较系数集要在每次 probe 前比一整套数，清空两条都不需要，而且一批就是一轮、一张 7.3 MB 的表清空不花钱。**适配度赛刻意不共享**（`play_match` 两侧同时握着两套系数，共享等于拿对手的数给自己的位置打分）。
-- CLI：`--shared-tt N`（帮助 `src/training/main_trainer.cpp:50-54`，解析 `:235-238`，`require_int` 的下界给 0 因为 0 是「不要共享」这个答案本身），上限在 `:291-296` 卡在 2^22 = 4,194,304 槽（28 B/槽 ≈ 117 MB，正是 `:433` 自己举的量级）——再大不是买复用，是买一张没人填得满的表，而这条路径不接 `bad_alloc`。缺省 `1 << 18`（`src/training/trainer.h:67`）＝一个 worker 原本的表大小：先让「解耦」成立，再谈要不要一张大表。观测口 `shared_transposition_table()`（`:121`）、成员 `shared_tt_`（`:152`）。README `:200` 行内改，658 行不变。
+- 训练侧两处：批次头建表并清空（`src/training/trainer.cpp:232-245`），worker 的引擎走注入（`:265`）。批首那次 `clear()` 就是轮次125 要的失效口径——记录是「写它时那套系数」的分数，而冠军可能已经换了；打系数戳要加宽表项，比较系数集要在每次 probe 前比一整套数，清空两条都不需要，而且一批就是一轮、一张 7.3 MB 的表清空不花钱。**适配度赛刻意不共享**（`play_match` 两侧同时握着两套系数，共享等于拿对手的数给自己的位置打分）。
+- CLI：`--shared-tt N`（帮助 `src/training/main_trainer.cpp:60-64`，解析 `:254-257`，`require_int` 的下界给 0 因为 0 是「不要共享」这个答案本身），上限在 `:310-315` 卡在 2^22 = 4,194,304 槽（28 B/槽 ≈ 117 MB，正是 `:433` 自己举的量级）——再大不是买复用，是买一张没人填得满的表，而这条路径不接 `bad_alloc`。缺省 `1 << 18`（`src/training/trainer.h:75`）＝一个 worker 原本的表大小：先让「解耦」成立，再谈要不要一张大表。观测口 `shared_transposition_table()`（`:147`）、成员 `shared_tt_`（`:180`）。README `:200` 行内改，658 行不变。
 
 ### 读数 1：`:433` 的「只读语义不变」——同一棵树，221,774 一个不差
 
@@ -2028,7 +2123,7 @@ no existing assertion was edited.
 
 ### 共享真正改变的东西：一批局里的信息，不只是成本
 
-样本数：8 局阶梯（t=1/2/4）两臂都是 112/224/496，`arms2` 的 40 局 t=4 两臂都是 496——这四个读数证明「同尺度下批量不变」；但 8 局 t=8 是 952 → 1,000，节点预算 40 局 t=4 是 1,152 → 1,008，节点预算 8 局 t=8 是 1,600 → 848。这不是漏账：一张表意味着 A worker 写的记录可能被 B worker 命中，而 B 的 root 是 A 永远走不到的位置。同批共享的前提正是「所有 worker 用同一套 `current_champion` 系数」（`trainer.cpp:203`），跨批靠批首 `clear()`。年龄/标签方案本来就吃这种记录（键不同就不算同一条），但读数 1 只证明了**一棵树**不变，没有证明**一批局**不变。
+样本数：8 局阶梯（t=1/2/4）两臂都是 112/224/496，`arms2` 的 40 局 t=4 两臂都是 496——这四个读数证明「同尺度下批量不变」；但 8 局 t=8 是 952 → 1,000，节点预算 40 局 t=4 是 1,152 → 1,008，节点预算 8 局 t=8 是 1,600 → 848。这不是漏账：一张表意味着 A worker 写的记录可能被 B worker 命中，而 B 的 root 是 A 永远走不到的位置。同批共享的前提正是「所有 worker 用同一套 `current_champion` 系数」（`trainer.cpp:230`），跨批靠批首 `clear()`。年龄/标签方案本来就吃这种记录（键不同就不算同一条），但读数 1 只证明了**一棵树**不变，没有证明**一批局**不变。
 
 ### 变异矩阵：六条各破一句，最后一条是给仪器本身
 
@@ -2036,12 +2131,12 @@ no existing assertion was edited.
 
 | 变异 | 改动 | 结果 |
 |---|---|---|
-| M1 | `store()` 不取片锁（`transposition.cpp:75` 整行去掉） | rc=134，`tests/test_training.cpp:4479: Assertion 'torn == 0' failed`，读数行自己印 80,000 写/80,000 读里 **torn=140** |
+| M1 | `store()` 不取片锁（`transposition.cpp:75` 整行去掉） | rc=134，`tests/test_training.cpp:4480: Assertion 'torn == 0' failed`，读数行自己印 80,000 写/80,000 读里 **torn=140** |
 | M2 | `probe()` 不取片锁（`:139`） | rc=134，同一行 `:4479`，**torn=87** |
 | M3 | 共享臂按 `num_entries / 4` 建表（分片连记录一起挪） | rc=134 / 426 s，`tests/test_search.cpp:8509` 的 `tt.size() == entries` 先炸——尺寸断言排在节点断言前面 |
 | M3b | 只改淘汰：共享表上同键不更新（`if (slot.key != key \|\| shared_) continue;`），表大小不变 | rc=134 / 428 s，`tests/test_search.cpp:8520: Assertion 'shard.nodes == plain.nodes' failed`——节点等式对「记录被动了」确实敏感，这一条才是读数 1 背后的仪器 |
-| M4 | 删掉批首 `clear()`（`trainer.cpp:218`） | rc=134，`:4364: Assertion '!survived' failed`，读数行印 `sentinel after the next batch: STILL THERE, generation back to 8` |
-| M5 | 删掉注入实参（`trainer.cpp:238` 改传 `nullptr`） | rc=134，`:4333: Assertion 'games_with_hits == games' failed`，读数行印 `games answered by the table=0 generation=0` |
+| M4 | 删掉批首 `clear()`（`trainer.cpp:245`） | rc=134，`:4364: Assertion '!survived' failed`，读数行印 `sentinel after the next batch: STILL THERE, generation back to 8` |
+| M5 | 删掉注入实参（`trainer.cpp:265` 改传 `nullptr`） | rc=134，`:4333: Assertion 'games_with_hits == games' failed`，读数行印 `games answered by the table=0 generation=0` |
 
 **harness 自己的一条缺陷，记下来**：M3b 第一版的锚点写成裸的一行 `if (slot.key != key) continue;`，而这行在 `store()`／`probe()`／`put_static_eval()` 里出现 **3 次**；python 的 `count == 1` 断言先炸，脚本却没有停，于是 build 了一颗没变异的树并「测」出 rc=0。第二版把锚点扩到带后随注释的两行、并在 patch 失败处 `exit 1`，才拿到上面那条红。这与轮次124 的「零计数来自一棵没建起来的树」、轮次126 的「`--target test_training` 不重建 `gomoku_train`」是同一面墙的第三次撞法，代价是一次 428 s 的白跑。
 
@@ -2049,7 +2144,7 @@ no existing assertion was edited.
 
 `ctest` **8/8 / 463.62 s**（`test_search` 432.25 s ＝ 套件的 93.2 %，`test_training` 11.81 s，`test_position` 8.58 s，`test_server` 9.88 s）；`node tests/web_frontend_check.js` **105/105**；`node tests/readme_anchor_check.js` **120 citations / 0 problems**；README **658 行**。门禁之后 `cmp` 过 `src/optimization/transposition.cpp` 与 `src/training/trainer.cpp` 对门禁快照逐字节相同——TSan 活性对照那次临时去锁没有留在树里。
 
-引用重钉：本轮 `trainer.cpp` +24/−1、`search_engine.cpp` +10/−6，后面的行整体下移 23 / 4 行，跟着重钉 9 条注释锚点（`tests/test_training.cpp:439`→`trainer.cpp:371`、`:2105`→`:291`、`:3398`→`:347`、`:3500-3501`→`trainer.cpp:586`/`:444`、`:4025`→`search_engine.cpp:295`/`:260`；`tests/test_search.cpp:3907`→`search_engine.cpp:290-291`、`:5757` 与 `:6214`→`:357`）。全部是行内替换，两个测试文件行数不变（8749 / 4647）：`assert(result.resigned)` 仍在 `:2591`、10 ms 那一臂仍在 `:3973`、`assert(completed.method == "alphabeta")` 仍在 `:3986`；这两个文件里被删掉的行**只有**这 9 条注释，没有一条断言被改。`CMakeLists.txt`、`web/`、`tools/` 一字未动。`docs/ENGINE_REDESIGN.md` 指向代码的锚点（`:108` 的 `search_engine.h:77`、`:84` 的 `transposition.cpp:37-39`）不动：那是重设计文档在 phase-5 开工前的现状快照，按当前树改写等于抹掉需求文档自己的历史前提。
+引用重钉：本轮 `trainer.cpp` +24/−1、`search_engine.cpp` +10/−6，后面的行整体下移 23 / 4 行，跟着重钉 9 条注释锚点（`tests/test_training.cpp:440`→`trainer.cpp:408`、`:2106`→`:318`、`:3399`→`:374`、`:3501-3502`→`trainer.cpp:628`/`:486`、`:4026`→`search_engine.cpp:295`/`:260`；`tests/test_search.cpp:3907`→`search_engine.cpp:290-291`、`:5757` 与 `:6214`→`:357`）。全部是行内替换，两个测试文件行数不变（8749 / 4647）：`assert(result.resigned)` 仍在 `:2591`、10 ms 那一臂仍在 `:3973`、`assert(completed.method == "alphabeta")` 仍在 `:3986`；这两个文件里被删掉的行**只有**这 9 条注释，没有一条断言被改。`CMakeLists.txt`、`web/`、`tools/` 一字未动。`docs/ENGINE_REDESIGN.md` 指向代码的锚点（`:108` 的 `search_engine.h:77`、`:84` 的 `transposition.cpp:37-39`）不动：那是重设计文档在 phase-5 开工前的现状快照，按当前树改写等于抹掉需求文档自己的历史前提。
 
 ### Valgrind / TSan
 
@@ -2077,10 +2172,10 @@ no existing assertion was edited.
 
 ### 实现：预算走的是引擎字段，不是新开关
 
-- `SelfPlayConfig::max_nodes`（`src/training/self_play.h:18`，缺省 0）、`TrainingConfig::max_nodes`（`src/training/trainer.h:37`，缺省 0）。
+- `SelfPlayConfig::max_nodes`（`src/training/self_play.h:18`，缺省 0）、`TrainingConfig::max_nodes`（`src/training/trainer.h:38`，缺省 0）。
 - 装表的唯一位置是 `SelfPlay` 的构造函数（`src/training/self_play.cpp:25-26`）。这不是顺手：`SearchEngine::search()` 的签名只接深度和毫秒（`src/search/search_engine.h:56-58`），节点上限进不了那一次调用，只有引擎字段这一条路（读它在 `src/search/search_engine.cpp:299`）。构造即装表同时管住两条调用线——采集侧的 `RetryExplorer` 把配置原样转交给它内嵌的 `SelfPlay`（`self_play.cpp:150-152`），`set_max_nodes` 对非正数夹回 0（`search_engine.h:78`），所以「0 = 不装」在两个方向上都成立（M 臂 M3 之外还专门有一条用例盯这一点）。
-- 两处拷贝：`trainer.cpp:65`（适配度赛与验证赛走 `play_game`）与 `trainer.cpp:221`（采集 worker 在自己的线程里建 `RetryExplorer`）。这两行不是一行：`--threads` 只并行采集（轮次125 第 1 条），漏掉任何一条就是一半的局未按预算跑。
-- CLI：`main_trainer.cpp:39-42` 帮助、`:213-217` 解析。`require_int` 的下界给的是 **0** 而不是缺省的 1，因为 0 是这个开关自己的答案（「不要节点上限」），而其它计数项的 0 是「跑一趟什么都不做」；`:272` 那条旧校验一字未动，负数在解析阶段就被拒。
+- 两处拷贝：`trainer.cpp:65`（适配度赛与验证赛走 `play_game`）与 `trainer.cpp:248`（采集 worker 在自己的线程里建 `RetryExplorer`）。这两行不是一行：`--threads` 只并行采集（轮次125 第 1 条），漏掉任何一条就是一半的局未按预算跑。
+- CLI：`main_trainer.cpp:39-42` 帮助、`:225-229` 解析。`require_int` 的下界给的是 **0** 而不是缺省的 1，因为 0 是这个开关自己的答案（「不要节点上限」），而其它计数项的 0 是「跑一趟什么都不做」；`:291` 那条旧校验一字未动，负数在解析阶段就被拒。
 - 新增的唯一读取口是 `search_engine.h:81` 的 `max_nodes()`。加它是因为 `SelfPlay` 装表之后，训练侧的接线只有从引擎外面才量得到（`tests/test_training.cpp` 的 `#define private public` 只重写了 `trainer.h`，`SearchEngine` 的字段仍是私有的）。
 
 **`--max-nodes` 不置 `limits.training`**，这是本轮唯一一处「文档内部打架、按其中一条实现」的决定，也是量出来才发现的：`:434` 要保留兜底，`:251` 却要「训练模式：直接返回 {0,0,max_nodes}，时间预算不参与」。按 `:251` 实现本来会关掉什么？——**什么也关不掉**。`TimeManager::allocate`（`src/search/time_manager.cpp:43-92`）在生产路径里**没有调用者**（全树只有 `tests/test_search.cpp:4039-4102` 的 A1 脚手架调它），而一手棋的时钟是 `SearchEngine` 自己两处装的：`limits.hard_time_ms`（`search_engine.cpp:291`）与 `ab.set_deadline`（`:256`）。所以「保留兜底」在这棵树里不是一个可以被开关违背的选项，它是现状；要把它拆掉得动那两行，本轮不动，并且用 M5 证明「拆掉两处才红、拆一处不红」。`:251` 那行等 `TimeManager` 真的接到搜索上的那一天再结算。
@@ -2112,8 +2207,8 @@ no existing assertion was edited.
 2. `test_self_play_ms_budget_backs_up_a_generous_node_ceiling`（`:4024`）——深度 8 / 60 ms / 2000 万节点：4 着全按 alphabeta 回答，**没有一着报 `nodes`**，且至少一着报 `time_hard`（读数打印 `4/4`）。断言的是停止原因而不是时长，理由同上。
 3. `test_self_play_zero_ceiling_arms_no_node_budget`（`:4067`）——`max_nodes` 缺省时构造 `SelfPlay` 前后 `max_nodes()` 都是 0，整盘没有任何一着 `stopped == "nodes"`。这条是「老调用者一字不变」的下界（`quick_play_config()` 与 `RetryExplorer` 数据侧全靠它）。
 4. `test_self_play_one_node_ceiling_still_answers_legally`（`:4094`）——1 节点上限：6 着全报 `nodes == 1`、`depth == 0`、`partial_depth == 1`，整盘仍 `assert_playable`、结局是 `MOVE_LIMIT` 而不是 `INVALID`。预算再小也不许把盘写坏，这条是「训练侧必须继续能吃 `src/search/search_engine.cpp:341-346` 那套分层账」的钉子。
-5. `test_trainer_config_node_budget_reaches_both_game_paths`（`:4127`）——`play_game` 之后两台引擎都读回 1000；换成 `max_nodes` 未给的配置去开一台已被 `set_max_nodes(9000)` 装过的引擎，必须夹回 0；再走采集侧：`generate_data_games(1, 1)` 写出的 JSONL 用 `GameRecord::from_json` 读回，逐着 `nodes <= 1000` 且至少一着真触顶（打印 `data games=1 node-capped plies=4`）。
-6. `test_trainer_cli_max_nodes_probes`（`:4199`）——`--max-nodes 0` 与 `--max-nodes 5000` 都退出 0 且 stderr 空，`-1` 退出 1 且报这个旗标名，缺值与 `1e3` 退出 1，`--help` 里有这一行。
+5. `test_trainer_config_node_budget_reaches_both_game_paths`（`:4130`）——`play_game` 之后两台引擎都读回 1000；换成 `max_nodes` 未给的配置去开一台已被 `set_max_nodes(9000)` 装过的引擎，必须夹回 0；再走采集侧：`generate_data_games(1, 1)` 写出的 JSONL 用 `GameRecord::from_json` 读回，逐着 `nodes <= 1000` 且至少一着真触顶（打印 `data games=1 node-capped plies=4`）。
+6. `test_trainer_cli_max_nodes_probes`（`:4202`）——`--max-nodes 0` 与 `--max-nodes 5000` 都退出 0 且 stderr 空，`-1` 退出 1 且报这个旗标名，缺值与 `1e3` 退出 1，`--help` 里有这一行。
 
 ### 变异矩阵：六臂，逐臂只红一处，全部被抓
 
@@ -2121,9 +2216,9 @@ no existing assertion was edited.
 
 | 臂 | 改动 | 结果 |
 | --- | --- | --- |
-| M1 | 删 `self_play.cpp:25-26` 两行装表 | rc=134，`test_training.cpp:3990` `entry.stopped == "nodes"` |
-| M2 | 删 `trainer.cpp:65`（适配度侧拷贝） | rc=134，`:4140` `black.max_nodes() == config.max_nodes` |
-| M3 | 删 `trainer.cpp:221`（采集侧拷贝） | rc=134，`:4182` `entry.nodes <= data.max_nodes` |
+| M1 | 删 `self_play.cpp:25-26` 两行装表 | rc=134，`test_training.cpp:3991` `entry.stopped == "nodes"` |
+| M2 | 删 `trainer.cpp:65`（适配度侧拷贝） | rc=134，`:4143` `black.max_nodes() == config.max_nodes` |
+| M3 | 删 `trainer.cpp:248`（采集侧拷贝） | rc=134，`:4185` `entry.nodes <= data.max_nodes` |
 | M4 | `require_int("--max-nodes", …, 0)` 改回缺省下界 1 | rc=134，`:4231` `zero == 0` |
 | M5 | 同时拆掉两处时钟装配（`search_engine.cpp:291` 与 `:256`） | rc=134，`:4059` `done >= 1`，打印 `0/4 plies cut by the ms budget` |
 | M6 | 只装黑棋引擎 | rc=134，`:3990`（白棋那一着未封顶） |
@@ -2158,7 +2253,7 @@ no existing assertion was edited.
 - `ctest`：**8/8 通过 / 442.47 s**（`test_search` 414.18 s 占 93.6 %、`test_training` 9.89 s、`test_server` 10.23 s、`test_position` 7.93 s）。
 - `node tests/web_frontend_check.js`：**105/105**；`node tests/readme_anchor_check.js`：**120 citations / 0 problems**；README **658 行**。
 - README 的 `--max-nodes` 是**行内改写 `:195`**（选项表那一行），没有增删行——被注释引用的 `:198`/`:204`/`:206`/`:207`/`:215` 全部还在原行，这也是 anchor 读数与上一轮相同的原因。
-- 位移波及的行号全部重新钉过：`docs/ENGINE_REDESIGN.md:108` 的 `trainer.cpp:100-101 → 101-102`、`trainer.cpp:214 → 215`；`tests/test_training.cpp` 里 6 处 `trainer.cpp` / `self_play.cpp` 行号按本树重定位，其中 `:59`、`:256`、`:312`、`:551`、`:409`、`:122-131` 这六条在 HEAD 上**本来就已指向空行或别的语句**（逐条 `git show HEAD:… | sed -n 'Np'` 对过），一并钉到当前真位置（`:69`、`:268`、`:324`、`:563`、`:421`、`:137-143`）。
+- 位移波及的行号全部重新钉过：`docs/ENGINE_REDESIGN.md:108` 的 `trainer.cpp:110-111 → 101-102`、`trainer.cpp:241 → 215`；`tests/test_training.cpp` 里 6 处 `trainer.cpp` / `self_play.cpp` 行号按本树重定位，其中 `:59`、`:256`、`:312`、`:551`、`:409`、`:122-131` 这六条在 HEAD 上**本来就已指向空行或别的语句**（逐条 `git show HEAD:… | sed -n 'Np'` 对过），一并钉到当前真位置（`:69`、`:295`、`:351`、`:605`、`:463`、`:164-170`）。
 - `src/` 之外只动 `tests/test_training.cpp`（+313/−8，8 行删除全是上条所列注释行号重钉）与两份文档；`CMakeLists.txt`、`web/`、`tools/` 一字未动。
 
 ### 未达成 / 未完成
@@ -2167,7 +2262,7 @@ no existing assertion was edited.
 - **节点上限只封 AlphaBeta**：VCF/VCT 与认输探测仍按 `--timeout-ms` 切片（`search_engine.cpp:214-217`、`:236-239`、`:368-388`）。实测（`/tmp/d1/probe5.out`，本树重建的探针）：深度 2 / 1000 节点 / 20 s 的一盘 8 着，逐着 AlphaBeta 节点数在「战术层开」与「战术层关」两次完全相同（72/76/252/446/797/827/868/573，合计 3,911），而第 7 着开着战术层吃 **6,016 ms**、关掉吃 **16 ms**；整盘 `sum_elapsed` 6,103 ms → 86 ms（`/tmp/d1/probe3.out`）。那一着的 AlphaBeta 只用了 868 个节点，离 1,000 的上限还有距离，所以节点预算对它无话可说。「训练时长可控」在战术密集的局面下仍不成立，`:434` 那句「每盘成本可预测」的适用范围应按这个口径缩小（README `:195` 本轮就按「AlphaBeta 那一手的工作量」写）。要不要把战术层也接进节点预算，是一个新的口径决定，留给 D-2/D-3 之后单独立项，本轮不顺手改。
 - 采集数据会随预算变薄，且这本账现在能算平：默认量级样本 704 → 560，等于 alphabeta 着数 88 → 70 乘以 `SYMMETRY_COUNT = 8`（`transforms.h:12`）；引擎着法总数 116 → 90，掉的那 26 着里 alphabeta 少 18、`must_block` 少 8（24 → 16，`vcf` 两臂都是 4）。两臂的 alphabeta 着法 depth 全部 ≥ 1（`{3,4}` 与 `{2,3}`），所以 `data_collector.cpp:130` 的 `entry.depth >= min_search_depth_` 门（`min_search_depth_ = 1`，`data_collector.h:74`）在这把尺子上一个样本都没砍掉；它砍样本是在预算压到 `depth == 0` 的那一档（本轮用例 4 就是那一档：6 着全 `depth == 0`，一个样本都不会产生）。所以「预算越小数据越薄」在这一轮是**棋局变短、早退变多**的结果，不是过滤器在动手——这条要按这个口径记，否则 D-3/D-4 会去修一个没坏的门。
 - 上一轮欠的一条账在这里补：`23e6453` 的提交信息写 `+5/-1`（那条对）与本轮无关，但它自身正文里「tests/test_search.cpp is +492/-0」同类口径的 `+24/-11` 实为 `git diff --numstat` 的 **25/11**，已发布的提交不改写，按原样申报。
-- D 阶段进度：`#2` 本轮落地；`#1`（分片共享 TT，按 7.3 MB/worker 定价，且必须先给 `trainer.cpp:96-99` 那条「表里的分数是换掉的系数算出来的」建失效口径）、`#3`（SPRT，动 `trainer.cpp:108` 的 `pairs`）、`#4`（开局库数据通路）、`#5`（`controller.h:50` 与 `alphabeta.cpp:601` 的两处 `Board` 拷贝）依次未完。
+- D 阶段进度：`#2` 本轮落地；`#1`（分片共享 TT，按 7.3 MB/worker 定价，且必须先给 `trainer.cpp:107-109` 那条「表里的分数是换掉的系数算出来的」建失效口径）、`#3`（SPRT，动 `trainer.cpp:125` 的 `pairs`）、`#4`（开局库数据通路）、`#5`（`controller.h:50` 与 `alphabeta.cpp:601` 的两处 `Board` 拷贝）依次未完。
 
 ## 轮次125 D 阶段基线：一轮训练的成本几乎全在串行的适配度赛，而并发的那张表第一次量到 7.3 MB — engine redesign stage D, baseline measurement
 
@@ -2190,21 +2285,21 @@ no existing assertion was edited.
 
 ### 五条「文档说的与树里有的不一样」，它们决定 D 阶段怎么排
 
-1. **`--threads` 在没有数据采集时是完全惰性的**（B 臂三行）：`user ≈ wall`（56.50 对 57.06），RSS 三行只差 212 kB。`--threads` 的定义就是「Parallel **data-collection** workers」（`main_trainer.cpp:45`），适配度赛与验证赛一个线程都不开。所以 §2.8 `#1`（共享 TT）与 `#5`（去拷贝）按构造**碰不到** `:550` 的耗时那一半。
-2. **一轮 ~30 s 里约 28 s 是串行的 optimise + verification**：`Trainer::run_round` 的先优化再验证（`trainer.cpp:289-346`）跑在 `generate_data_games`（`:369`）**之前**；C 臂把采集加进来只多 1.99 s（1 worker），到 4 worker 连这 2 s 都被并行吸收（30.00 对 29.96，噪声内）。于是 `:550` 的「单轮 −≥40 %」只有两个来源：**让每次思考更便宜或更少**——即 `#2`（`--max-nodes`）与 `#3`（SPRT 少下几局）。这一点不量出来，D 阶段会先去动那 6.7 %。
+1. **`--threads` 在没有数据采集时是完全惰性的**（B 臂三行）：`user ≈ wall`（56.50 对 57.06），RSS 三行只差 212 kB。`--threads` 的定义就是「Parallel **data-collection** workers」（`main_trainer.cpp:46`），适配度赛与验证赛一个线程都不开。所以 §2.8 `#1`（共享 TT）与 `#5`（去拷贝）按构造**碰不到** `:550` 的耗时那一半。
+2. **一轮 ~30 s 里约 28 s 是串行的 optimise + verification**：`Trainer::run_round` 的先优化再验证（`trainer.cpp:316-373`）跑在 `generate_data_games`（`:433`）**之前**；C 臂把采集加进来只多 1.99 s（1 worker），到 4 worker 连这 2 s 都被并行吸收（30.00 对 29.96，噪声内）。于是 `:550` 的「单轮 −≥40 %」只有两个来源：**让每次思考更便宜或更少**——即 `#2`（`--max-nodes`）与 `#3`（SPRT 少下几局）。这一点不量出来，D 阶段会先去动那 6.7 %。
 3. **并发内存 = 每 worker 一张表，实测就是表的尺寸**：1→2 worker `+7,148 kB`，2→4 `+14,704 kB`（均摊 `+7,352 kB`/worker），对上 `transposition.h:62` 自己记的「2^18 × 28B ≈ 7.3MB per table, **down from 8.4MB**」。`:434` 的 8.4 MB 是这张表被改小**之前**的数；`#1` 的收益应按 7.3 MB/worker 结算，而不是 8.4。
 4. **「每盘成本可预测」现在连仪器都没有**：C 臂 8 盘里只有 1 盘真搜索（game 0：2 着 replay + 19 着搜索，整盘 154,953 节点，单着最高 30,287 节点 / 336 ms），其余 7 盘是悔棋续战（`RetryExplorer::rewind_to_next_branch`，`self_play.cpp:202-224`，把上一盘的前缀重放到第一个未试分支），每盘只剩 1 着要想要，而那一着走的是 `vcf` / `must_block` 早退——**这两个 method 的 `nodes_searched` 按定义是 0**（`search_engine.cpp:338-340` 只有 alphabeta 填，`search_engine.h:23` 明写「depth and nodes_searched stay 0 outside AlphaBeta」）。所以 records 里那些 0 不代表便宜，代表这次回答根本没进 alphabeta；`#2` 落地时要一并说清节点预算**计不计**战术早退，否则「可预测」是拿一个不存在的数在预测。
-5. **fitness 只有三档是算术，不是棋力**：`trainer.cpp:108` `pairs = max(1, (games+1)/2)`，`:128` `score / played_games`，`--fitness-games 2` ⇒ `pairs = 1` ⇒ 值域恰好 `{0, 0.5, 1}`。README `:213` 记的 0.56 门槛正是为了让**只有 1.0 能晋升**。`#3` 要动的是 `pairs` 这条（序贯到显著即停），而不是分母；文档说它「解决三档问题的一半」是准确的，另一半是 `:435` 没写的位置项。
+5. **fitness 只有三档是算术，不是棋力**：`trainer.cpp:125` `pairs = max(1, (games+1)/2)`，`:155` `score / played_games`，`--fitness-games 2` ⇒ `pairs = 1` ⇒ 值域恰好 `{0, 0.5, 1}`。README `:213` 记的 0.56 门槛正是为了让**只有 1.0 能晋升**。`#3` 要动的是 `pairs` 这条（序贯到显著即停），而不是分母；文档说它「解决三档问题的一半」是准确的，另一半是 `:435` 没写的位置项。
 
 另外两条在实现时会硌到：
 
-- **训练数据只覆盖 alphabeta 决策**：`DataCollector::min_search_depth_ = 1`（`data_collector.h:74`）从未被覆盖（`trainer.cpp:201` 裸构造），配合上面第 4 条，`vcf`/`must_block` 的着法一律不进样本——样本数正好等于 alphabeta 着数 × 8 个对称（14/28/62 → 112/224/496，`data_collector.cpp:128-131` 的 `engine_chose` 门与 `transforms.h:12` 的 `SYMMETRY_COUNT = 8`）。同一件事也解释了「同样 8 盘记录，样本数随 worker 涨」：`trainer.cpp:180-181` 把局数均分给每个 worker，而**每个 worker 都有自己的昂贵第一盘**（`:222-223` 各自 `set_start_line(random_opening_line(config_.data_opening_plies, seed))`，`data_opening_plies = 2` 在 `trainer.h:53`）。
+- **训练数据只覆盖 alphabeta 决策**：`DataCollector::min_search_depth_ = 1`（`data_collector.h:74`）从未被覆盖（`trainer.cpp:228` 裸构造），配合上面第 4 条，`vcf`/`must_block` 的着法一律不进样本——样本数正好等于 alphabeta 着数 × 8 个对称（14/28/62 → 112/224/496，`data_collector.cpp:128-131` 的 `engine_chose` 门与 `transforms.h:12` 的 `SYMMETRY_COUNT = 8`）。同一件事也解释了「同样 8 盘记录，样本数随 worker 涨」：`trainer.cpp:207-208` 把局数均分给每个 worker，而**每个 worker 都有自己的昂贵第一盘**（`:222-223` 各自 `set_start_line(random_opening_line(config_.data_opening_plies, seed))`，`data_opening_plies = 2` 在 `trainer.h:54`）。
 - **开局库不是「被关掉」，是无处可开**：`trainer.cpp:55` 确实 `set_book_enabled(false)`，但 `book_` 默认 `nullptr`（`search_engine.h:121`）且只有 `server.cpp:1222` 会挂表，所以训练里那个分支本来就到不了——`#4`「按权重采样开局」需要一条新的数据通路，翻开关不够。
 - **`#5` 的两处拷贝按树里读是「传参一次 + 每次思考一次」**：`controller.cpp:36` 把 `board` 按值带进线程（`search_worker(Board board, ...)`，`controller.h:50`），`alphabeta.cpp:601` 的 `Board work_board = board;` 在 `:604` 的深度循环**之前**，所以是每次思考一次，不是每层一次。`:437` 的措辞要按这个改。
 
 ### D 阶段因此这样排
 
-`#2`（`--max-nodes`）先做，因为它同时是 `:550` 耗时那一半和上面第 4 条「成本可预测」的唯一入口；再 `#3`（SPRT，减验证局数，和 `#2` 一起才可能凑出 −40 %）。`#1`（分片共享 TT）按 7.3 MB/worker 定价，并且必须先给 `#2` 留一个失效口径——`trainer.cpp:96-99` 的注释写着为什么现在每候选换一张新表（表里的分数是**换掉的系数**算出来的），共享之后这条失效要显式建，否则 `#1` 是用正确性换 7 MB。`#4` 依赖 book 数据通路，`#5` 是两处一次性拷贝、收益最小。
+`#2`（`--max-nodes`）先做，因为它同时是 `:550` 耗时那一半和上面第 4 条「成本可预测」的唯一入口；再 `#3`（SPRT，减验证局数，和 `#2` 一起才可能凑出 −40 %）。`#1`（分片共享 TT）按 7.3 MB/worker 定价，并且必须先给 `#2` 留一个失效口径——`trainer.cpp:107-109` 的注释写着为什么现在每候选换一张新表（表里的分数是**换掉的系数**算出来的），共享之后这条失效要显式建，否则 `#1` 是用正确性换 7 MB。`#4` 依赖 book 数据通路，`#5` 是两处一次性拷贝、收益最小。
 
 ### 门禁
 
@@ -4092,7 +4187,7 @@ anchor **118 引用 / 0 problems**，README 仍 **658 行**。以上每一条都
   （`no known coefficient key found in the file`）。
 - 子集驱动 `/mnt/d/tmp/p1_subset_main.cpp`（同 `-Dmain=suite_main` 手法，挑五条：改写后的播种覆盖、加了两条新行的越界
   拒绝、老 12 键对照、四枚新基因往返、只拒已声明的宽度冲突）：Debug 形状直跑 **`PLAIN_RC=0`**，memcheck
-  **`MEMCHECK_RC=0`、报告 0 行**；这五条排在 `test_training.cpp:2055` 那条既存墙钟脆弱断言之后，全量跑不到 ⇒ 由子集覆盖。
+  **`MEMCHECK_RC=0`、报告 0 行**；这五条排在 `test_training.cpp:2056` 那条既存墙钟脆弱断言之后，全量跑不到 ⇒ 由子集覆盖。
 - 全量（`tools/valgrind_check.sh memcheck test_board test_pattern test_evaluator test_training`，`/mnt/d/tmp/p1_vgfull.out`）：
   **四条全 `clean`、`reports=0`**，1406 s / 5 s / 2 s / **179 s**（`test_training` 直跑 10.18 s ⇒ 约 18× 减速），
   `FULL_RC=0`。**这一轮 `:2055` 那条既存墙钟脆弱断言没有触发**，整套跑到 `main()` 末尾，所以五条新/改用例既被子集覆盖、
@@ -4261,7 +4356,7 @@ Valgrind（§5 的口径：`build-vg/` Debug + `-UNDEBUG`，计数 `grep -c '^==
   `no centre 249892 / centre 250886 / negated centre 249894` —— 与 A6 记的数字**逐字相同**，即减速没有改变「窗口
   决定工作量」这条结论；第二条 SIGABRT 于 `tests/test_search.cpp:3497` `assert(plain.depth == 4)`。该用例把时限设成
   600000 ms 并声称「这笔预算花不完」，但 memcheck 的减速下 depth 4 的一趟就能越过 600 s 的墙 ⇒ 这是一条**墙钟前提**，
-  与 A2/A6 记的 `test_engine_progress_callback_reports_each_layer`、`test_training.cpp:2055`、`test_server.cpp:1706`
+  与 A2/A6 记的 `test_engine_progress_callback_reports_each_layer`、`test_training.cpp:2056`、`test_server.cpp:1706`
   同类。按「减速下死掉的门禁用例要在改动前树上重测，而不是删掉」的规矩，改动前树（`87ee891`，同一 Debug 形状、同一
   套 memcheck 参数、串行独跑）的对照结果是：**`MEMCHECK_RC=134`、报告 0 行、4897 s**，第一条通过并打印
   `no centre 249892 / centre 250886 / negated centre 249894` —— 与本树**逐字相同**的三个节点数，第二条 SIGABRT 于
@@ -4578,7 +4673,7 @@ Valgrind（`build-vg/`，Debug + `-UNDEBUG`，`tools/valgrind_check.sh`）：`te
 `peak RSS 314 MB`、红在 `tests/test_position.cpp:1127` 的 `assert(after.ru_maxrss < 250LL * 1024)`、rc=134、
 valgrind 报告 **0 条**。那条断言读的是**进程**峰值 RSS，而 memcheck 的影子内存本身就记在它头上（全套跑时更高，425 MB），
 与这条用例测的「一遍扫描 vs 每符号一个容器」的成本级无关；这一用例从头到尾不碰 `Evaluator`。⇒ 它加进 §5 基线里
-`test_training.cpp:2055` / `test_server.cpp:1706` 那一对的同类型记录：**按既存记录、不计为新增**，门禁只看
+`test_training.cpp:2056` / `test_server.cpp:1706` 那一对的同类型记录：**按既存记录、不计为新增**，门禁只看
 「abort 之前零新增 + abort 点未前移」，两处都成立（`reports=0`，且红点在改动前的树上同样红）。
 `test_search` 的全量 memcheck 按 §5 节奏留给 A6 checkpoint（A5 之后它的 222885 节点上限用例仍是同一条线）。
 
@@ -5123,9 +5218,9 @@ anchor **100 citations / 0 problems**（新增的两处 README 引用：`web/app
 代码里自带注释的既定取舍，README:355/378 只承诺 取消/确认 是丢弃路径，副本从未离开过 socket，服务器无从知道它。
 `syncTimeoutBounds('bounds')` 把会话里的 `max_depth:1` 抹成 2——README:346-347 自己写着「2–20」是
 **输入框的网页规则**，1–20 才是服务器夹取，且这位审计也承认网页上构造不出 `depth=1` 的会话。训练域：
-`trainer.cpp:174-178` 在既没给 `--records` 也没给 `--samples` 时跳过整步采集数据——没有地方可写，且它打印
+`trainer.cpp:201-205` 在既没给 `--records` 也没给 `--samples` 时跳过整步采集数据——没有地方可写，且它打印
 `skipping data games this round: ...`，不是静默；README:181 的第 4 步是流程叙述，不是「把四盘自我对弈算完再扔掉」
-的承诺。`verification` 一局未成仍 `elo_.record_result`（`trainer.cpp:127` + `:350`）需要引擎产出非法着法或外部
+的承诺。`verification` 一局未成仍 `elo_.record_result`（`trainer.cpp:154` + `:350`）需要引擎产出非法着法或外部
 stop，训练侧恒传 `nullptr`——无法构造。记录→回放域：`app.js:710` 用原始 `base.length` 供奇偶、`baseStones`
 却过 filter——`base` 只来自 `board_.move_history()`，`session_from_json:213-217` 对越界 base 直接拒绝加载，
 filter 无从丢子；`handleMoveMade:1750` 清 `moveHistory` 不清 `analysis`——进入那分支的两条路
@@ -5180,7 +5275,7 @@ entry 在 `sessions_` 里等满 1800 s——两半都是文档写的（README:48
 `replay_snapshot()` + `snapshot_of()` + `json::dump(2)` 有 `payload == saved_payload` 去重（时间戳先归零），
 没动过的盘既不写也不 unlink，只有 CPU；`Board::get_candidate_moves()` 与 `has_neighbor_` 是死码，删它要动 `.h`
 且没有可观察差异。运行文件域：训练侧 `ensure_parent_directory` 吞掉 `error_code`，但冠军写入
-（`Error: cannot write champion parameters` + 退出 1）与 `trainer.cpp:389` 的断点保存失败都会说话，没有静默丢；
+（`Error: cannot write champion parameters` + 退出 1）与 `trainer.cpp:428` 的断点保存失败都会说话，没有静默丢；
 开局库 README 从不描述文件 schema，所以逐行 `continue` 的部分载入不违反任何一句，且 disabled / loaded N-M /
 unavailable 三态都打印，`load_or_default()` 零调用者也没有任何文档承诺内置退路；七个局面模板没有运行期读者
 （只有测试读）；`set_position` 全程不碰磁盘，所以 `load_position_file` 没有穿越守卫是**无法构造**；
@@ -5240,7 +5335,7 @@ INVALID 的 `continue` 在领取之前，所以领取次数 == 合并后的记�
 **Verified.** 测试会话只动 `tests/`：`tests/test_training.cpp` +94/0、`tests/test_server.cpp` +101/0、
 `tests/web_frontend_check.js` +123/−2、`tests/test_search.cpp` +6/−1（只有轮次111 授权的 §3(a)：`:2742` 控制臂预算
 2000→20000 ms，`:2149` 所在用例没碰）。HEAD 反证（`git archive 1fac892` 只读解包 + 单 TU 重链）红点
-`test_training.cpp:2171`（两批 id 集合相交）、`test_server.cpp:1256`（冷架仍留空快照、旧 token 复活）、
+`test_training.cpp:2172`（两批 id 集合相交）、`test_server.cpp:1256`（冷架仍留空快照、旧 token 复活）、
 `web_frontend_check.js:2884`（HEAD 打「11 手」）、`:2935`（`replayTimer` 仍在），HEAD 整跑 web **70/74**；四条控制臂
 （同一次调用内的 id 带互不重叠、有子的会话仍按同 token 复活、replay 支仍写「手」、未接管时定时器与「暂停」按钮都在）
 两棵树都绿。
@@ -5306,7 +5401,7 @@ README:30 自己列举的范围（`evaluate_position` / `evaluate_position_pair`
 
 **裁决（不是缺陷）.** `src/training/hill_climbing.cpp:26` 的 `rounded <= 0 ? 1 : …`：审计报「步长被抬成 1 会
 掩盖 0」。逐函数读后判**无可观察差异**——乘数只可能来自 `{1.6, 0.625}` 两个步长（`hill_climbing.h:17`，
-`trainer.cpp:311-314` 从不覆盖），任何一条路径都算不出 `rounded <= 0`，两棵树上这段代码的观察面完全相同。
+`trainer.cpp:338-341` 从不覆盖），任何一条路径都算不出 `rounded <= 0`，两棵树上这段代码的观察面完全相同。
 
 **Verified.** 测试会话只动 `tests/`：`tests/test_server.cpp` +188/−2（两条用例
 `test_http_answers_a_read_with_the_file_and_a_write_with_a_refusal`、
@@ -5374,7 +5469,7 @@ tmp+rename、`--resume`×`--seed`/`--params`/`--checkpoint` 三条拒绝的先�
 
 **Verified.** 测试会话只动 `tests/`：`tests/test_training.cpp` +199/−0，两条用例
 `test_trainer_refuses_one_file_written_two_ways_for_out_and_checkpoint`（判别：异写法同文件 → 修复树 exit 1
-且断点字节不变；HEAD exit 0 且 1284→325，红在 `tests/test_training.cpp:3567`）与
+且断点字节不变；HEAD exit 0 且 1284→325，红在 `tests/test_training.cpp:3568`）与
 `test_trainer_accepts_a_resume_and_checkpoint_that_differ_only_by_a_dot_segment`（判别：合法 resume → 修复树
 exit 0 且 `--out` 写出；HEAD exit 1 且 `--out` 不存在）。三条对照两棵树都绿：同一写法仍被拒、两个真正
 不同的文件仍跑通并都写出、**两个不同文件的 `--resume`×`--checkpoint` 仍双双退出 1**（证明修复没把真拒绝
@@ -5476,8 +5571,8 @@ stated encoding（姿势 F）两棵树都拒、都 0/0，只差被点名的符�
 三条本来就已写明，代码只是回到文档。
 
 **裁决（不是缺陷）.** 优化器与训练消费侧四条：`hill_climbing.cpp:26` 把 0 个基因夹成 1（README 未约定可达集）、
-`trainer.cpp:126` 不可下棋的匹配返回 0.0（构造不出来，`--verification-games` 走 `require_int(minimum=1)`）、
-`genetic.cpp:45-46` 的注释措辞（轮次 87 的用例已钉住当前分类）、`trainer.cpp:216-224` 注释与 `:236/:240` 的
+`trainer.cpp:153` 不可下棋的匹配返回 0.0（构造不出来，`--verification-games` 走 `require_int(minimum=1)`）、
+`genetic.cpp:45-46` 的注释措辞（轮次 87 的用例已钉住当前分类）、`trainer.cpp:243-251` 注释与 `:236/:240` 的
 id 不致密（无 README 依据）。审计里被我自己否掉的三条：`self_play.h` 的 `max_moves = 80` 默认值与
 `evaluate_position_both` 都没有消费者；position 域里 INVALID id 密度的注释与代码不一致只是注释问题。
 搜索编排审计交回**空表**，它逐条读过并自杀的五条留给后续轮次别再重提：终止后的 `greedy` 尾巴（轮次 94 已否）、
@@ -5521,7 +5616,7 @@ VCT 的 90000 分（= Z4，与 README:338/P1 一起挂起）、终帧 `thinking_
   `generations_run == 1`——而 `genetic.h:39-41` 的契约说的是「这一次 run 自己的改进历史」。
 - **KK2** `--help` 里 `--stagnation` 那三行（`main_trainer.cpp:30-32`）写的是
   “hill climbing uses 3x this as its probe budget”。探针总数其实是 `--hill-iterations`
-  （`trainer.cpp:311`），`3x` 那个值是传给 `stagnation_limit` 的（`:312`），含义是「连续
+  （`trainer.cpp:373`），`3x` 那个值是传给 `stagnation_limit` 的（`:374`），含义是「连续
   stagnation_limit 个真的变了却没提升的探针就提前停」（`hill_climbing.cpp:79-85`；`:61`
   那种与当前点完全相同的邻居被跳过、根本不计数）。旧文案会让人以为 `--stagnation 3` 等于
   爬山只试 9 个邻居。
@@ -5534,22 +5629,22 @@ VCT 的 90000 分（= Z4，与 README:338/P1 一起挂起）、终帧 `thinking_
 **裁决（不是缺陷）.** 优化器/对称性审计的其余三条我读回代码后否掉了：「0 局对抗也能算出 accept」
 那条我按 `trainer.cpp` 的晋升分支逐行读过，判为走不到；`hill_climbing.cpp:26` 的
 `rounded <= 0 ? 1 : …` 是「系数不得塌成 0」的既有语义，不是缺陷；`seed_population` 的措辞属纯注释，
-而 --help 的文案早已由 `tests/test_training.cpp:3137-3162` 钉住。训练数据审计的
+而 --help 的文案早已由 `tests/test_training.cpp:3138-3163` 钉住。训练数据审计的
 K2（会话目录建不出来时顺带清 `records_path_`）以 `--no-sessions` × 已写明的 `--records` 那条
-CLI 拒绝为反证——该拒绝被 `tests/test_training.cpp:3201-3203` 钉着，说明耦合是规格里的；
-K3（`trainer.cpp:355` 的 `result.games_played` 快照过早）grep 全仓后确认
+CLI 拒绝为反证——该拒绝被 `tests/test_training.cpp:3202-3204` 钉着，说明耦合是规格里的；
+K3（`trainer.cpp:382` 的 `result.games_played` 快照过早）grep 全仓后确认
 `RoundResult::games_played` 没有任何消费者，无可观察差异；K4（`self_play.cpp:197-199` 的
 `ply + 3 > max_moves`）那行本来就带解释它是保守上界的注释。
 
 **Verified.** 测试会话只写 `tests/`：`tests/test_training.cpp` +75/0 一例
 `test_genetic_stagnation_count_is_per_run`（`:3446`，注册于 `:3567`）。配置
 `{population_size 2, stagnation_generations 2, max_generations 2}` + 恒定 fitness + 固定 seed，
-判别子落在同一个对象的第二次 `run()`：`tests/test_training.cpp:3476` 断言
+判别子落在同一个对象的第二次 `run()`：`tests/test_training.cpp:3477` 断言
 `second_generations == 2`，HEAD 上是 1（`abort`，exit 134）；第一轮、全新对象、以及
 `evaluations()` 按 `population + generations*(population-1)` 计的**增量**（钉住累计开销不被顺手清零，
 两棵树都绿）三个控制臂全绿。HEAD 负例用 `git archive 5459c2f` 解到 /tmp，只编 HEAD 的两个 TU
 再从 `link.txt` 的对象表里换掉对应 `.o`（脚本留在 `build/r107_kk1_head.sh`，gitignore 内）。
-KK2 按纪律报「无可观察差异」，没有为文案编行为用例，只确认 `tests/test_training.cpp:3137-3162`
+KK2 按纪律报「无可观察差异」，没有为文案编行为用例，只确认 `tests/test_training.cpp:3138-3163`
 那三条子串钉（`--stagnation`/`3x`/`N+1`）在两棵树都绿。我另外要求的那条「hill 的评估数与
 `--stagnation` 无关」被测试会话以理由驳回并被 Accepted：`hill_climbing.cpp:79-85` 确实会被
 `stagnation_limit`（= 3N）截断，独立的只有 `--hill-iterations + 1` 这个上界，不是计数。
@@ -5569,11 +5664,11 @@ LL2 `server.cpp:1531-1543` 的 `flush_all()` 在关停时先 `export_game_record
 `aiThinking = false` 点（`:210/:297/:1565/:1751/:1877`）后面都跟着刷新，这是唯一的漏网，与 JJ3
 同形。暂缓：evaluator 的 `cap = five - 1`（`evaluator.cpp:175`）确实会给出 99999，正好落在
 README:338 的「已证胜负」带上，但改它必须同时决定 P1（`five` 可调 vs 前端常量 99999）与 Z4，
-而且 `tests/test_evaluator.cpp:25-31`、`:317` 与 `tests/test_training.cpp:2489-2504` 三面都在钉
+而且 `tests/test_evaluator.cpp:25-31`、`:317` 与 `tests/test_training.cpp:2490-2505` 三面都在钉
 `five - 1`，属设计判定不是单行修；`board.cpp:58-74` 的颜色守卫排在 `cells_`/Zobrist 写之后
 （`random_table_` 内层只有 3 格）是防御性缺口，但没有任何经校验的调用方能送进非法颜色；
-`trainer.cpp:225` 的 `games_played_ + 1 + t*1000` 在每 worker ≥1000 局时才会撞 id，README 未约定
-id 语义且判别要真跑两千局自对弈；`trainer.cpp:216-224` 注释与 `:236`/`:240` 的 id 不致密只是注释
+`trainer.cpp:252` 的 `games_played_ + 1 + t*1000` 在每 worker ≥1000 局时才会撞 id，README 未约定
+id 语义且判别要真跑两千局自对弈；`trainer.cpp:243-251` 注释与 `:236`/`:240` 的 id 不致密只是注释
 与代码不一致，无 README 依据。
 
 ## 轮次106 求招留在棋盘上的那一圈，与两个入口抢同一个文件 — bugfix round 106 batch JJ
@@ -5586,7 +5681,7 @@ id 语义且判别要真跑两千局自对弈；`trainer.cpp:216-224` 注释与 
   README:326 要求 求招「结果标在棋盘上并写入状态栏」，README:326-327 又要求「局面又落一手，这一份建议作废」：
   前半句现在只在画的那一刻成立，后半句根本没人实现。
 - **JJ2** `--out` 与 `--checkpoint` 指向同一个文件时无人拒绝：`--resume` 的三种冲突在
-  `main_trainer.cpp:259-286` 逐一退出，`:288-289` 却把这两个路径一起接住；收尾 `:323` 的
+  `main_trainer.cpp:278-305` 逐一退出，`:307-308` 却把这两个路径一起接住；收尾 `:342` 的
   `save(out_path, …)` 遂把断点文件换成参数文件，本轮日志里「checkpoint saved」全是假的，
   下一次 `--resume` 直接读不回来。
 - **JJ3** `handleStateSync`（`:1696`）把 `replayIndex` 清成 `null` 却没 `stopReplayAuto()`——
@@ -5631,10 +5726,10 @@ lineWidth 2 与旧代码逐字一致），`highlightMove` 只写状态并重绘�
 **Held.** 训练数据审计给出的四条排进轮次107：K1 导出条件用 `is_decisive()`，而 README:574 说的是
 「终局」、README:63 说的是「完局」——满盘判和（`game_manager.cpp:445-452`，winner EMPTY）因此不进
 `records.jsonl`，而 trainer 自己却把 `move_limit`/`board_full` 的未分胜负局写进同一个文件
-（`trainer.cpp:236-237`），两个生产者对「完局」的理解不一致；改的时候必须同时改 `:1460` 与冷重建的
+（`trainer.cpp:263-264`），两个生产者对「完局」的理解不一致；改的时候必须同时改 `:1460` 与冷重建的
 `:1207`，否则和棋局会在一次 resume 后被追加两次。K2 `server.cpp:546-549` 会话目录建不出来时顺手清了
 `records_path_`（README:165-166 只授权关闭落盘，README:161/169-172 把 `--records` 当独立功能）。
-K3 `trainer.cpp:355` 的 `result.games_played` 快照取在本轮数据局之前，而 `:360` 的 `samples_collected`
+K3 `trainer.cpp:429` 的 `result.games_played` 快照取在本轮数据局之前，而 `:434` 的 `samples_collected`
 取在之后。K4 `self_play.cpp:197-199` 的 `ply + 3 > max_moves` 与 README:609「最靠近终局的那一步」相差
 两手。否掉的：不给路径时数据局整个跳过（README:205 的「默认空」才是那句具体规定）、
 `--no-resign` × `no_legal_move` → INVALID 弃局（要构造全盘无合法点的局面，与轮次92/101 已判过的
@@ -5768,7 +5863,7 @@ harness 没有真定时器、测不了，不下发。**N1 机制成立但本轮�
 丢弃 `flush_entry` 的 bool，`stop()` 在 :583 调完就 `ioc_.stop()`（:589），而 :1465 的
 `payload == entry->saved_payload` 正是「运行期会重试、停机时不会重试」的成因——它的正确修法是终局 flush
 改成先追加记录再写会话文件，那属于轮次85 已定的「绝不重复导出」取舍的持久化次序那一半，必须先设计再下发。
-冷重建把 `exported` 置真那一行经复核**仍是**轮次85 的既有取舍，不再重开；`trainer.cpp:264-267` 的
+冷重建把 `exported` 置真那一行经复核**仍是**轮次85 的既有取舍，不再重开；`trainer.cpp:291-294` 的
 `break` + 孤儿样本同理维持原判。
 
 **Verified.** 测试会话只写 `tests/web_frontend_check.js`（+175/−1，唯一删除行是 harness 自身的
@@ -5816,7 +5911,7 @@ HH3 三条（思考中行点击不改 `replayIndex`、不在思考时同一点�
 （`server.cpp:758/897/990/1207/1504/1511`），而 `flush_entry` 先 `save_session`（:1494）后追加 records
 （:1506），所以会话文件本身无法区分「已追加」与「写完会话就崩了」——正确的修法必须让
 `SessionSnapshot` 持久化这个标志（要动 `.h` 并由我同步改 README 的 `session` 样本），单独排一轮。
-`trainer.cpp:264-266` 的 `break`（换 `continue` 也无从判别：写坏的路径会让整轮全失败）与
+`trainer.cpp:291-293` 的 `break`（换 `continue` 也无从判别：写坏的路径会让整轮全失败）与
 `games_played_`（:256）在落盘之前就计数、检查点在 :373 保存，是一个需要设计取舍的「失败追加欠谁」问题，
 未凑成一行下发。前端审计余下的 C1（陈旧 `position_preview` 回盘重新武装 确认）、C2（`handleGameOver`
 不调 `updateTurnInfo()`）、C3（落子记录行点击绕过回放锁）、C4（接管后 `btn-restart` 仍武装）、
@@ -5849,10 +5944,10 @@ listener 并 `return element`），该会话明确说明存量用例从不触发
 - **FF1（中，统计口径自相矛盾）** `src/training/elo.cpp:84-93` 的 W/L/D 括号与它**自己上面的注释**相反：
   注释写「只有正好一半才算和棋，因为 `--verification-games 4` 的 3-1 是 0.75」，代码却用
   `>= 0.75` / `<= 0.25`。README:198 的默认值是 `--verification-games 8`，得分以 0.125 为步长，于是 5-3 局
-  （0.625）两边各记 `draws++`——而这一局正是 `trainer.cpp:336` 按 `accept_score` 0.56 把挑战者晋升的那一局，
-  `main_trainer.cpp:324` 随后把它打印成 `0-0-1`。晋升、Elo 增量、`games` 都没错，错的只有胜负场次归属。
+  （0.625）两边各记 `draws++`——而这一局正是 `trainer.cpp:363` 按 `accept_score` 0.56 把挑战者晋升的那一局，
+  `main_trainer.cpp:343` 随后把它打印成 `0-0-1`。晋升、Elo 增量、`games` 都没错，错的只有胜负场次归属。
   两名审计独立报出同一条。
-- **FF2（中，明说的参数被静默丢弃）** `main_trainer.cpp:210` 接受 `--seed`，`trainer.cpp:551` 在 `--resume`
+- **FF2（中，明说的参数被静默丢弃）** `main_trainer.cpp:222` 接受 `--seed`，`trainer.cpp:593` 在 `--resume`
   时用 checkpoint 里的 `seed` 键覆盖它，所以 `--resume … --seed 7` 读完就扔、退出码仍为 0；README 从未授权
   `--resume` 覆盖 `--seed`。与已落地的 Q2（`--resume` × `--params` 拒绝）是同一类「同一入口的两种说法互相
   矛盾」，README:169-172 的口径是解析期报错退出并点名 flag。
@@ -5876,18 +5971,18 @@ false，提交门换成 `layer_complete && !stop_flag.load() && !aborted_`（+8/
 `analyses_.size()`，`replay_snapshot()` 同一条不变量的反向）。4. `Board` 落子时不清
 `neighbor_count_[placed]` 是对的，因为 `undo_last_move` 严格按栈序移除。5. `SearchController` 无生产调用方、
 搜索非并行，README:596-597/399 已明说。另否掉/挂起：`elo` 的 `games` 按场计而非按局（README:49 只要求「自适应
-K」）、`trainer.cpp:225` `game_id_base`、`data_collector.cpp:171` 忽略 `place_stone` 返回值（仓库内无人回读
+K」）、`trainer.cpp:252` `game_id_base`、`data_collector.cpp:171` 忽略 `place_stone` 返回值（仓库内无人回读
 `records.jsonl`）、VCF/VCT 绑定了 `tt_` 却不查询（文档未要求的优化缺失）、`high_resolution_clock` 与
 `steady_clock` 混用（此处不可测）。前端审计的「每帧全量 `drawBoard()`」是 README:519-521 的要求，不是缺陷。
 
 **Verified.** 测试会话只写 `tests/`（`test_training.cpp` +172/0、`test_search.cpp` +76/0，`git diff -- tests/`
 零删除行，我逐行核过），HEAD 负例树用只读 `git archive a9651bd` 建到 /tmp：
 `test_elo_scores_a_majority_match_as_a_win` 直接驱动 `EloSystem::record_result` 七个得分档位，同时断两边
-w/l/d、`games == 1` 与 Elo 增量 `32*(score-0.5)`。HEAD 原文 `test_training.cpp:474: Assertion
+w/l/d、`games == 1` 与 Elo 增量 `32*(score-0.5)`。HEAD 原文 `test_training.cpp:475: Assertion
 'elo.player(a).wins == arm.wins_a' failed`，可观察行 `score 0.625 -> candidate w/l/d 0/0/1, champion w/l/d 0/0/1,
 elo 1504`——两棵树 elo 数值相同，正好证明分数回归从未移动。
 `test_trainer_refuses_a_seed_that_a_resume_would_drop` 只判退出码 + stderr 是否点名 `--seed`/`--resume` +
-checkpoint 里 `"seed"` 的数字。HEAD 原文 `test_training.cpp:3312: Assertion 'status == 1' failed`，可观察
+checkpoint 里 `"seed"` 的数字。HEAD 原文 `test_training.cpp:3313: Assertion 'status == 1' failed`，可观察
 `--resume '…ck.json' --seed 7 => exit 0:`，stderr 0 字节、checkpoint 仍是 `"seed": 20261011`。
 FF4 结论是**无可观察差异**：`alphabeta.h:63` 是裸 `high_resolution_clock`、没有注入缝，那条竞争窗口无法构造
 确定性负例，故只做代码形状钉（`test_search.cpp:2600`：声明 320 < 破坏 331 < 提交 351、`aborted_` 清 265、
@@ -5933,7 +6028,7 @@ flush 的 `net::post` 撞上 rotate）每条都指到了把它清掉的那一行
 **Verified.** 测试会话只写 `tests/test_training.cpp`（+124/0，`git diff -- tests/` 零删除行，我逐行核过）：
 `test_params_refuses_a_five_that_flattens_the_scale` 一边断加载器拒 `five:1`（且哨兵 31337/4242 不被改写）、
 `five:2` 仍接受，一边绕开加载器直接把机制钉在 `Evaluator` 上（黑四连 + 一白子：`five=1` ⇒ 评估 0，`five=2` ⇒ 非
-0）。HEAD 原文 `test_training.cpp:2417: Assertion '!CoefficientVector::from_json_string(...five":1)...' failed`。
+0）。HEAD 原文 `test_training.cpp:2418: Assertion '!CoefficientVector::from_json_string(...five":1)...' failed`。
 `test_server_refuses_no_sessions_with_a_stated_path` 每条都带一个不存在的 `--web-dir` 与 `--port 59321`，
 使两棵树都在 bind 之前退出、端口从未监听，再断退出 1 + stderr 点名 `--no-sessions` 且**不含** `--web-dir`
 （证明拒在新守卫而不是目录检查），覆盖 `--sessions` 前/后两种顺序与 `--records`，控制组（单用 `--no-sessions`
@@ -5962,7 +6057,7 @@ flush 的 `net::post` 撞上 rotate）每条都指到了把它清掉的那一行
 - **DD5（中，破坏性 CLI）**：`require_value` 接受空串。`--resume ""`（多半是未展开的 shell 变量）被解析成「不要
   resume」，训练照跑，然后把默认 checkpoint 覆写掉。
 - **DD6（低，文档性）**：`--stagnation` / `--hill-iterations` 的帮助文本没有说明 hill climbing 用 3x 该值作探测
-  预算（`trainer.cpp:312`），也没说明相同邻居被跳过 ⇒ 每轮至多 N+1 次评估（`hill_climbing.cpp:54-89`）。
+  预算（`trainer.cpp:339`），也没说明相同邻居被跳过 ⇒ 每轮至多 N+1 次评估（`hill_climbing.cpp:54-89`）。
 - **DD1（中，构建）**：`build.sh` 的 cmake-free 分支只链接 `gomoku_server`，按 README 的无 cmake 路径构建的人拿不到
   `gomoku_train`；而且「To train the threat coefficients」那句提示被 `if [ "$USE_CMAKE" -eq 1 ]` 挡住了，恰好在这条
   最需要指路的分支上不打印。
@@ -5977,7 +6072,7 @@ cmake-free 分支补齐 22 个 TU 的 `gomoku_train` 链接并解掉提示的门
 克隆到仓库根的 `deps/`，而此前只忽略了 CMake 的 `_deps/`，探针一跑就留下 24 MB 未跟踪树。
 
 **Not defects.** E 的 `handleTakenOver` 未清回放行（`:757-762` 自终止、不发帧，README:567-569 只承诺「不再自动重连」）；
-F 的 `game_id_base` 族（既有挂起项，`trainer.cpp:216-223` 自己写明要 export marker）；F 的 `checkpoint.json.tmp`
+F 的 `game_id_base` 族（既有挂起项，`trainer.cpp:243-250` 自己写明要 export marker）；F 的 `checkpoint.json.tmp`
 不落删除（无读者）；DD1 的 `deps/` 克隆本身（build.sh 既有行为）。
 
 **Verified.** 测试会话只写 `tests/`（`test_position.cpp` +47、`test_server.cpp` +114、`test_training.cpp` +89，
@@ -6099,7 +6194,7 @@ CC1b 无可观察差异，未立案。测试会话的 diff 只在 `tests/`（`te
   `hint_result`，而同一连接随后 `make_move` 拿到的却是 `Invalid move`。前端只是顺手挡住了按钮。
 - **BB3** `src/training/data_collector.cpp:223-224`：`game_id`/`move_index` 走 :206-209 那个
   「写坏了和没写都回落默认」的 `read_int`，于是 `"game_id":7.0` 这类行**读取成功**却把身份改成 `-1/-1`，
-  一批塌进同一个伪局，`(game_id, move_index)` 唯一性（REVIEW_LOG:1083、`test_training.cpp:1913/:1932`
+  一批塌进同一个伪局，`(game_id, move_index)` 唯一性（REVIEW_LOG:1083、`test_training.cpp:1914/:1932`
   钉着）就没了；同一个函数 :232-243 对 `move.row/col` 却是整条拒收。README:215 只允许元数据（节点数、
   搜索深度）回落默认，函数自己在 :225-226 也写着「only the engine numbers may fall back to defaults」。
 - **BB4** `src/server/session_store.cpp:123-125`：`read_number` 把「键存在但类型不对」静默读成 0，而
@@ -6123,8 +6218,8 @@ CC1b 无可观察差异，未立案。测试会话的 diff 只在 `tests/`（`te
 含 `base` 子）。任何 `error` 帧都清 `hintInFlight`：轮次77 钉过的、防止 求招 卡死的那扇门。`std::thread`
 构造抛异常会把 `ai_thinking_` 永久留在 true（`game_manager.cpp:370` 先置标志后建线程）——机理为真，但只有
 `ulimit -u` 掐光线程预算才构造得出来，**挂起而非驳回**，日后有确定性复现再开。审计自己承认打不动的：
-`genetic.cpp:112` 硬编码 0.5（没人设 `mutation_rate`）、`trainer.cpp:256` 的 `game_id_base` 撞号、
-`trainer.cpp:356` 的 int  cast、`black_profile`/`white_profile` 默认、`method` 非字符串→`""`（兄弟闸门
+`genetic.cpp:112` 硬编码 0.5（没人设 `mutation_rate`）、`trainer.cpp:283` 的 `game_id_base` 撞号、
+`trainer.cpp:383` 的 int  cast、`black_profile`/`white_profile` 默认、`method` 非字符串→`""`（兄弟闸门
 `data_collector.cpp:130` 已经把这些手数挡在外面）。测试会话另报两条「无可观察差异」：
 `session_from_json` 不复位 `out`、`request_hint` 读 `status_` 不持 `thinking_mutex_`（`games_mutex_` 下不可观察）。
 
@@ -6143,7 +6238,7 @@ CC1b 无可观察差异，未立案。测试会话的 diff 只在 `tests/`（`te
 `node tests/readme_anchor_check.js` **33 citations / 0 problems**。HEAD 反向证明建在 `build/neg97_src`
 （`git archive b601b3e`）：BB1 `FAIL … the dead board must be replaced`（36/37）、
 BB2 `tests/test_search.cpp:1929 assert(!game.request_hint(300, 1)) failed` 与
-`tests/test_server.cpp:1510 !game.hint_active_.load() failed`、BB3 `tests/test_training.cpp:1697 assert(!ok) failed`、
+`tests/test_server.cpp:1510 !game.hint_active_.load() failed`、BB3 `tests/test_training.cpp:1698 assert(!ok) failed`、
 BB4 `tests/test_session.cpp:635 session_from_json(with("created_ms", value), out, error) failed`。
 README 仍 658 行（:327 补一句「已结束的对局一律拒绝求招」、:459 补 `created_ms` / `updated_ms` 的整数闸门）。
 工件：`build/r97_*`。
@@ -6329,7 +6424,7 @@ same time; the sample loader does check feature arity (`data_collector.cpp:258`,
 `FEATURE_SIZE = 52` at `:31`) - the `push_back` loop at `:208-216` I first read is only the number filter;
 `hill_climbing.cpp:105-108`'s `INT_MIN → INT_MIN` re-derivation is its comment's stated intent, `candidate != current`
 at `:58` already refuses a no-op step so it cannot waste an iteration; `--gens -1` / `--pop 0` / `--seed -1` are all
-refused at the CLI by `require_int`'s `minimum = 1` default (`main_trainer.cpp:71-84`) and batch X's `require_seed`;
+refused at the CLI by `require_int`'s `minimum = 1` default (`main_trainer.cpp:83-96`) and batch X's `require_seed`;
 there is no `isfinite`-skip in the optimizers; `send_error` on a session whose `token` is still empty is harmless
 because the resume branch that could see it is reached only after `open_session` succeeds. The concurrency auditor's
 headline row again failed the whole-function test: `do_read`'s `if (ec)` branch **does** return (`:303`).
@@ -6395,7 +6490,7 @@ listed above (`params.cpp:231`, `search_engine.cpp:11` and `:277`, `app.js:184`,
 (`evaluator.cpp` README:27/29, `position_setup.cpp` 261-262, the two `server.cpp` 541-543, `trainer.cpp` 607-608) and
 left them alone. X2 rewrote README:338 as 「红点表示该手已证胜负（`|score| >= 99999`），而曲线本身只按 ±2000 截断——
 超量程的分值贴在边缘但并不画红点」, hunk header `@@ -338 +338 @@`, `wc -l README.md` still 658. X3's `require_seed`
-(`main_trainer.cpp:99-107`) now rejects anything `text.find_first_not_of("0123456789")` sees before `stoull` runs, so
+(`main_trainer.cpp:111-119`) now rejects anything `text.find_first_not_of("0123456789")` sees before `stoull` runs, so
 the `-1` wrap cannot reach a caller as a seed, and the two comments say what the code does (0 parses then is refused
 below; the bounds are the guard's business). One accepted side effect the fixer flagged rather than hid: `--seed 0x10`,
 which `stoull` used to read as 16, is now refused too - that converges on README's integer-seed口径, it is not a
@@ -6438,7 +6533,7 @@ failed out of 8` (26.15 s real) and `web_frontend_check: 35/35 passed`.
   rewritten README:338 now describes. Identical training command on both trees yields byte-identical
   `params.json` (`6d60f8d9…`), `checkpoint.json` and `samples.jsonl`; the only `records.jsonl` delta is
   `elapsed_ms` 3 vs 4 at `nodes=484`, `score=-2038`.
-- **Y3 (tests/, the tester's own file):** 4 stale citations corrected by digits only - `test_training.cpp:2199`
+- **Y3 (tests/, the tester's own file):** 4 stale citations corrected by digits only - `test_training.cpp:2200`
   `154→155`, `web_frontend_check.js:1056` and `:1064` `530→553`, `:1171` `283-284→289`; no assertion logic changed.
 - **Y4:** `node tests/readme_anchor_check.js` after Y3 reports `27 citations, 0 problems` (it had been the one that
   surfaced batch X). Its single remaining line is a `HINT` (`web_frontend_check.js:1549 → README:360`, a CJK-phrase
@@ -6479,10 +6574,10 @@ exist. Self-play/retry/book is likewise clean: `query` enforces side parity and 
 shipped lines open at the D4-invariant centre `[7,7]`, the runtime overload rejects `is_forbidden` before handing
 back a black book move, `max_depth_` matches the `move_count() <= max_depth()` gate, and
 `rewind_to_next_branch` marks every branch tried exactly once. The training CLI's stale promises
-(`main_trainer.cpp:166-168` calls `--rounds 0` 「the documented … case handled below」 while `:225` refuses it;
+(`main_trainer.cpp:178-180` calls `--rounds 0` 「the documented … case handled below」 while `:237` refuses it;
 `:180-184` says `--timeout-ms`/`--max-moves` 「keep accepting whatever the caller writes」 while `:236` refuses them;
 `require_seed` at `:100-108` lets `stoull("-1")` wrap to `18446744073709551615` and pass its own `used == size`
-guard) are queued as **round 93's batch X**, not folded into this one. `trainer.cpp:424-436` leaves a
+guard) are queued as **round 93's batch X**, not folded into this one. `trainer.cpp:466-478` leaves a
 `<path>.tmp` behind when the checkpoint flush fails while `params.cpp:338-348` removes it — real asymmetry, but
 IO-failure-only and not reachable through the gate, so it stays deliberately unfixed rather than dispatched with a
 test that cannot go red.
@@ -6504,7 +6599,7 @@ fast paths from real boards and asserts only `method`/`score`/`depth` — `force
 two extras, `resign` and `no_legal_move`, cannot reach a replay frame - `game_manager.cpp:395` returns on
 `result.resigned` and `:407` pushes only for a valid `best_move`), and in doing so surfaced a *separate* defect for
 the next round: eight pre-existing `README:NNN` citations in `src/`, `web/` and `tests/` drifted onto blank or
-unrelated lines (`params.cpp:231`→154, `test_training.cpp:2199`→154, `app.js:193`→545, `search_engine.cpp:11`→336,
+unrelated lines (`params.cpp:231`→154, `test_training.cpp:2200`→154, `app.js:193`→545, `search_engine.cpp:11`→336,
 `search_engine.cpp:277`→513, `app.js:919`/`:1663` + `web_frontend_check.js:1171`→283, `web_frontend_check.js:1056`/
 `:1064` + `app.js:184`→530, `server.cpp:1182` + `test_server.cpp:907`/`:1181`→476). They drifted at `7e458b6`
 already - this round replaced 3 lines with 3 lines - so the anchor-fix is batch X work, not a W regression.
@@ -6548,14 +6643,14 @@ appears for the board form, and refusing what a file actually stated is the load
 token rotation before the install, `game_id` density, and the mid-round `append_to_jsonl` failure window are the
 auditor's own unreachable / IO-only / already-closed cross-file trades. `--resume` letting the checkpoint's seed win
 was re-surfaced and re-refuted from rounds 73-74. `GeneticOptimizer::run` not resetting
-`generations_since_improvement_` is latent-only: `trainer.cpp:298` constructs a fresh optimizer per round. V3's twin
+`generations_since_improvement_` is latent-only: `trainer.cpp:325` constructs a fresh optimizer per round. V3's twin
 observation (`handleAiMove` overwriting 摆棋中 during a live AI frame) is by design — the server frame carries the
 newer truth and the setup panel is stale the moment a stone lands — and was not dispatched.
 
 **Verified.** Gate over the identical tree: `ctest` **8/8** (bare `cmake ..`) and
 `node tests/web_frontend_check.js` **32/32** (30 before E's two cases). HEAD negatives in `build/neg91`
 (`git archive 8b15beb` plus the current `tests/`): **2 of 8 binaries red** and nothing else — `5 - test_position` aborts at
-`tests/test_position.cpp:1010` `forced.ok()`, `8 - test_training` at `tests/test_training.cpp:2822`
+`tests/test_position.cpp:1010` `forced.ok()`, `8 - test_training` at `tests/test_training.cpp:2823`
 `augmented.size() == SYMMETRY_COUNT` (both had already printed 16 / 49 existing ` passed` lines), and the neg-tree
 web harness is `31/32` with only `tests/web_frontend_check.js:1564` failing. Anti-overreach pins green on **both**
 trees via the isolation driver: `test_collector_still_drops_genuine_symmetry_duplicates` (last stone also on the

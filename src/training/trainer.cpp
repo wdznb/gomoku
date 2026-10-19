@@ -86,12 +86,22 @@ double Trainer::play_game(SearchEngine& black, SearchEngine& white, int black_ow
 double Trainer::play_match(const ThreatCoefficients& candidate,
                            const ThreatCoefficients& reference,
                            int games) {
+    return score_match(candidate, reference, games).score;
+}
+
+MatchOutcome Trainer::score_match(const ThreatCoefficients& candidate,
+                                  const ThreatCoefficients& reference,
+                                  int games) {
+    MatchOutcome outcome;
     if (fitness_override_) {
         const double candidate_score = fitness_override_(candidate);
         const double reference_score = fitness_override_(reference);
-        if (candidate_score > reference_score + 1e-12) return 1.0;
-        if (candidate_score < reference_score - 1e-12) return 0.0;
-        return 0.5;
+        if (candidate_score > reference_score + 1e-12) outcome.score = 1.0;
+        else if (candidate_score < reference_score - 1e-12) outcome.score = 0.0;
+        else outcome.score = 0.5;
+        // An injected objective plays no games, so there is no record to test and
+        // the --accept-score bar stays the only rule that can promote.
+        return outcome;
     }
 
     // Fresh engines per evaluation, not a reused pair: a transposition table entry
@@ -103,9 +113,15 @@ double Trainer::play_match(const ThreatCoefficients& candidate,
     prepare(candidate_engine);
     prepare(reference_engine);
 
+    SprtConfig settings;
+    settings.effect_elo = config_.sprt_elo;
+    SprtTest test(settings);
+
     // Every pairing runs twice with the colours swapped, so a candidate cannot
     // pass on the strength of having the first move. Odd requests round UP to
-    // the next even count, as the config comment promises.
+    // the next even count, as the config comment promises; and since design doc
+    // 2.8 #3 both counts are ceilings, because the test below can end the match
+    // at a pair boundary before they are spent.
     const int pairs = std::max(1, (games + 1) / 2);
     double score = 0.0;
     int played_games = 0;
@@ -115,18 +131,29 @@ double Trainer::play_match(const ThreatCoefficients& candidate,
         if (valid) {
             score += first;
             ++played_games;
+            test.add_game(first);
         }
         valid = false;
         const double second = play_game(reference_engine, candidate_engine, 2, &valid);
         if (valid) {
             score += second;
             ++played_games;
+            test.add_game(second);
         }
+        // Polled between pairs, never between the two games of one pair: one
+        // game measures who moved first as much as who plays better, and a test
+        // allowed to stop on it would promote the colour advantage README's
+        // 颜色通吃 record is about - the reason the bar sits above half at all.
+        test.end_pair();
+        if (test.stop_requested()) break;
     }
+    outcome.games = played_games;
+    outcome.llr = test.llr();
+    outcome.verdict = test.verdict();
     // A discarded game has no result to average, so it leaves the denominator
     // rather than counting as a half; one that never got played cannot promote.
-    if (played_games == 0) return 0.0;
-    return score / played_games;
+    outcome.score = played_games == 0 ? 0.0 : score / played_games;
+    return outcome;
 }
 
 std::vector<Move> Trainer::random_opening_line(int plies, uint64_t seed) {
@@ -366,9 +393,21 @@ TrainerRound Trainer::run_round() {
     candidate.forbidden_penalty = result.champion.forbidden_penalty;
     result.candidate = candidate;
 
-    result.verification_score =
-        play_match(candidate, result.champion, config_.verification_games);
-    result.accepted = result.verification_score >= config_.accept_score;
+    const MatchOutcome check =
+        score_match(candidate, result.champion, config_.verification_games);
+    result.verification_score = check.score;
+    result.verification_verdict = check.verdict;
+    result.verification_llr = check.llr;
+    result.verification_match_games = check.games;
+    // The test's answer is the promotion rule whenever it has one: an ACCEPT is
+    // the same evidence the score bar was going to ask for, reached in fewer
+    // games, and a REJECT says the record is worse than the fraction it averaged
+    // to. Only an open match - the ceiling spent with the ratio still inside both
+    // bounds - falls back to --accept-score, which is the bar README's colour
+    // advantage record is measured against.
+    result.accepted = check.verdict == SprtVerdict::ACCEPT ||
+                      (check.verdict == SprtVerdict::OPEN &&
+                       check.score >= config_.accept_score);
 
     const size_t candidate_index = versions_.size();
     const int candidate_id = elo_.add_player(version_name(candidate_index));
@@ -400,7 +439,10 @@ TrainerRound Trainer::run_round() {
     rounds_completed_++;
     if (log_) {
         log_("round " + std::to_string(result.round) + ": verification score " +
-             std::to_string(result.verification_score) + " -> " +
+             std::to_string(result.verification_score) + " (sprt " +
+             sprt_verdict_name(result.verification_verdict) + ", llr " +
+             std::to_string(result.verification_llr) + ", " +
+             std::to_string(result.verification_match_games) + " games) -> " +
              (result.accepted ? "promoted" : "kept champion") + ", champion elo " +
              std::to_string(result.champion_elo));
     }

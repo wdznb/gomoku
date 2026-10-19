@@ -8,6 +8,7 @@
 #include "game_record.h"
 #include "genetic.h"
 #include "hill_climbing.h"
+#include "sprt.h"
 #include <functional>
 #include <random>
 #include <string>
@@ -51,6 +52,13 @@ struct TrainingConfig {
     int verification_games = 8;
     // A candidate must beat the champion by this score to be promoted.
     double accept_score = 0.56;
+    // The Elo gap a match's results are tested against (design doc 2.8 #3). Both
+    // doors above are ceilings now: a match stops at a pair boundary as soon as
+    // the sequential test leaves the bounds, so an eight-game verification costs
+    // four games when the candidate loses both colours twice. 0 plays every pair
+    // the counts ask for, which is what both flags meant before. sprt.h carries
+    // the arithmetic that makes 300 the smallest default the ceiling can reach.
+    int sprt_elo = 300;
 
     // Self-play games generated per round purely to collect training data.
     int data_games = 4;
@@ -82,11 +90,29 @@ struct TrainerRound {
     double champion_fitness = 0.0;
     double candidate_fitness = 0.0;
     double verification_score = 0.0;
+    // What the sequential test had to say about the match that produced that
+    // score, and how many games it needed to say it. OPEN means the ceiling was
+    // reached with no decision and --accept-score was the rule that fired; the
+    // game count is the match's own, not the run's running total.
+    SprtVerdict verification_verdict = SprtVerdict::OPEN;
+    double verification_llr = 0.0;
+    int verification_match_games = 0;
     bool accepted = false;
     int games_played = 0;
     int samples_collected = 0;
     double champion_elo = 0.0;
     double candidate_elo = 0.0;
+};
+
+// One match's answer. `score` is what the optimisers rank candidates on and what
+// the Elo table books; the three fields after it are the sequential test's own
+// reading of the same games, kept so a round can show *why* a candidate was
+// promoted instead of only the fraction that cleared the bar.
+struct MatchOutcome {
+    double score = 0.0;
+    int games = 0;
+    SprtVerdict verdict = SprtVerdict::OPEN;
+    double llr = 0.0;
 };
 
 // 3.6 training main loop: optimise coefficients, prove the result over the table
@@ -131,6 +157,8 @@ public:
 
 private:
     double measure_fitness(const ThreatCoefficients& coefficients);
+    MatchOutcome score_match(const ThreatCoefficients& candidate,
+                             const ThreatCoefficients& reference, int games);
     double play_match(const ThreatCoefficients& candidate, const ThreatCoefficients& reference,
                       int games);
     // Score for whoever holds the stones passed as `black_owner` (1 = the
