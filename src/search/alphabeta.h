@@ -132,6 +132,13 @@ private:
     NodeResult alphabeta(Board& board, int depth, int alpha, int beta, int color,
                          std::atomic<bool>& stop_flag, int ply = 0);
 
+    // Design doc 2.6 step 4's bound on the forcing tail. `qdepth` is the ply count
+    // inside quiescence, so this is a bound on one node's chain, not on one think: the
+    // node entered at this depth answers with its own static score and opens nothing.
+    // `seldepth` records the depth a node was entered at, so the deepest number a think
+    // can report is exactly this one.
+    static constexpr int kMaxQdepth = 8;
+
     NodeResult quiescence(Board& board, int alpha, int beta, int color,
                           std::atomic<bool>& stop_flag, int qdepth, uint64_t hash,
                           int32_t tt_eval);

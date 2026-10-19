@@ -186,6 +186,18 @@ NodeResult AlphaBetaSearch::quiescence(Board& board, int alpha, int beta, int co
         return {static_score(board, color, hash, tt_eval), false};
     }
 
+    // Design doc 2.6 step 4's tail bound, armed after the stop test so a dead budget
+    // still unwinds through the branch above. The node it caps is a leaf in exactly
+    // the sense a depth-0 alphabeta node is one: the number is the position's own
+    // static score, and nothing was abandoned mid-calculation, so it is reported as
+    // sound. Marking it unsound would be the damage - `sound` gates the bound a node
+    // writes to the table, the line a parent extends out of the PV table, and the layer
+    // that commits, so one capped ply would cost its whole ancestor chain its
+    // bookkeeping.
+    if (qdepth >= kMaxQdepth) {
+        return {static_score(board, color, hash, tt_eval), true};
+    }
+
     int stand_pat = static_score(board, color, hash, tt_eval);
 
     // Fail-soft on the stand-pat cutoff: returning `beta` (the window edge)

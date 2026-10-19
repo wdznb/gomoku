@@ -8075,6 +8075,395 @@ void test_the_nodes_a_cut_kills_pay_the_sum_out_of_the_records() {
               << std::endl;
 }
 
+// ---------------------------------------------------------------------------
+// C4 - quiescence 深度上限 (design doc 2.6 Step 4, :413: 「当前 `quiescence` 无深度上限
+// （靠威胁过滤收敛）。加 `MAX_QDEPTH = 8` 与 `seldepth` 记账，避免极端局面下的长尾」).
+//
+// Half the row was already shipped, and the shipped half is what makes the other half a
+// fact rather than a coincidence. The accounting is stage A's: SearchInfo::seldepth
+// (alphabeta.h:34), SearchStats::seldepth, the frame that carries it (server.cpp:1674)
+// and the case that pins them (:3172). What feeds it - ctx_.note_quiescence_depth(qdepth)
+// - is armed one line after the node counter and *before* the cap test, so a think reports
+// the depth a node was entered at, not the depth it expanded to. That ordering is why
+// seldepth == kMaxQdepth is the deepest number a think can produce and can therefore be
+// asserted both ways: equal on a board that has a tail, capped-at on a population.
+//
+// Where the tail actually is was measured before anything was written, and the row's
+// 「极端局面」 is exact. Over the 24 positional arms this suite already owns
+// (/tmp/r124_c4/hist_base.txt: 12,687,567 nodes, 7,917,361 quiescence nodes) the deepest
+// node was entered at ply 7 and no node at all was entered at 8, so on every arm pinned by
+// node count the cap cannot fire and the literals are the same literals. It is real on
+// dense random clusters - 30 stones in a 9x9 window, 3,943 thinks over three root depths -
+// where the per-board maximum reach is 11 at root depth 2 and 15 at 4 and 6, with 51/2,918,
+// 22/781 and 12/244 boards having a node at 8 or past it.
+//
+// What it costs is the reason the cases below pin answers as well as counts. On those
+// 3,943 thinks the capped and uncapped trees agree on score, best move, completed depth,
+// stop reason and tt_hits - zero differences on every one of the three populations - while
+// nodes move -0.111 % / -0.032 % / -0.102 % (d2 / d4 / d6). The saving is not the tail's
+// size and it is not monotone: on the 781 depth-4 thinks the bound stops 4,055 nodes from
+// being entered (nodes at qdepth >= 8: 5,489 -> 1,434) yet the trees net 1,778 - 13 boards
+// end 2,727 smaller against 8 ending 949 larger (+572 on a 211,698-node board; the 43,628
+// one gives back 25), because a capped node's number is not the one its parent cut on.
+//
+// Five cases, one per claim: what the capped node is (C4-1, with the two controls that
+// make it a bound and not a shutdown), that a dead budget still outranks it (C4-2), the
+// two thinks whose tails reach it (C4-3, C4-4), and that the bound holds across a
+// population while staying inert where there is no tail (C4-5).
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// A 30-stone cluster inside a 9x9 window, WHITE to move, root depth 4. Sweep board 105 of
+// /tmp/r124_c4/c4_fuzz.cpp (mt19937 seed 20261019, 30 stones, span 4), stone for stone. Its
+// quiescence ran to ply 15 before step 4; it is the board whose capped answer is C4-3.
+Board c4_tail_long() {
+    return b1_board({
+        {3, 4, BLACK}, {3, 9, WHITE}, {8, 10, BLACK}, {11, 4, WHITE}, {3, 5, BLACK},
+        {9, 5, WHITE}, {7, 6, BLACK}, {8, 7, WHITE}, {9, 4, BLACK}, {7, 11, WHITE},
+        {10, 11, BLACK}, {7, 4, WHITE}, {6, 8, BLACK}, {11, 3, WHITE}, {4, 10, BLACK},
+        {5, 4, WHITE}, {11, 9, BLACK}, {8, 3, WHITE}, {7, 9, BLACK}, {11, 7, WHITE},
+        {8, 11, BLACK}, {11, 11, WHITE}, {6, 3, BLACK}, {10, 10, WHITE}, {10, 9, BLACK},
+        {11, 10, WHITE}, {7, 5, BLACK}, {10, 8, WHITE}, {9, 3, BLACK}, {4, 8, WHITE},
+    });
+}
+
+// The same generator's board 740, BLACK to move, root depth 4: reach 11 before the cap and
+// 73 nodes dearer after it. The give-back is the point of choosing it.
+Board c4_tail_dense() {
+    return b1_board({
+        {10, 4, BLACK}, {9, 8, WHITE}, {10, 11, BLACK}, {11, 6, WHITE}, {7, 10, BLACK},
+        {6, 7, WHITE}, {5, 8, BLACK}, {11, 10, WHITE}, {4, 11, BLACK}, {6, 9, WHITE},
+        {7, 7, BLACK}, {3, 5, WHITE}, {3, 10, BLACK}, {11, 5, WHITE}, {5, 11, BLACK},
+        {8, 6, WHITE}, {11, 8, BLACK}, {8, 5, WHITE}, {8, 7, BLACK}, {10, 9, WHITE},
+        {9, 4, BLACK}, {5, 5, WHITE}, {11, 9, BLACK}, {9, 11, WHITE}, {11, 3, BLACK},
+        {7, 3, WHITE}, {11, 7, BLACK}, {4, 3, WHITE}, {5, 3, BLACK}, {3, 9, WHITE},
+    });
+}
+
+// One node of quiescence, entered at a depth the caller chooses. A fresh search object per
+// call, because every number compared below is a per-node delta read off a table that has
+// seen nothing but this position's own static score: `want` is that scan, `opened` counts
+// the quiescence nodes the call created (itself included) and `probes` the candidate-cache
+// reads it made. A capped node must open one and zero.
+struct C4Node {
+    int want = 0;
+    int score = 0;
+    bool sound = false;
+    uint64_t opened = 0;
+    uint64_t probes = 0;
+    uint64_t evals = 0;
+};
+
+C4Node c4_quiescence_at(Board& board, int color, int qdepth, bool armed_stop) {
+    Evaluator evaluator;
+    TranspositionTable tt;
+    AlphaBetaSearch search(evaluator, tt);
+    SearchLimits limits;
+    std::atomic<bool> stop(false);
+    search.ctx_.start(limits, system_search_clock(), stop);
+
+    const uint64_t hash = board.zobrist_hash();
+    C4Node out;
+    out.want = search.static_score(board, color, hash, NO_STATIC_EVAL);
+    const uint64_t opened_before = search.ctx_.quiescence_nodes();
+    const uint64_t probes_before = search.move_gen_.cache().probes();
+    // Armed after the ledger is read - the branch under test has to be the one that was
+    // not already taken by the read above it.
+    if (armed_stop) search.ctx_.set_reason(StopReason::NODES);
+    // Wide, and deliberately not INT_MAX: quiescence negates the window at every ply.
+    const NodeResult r =
+        search.quiescence(board, -1000000, 1000000, color, stop, qdepth, hash,
+                          NO_STATIC_EVAL);
+    out.score = r.score;
+    out.sound = r.sound;
+    out.opened = search.ctx_.quiescence_nodes() - opened_before;
+    out.probes = search.move_gen_.cache().probes() - probes_before;
+    out.evals = search.ctx_.eval_scans() + search.ctx_.eval_reuses();
+    return out;
+}
+
+// One think of a tail board: the sweep's own shape (plain coefficients, fresh table, no
+// wall clock, no reachable node ceiling) so the numbers are the sweep's.
+struct C4Think {
+    uint64_t nodes = 0;
+    uint64_t qnodes = 0;
+    uint64_t tt_hits = 0;
+    uint64_t evals = 0;
+    uint64_t probes = 0;
+    uint64_t hits = 0;
+    uint64_t recomputes = 0;
+    int seldepth = 0;
+    int score = 0;
+    int completed = 0;
+    int root_done = 0;
+    int root_total = 0;
+    size_t pv = 0;
+    Move best;
+    StopReason stopped = StopReason::NONE;
+};
+
+C4Think c4_think(Board& board, int color, int depth) {
+    Evaluator evaluator;
+    TranspositionTable tt;
+    AlphaBetaSearch search(evaluator, tt);
+    search.set_node_limit(INT_MAX);
+    SearchLimits limits;
+    limits.max_depth = depth;
+    std::atomic<bool> stop(false);
+
+    C4Think out;
+    out.best = search.search(board, color, limits, stop);
+    const SearchStats& stats = search.last_stats();
+    const SearchInfo& info = search.last_search_info();
+    out.nodes = stats.nodes;
+    out.qnodes = stats.qnodes;
+    out.tt_hits = stats.tt_hits;
+    out.seldepth = stats.seldepth;
+    out.score = stats.score;
+    out.completed = stats.completed_depth;
+    out.stopped = stats.stopped;
+    out.root_done = info.root_moves_done;
+    out.root_total = info.root_moves_total;
+    out.pv = info.principal_variation.size();
+    out.evals = search.ctx_.eval_scans() + search.ctx_.eval_reuses();
+    const CandidateCache& cache = search.move_gen_.cache();
+    out.probes = cache.probes();
+    out.hits = cache.hits();
+    out.recomputes = cache.recomputes();
+    return out;
+}
+
+}  // namespace
+
+void test_a_quiescence_node_entered_at_the_cap_answers_only_its_own_static_score() {
+    Board dense = c4_tail_dense();
+    Board long_tail = c4_tail_long();
+    const int cap = AlphaBetaSearch::kMaxQdepth;
+
+    // The capped node: its own static score, reported as sound, one node created, no
+    // candidate read. `sound` is the half that costs something to get wrong - it gates the
+    // bound this node writes to the table, the line a parent extends out of the PV table
+    // and the layer that commits - and a leaf whose number was never in doubt has to keep
+    // all three.
+    const C4Node at_cap = c4_quiescence_at(dense, BLACK, cap, false);
+    assert(at_cap.want == -1488);
+    assert(at_cap.score == at_cap.want);
+    assert(at_cap.sound);
+    assert(at_cap.opened == 1);
+    assert(at_cap.probes == 0);
+    assert(at_cap.evals == 2);  // the `want` scan plus this node's own read of it
+
+    // One ply short of the bound, the same node is an ordinary node: it opens 21 of them,
+    // prices 2,863 candidates, and answers something other than the position's number.
+    // This is the control that keeps the bound a bound rather than a shutdown - were the
+    // cap one lower, this arm would be the capped one and the tail would end at 7.
+    const C4Node one_short = c4_quiescence_at(dense, BLACK, cap - 1, false);
+    assert(one_short.opened == 21);
+    assert(one_short.probes == 2863);
+    assert(one_short.want == -1488);
+    assert(one_short.score == 99700);
+    assert(one_short.score != one_short.want);
+    assert(one_short.sound);
+
+    // The root of the tail, where nothing is capped at all: 41 nodes for the same call.
+    const C4Node at_root = c4_quiescence_at(dense, BLACK, 0, false);
+    assert(at_root.opened == 41);
+    assert(at_root.probes == 8367);
+    assert(at_root.score == 99700);
+
+    // The number is this colour's own, in each direction, on both boards.
+    const C4Node white_at_cap = c4_quiescence_at(dense, WHITE, cap, false);
+    assert(white_at_cap.want == 1488);
+    assert(white_at_cap.score == 1488);
+    assert(white_at_cap.sound && white_at_cap.opened == 1 && white_at_cap.probes == 0);
+
+    const C4Node other_at_cap = c4_quiescence_at(long_tail, WHITE, cap, false);
+    assert(other_at_cap.want == -50196);
+    assert(other_at_cap.score == -50196);
+    assert(other_at_cap.sound && other_at_cap.opened == 1 && other_at_cap.probes == 0);
+    // The other board's unclosed tail, for the same control as above.
+    const C4Node other_at_root = c4_quiescence_at(long_tail, WHITE, 0, false);
+    assert(other_at_root.opened == 84);
+    assert(other_at_root.probes == 16796);
+    assert(other_at_root.score == 90238);
+
+    std::cout << "test_a_quiescence_node_entered_at_the_cap_answers_only_its_own_static_score"
+                 " passed (qdepth 8: 1 node / 0 candidate reads / the position's own -1,488 "
+                 "as a sound leaf, and 1,488 for WHITE; qdepth 7: 21 nodes / 2,863 reads / "
+                 "99,700; qdepth 0: 41 nodes on the dense board, 84 and 16,796 reads on the "
+                 "long one answering 90,238)"
+              << std::endl;
+}
+
+void test_a_dead_budget_outranks_the_depth_cap_its_check_sits_behind() {
+    Board dense = c4_tail_dense();
+    Board long_tail = c4_tail_long();
+    const int cap = AlphaBetaSearch::kMaxQdepth;
+
+    // Two branches, one number. A capped node and a node the budget killed both answer the
+    // position's static score, and only `sound` separates them: the cap says "this is what
+    // the position is worth", the stop test says "this is what I had on hand". Arming the
+    // stop at the cap therefore has to produce the same score and the opposite claim.
+    const C4Node capped = c4_quiescence_at(dense, BLACK, cap, false);
+    assert(capped.sound);
+    const C4Node stopped_at_cap = c4_quiescence_at(dense, BLACK, cap, true);
+    assert(!stopped_at_cap.sound);
+    assert(stopped_at_cap.score == stopped_at_cap.want);
+    assert(stopped_at_cap.opened == 1);
+    assert(stopped_at_cap.probes == 0);
+    assert(stopped_at_cap.evals == 2);
+
+    // The ordering is visible where the cap says nothing. At qdepth 0 a live node opens 41;
+    // with the budget dead it opens 1 and calls it unsound, so the branch that ran is the
+    // stop test's, whichever depth the node was entered at.
+    const C4Node stopped_at_root = c4_quiescence_at(dense, BLACK, 0, true);
+    assert(!stopped_at_root.sound);
+    assert(stopped_at_root.score == stopped_at_root.want);
+    assert(stopped_at_root.opened == 1);
+    assert(stopped_at_root.probes == 0);
+
+    const C4Node stopped_at_seven = c4_quiescence_at(dense, BLACK, cap - 1, true);
+    assert(!stopped_at_seven.sound && stopped_at_seven.opened == 1);
+
+    // And on the board whose tail is the longer one, where the killed node would have
+    // opened 84.
+    const C4Node other_stopped = c4_quiescence_at(long_tail, WHITE, 0, true);
+    assert(!other_stopped.sound);
+    assert(other_stopped.score == -50196);
+    assert(other_stopped.want == -50196);
+    assert(other_stopped.opened == 1);
+
+    std::cout << "test_a_dead_budget_outranks_the_depth_cap_its_check_sits_behind passed "
+                 "(armed at qdepth 8, 7 and 0: 1 node / 0 reads / the static score as an "
+                 "UNSOUND leaf every time, against 41 and 84 nodes opened unarmed)"
+              << std::endl;
+}
+
+void test_a_think_that_runs_into_the_cap_reports_the_cap_and_the_same_answer() {
+    Board board = c4_tail_long();
+    const C4Think think = c4_think(board, WHITE, 4);
+
+    // The whole tuple, pinned: the sweep's row for this board, root depth 4, plain
+    // coefficients, fresh table. seldepth is the number the cap moved (15 -> 8) and the
+    // tree's size is the one the 800 killed tail nodes leave behind (64,517 -> 63,717).
+    assert(think.seldepth == AlphaBetaSearch::kMaxQdepth);
+    assert(think.nodes == 63717);
+    assert(think.qnodes == 49098);
+    assert(think.tt_hits == 6471);
+    assert(think.score == -22366);
+    assert(think.completed == 4);
+    assert(think.root_done == 55 && think.root_total == 55);
+    assert(think.best.pos.row == 11 && think.best.pos.col == 5);
+    assert(think.stopped == StopReason::NONE);
+    assert(think.pv == 4);
+
+    // Nothing about this think is free, and the cap does not make it cheaper than the
+    // ledger can account for: all 800 nodes it removes are quiescence nodes (49,898 ->
+    // 49,098), and every one of the survivors pays exactly one evaluation read of its own,
+    // capped ones included - a capped node pays that one read and no candidate generation.
+    assert(think.evals == think.qnodes);
+    assert(think.hits + think.recomputes == think.probes);
+    assert(think.probes == 4445432);
+    assert(think.hits == 2963010);
+    assert(think.recomputes == 1482422);
+
+    std::cout << "test_a_think_that_runs_into_the_cap_reports_the_cap_and_the_same_answer "
+                 "passed (sweep board 105, WHITE, depth 4: 63,717 nodes / 49,098 of them "
+                 "quiescence / seldepth 8 where the uncapped tree reached 15, and the "
+                 "answer -22,366 at (11,5) over 4 committed layers unchanged; 4,445,432 "
+                 "candidate reads = 2,963,010 + 1,482,422)"
+              << std::endl;
+}
+
+void test_a_capped_tail_can_pay_back_nodes_it_did_not_save() {
+    Board board = c4_tail_dense();
+    const C4Think think = c4_think(board, BLACK, 4);
+
+    // The give-back board, pinned as a cost and not as an exception to explain away: the
+    // uncapped tree needed 153,383 nodes for this answer and the capped one needs 73 more,
+    // and all 73 are quiescence nodes (138,837 -> 138,910, while the alphabeta part of both
+    // trees is 14,546 nodes), for a tail whose reach fell from 11 to 8. The same board is
+    // one of the 47 that move on the depth-2 sweep (+96) and one of the 8 that move the
+    // wrong way on the depth-4 one: its +73 is part of the 949 those eight pay, against
+    // the 2,727 the 13 that shrink save, because a capped node's number is not the number
+    // its parent would have cut on.
+    assert(think.seldepth == AlphaBetaSearch::kMaxQdepth);
+    assert(think.nodes == 153456);
+    assert(think.qnodes == 138910);
+    assert(think.tt_hits == 1670);
+    assert(think.completed == 4);
+    assert(think.root_done == 44 && think.root_total == 44);
+    assert(think.best.pos.row == 2 && think.best.pos.col == 11);
+    assert(think.stopped == StopReason::NONE);
+    // 99,999 is the evaluator's ceiling, not a proof: this arm's answer is the same in
+    // both trees, which is the point - and the same reason the score is not asserted as a
+    // mate distance.
+    assert(think.score == 99999);
+    assert(think.pv == 4);
+    assert(think.evals == think.qnodes);
+    assert(think.hits + think.recomputes == think.probes);
+    assert(think.probes == 18238659);
+    assert(think.hits == 12508908);
+
+    std::cout << "test_a_capped_tail_can_pay_back_nodes_it_did_not_save passed (sweep board "
+                 "740, BLACK, depth 4: 153,456 nodes against the uncapped tree's 153,383, "
+                 "+73 for a tail that got 3 plies shorter (seldepth 11 -> 8), with the "
+                 "answer 99,999 at (2,11) over 4 layers unchanged and 138,910 evaluation "
+                 "reads for 138,910 quiescence nodes)"
+              << std::endl;
+}
+
+void test_the_cap_bounds_every_arm_of_the_census_and_is_inert_where_there_is_no_tail() {
+    const int cap = AlphaBetaSearch::kMaxQdepth;
+
+    // The population half of the bound: 42 boards x both colours at root depth 2, the same
+    // generator C2's census is built from. 84 arms, 155,052 nodes, and exactly one of them
+    // has a node entered at the cap (board 0, BLACK). No arm may report past it, and the
+    // aggregate is pinned so a bound that quietly started firing on the other 83 is red
+    // here rather than in a node count nobody reads.
+    uint64_t total_nodes = 0;
+    uint64_t total_qnodes = 0;
+    int deepest = 0;
+    int at_cap = 0;
+    const std::vector<Board> boards = c2_census_boards();
+    for (const Board& board : boards) {
+        for (const int color : {BLACK, WHITE}) {
+            Board work = board;
+            const C4Think think = c4_think(work, color, 2);
+            assert(think.seldepth <= cap);
+            if (think.seldepth == cap) ++at_cap;
+            if (think.seldepth > deepest) deepest = think.seldepth;
+            assert(think.evals == think.qnodes);
+            total_nodes += think.nodes;
+            total_qnodes += think.qnodes;
+        }
+    }
+    assert(boards.size() == 42);
+    assert(total_nodes == 155052);
+    assert(total_qnodes == 139879);
+    assert(deepest == cap);
+    assert(at_cap == 1);
+
+    // The inert half, on two of the arms the tail census measured at reach 6: the cap has
+    // nothing to fire on where the forcing moves run out first, so the node literals this
+    // suite has carried since B3 still hold here.
+    const B2Think quiet_black = b2_think(b1_quiet(), BLACK, 6, 24, 8);
+    assert(quiet_black.nodes == 221774);
+    assert(quiet_black.seldepth == 6);
+    assert(quiet_black.seldepth < cap);
+    const B2Think quiet_white = b2_think(b1_quiet(), WHITE, 6, 24, 8);
+    assert(quiet_white.nodes == 156428);
+    assert(quiet_white.seldepth == 6);
+    assert(quiet_white.seldepth < cap);
+
+    std::cout << "test_the_cap_bounds_every_arm_of_the_census_and_is_inert_where_there_is_no_"
+                 "tail passed (84 census arms / 155,052 nodes / deepest 8 on exactly 1 arm, "
+                 "every arm's evaluation ledger closing on its quiescence count; the "
+                 "tail-free quiet pose keeps 221,774 and 156,428 nodes at seldepth 6)"
+              << std::endl;
+}
+
 int main() {
     std::cout << "Running search tests..." << std::endl;
 
@@ -8242,6 +8631,15 @@ int main() {
     test_a_far_stone_moves_both_sums_alike_and_undo_brings_both_back();
     test_one_set_of_records_answers_the_sum_for_either_colour();
     test_the_nodes_a_cut_kills_pay_the_sum_out_of_the_records();
+
+    // C4, in the contract's order: what a node entered at the bound is, that the budget
+    // still outranks it, the two thinks whose tails reach it, then the bound across a
+    // population and its silence where there is no tail.
+    test_a_quiescence_node_entered_at_the_cap_answers_only_its_own_static_score();
+    test_a_dead_budget_outranks_the_depth_cap_its_check_sits_behind();
+    test_a_think_that_runs_into_the_cap_reports_the_cap_and_the_same_answer();
+    test_a_capped_tail_can_pay_back_nodes_it_did_not_save();
+    test_the_cap_bounds_every_arm_of_the_census_and_is_inert_where_there_is_no_tail();
 
     std::cout << "All search tests passed!" << std::endl;
     return 0;
