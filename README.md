@@ -192,7 +192,7 @@ cd build
 | --- | --- | --- |
 | `--method` | `genetic` | `genetic` 或 `hill`（爬山法） |
 | `--rounds` | 3 | 训练轮数；配合 `--resume` 表示**额外**轮数 |
-| `--depth` / `--timeout-ms` | 4 / 400 | 训练对局的搜索深度与单步思考预算 |
+| `--depth` / `--timeout-ms` / `--max-nodes` | 4 / 400 / 0 | 训练对局的搜索深度、单步思考预算与单步节点上限；`--max-nodes` 给正数时**AlphaBeta 那一手的工作量**按节点定死（负载只改耗时，不改这一手实际搜到多深），VCF/VCT 与认输探测仍按 `--timeout-ms` 切片，所以时间预算留着当兜底；0 是缺省，上限仍由剩余时间换算 |
 | `--max-moves` | 60 | 单盘步数上限，未分胜负记为和 |
 | `--fitness-games` | 2 | 评估一个候选所用的对局数 |
 | `--verification-games` | 8 | 晋升前的验证对局数 |

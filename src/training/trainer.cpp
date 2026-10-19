@@ -62,6 +62,7 @@ double Trainer::play_game(SearchEngine& black, SearchEngine& white, int black_ow
     SelfPlayConfig settings;
     settings.max_depth = config_.search_depth;
     settings.timeout_ms = config_.timeout_ms;
+    settings.max_nodes = config_.max_nodes;
     settings.max_moves = config_.max_moves;
 
     SelfPlay play(black, white, settings);
@@ -217,6 +218,7 @@ int Trainer::generate_data_games(int games, int threads) {
             SelfPlayConfig settings;
             settings.max_depth = config_.search_depth;
             settings.timeout_ms = config_.timeout_ms;
+            settings.max_nodes = config_.max_nodes;
             settings.max_moves = config_.max_moves;
 
             RetryExplorer explorer(engine, engine, settings);

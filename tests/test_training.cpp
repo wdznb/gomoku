@@ -434,7 +434,7 @@ void test_elo_system() {
 
 // Round 101 FF1: the bracket behind the rating table disagreed with the promotion
 // rule it sits next to. README:198 makes a verification match 8 games, so a 5-3
-// candidate scores 0.625, which trainer.cpp:336 promotes (>= the 0.56 accept score)
+// candidate scores 0.625, which trainer.cpp:348 promotes (>= the 0.56 accept score)
 // while the old `>= 0.75 / <= 0.25` test booked *both* sides a draw - the table
 // printed a match somebody had clearly taken as nobody winning. The bracket now
 // follows what a match score means: above half is a win, below half a loss, exactly
@@ -1821,9 +1821,9 @@ void test_sample_refuses_unreadable_identity_keys() {
 // out-parameter, so a discarded game leaves the denominator instead of
 // counting as a half. An INVALID record cannot be produced deterministically
 // through this door: play_game passes an empty prefix and a null stop flag
-// (trainer.cpp:59), SelfPlay::run only reports INVALID for an illegal prefix
-// (self_play.cpp:32-42), an external stop (:122-131) or an engine illegal move
-// (:71-82), and every move generator filters forbidden points. So the out-
+// (trainer.cpp:69), SelfPlay::run only reports INVALID for an illegal prefix
+// (self_play.cpp:38-48), an external stop (:137-143) or an engine illegal move
+// (:77-88), and every move generator filters forbidden points. So the out-
 // parameter is pinned on the valid side here and through the denominator
 // identity below; the negative proof for the exclusion is at compile level.
 void test_play_game_counts_only_valid_games() {
@@ -2100,7 +2100,7 @@ void test_data_game_ids_unique_across_batches() {
 }
 
 // Round 112 PP1: the id a data game got used to be games_played_ + 1 + t * 1000, i.e. a
-// fixed offset off a counter every round advances (trainer.cpp:72 and :256 add each
+// fixed offset off a counter every round advances (trainer.cpp:74 and :268 add each
 // merged record, plus the fitness and verification games). A long run therefore
 // re-reaches the offset legitimately: on the round where games_played_ is 1000, worker
 // 0's base is exactly the base worker 1 used on the games_played_ = 0 round, so two
@@ -3393,7 +3393,7 @@ void test_trainer_refuses_an_empty_flag_value() {
 // Round 99 DD6, labelled as what it is: a help-text assert. Only the usage
 // entries for --stagnation and --hill-iterations were rewritten, and the two
 // claims they now make are the code's existing behaviour - the 3x probe budget is
-// trainer.cpp:312 and the N+1 ceiling is hill_climbing.cpp skipping a step whose
+// trainer.cpp:324 and the N+1 ceiling is hill_climbing.cpp skipping a step whose
 // neighbour is identical. No call path changes, so there is nothing else to pin.
 void test_trainer_help_states_the_probe_budget() {
 #ifndef _WIN32
@@ -3495,8 +3495,8 @@ void test_server_refuses_no_sessions_with_a_stated_path() {
 }
 
 // Round 101 FF2: `--resume CK --seed N` used to start, parse N, and then let the
-// resume overwrite it (trainer.cpp:551 assigns the seed the checkpoint recorded, and
-// trainer.cpp:409 always writes one), so the reproducibility the caller asked for was
+// resume overwrite it (trainer.cpp:563 assigns the seed the checkpoint recorded, and
+// trainer.cpp:421 always writes one), so the reproducibility the caller asked for was
 // not the run that actually happened. The parser now refuses the pair, the same class
 // as the --params/--resume contradiction it sits next to.
 //
@@ -3959,6 +3959,305 @@ void test_trainer_accepts_a_resume_and_checkpoint_that_differ_only_by_a_dot_segm
 #endif
 }
 
+// Round 126, D-1 (docs/ENGINE_REDESIGN.md :434, :592): a training ply may be priced
+// in nodes instead of milliseconds. SelfPlayConfig::max_nodes is armed on both
+// engines by the SelfPlay constructor, because search() names only a depth and a
+// millisecond limit and the engine field is the only route the ceiling has into the
+// next think. The assertions below are exact node counts, which is the property the
+// knob exists to buy: the cut point is a counter read at every node, so it lands on
+// the same number under load, under valgrind, and on a machine that is half asleep -
+// unlike the 10 ms wall-clock arm REVIEW_LOG records for test_search.
+void test_self_play_node_budget_bounds_every_think() {
+    SearchEngine black;
+    SearchEngine white;
+    black.set_resign_detection(false);
+    white.set_resign_detection(false);
+    SelfPlayConfig settings;
+    settings.max_depth = 4;
+    // Five seconds: an unstarted depth-4 think costs a few thousand nodes here, so a
+    // ceiling of 1000 is what must cut every ply, never the clock.
+    settings.timeout_ms = 5000;
+    settings.max_nodes = 1000;
+    settings.max_moves = 8;
+
+    SelfPlay play(black, white, settings);
+    GameRecord record = play.run(std::vector<Move>(), nullptr, nullptr);
+    assert(record.reason != GameEndReason::INVALID);
+    assert(record.moves.size() == 8);
+    assert_playable(record);
+    for (const auto& entry : record.moves) {
+        assert(entry.method == "alphabeta");
+        assert(entry.stopped == "nodes");
+        assert(entry.nodes == settings.max_nodes);
+    }
+    // The record's own sum is the ledger the training run is measured by.
+    assert(record.total_nodes == 8 * settings.max_nodes);
+
+    // A second, independent pair on the same ceiling replays the identical line and
+    // reports the identical work ply for ply: with the budget in nodes, "how much
+    // this game cost" is a property of the position, not of the run.
+    SearchEngine black_b;
+    SearchEngine white_b;
+    black_b.set_resign_detection(false);
+    white_b.set_resign_detection(false);
+    SelfPlay again(black_b, white_b, settings);
+    GameRecord second = again.run(std::vector<Move>(), nullptr, nullptr);
+    assert(second.moves.size() == record.moves.size());
+    for (size_t i = 0; i < second.moves.size(); ++i) {
+        assert(second.moves[i].move == record.moves[i].move);
+        assert(second.moves[i].nodes == record.moves[i].nodes);
+        assert(second.moves[i].stopped == record.moves[i].stopped);
+    }
+
+    std::cout << "test_self_play_node_budget_bounds_every_think passed" << std::endl;
+}
+
+// The doc keeps --timeout-ms as 安全兜底 (docs :434), so a named node ceiling must not
+// disarm the wall clock: with a ceiling too large to reach, the think still stops for
+// time. The reason is asserted rather than a duration, because a duration is what a
+// loaded machine cannot promise. Nothing in this tree could remove that fallback
+// through a flag: TimeManager::allocate's training branch (time_manager.cpp:51) zeroes
+// the soft/hard slice of a MoveBudget that no production caller reads - allocate() is
+// only ever called from the A1 scaffolding tests - and SearchEngine arms the clock
+// twice over, through limits.hard_time_ms and through ab.set_deadline
+// (search_engine.cpp:291, :256).
+void test_self_play_ms_budget_backs_up_a_generous_node_ceiling() {
+    SearchEngine black;
+    SearchEngine white;
+    black.set_resign_detection(false);
+    white.set_resign_detection(false);
+    SelfPlayConfig settings;
+    // Eight layers: no machine finishes that inside 60 ms on these positions, so the
+    // wall clock is certain to be the thing that cuts, while the 20M-node ceiling is
+    // certain never to be reached.
+    settings.max_depth = 8;
+    settings.timeout_ms = 60;
+    settings.max_nodes = 20000000;
+    settings.max_moves = 4;
+
+    SelfPlay play(black, white, settings);
+    GameRecord record = play.run(std::vector<Move>(), nullptr, nullptr);
+    assert(record.reason != GameEndReason::INVALID);
+    assert(record.moves.size() == 4);
+    assert_playable(record);
+    int thought = 0;
+    int done = 0;
+    for (const auto& entry : record.moves) {
+        if (entry.method != "alphabeta") continue;
+        ++thought;
+        // A think that finished every layer it was asked for stops for "none"; that
+        // is still the clock's answer, not the ceiling's.
+        assert(entry.stopped != "nodes");
+        assert(entry.nodes < settings.max_nodes);
+        if (entry.stopped == "time_hard") ++done;
+    }
+    // A game whose every ply answered off a fast path would prove nothing, because
+    // those paths report 0 nodes whatever the budgets say.
+    assert(thought == 4);
+    std::cout << "  [r126] fallback arm: " << done << "/4 plies cut by the ms budget"
+              << std::endl;
+    assert(done >= 1);
+
+    std::cout << "test_self_play_ms_budget_backs_up_a_generous_node_ceiling passed" << std::endl;
+}
+
+// 0 is the default and the old behavior: no ceiling is armed, so nothing can stop for
+// want of one. This is also what keeps every existing SelfPlay caller - the
+// quick_play_config() tests and RetryExplorer's data side - unchanged by the new field.
+void test_self_play_zero_ceiling_arms_no_node_budget() {
+    SearchEngine black;
+    SearchEngine white;
+    black.set_resign_detection(false);
+    white.set_resign_detection(false);
+    SelfPlayConfig settings = quick_play_config();
+    assert(settings.max_nodes == 0);
+    assert(black.max_nodes() == 0);
+
+    SelfPlay play(black, white, settings);
+    assert(black.max_nodes() == 0);
+    assert(white.max_nodes() == 0);
+    GameRecord record = play.run(std::vector<Move>(), nullptr, nullptr);
+    assert(record.reason != GameEndReason::INVALID);
+    assert(!record.moves.empty());
+    assert_playable(record);
+    for (const auto& entry : record.moves) {
+        assert(entry.stopped != "nodes");
+    }
+
+    std::cout << "test_self_play_zero_ceiling_arms_no_node_budget passed" << std::endl;
+}
+
+// A one-node ceiling is not a broken think: the interrupted layer hands back the root
+// move it had, so the game keeps going with a legal - if shallow - line. Zero completed
+// layers with a reported cut is the accounting design doc 2.3.3 asks for, and this is
+// the training-side caller that has to keep working under it.
+void test_self_play_one_node_ceiling_still_answers_legally() {
+    SearchEngine black;
+    SearchEngine white;
+    black.set_resign_detection(false);
+    white.set_resign_detection(false);
+    SelfPlayConfig settings;
+    settings.max_depth = 4;
+    settings.timeout_ms = 5000;
+    settings.max_nodes = 1;
+    settings.max_moves = 6;
+
+    SelfPlay play(black, white, settings);
+    GameRecord record = play.run(std::vector<Move>(), nullptr, nullptr);
+    assert(record.reason == GameEndReason::MOVE_LIMIT);
+    assert(record.moves.size() == 6);
+    assert_playable(record);
+    for (const auto& entry : record.moves) {
+        assert(entry.method == "alphabeta");
+        assert(entry.nodes == 1);
+        assert(entry.stopped == "nodes");
+        // Nothing finished, and the layer that was cut is reported as cut.
+        assert(entry.depth == 0);
+        assert(entry.partial_depth == 1);
+    }
+
+    std::cout << "test_self_play_one_node_ceiling_still_answers_legally passed" << std::endl;
+}
+
+// The two copies TrainingConfig::max_nodes has to make - fitness games go through
+// play_game, data games through the worker lambda - are separate lines, and a run can
+// be half budgeted if only one of them is wired. The fitness side is read back off the
+// engines; the data side owns its engines inside the worker, so it is read off the
+// record file it writes.
+void test_trainer_config_node_budget_reaches_both_game_paths() {
+    TrainingConfig config = fast_training_config();
+    config.search_depth = 4;
+    config.timeout_ms = 5000;
+    config.max_nodes = 1000;
+    config.max_moves = 2;
+
+    Trainer trainer(ThreatCoefficients(), config);
+    SearchEngine black;
+    SearchEngine white;
+    bool played = false;
+    assert(trainer.play_game(black, white, 1, &played) == 0.5);
+    assert(played);
+    assert(black.max_nodes() == config.max_nodes);
+    assert(white.max_nodes() == config.max_nodes);
+
+    // The same engines are the only thing a config that names no ceiling can leave
+    // armed: 0 has to disarm, not inherit whatever the last caller set.
+    TrainingConfig off = fast_training_config();
+    off.search_depth = 4;
+    off.timeout_ms = 5000;
+    off.max_moves = 2;
+    Trainer unarmed(ThreatCoefficients(), off);
+    SearchEngine black_b;
+    SearchEngine white_b;
+    black_b.set_max_nodes(9000);
+    white_b.set_max_nodes(9000);
+    assert(unarmed.play_game(black_b, white_b, 1, nullptr) == 0.5);
+    assert(black_b.max_nodes() == 0);
+    assert(white_b.max_nodes() == 0);
+
+    const std::filesystem::path records = temp_path("r126_node_budget_records.jsonl");
+    TrainingConfig data = config;
+    data.max_moves = 6;
+    data.data_threads = 1;
+    data.data_opening_plies = 2;
+    data.seed = 4242;
+    data.records_path = records.string();
+    data.samples_path.clear();
+    Trainer collector(ThreatCoefficients(), data);
+    assert(collector.generate_data_games(1, 1) > 0);
+
+    std::ifstream records_file(records);
+    std::string line;
+    int games = 0;
+    int capped = 0;
+    std::string error;
+    while (std::getline(records_file, line)) {
+        if (line.empty()) continue;
+        GameRecord record;
+        assert(GameRecord::from_json(line, record, error));
+        ++games;
+        for (const auto& entry : record.moves) {
+            // The two opening plies are replayed, not thought, so they carry no budget.
+            if (entry.method == "replay") continue;
+            assert(entry.nodes <= data.max_nodes);
+            if (entry.stopped == "nodes") ++capped;
+        }
+    }
+    std::cout << "  [r126] data games=" << games << " node-capped plies=" << capped << std::endl;
+    assert(games >= 1);
+    // Uncapped this arm's depth-4 plies cost several thousand nodes each (measured for
+    // this round), so a single capped ply can only mean the ceiling reached the worker.
+    assert(capped >= 1);
+
+    std::error_code ec;
+    std::filesystem::remove(records, ec);
+    std::cout << "test_trainer_config_node_budget_reaches_both_game_paths passed" << std::endl;
+}
+
+// The CLI half: --max-nodes parses, 0 is its own answer rather than a rejected count,
+// and the negative and missing-value arms are refused before a game is played.
+void test_trainer_cli_max_nodes_probes() {
+#ifndef _WIN32
+    if (!std::filesystem::exists("gomoku_train")) {
+        std::cout << "  --max-nodes probes skipped: gomoku_train is not in the working "
+                     "directory" << std::endl;
+        std::cout << "test_trainer_cli_max_nodes_probes passed" << std::endl;
+        return;
+    }
+    const std::string base =
+        "--rounds 1 --population 2 --generations 1 --depth 1 --timeout-ms 1 --max-moves 2 "
+        "--fitness-games 1 --verification-games 2 --no-data --quiet";
+    const std::filesystem::path err = temp_path("r126_max_nodes_stderr.txt");
+    const std::filesystem::path out_path = temp_path("r126_max_nodes_out.json");
+    auto read_all = [](const std::filesystem::path& p) {
+        std::ifstream in(p);
+        std::ostringstream text;
+        text << in.rdbuf();
+        return text.str();
+    };
+    auto run = [&](const std::string& arguments) {
+        const std::string command = "./gomoku_train " + base + " --out '" + out_path.string() +
+                                    "' " + arguments + " > /dev/null 2> '" + err.string() + "'";
+        const int status = std::system(command.c_str());
+        assert(status != -1);
+        return WEXITSTATUS(status);
+    };
+
+    const int zero = run("--max-nodes 0");
+    const int named = run("--max-nodes 5000");
+    std::string zero_err = read_all(err);
+    std::cout << "  [r126] --max-nodes 0 => exit " << zero << ", --max-nodes 5000 => exit "
+              << named << std::endl;
+    assert(zero == 0);
+    assert(zero_err.empty());
+    assert(named == 0);
+
+    const int negative = run("--max-nodes -1");
+    const std::string negative_err = read_all(err);
+    std::cout << "  [r126] --max-nodes -1 => exit " << negative << ", stderr says "
+              << (negative_err.find("--max-nodes") != std::string::npos ? "the flag" : "nothing")
+              << std::endl;
+    assert(negative == 1);
+    assert(negative_err.find("--max-nodes") != std::string::npos);
+
+    const int missing = run("--max-nodes");
+    assert(missing == 1);
+    const int junk = run("--max-nodes 1e3");
+    assert(junk == 1);
+
+    const std::filesystem::path usage = temp_path("r126_max_nodes_usage.txt");
+    assert(std::system(("./gomoku_train --help > '" + usage.string() + "' 2>&1").c_str()) != -1);
+    const std::string help = read_all(usage);
+    std::cout << "  [r126] --help mentions --max-nodes: "
+              << (help.find("--max-nodes") != std::string::npos ? "yes" : "no") << std::endl;
+    assert(help.find("--max-nodes") != std::string::npos);
+
+    std::error_code ec;
+    std::filesystem::remove(out_path, ec);
+    std::cout << "test_trainer_cli_max_nodes_probes passed" << std::endl;
+#endif
+}
+
 int main() {
     std::cout << "Running training tests..." << std::endl;
 
@@ -4029,6 +4328,12 @@ int main() {
     test_params_legacy_12_key_file_still_loads();
     test_params_position_and_width_genes_round_trip();
     test_params_refuses_only_stated_width_conflicts();
+    test_self_play_node_budget_bounds_every_think();
+    test_self_play_ms_budget_backs_up_a_generous_node_ceiling();
+    test_self_play_zero_ceiling_arms_no_node_budget();
+    test_self_play_one_node_ceiling_still_answers_legally();
+    test_trainer_config_node_budget_reaches_both_game_paths();
+    test_trainer_cli_max_nodes_probes();
 
     std::cout << "All training tests passed" << std::endl;
     return 0;

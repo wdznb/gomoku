@@ -30,6 +30,11 @@ struct TrainingConfig {
     // are the knobs that decide how long a run takes.
     int search_depth = 4;
     int timeout_ms = 400;
+    // Nodes one think may spend during training matches. Zero keeps today's cost
+    // model, where the ceiling is what the remaining milliseconds derive. A named
+    // value makes a ply cost the same on an idle and a loaded machine, and
+    // timeout_ms then only backs the think up if it runs long.
+    int max_nodes = 0;
     int max_moves = 60;
     bool resign_enabled = true;
 

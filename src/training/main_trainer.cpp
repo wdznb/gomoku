@@ -36,6 +36,10 @@ void print_usage(const char* program) {
         "                              N+1 evaluations per round (12)\n"
         "  --depth N                   Search depth during training games (4)\n"
         "  --timeout-ms N              Per-move thinking budget in ms (400)\n"
+        "  --max-nodes N               Per-move node ceiling; 0 lets the ms budget\n"
+        "                              set the ceiling, a positive number makes each\n"
+        "                              ply cost the same whatever the machine is\n"
+        "                              doing, with --timeout-ms as the fallback (0)\n"
         "  --max-moves N               Ply cap for a training game (60)\n"
         "  --fitness-games N           Games used to score one candidate (2)\n"
         "  --verification-games N      Games a candidate must beat the champion\n"
@@ -206,6 +210,11 @@ int main(int argc, char** argv) {
                 // The bounds are the guard below's business (--timeout-ms at least
                 // 1, --max-moves at least 2), so this parses any integer written.
                 config.timeout_ms = require_int("--timeout-ms", i, argc, argv, INT_MIN);
+            } else if (flag == "--max-nodes") {
+                // Zero is this knob's own answer - "the ms budget sets the ceiling" -
+                // so unlike the counts where 0 is a run that silently does nothing,
+                // it has to parse. Only negatives are refused.
+                config.max_nodes = require_int("--max-nodes", i, argc, argv, 0);
             } else if (flag == "--max-moves") {
                 config.max_moves = require_int("--max-moves", i, argc, argv, INT_MIN);
             } else if (flag == "--fitness-games") {

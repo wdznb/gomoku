@@ -18,7 +18,13 @@ std::vector<Move> legal_moves(const Board& board, int color) {
 
 SelfPlay::SelfPlay(SearchEngine& black_engine, SearchEngine& white_engine,
                    const SelfPlayConfig& config)
-    : black_engine_(black_engine), white_engine_(white_engine), config_(config) {}
+    : black_engine_(black_engine), white_engine_(white_engine), config_(config) {
+    // search() names only a depth and a millisecond limit, so the engine field is
+    // the only route a node ceiling has into the next think. A non-positive value
+    // clamps to 0 inside the setter, which is the previous behavior.
+    black_engine_.set_max_nodes(config_.max_nodes);
+    white_engine_.set_max_nodes(config_.max_nodes);
+}
 
 GameRecord SelfPlay::run(const std::vector<Move>& prefix,
                          std::vector<PlyChoices>* out_choices,

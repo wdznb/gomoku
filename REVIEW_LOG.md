@@ -1979,6 +1979,104 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次126 引擎重构 D-1：一手棋第一次可以按节点出价，而时钟留在原地 — engine redesign stage D1, --max-nodes
+
+规格 `docs/ENGINE_REDESIGN.md` `:434`（§2.8 `#2`「节点预算替代时间预算：训练配置从 `--timeout-ms` 改为 `--max-nodes`（保留 `--timeout-ms` 作为安全兜底）。每盘成本可预测，训练时长可控，且不受机器负载影响」），落地清单 `:592` 认的接口是「`src/training/main_trainer.cpp` 新增 `--max-nodes`；保留 `--timeout-ms` 为兜底」，验收仍在 `:550`：「单轮训练耗时下降 ≥ 40 %；内存峰值与并发局数解耦；`--fitness-games 2` 下 fitness 不再只有三档」。轮次125 把尺子交出来，本轮按那把尺子复测。
+
+### 实现：预算走的是引擎字段，不是新开关
+
+- `SelfPlayConfig::max_nodes`（`src/training/self_play.h:18`，缺省 0）、`TrainingConfig::max_nodes`（`src/training/trainer.h:37`，缺省 0）。
+- 装表的唯一位置是 `SelfPlay` 的构造函数（`src/training/self_play.cpp:25-26`）。这不是顺手：`SearchEngine::search()` 的签名只接深度和毫秒（`src/search/search_engine.h:56-58`），节点上限进不了那一次调用，只有引擎字段这一条路（读它在 `src/search/search_engine.cpp:299`）。构造即装表同时管住两条调用线——采集侧的 `RetryExplorer` 把配置原样转交给它内嵌的 `SelfPlay`（`self_play.cpp:150-152`），`set_max_nodes` 对非正数夹回 0（`search_engine.h:78`），所以「0 = 不装」在两个方向上都成立（M 臂 M3 之外还专门有一条用例盯这一点）。
+- 两处拷贝：`trainer.cpp:65`（适配度赛与验证赛走 `play_game`）与 `trainer.cpp:221`（采集 worker 在自己的线程里建 `RetryExplorer`）。这两行不是一行：`--threads` 只并行采集（轮次125 第 1 条），漏掉任何一条就是一半的局未按预算跑。
+- CLI：`main_trainer.cpp:39-42` 帮助、`:213-217` 解析。`require_int` 的下界给的是 **0** 而不是缺省的 1，因为 0 是这个开关自己的答案（「不要节点上限」），而其它计数项的 0 是「跑一趟什么都不做」；`:272` 那条旧校验一字未动，负数在解析阶段就被拒。
+- 新增的唯一读取口是 `search_engine.h:81` 的 `max_nodes()`。加它是因为 `SelfPlay` 装表之后，训练侧的接线只有从引擎外面才量得到（`tests/test_training.cpp` 的 `#define private public` 只重写了 `trainer.h`，`SearchEngine` 的字段仍是私有的）。
+
+**`--max-nodes` 不置 `limits.training`**，这是本轮唯一一处「文档内部打架、按其中一条实现」的决定，也是量出来才发现的：`:434` 要保留兜底，`:251` 却要「训练模式：直接返回 {0,0,max_nodes}，时间预算不参与」。按 `:251` 实现本来会关掉什么？——**什么也关不掉**。`TimeManager::allocate`（`src/search/time_manager.cpp:43-92`）在生产路径里**没有调用者**（全树只有 `tests/test_search.cpp:4039-4102` 的 A1 脚手架调它），而一手棋的时钟是 `SearchEngine` 自己两处装的：`limits.hard_time_ms`（`search_engine.cpp:291`）与 `ab.set_deadline`（`:256`）。所以「保留兜底」在这棵树里不是一个可以被开关违背的选项，它是现状；要把它拆掉得动那两行，本轮不动，并且用 M5 证明「拆掉两处才红、拆一处不红」。`:251` 那行等 `TimeManager` 真的接到搜索上的那一天再结算。
+
+### 读数：`:550` 的耗时那一半达成，代价写在同一行
+
+同一把尺子（`--depth 4 --max-moves 60 --seed 20261011 --rounds 1`，`/usr/bin/time`，6 核机器，每臂串行），产物只落 `/tmp/d1/`。
+
+| 臂 | 预算 | 墙钟 | user | 峰值 RSS | 该轮结论 |
+| --- | --- | --- | --- | --- | --- |
+| B-ms ×2 | `--timeout-ms 400`，`--no-data`，pop 4 × gen 2 | 58.53 / 57.10 s | 57.43 / 56.62 s | 27,260 / 27,092 kB | 2 代 10 评估、验证 1.000 晋升，22 盘 |
+| B-n4000 | 同上 + `--max-nodes 4000` | **16.99 s** | 16.42 s | 27,100 kB | 同一结论 |
+| B-n12000 | 同上 + `--max-nodes 12000` | 32.86 s | 32.37 s | 26,920 kB | 同一结论 |
+| B-n500 | 同上 + `--max-nodes 500` | 10.20 s | 10.06 s | 20,088 kB | 同一结论 |
+| D-ms ×2 | 默认量级（pop 8 × gen 4、验证 8 局、采集 4 盘 × 2 线程） | 180.59 / 183.48 s | 187.28 / 189.32 s | 42,512 / 42,084 kB | 3 代 29 评估、验证 **0.875 晋升 v1**、70 盘 / 704 样本 |
+| D-nodes ×2 | 同上 + `--max-nodes 4000` | **52.53 / 51.21 s** | 53.15 / 52.66 s | 42,420 / 42,268 kB | 3 代 29 评估、验证 **0.375 不晋升**、70 盘 / 560 样本 |
+
+- **耗时**：no-data 尺子相对两次 ms 的均值 57.82 s，`--max-nodes 4000` 是 −70.6 %、12000 是 −43.2 %、500 是 −82.4 %；默认量级相对均值 182.04 s 是 **−71.5 %**（逐臂 −70.9 % / −72.1 %）。`:550` 的「单轮 −≥40 %」由 D-1 一条就在这把尺子上过线了；README `:186` 那条 `--rounds 20` 按轮次125 的尺子是 ≈61 分钟，按 `--max-nodes 4000` 是 ≈17 分钟。
+- **代价必须写在同一行**：这一半是「每手棋搜得更浅」买的，不是免费的。records 里 alphabeta 着法达到的深度，ms 臂是 `{3, 4}`，节点臂是 `{2, 3}`；同一 seed 下默认量级的验证赛结论因此**翻了面**（0.875 晋升 ↔ 0.375 不晋升，两次复跑各自稳定）。所以 `#2` 换到的是**口径**（成本可按节点定价、逐着可复现），不是一个可以让同一轮既便宜又做同样决定的旋钮。要按节点训练，预算得先按「这一档深度还认不认」定，而不是按省了多少秒定。
+- **「每盘成本可预测」第一次有仪器**（轮次125 第 4 条欠的那件）：节点臂 4 盘记录共 90 个引擎着法，其中 **70 个正好 4000 节点**，`sum_nodes` 两次都是 280,000 = 70 × 4000；ms 臂 116 个引擎着法、两次 1,849,936 / 1,840,180 节点。剩下的 20 着仍是 `must_block`/`vcf` 早退，按定义记 0（`search_engine.h:23`），这条口径没变，也仍然是「0 ≠ 便宜」。
+- **「不受机器负载影响」量到的是复现性**：同一二进制、同一 seed 两次跑，ms 臂 88 个 alphabeta 着法里只有 **78 个**报同样的节点数（差的 10 个正是被时钟切的位置），节点臂 **70/70 全等**。两次 ms 臂的验证分这回合都是 0.875，所以不能把轮次125 那一次的 1.000 归因于此——逐着工作量已经证明「同一 seed 的 ms 臂不保证同一盘棋」，但要把 1.000↔0.875 记在这笔账上还需要更多样本，本轮不下这个结论。
+- **内存**：42,512 / 42,084 对 42,420 / 42,268 kB，四个数同一量级——预算口径不动内存，`:550` 的第二条（与并发局数解耦）不是 `#2` 能碰的，它是 D-2。
+
+### 测试：六个用例，断言写的是精确节点数
+
+`tests/test_training.cpp` `+313/−8`，其中 8 行删除全部是本节『门禁』列出的注释行号重钉，新增的六个用例本身是纯追加（定义 `:3970-4259`，注册 `:4331-4336`），写法沿用 REVIEW_LOG 既有风格：先跑真实对局再对账，不用桩。
+
+1. `test_self_play_node_budget_bounds_every_think`（`:3970`）——深度 4 / 5 s / 1000 节点下的 8 着：每着 `method == "alphabeta"`、`stopped == "nodes"`、`nodes == 1000` 逐着全等，`total_nodes == 8000`；再用另一对全新引擎复跑，逐着比对落子与节点数（`:4005-4010`）。**断言敢写精确值，正是因为截止点是一个每节点都读的计数器**（`search_state.h:422`）而不是墙钟——这与 `test_search.cpp:3973` 那条 10 ms 臂在 valgrind 下必红是同一件事的两面。
+2. `test_self_play_ms_budget_backs_up_a_generous_node_ceiling`（`:4024`）——深度 8 / 60 ms / 2000 万节点：4 着全按 alphabeta 回答，**没有一着报 `nodes`**，且至少一着报 `time_hard`（读数打印 `4/4`）。断言的是停止原因而不是时长，理由同上。
+3. `test_self_play_zero_ceiling_arms_no_node_budget`（`:4067`）——`max_nodes` 缺省时构造 `SelfPlay` 前后 `max_nodes()` 都是 0，整盘没有任何一着 `stopped == "nodes"`。这条是「老调用者一字不变」的下界（`quick_play_config()` 与 `RetryExplorer` 数据侧全靠它）。
+4. `test_self_play_one_node_ceiling_still_answers_legally`（`:4094`）——1 节点上限：6 着全报 `nodes == 1`、`depth == 0`、`partial_depth == 1`，整盘仍 `assert_playable`、结局是 `MOVE_LIMIT` 而不是 `INVALID`。预算再小也不许把盘写坏，这条是「训练侧必须继续能吃 `src/search/search_engine.cpp:341-346` 那套分层账」的钉子。
+5. `test_trainer_config_node_budget_reaches_both_game_paths`（`:4127`）——`play_game` 之后两台引擎都读回 1000；换成 `max_nodes` 未给的配置去开一台已被 `set_max_nodes(9000)` 装过的引擎，必须夹回 0；再走采集侧：`generate_data_games(1, 1)` 写出的 JSONL 用 `GameRecord::from_json` 读回，逐着 `nodes <= 1000` 且至少一着真触顶（打印 `data games=1 node-capped plies=4`）。
+6. `test_trainer_cli_max_nodes_probes`（`:4199`）——`--max-nodes 0` 与 `--max-nodes 5000` 都退出 0 且 stderr 空，`-1` 退出 1 且报这个旗标名，缺值与 `1e3` 退出 1，`--help` 里有这一行。
+
+### 变异矩阵：六臂，逐臂只红一处，全部被抓
+
+每臂改一处、整树重建、只跑 `test_training`；控制臂是未改动的同一驱动（rc=0 / 9.84 s）。
+
+| 臂 | 改动 | 结果 |
+| --- | --- | --- |
+| M1 | 删 `self_play.cpp:25-26` 两行装表 | rc=134，`test_training.cpp:3990` `entry.stopped == "nodes"` |
+| M2 | 删 `trainer.cpp:65`（适配度侧拷贝） | rc=134，`:4140` `black.max_nodes() == config.max_nodes` |
+| M3 | 删 `trainer.cpp:221`（采集侧拷贝） | rc=134，`:4182` `entry.nodes <= data.max_nodes` |
+| M4 | `require_int("--max-nodes", …, 0)` 改回缺省下界 1 | rc=134，`:4231` `zero == 0` |
+| M5 | 同时拆掉两处时钟装配（`search_engine.cpp:291` 与 `:256`） | rc=134，`:4059` `done >= 1`，打印 `0/4 plies cut by the ms budget` |
+| M6 | 只装黑棋引擎 | rc=134，`:3990`（白棋那一着未封顶） |
+
+**本轮工具自己的两处缺陷，按原样报而不是当发现交出去**：
+
+1. 第一遍跑矩阵时 `run_arm` 用的是 `cmake --build build --target test_training`，它**不重建 `gomoku_train`**，而用例 6 的 CLI 探臂 exec 的是 cwd 里那个二进制——于是 M4 报了一次假绿（rc=0）。第二遍改成整树重建才拿到 `:4231` 的红。这与轮次124 记的「零计数来自一棵没建起来的树」是同一类错误，只是这次藏在另一个目标上。
+2. 同一个 M5 第一遍的 rc=0 **是真读数不是工具问题**：只把 `limits.hard_time_ms` 归零并不足以拆掉兜底，`ab.set_deadline` 那一处在装着同一个时钟。这一条也正是上面「`limits.training` 什么也关不掉」那个判断的实验根据。
+
+`/tmp/d1/`：`mut.sh`（M1-M3、M6）、`mut2.sh`（M4、M5，整树重建）、`measure.sh`（成本臂）、`repro.sh`（复现臂 + Valgrind）、`mem.sh`（四臂 memcheck）、`driver_d1.cpp`。
+
+### Valgrind
+
+四臂 memcheck 串行跑在空闲机上（`--tool=memcheck --leak-check=full --show-leak-kinds=all --track-origins=yes`，`--log-file` 把 stderr 全留在盘上，不用 `tools/valgrind_check.sh`——轮次124 记过它把 stderr 送进 mktemp 再 `rm -f`，断言文本从来落不了盘）。二进制来自 `build-vg`，用离线 pin 配置（`-DFETCHCONTENT_SOURCE_DIR_JSON=build/_deps/json-src -DFETCHCONTENT_FULLY_DISCONNECTED=ON`）；`test_training` 与 `test_server` 都在 `build-vg` 目录里执行，因为它们的 CLI 探臂 exec 的是 cwd 下的 `./gomoku_train`，换个目录就是静默 skip 而不是失败。
+
+| 臂 | rc | 时长 | ERROR SUMMARY | in use at exit | 堆使用（allocs/frees/bytes） |
+| --- | --- | --- | --- | --- | --- |
+| driver `/tmp/d1/driver_d1_vg` | 0 | 26 s | 0 errors from 0 contexts | 0 bytes | 26,871 / 26,871 / 69,989,264 |
+| `test_training` | 0 | 219 s | 0 errors from 0 contexts | 0 bytes | 286,104 / 286,104 / 418,388,354 |
+| `test_server` | 0 | 42 s | 0 errors from 0 contexts | 0 bytes | 110,677 / 110,677 / 468,062,337 |
+| `test_search` | 134 | 254 s | 到不了（进程在 `:3973` abort，无 HEAP SUMMARY） | — | 20 条 loss record：19 still reachable + 1 possibly lost；invalid read/write 0、uninitialised 0 |
+
+- 前三臂每一行都是 `All heap blocks were freed -- no leaks are possible`，allocs 与 frees 相等。driver 臂是本轮的接线仪器（`/tmp/d1/driver_d1.cpp`，非提交物）：`armed max_nodes black=1000 white=1000` → 6 着 6,000 节点 → `disarmed max_nodes=0` → 1 节点臂 `total_nodes=4`、20 s 兜底臂 `total_nodes=554`，`DRIVER plies=14 capped=10`。
+- **工具缺陷一条，按原样报**：第一遍四臂都带 `-q`，而 `-q` 下 clean run 写出的 log 是 **0 字节**（对照：`valgrind -q /bin/true` 落 0 字节，去掉 `-q` 落 658 字节并打印 `ERROR SUMMARY: 0 errors from 0 contexts`）。所以第一遍那三行的 `uninit=0 invalid_read=0` 是对空文件 grep 出来的，`ERROR SUMMARY`/`definitely lost` 两个字段直接是空串——与轮次124 记的「零计数来自一棵没建起来的树」同类，只是这次藏在 flag 上。上表来自第二遍（`/tmp/d1/mem2.sh`，三臂不带 `-q` 重跑，26/219/42 s），`test_search` 那一行仍取第一遍的 28 KB log，因为它本来就有内容。
+- `test_search` 的 rc=134 复现的是**既有**那条 10 ms 墙钟臂，文本逐字一致：`test_search: /home/wdz/Desktop/workspace/gomoku/tests/test_search.cpp:3973: void test_engine_reports_the_interrupted_alphabeta_layer(): Assertion 'interrupted.partial_depth == 1' failed.`（`out_test_search.log`，紧邻的上一行是 `test_engine_reports_the_interrupted_alphabeta_layer measured (interrupted: alphabeta d0+partial 0/n0 time_hard, ...)`，即断言之前读数已经打印）。它红在 valgrind 的时间尺度而不是本轮代码——本轮六条新用例全在 `test_training`，那一臂 rc=0 且 `All training tests passed`。
+- 那 20 条 loss record 的归属可查：still-reachable 的栈顶是 `TranspositionTable::TranspositionTable`（`src/search/transposition.cpp:23`）经 `SearchEngine::SearchEngine()`（`src/search/search_engine.cpp:26`），即进程 abort 时仍活着的引擎自有的表；possibly lost 的 304 B 是 glibc `pthread_create` 的 DTV 分配（`allocate_dtv (dl-tls.c:470)`）。两条都随 abort 一起消失，不是本轮引入的分配。
+- TSan 不复跑，理由与轮次124 同一条并加强：本轮新增的共享面是**零**——`max_nodes` 只在 `SelfPlay` 构造时写进各自引擎的字段（`self_play.cpp:25-26`），读取方 `search_engine.cpp:299` 与 `search_state.h:422` 都在同一线程的那次思考之内；worker 之间没有任何新交叉。B3 记在案的那个真竞态在 `server` 侧，仍排队在 bugfix 批。
+
+
+### 门禁
+
+- `ctest`：**8/8 通过 / 442.47 s**（`test_search` 414.18 s 占 93.6 %、`test_training` 9.89 s、`test_server` 10.23 s、`test_position` 7.93 s）。
+- `node tests/web_frontend_check.js`：**105/105**；`node tests/readme_anchor_check.js`：**120 citations / 0 problems**；README **658 行**。
+- README 的 `--max-nodes` 是**行内改写 `:195`**（选项表那一行），没有增删行——被注释引用的 `:198`/`:204`/`:206`/`:207`/`:215` 全部还在原行，这也是 anchor 读数与上一轮相同的原因。
+- 位移波及的行号全部重新钉过：`docs/ENGINE_REDESIGN.md:108` 的 `trainer.cpp:100-101 → 101-102`、`trainer.cpp:214 → 215`；`tests/test_training.cpp` 里 6 处 `trainer.cpp` / `self_play.cpp` 行号按本树重定位，其中 `:59`、`:256`、`:312`、`:551`、`:409`、`:122-131` 这六条在 HEAD 上**本来就已指向空行或别的语句**（逐条 `git show HEAD:… | sed -n 'Np'` 对过），一并钉到当前真位置（`:69`、`:268`、`:324`、`:563`、`:421`、`:137-143`）。
+- `src/` 之外只动 `tests/test_training.cpp`（+313/−8，8 行删除全是上条所列注释行号重钉）与两份文档；`CMakeLists.txt`、`web/`、`tools/` 一字未动。
+
+### 未达成 / 未完成
+
+- `:550` 的三条只推进了第一条的一半：**内存与并发解耦**没动（本轮 RSS 与预算口径无关，四个读数同量级），**`--fitness-games 2` 三档**没动（轮次125 第 5 条：那是 `pairs = 1` 的算术，归 D-3 的 SPRT）。耗时那一半达成（−71.5 % @默认量级），但达成方式是「搜得更浅」，本轮把它连同翻面的验证分一起交了，没有粉饰成免费收益。
+- **节点上限只封 AlphaBeta**：VCF/VCT 与认输探测仍按 `--timeout-ms` 切片（`search_engine.cpp:214-217`、`:236-239`、`:368-388`）。实测（`/tmp/d1/probe5.out`，本树重建的探针）：深度 2 / 1000 节点 / 20 s 的一盘 8 着，逐着 AlphaBeta 节点数在「战术层开」与「战术层关」两次完全相同（72/76/252/446/797/827/868/573，合计 3,911），而第 7 着开着战术层吃 **6,016 ms**、关掉吃 **16 ms**；整盘 `sum_elapsed` 6,103 ms → 86 ms（`/tmp/d1/probe3.out`）。那一着的 AlphaBeta 只用了 868 个节点，离 1,000 的上限还有距离，所以节点预算对它无话可说。「训练时长可控」在战术密集的局面下仍不成立，`:434` 那句「每盘成本可预测」的适用范围应按这个口径缩小（README `:195` 本轮就按「AlphaBeta 那一手的工作量」写）。要不要把战术层也接进节点预算，是一个新的口径决定，留给 D-2/D-3 之后单独立项，本轮不顺手改。
+- 采集数据会随预算变薄，且这本账现在能算平：默认量级样本 704 → 560，等于 alphabeta 着数 88 → 70 乘以 `SYMMETRY_COUNT = 8`（`transforms.h:12`）；引擎着法总数 116 → 90，掉的那 26 着里 alphabeta 少 18、`must_block` 少 8（24 → 16，`vcf` 两臂都是 4）。两臂的 alphabeta 着法 depth 全部 ≥ 1（`{3,4}` 与 `{2,3}`），所以 `data_collector.cpp:130` 的 `entry.depth >= min_search_depth_` 门（`min_search_depth_ = 1`，`data_collector.h:74`）在这把尺子上一个样本都没砍掉；它砍样本是在预算压到 `depth == 0` 的那一档（本轮用例 4 就是那一档：6 着全 `depth == 0`，一个样本都不会产生）。所以「预算越小数据越薄」在这一轮是**棋局变短、早退变多**的结果，不是过滤器在动手——这条要按这个口径记，否则 D-3/D-4 会去修一个没坏的门。
+- 上一轮欠的一条账在这里补：`23e6453` 的提交信息写 `+5/-1`（那条对）与本轮无关，但它自身正文里「tests/test_search.cpp is +492/-0」同类口径的 `+24/-11` 实为 `git diff --numstat` 的 **25/11**，已发布的提交不改写，按原样申报。
+- D 阶段进度：`#2` 本轮落地；`#1`（分片共享 TT，按 7.3 MB/worker 定价，且必须先给 `trainer.cpp:96-99` 那条「表里的分数是换掉的系数算出来的」建失效口径）、`#3`（SPRT，动 `trainer.cpp:108` 的 `pairs`）、`#4`（开局库数据通路）、`#5`（`controller.h:50` 与 `alphabeta.cpp:601` 的两处 `Board` 拷贝）依次未完。
+
 ## 轮次125 D 阶段基线：一轮训练的成本几乎全在串行的适配度赛，而并发的那张表第一次量到 7.3 MB — engine redesign stage D, baseline measurement
 
 规格 `docs/ENGINE_REDESIGN.md` `:433-437` §2.8 列了五件事，验收在 `:550`：「单轮训练耗时下降 ≥ 40 %；内存峰值与并发局数解耦；`--fitness-games 2` 下 fitness 不再只有三档」。本轮**不动一行代码**，只做一件事——把「一轮训练的成本到底花在哪」量出来。这个必须先量，因为按文档给的数去改会改错地方：文档 `:434` 说「当前是每引擎一张 8.4MB 表，N 个并发 → N × 8.4MB」，而 `:437` 的 `#5` 说 `Board` 是「传参一次 + 每层一次」；两条都不是这棵树现在的形状，量完发现真正吃掉一轮的是**另一件事**。

@@ -76,6 +76,9 @@ public:
     // which a millisecond budget cannot promise on a loaded machine.
     void set_soft_time_ms(int ms) { soft_time_ms_ = ms > 0 ? ms : 0; }
     void set_max_nodes(int nodes) { max_nodes_ = nodes > 0 ? nodes : 0; }
+    // What the next think is held to. Only AlphaBeta reads it; the tactical phases
+    // and the resign probe still slice the millisecond budget.
+    int max_nodes() const { return max_nodes_; }
 
     void set_coefficients(const ThreatCoefficients& coeffs);
 
