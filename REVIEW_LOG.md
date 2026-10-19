@@ -1979,6 +1979,95 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次130 引擎重构 D-5：一次交接从两份 Board 变成一份，而这一笔只能用 TSan 和指令数说话 — engine redesign stage D5, the controller's Board hand-off
+
+规格 `docs/ENGINE_REDESIGN.md:437` 的 `#5` 是 §2.8 五条里唯一一条不碰训练资源、只碰一次函数调用的：
+
+> **去掉不必要的 Board 复制**：`SearchController::search_worker` 改为接收 `const Board&` 并在 worker 内自行构造可变副本（或直接在 worker 内 copy 一次），避免「传参一次 + 每层一次」的重复复制。
+
+落地面 `:585` 那一行是 `src/search/controller.h/.cpp` ——「`search_worker` 不再按值收 `Board`；透传 `SearchLimits` 与上一手 `hint`」，验收 `:550` 是 D 阶段那三笔（单轮耗时 −40 %／内存与并发解耦／`--fitness-games 2` 下 fitness 不再只有三档）。
+
+### 读数 1：动手前先量，文档的前提已经不是现状
+
+「传参一次」在，「每层一次」不在。三档节点预算下把每次 think 里所有 Board 复制点逐个清点（仪表在树外，`/tmp/d5/count_copies.py` 上`--on`／下`--off`，跑完 `git checkout` 还原）：
+
+| 量什么 | 量到什么 | 哪份产物能重算 |
+| --- | --- | --- |
+| `sizeof(Board)` | **4664 B**（bitboard + 邻居计数 + `active_empty` + 两手历史） | `/tmp/d5/probe.cpp`、`/tmp/d5/cpu.log` P1 两条独立打印 |
+| 一次 copy-assign | **90.0 ns/op**（20 万次循环，`build/` 的 -O2 对象） | `/tmp/d5/gate_probe.log` 第 3 行 |
+| 旧的整个交接（构参 + move 一对） | **178.7 ns/op** ⇒ 本轮省下 **88.7 ns**，即 178.7 − 90.0 | 同上第 5 行与第 3 行相减；`move` 单独一项由 177.9 − 90.0 = 87.9 ns 交叉核过 |
+| 「每层一次」还在不在 | 不在了：`src/search/alphabeta.cpp:601` 的 `Board work_board = board;` 在深度循环（`:603`）**之前**，一次 think 只有一份，不是每层一份 | `src/search/alphabeta.cpp:598-604` |
+| 一次 think 究竟几份 | **3.10／5.00／6.73 份每 think**（21／26／30 手分别共 65／130／202 份） | `/tmp/d5/census_2000.txt`、`census_20000.txt`、`census_200000.txt` 各自倒数第二行 |
+| 这些复制值多少钱 | 那三份仪表自报的口径是 94 ns/份：2000 节点臂 **0.01 ms 对 1.22 s**、20000 臂 0.01 ms 对 2.79 s、200 000 臂 0.02 ms 对 4.35 s，即 ~0.0005 %。**同一台机器重跑同一个探针量到 90.0 ns**，4 ns 的差就是这台机器的墙钟噪声等级 —— 所以这一栏只当量级看，本轮不用它下结论（结论用读数 4 的指令数） | 同上，每臂末尾 `at 94 ns/copy:` 行 vs `/tmp/d5/gate_probe.log` |
+| 复制的大头在哪 | `src/search/vcf.cpp:420` 的 `Board after = board;`（每个防守应手一份）占 **53.8 %／70.0 %／75.7 %**；`alphabeta.cpp:601` 那一手一份只占 23.1 %／14.6 %／10.4 % | 同上，`site … ( % of the run's counted copies)` 行 |
+
+而 `SearchController` 在生产里**一个调用者都没有**：`grep -rn SearchController src/` 除了它自己那对文件之外为空，服务器与自对弈都直接调 `SearchEngine::search(const Board&, …)`（`src/server/game_manager.cpp:363`、`:467`、`src/training/self_play.cpp:68`），且这三处传的都是**调用方自己拥有的快照**（`board_snapshot`、`snapshot`、`board`）。本轮给控制器补上的形态，正是生产路径一直在用的形态。
+
+### 实现
+
+- `src/search/controller.h:53` 新增私有成员 `Board search_board_;`，`:58` 的签名从 `search_worker(Board board, …)` 改成 `search_worker(const Board& board, …)`；`src/search/controller.cpp:37` 在**无条件 join 之后**写一次 `search_board_ = board;`，`:39` 用 `std::cref(search_board_)` 起线程。线程参数表里不再放第二份 Board：旧的按值交接要为一次 think 付「构造实参 + move 进形参」这一对（178.7 ns），现在只付一次 copy-assign（90.0 ns）。
+- **与文档字面不同的一处，故意不照做**：文档给的两个选项之一是「在 worker 内自行构造可变副本」，但 `engine_.search()` 收的是 `const Board&`（`src/search/search_engine.h:68`），worker 内没有任何人需要可变副本；照字面写等于**再加**一份 4664 B 的复制，与「去掉不必要的复制」正好相反。括号里第二个选项「直接 copy 一次」才是落地的形状，只是那一次 copy 放在调用方而不是被调方 —— 交接之后 caller 的板子归 caller 继续改，这正是 `:585` 那句「不再按值收」要的语义。
+- 「透传 `SearchLimits` 与上一手 `hint`」这半句**没有新增管道**：`max_depth`／`hard_time_ms`／`max_nodes` 与 `hint` 全是引擎上的 setter（`search_engine.h:90`、`:109-117`），`SearchController::engine()`（`controller.h:35`）本来就把手柄交了出去，生产路径就是这么用的（`game_manager.cpp:356-361` 连着 `:363` 那一次 `engine_.search(board_snapshot, …)`）。给一个没有生产调用者的类再加一层同名转发参数，只是多一个会被忘记同步的地方。这条偏差按上表如实记，不当作已完成。
+
+### 测试
+
+两条新用例在 `tests/test_search.cpp:8580-8624`、`:8626-8674`，注册在 `:8724-8725`。放在文件末尾而不是紧挨另外三条控制器用例（`:1221-1303`），因为那三条在受保护断言 `tests/test_search.cpp:3973` 之上，往那儿插行会推走 REVIEW_LOG 反复引用的 `:2591`／`:3973`／`:3986`；本轮逐条核回原位（`assert(result.resigned)` 仍在 `:2591`、`assert(interrupted.partial_depth == 1)` 仍在 `:3973`、`assert(completed.method == "alphabeta")` 仍在 `:3986`），旧引用最大的一条是 `:8520`，本轮插入点在其下，被移动的只有 `int main()` 自己那一行（`:8567`→`:8676`），没有任何引用指向它。文件 8749 → **8860** 行。
+
+- **`test_controller_think_ignores_later_caller_board_edits`**：20 轮，每轮一个黑棋四连（`(7,3)-(7,6)`，左端 `(7,2)` 已被白占死，唯一赢法是 `(7,7)`），`start_search` 一返回就立刻在**调用方**那块板上堵掉 `(7,7)` 再补两手；交付结果必须仍是 `(7,7)` 且 `score >= 99000`。线程创建要几十微秒，而三手 `place_stone` 只要几十纳秒 —— 一旦 worker 读的是调用方的板，第一手就一定赶在读取之前。M1 那一行证明这个窗口是真的能被踩到，不是推理。
+- **`test_controller_second_think_uses_the_new_position`**：先对无战术的安静局面发一次 depth 12／3 s 的思考（`assert(controller.is_thinking())` 写在调用之后），紧接着对**另一个**局面（白棋 `(10,4)-(10,7)` 四连，唯一赢法 `(10,8)`）再发一次；交付必须是 `(10,8)`。这条钉的是「成员快照只有在 join 掉上一个 worker 之后才写」这一不变量 —— 轮次34 F2 那次无条件 join 就是它的前提。
+
+### 变异矩阵：四条里两条被断言杀掉，第三条只能由 TSan 杀
+
+出厂套件要 427.79 s 才轮得到这两条，所以变异跑的是树外探针 `/tmp/d5/tsan_probe.cpp`：语句与上面两条用例逐条对齐（`diff` 只报 include 块与打印文案的差别），链到 `build/` 的对象上单跑，一轮几秒。
+
+| 变异 | 改的是什么 | 结果 |
+| --- | --- | --- |
+| 控制 | 出厂形态 | `rc=0`，2／2 通过（`/tmp/d5/mut_run_control.log`） |
+| M1 | `std::cref(search_board_)` → `std::cref(board)`，即线程引用**调用方**的板 | **`rc=134`，0／2**：`Assertion 'result.best_move.pos.row == 7' failed`（`mut_run_m1.log`） |
+| M2 | 完全退回旧的按值签名 | `rc=0`，2／2 —— 预期：这两条钉的是**契约**（交接之后的改动不许影响这一手），旧形态同样满足；本轮删的是那一份多余复制，不是换一种正确性 |
+| M3 | 把 `search_board_ = board;` 挪到 `make_unique<std::thread>(…)` **之后** | `rc=0`，2／2 —— **断言杀不掉**，竞争窗口太窄，交给下一节的 TSan |
+| M4 | 删掉那次写入（worker 永远读默认构造的空板） | **`rc=134`，0／2**：`Assertion 'result.score >= 99000' failed`（`mut_run_m4.log`） |
+
+第一遍跑 M3／M4 是 `BUILD-FAILED`，原因不在代码而在仪表脚本自己：M2 重写的是 `controller.h`，而 M3／M4 只还原 `controller.cpp`，于是 `const Board&` 的定义对不上按值的声明（`no declaration matches 'void gomoku::SearchController::search_worker(const gomoku::Board&, int, int, int)'`）。`/tmp/d5/mut_d5_m34.sh` 两个文件一起还原后重跑，才是上表那两行。
+
+### 读数 2：并发与 CPU —— 这台机器上 `perf` 用不了，两笔都换了仪器
+
+`/proc/sys/kernel/perf_event_paranoid` 读到的是 **4**，非特权进程拿不到采样；「不得修改系统配置」是硬约束，S9 也禁 sysctl，所以 `perf` 这一项是**取不到**而不是没做。替代仪器是 TSan（happens-before）和 callgrind（指令计数）。
+
+- **TSan 干净树**：`build-tsan` 重建 24 个 TU，探针 `rc=0`、**`races=0`**，两条用例都过（`/tmp/d5/tsan.log`）。TSan 这次不需要 `vm.mmap_rnd_bits=28` 就能起来，也没触发 `setarch -R` 重试 —— 轮次记的「必须用户跑特权 sysctl」这一条在本机今夜不成立。
+- **TSan on M3**（写入挪到起线程之后）：`rc=66`、**`races=22`**。第一条报告的两条栈正是本轮新增跨线程对象的两端：线程 T1 在 `src/core/board.cpp:160`（经 `src/core/pattern.cpp:575` ← `src/search/search_engine.cpp:81` ← `src/search/controller.cpp:63`）**读**，主线程上一次**写**在 `src/core/board.h:45` 的 `Board::operator=`（`/tmp/d5/tsan_m3.err`）。所以上面那句「干净树 0 race」不是仪器没通电：同一套栈在 M3 上会响 22 次。M3 这一行因此是**判掉**的，不是漏掉的。
+- **callgrind 交接路径臂**（`/tmp/d5/cg_controller.out`，12 次控制器思考）：总 186,824,692 Ir，首位 `PatternRecognizer::match_pattern` 23.21 %，其后 `finish_direction` 4.81 %、`recognize_position_both` 2.12 %、`CandidateCache::cell` 1.69 %、`recognize_direction` 1.34 %、`Board::is_empty` 0.79 %、`Board::undo_last_move` 0.59 % —— 表里没有一项是 Board 复制。这一臂只能算交接路径画像：think 被自己的 20 ms 墙钟裁掉，同一件事在本机 21.75 ms（P1，40 次共 870.05 ms），在 valgrind 下 79.59 ms（P3，20 次共 1591.90 ms），树深跟着缩水。
+- **callgrind 整机臂**（`/tmp/d5/cg_train.out`，`build-vg/gomoku_train --rounds 1 --population 2 --generations 1 --depth 4 --max-nodes 20000 --timeout-ms 5000 --max-moves 12 --fitness-games 2 --verification-games 2 --no-data --seed 20261011`，`rc=0`、301 s、`Training finished: rounds=1 versions=2 champion=v0 games=8 samples=0`，**`I refs: 56,620,693,932`**）：按节点预算跑，树与工具速度无关（那正是 D-1 加 `--max-nodes` 的理由）。
+
+| 名次 | self 函数 | Ir | 占比 |
+| --- | --- | --- | --- |
+| 1 | `src/core/evaluator.cpp:gomoku::Evaluator::pattern_score` | 11,847,254,774 | **20.92 %** |
+| 2 | `src/core/pattern.cpp:PatternRecognizer::finish_direction` | 9,282,418,688 | 16.39 % |
+| 3 | `src/core/pattern.cpp:PatternRecognizer::recognize_position_both` | 5,349,879,030 | 9.45 % |
+| 4 | `src/search/search_state.h:CandidateCache::cell` | 5,322,535,217 | 9.40 % |
+| 5 | `src/core/pattern.cpp:PositionPattern::analyze` | 3,542,825,868 | 6.26 % |
+| 6 | `src/core/pattern.cpp:PatternRecognizer::is_forbidden_from_pattern` | 3,301,154,612 | 5.83 % |
+| 7 | `src/core/evaluator.cpp:Evaluator::candidate_value` | 2,221,441,279 | 3.92 % |
+| 8 | `src/core/board.cpp:Board::is_empty(int, int) const` | 1,857,773,906 | 3.28 % |
+| 9 | `src/search/move_generator.cpp:MoveGenerator::generate` | 1,629,287,505 | 2.88 % |
+
+「哪个函数 CPU 卡比较久」的答复是**评估与图案识别**：前三合 46.76 %，第 1 名单独占 1/5；`board.cpp` 那一堆（`is_empty`、`undo_last_move` 1.41 %、`update_active_empty` 1.12 %、`get` 1.11 %）全是**读**板子而不是搬板子。本轮那一类搬运在表里只有一个落点：`__memcpy_avx_unaligned_erms` **27,789,314 Ir = 0.05 %**，而这一行是所有 Board 复制被内联之后的**合**记账，无法把 D-5 省下的那一份单独拆出来；`alphabeta.cpp:601` 那一行在 auto-annotation 下直接记账为空，紧随的 `search_root_with_aspiration(work_board, …)` 才 9,238 Ir（0.00 %）。于是「−40 % 单轮耗时」与这笔的关系有了硬口径：**整个 memcpy 类只值 0.05 %**，`#5` 的天花板在它下面，不在它旁边。
+- **内存**：`sizeof(SearchController)` 现在是 **6968 B**（减掉新成员 4664 得 2304，即本轮之前那个类的大小）（`sizeof(SearchEngine)=2040` + 新成员 4664 + 原子量/mutex/回调 ~264），因为它现在**自己拥有**那块板；旧的按值形态把同样 4664 B 放在 worker 线程的栈上，而那次线程创建本来就已经预留栈。所以本轮改的是「同一份内在谁名下」，不是内存增减。memcheck 两臂（`/tmp/d5/cpu.log` P3）：探针 20 次真实交接 `rc=0`、`ERROR SUMMARY: 0 errors from 0 contexts`、`23,644 allocs, 23,644 frees, 149,665,336 bytes`、`in use at exit: 0 bytes in 0 blocks`；出厂二进制 `gomoku_train`（1 轮 8 局）`rc=0`、`ERROR SUMMARY: 0`、`75,217 allocs = 75,217 frees`、`in use at exit: 0 bytes`。
+- **覆盖不到的地方照写**：除 `tests/test_search.cpp` 外没有任何测试二进制或生产代码引用 `SearchController`（`grep -c SearchController` 在 `test_server`／`test_session`／`test_training` 都是 0），而 `test_search` 不能进 memcheck —— `:3973` 那条 10 ms 墙钟断言在任何非本机时间尺度上都会炸（轮次124 起记在案）。所以 `#5` 的 memcheck／TSan 两臂用的都是树外探针；出厂二进制的 memcheck 只能证明「本轮没把别的弄坏」，不能算作本轮改动的内存证据。
+
+### 读数 3：`:550` 第一笔账又添一条反面证据
+
+`/tmp/d5/census_20000.txt` 里同一盘棋、同一个 20 000 节点预算的两手：第 5 手 `nodes=20000 / 65 951 µs`，第 18 手 `nodes=20000 / 1 970 342 µs` —— **节点数全等，墙钟差 29.9 倍**。预算买到的只有 alphabeta 那一段；VCF／VCT／认负探针三段各有自己的时间份额，`--max-nodes` 碰不到它们。这与轮次125 记的「`nodes_searched=0` 不是便宜，是压根没进 alphabeta」是同一件事的两面，仍是**没有仪表**的账：D-1 的预算口径没定，−40 % 无法结算。
+
+### 门禁与没动的账
+
+- `cmake --build build -j4` `rc=0`（还原后 6 个 TU），`ctest` **8/8 通过 / 458.68 s**（`test_search` 427.79 s、`test_position` 7.90 s、`test_server` 12.10 s、`test_training` 10.73 s，其余四条 < 0.1 s），`node tests/web_frontend_check.js` **105/105**，`node tests/readme_anchor_check.js` **120 citations / 0 problems**，README 仍 **658 行**（本轮一字未动：`README.md:399` 只在目录树里点了 `controller.h/cpp # 异步思考控制`，没有任何一句话描述 Board 怎么交接，也就没有需要更正的旧说法）。三条门禁全部跑在 `src/`＋`tests/` 定稿之后的树上，串行一条流水线（`/tmp/d5/final_gate.log`，02:15:24 → 02:23:07，7 分 43 秒），入口打印的机器负载是 1.86／3.29／4.08（1／5／15 分钟），`nproc=6`；仪表与门禁不重叠，callgrind 与 memcheck 各跑各的。`ctest` 之后树里只动了本文件，所以那两条会读文档的检查在本节写完之后又各跑一遍：`readme_anchor_check` 仍是 **120 citations / 0 problems**、`web_frontend_check` 仍是 **105/105**，README **658 行**、REVIEW_LOG **6828 行**（本节 +89）。
+- 提交前遇到的两次事故都记下来：(1) `build/` 的 CMake 缓存丢了离线 FetchContent 钉（`FETCHCONTENT_SOURCE_DIR_JSON` 为空、`FETCHCONTENT_FULLY_DISCONNECTED=OFF`，而 `build-vg`／`build-tsan` 都带着钉），于是第一次变异跑在 configure 阶段去 github 取 nlohmann/json，TLS 报 `status_code: 35 (SSL connect error)`（DNS 解析到 20.205.243.166 成功），重试五档（15 s、60 s…）后 `Configuring incomplete, errors occurred!`。按项目既有做法把 `build/` 也钉到 `build/_deps/json-src` 后 configure 通过，代价是全量重建 **139 个 TU**，之后每臂只重建 1 个。(2) 上面变异表里那条仪表脚本 bug。
+- §2.8 到这里**五条全部动过代码**：`#1` 共享表（轮次127）、`#2` 节点预算（轮次126）、`#3` SPRT 自适应局数（轮次128）、`#4` 开局多样化（轮次129，机制出厂、默认 0）、`#5` 本轮。`:550` 三笔本轮一笔没付，也不该由 `#5` 付。
+- **`vcf.cpp:420` 才是 Board 复制的大头**（一次 think 的 53.8–75.7 %），但那一处是**为可复现性付的**：注释写明复用同一块板会让每个防守应手拿到不同的 `active_empty()` 顺序，而威胁排序的平局就是按这个顺序破的（`src/search/vcf.cpp:418-420`；同一理由还在 `alphabeta.cpp:598-601`、`src/core/transforms.cpp:15`、`src/training/data_collector.cpp:141`，以及 `vcf.cpp:244` 的 `Board working = board;`、`vct.cpp:334` 的 `Board mutable_board = board;`）。要动它得先给排序一个与遍历顺序无关的定义，那需要一轮自己的测量，本轮不动。
+- 编号清单里还剩**一条从未排进任何阶段的增强**：§2.7 表 `:426` 的「LMR（后排着法减深）| 节点数 −15~25 % | 中（需 re-search 校验）」——`grep -rn "LMR\|late.move\|reduce_depth\|reduction" src/search/` 为空。它不在 `:548` 的 B 阶段验收行里（那行列的是 PVS／排序／aspiration／PV 提取／威胁延伸／双威胁／VCF-VCT 按需），所以 B 阶段结掉之后一直没被认领，而 `:419` 那句「建议全部实现」把它算在内。威胁延伸（`:427`）是量过之后判**不落地**（轮次121 B4），null-move（`:428`）是文档自己写的「本期不做」，只有 LMR 是既没做也没判 —— 下一轮按顺序就是它。
+- 继续延期、与轮次129 同一张单：shared-TT 命中率扫描、无锁 TT、SPRT 误晋级率、Elo 账本不按局数加权、`:550` 第三笔的措辞。未跟踪的 `docs/2026-10-17.md`、`docs/PROMPT_STRESS_TEST.md`、`docs/STRESS_TEST_RULES.md` 照旧等用户发话；仪表与探针（`/tmp/d5/` 下 7 个脚本与 3 份 census 输出）一律留在树外。
+
 ## 轮次129 引擎重构 D-4：开局多样化第一次能做，而镜像筛查证明它在这个强度上是反的 — engine redesign stage D4, match openings and the mirror screen that turned the default off
 
 规格 `docs/ENGINE_REDESIGN.md` `:436`（§2.8 `#4`「开局多样化：从开局库按权重采样不同开局（当前训练期开局库被完全关闭，导致"颜色通吃"）。改为『固定一组多样化开局 + 交换黑白』，让胜负由系数而非先手决定」）。落地清单只把这一件记了一处：`:590` 的 `src/training/self_play.cpp` 行「节点预算；共享 TT；开局多样化」——`:591` 的 `trainer.cpp` 行没有它（那行是「SPRT 自适应对局数；共享 TT；引擎复用」），`:592` 是 `main_trainer.cpp`。验收仍是 `:550` 那一行的三个读数（单轮耗时 −40 %、内存峰值与并发局数解耦、`--fitness-games 2` 下 fitness 不再只有三档）。本轮把这一件的**机制**做完并留在树上，然后把**缺省关掉**（`--match-opening-plies 0`）：一个树外仪表、一次镜像筛查、一轮两局的轮换见证，三个读数指向同一个结论——在深度 4 / 400 ms 这个强度上，先重放一条固定开局不会让胜负「由系数而非先手决定」，它把一个本来就是必胜的局面钉成 0.5 的一对。`:550` 的三个读数本轮一个都没动：机制改的是**配对打什么局面**，不是成本模型。

@@ -8564,6 +8564,115 @@ void test_a_sharded_table_searches_the_tree_an_unshared_one_searches() {
               << std::endl;
 }
 
+// 轮次130 · 设计文档 2.8 #5: `search_worker` no longer receives a Board by value;
+// the hand-off is one copy into the controller's own `search_board_`, and the
+// thread carries a reference to that member. Two things have to stay true for that
+// to be safe, and both are pinned here rather than left to the join comment:
+//   (a) the think reads the position as it was when `start_search` returned, so the
+//       caller may keep editing its own Board - the old by-value signature gave that
+//       guarantee for free, and a `cref` bound to the caller's board (the mistake
+//       this change is one step away from) would not;
+//   (b) a second `start_search` overwrites the member only after the first worker is
+//       joined, so the second think answers its own position and never a stale one.
+// These two cases sit here, at the end of the file rather than beside the other
+// controller tests (:1221-1303), because those are above the cited assertion at
+// :3973 and inserting there would move it.
+void test_controller_think_ignores_later_caller_board_edits() {
+    for (int round = 0; round < 20; ++round) {
+        Board board;
+        board.place_stone(7, 3, BLACK);
+        board.place_stone(7, 4, BLACK);
+        board.place_stone(7, 5, BLACK);
+        board.place_stone(7, 6, BLACK);
+        board.place_stone(7, 2, WHITE);   // closes the left end: only (7,7) wins
+        board.place_stone(9, 9, WHITE);
+
+        SearchController controller;
+        std::atomic<bool> done(false);
+        controller.set_completion_callback([&](SearchResult result) {
+            if (result.best_move.pos.is_valid()) done.store(true);
+        });
+
+        controller.start_search(board, BLACK, 4, 1500);
+
+        // Edit the caller's board right after the hand-off. Thread startup costs tens
+        // of microseconds, so a worker bound to this Board would read the block at
+        // (7,7) before its first node; a worker reading the controller's snapshot
+        // cannot see any of it.
+        board.place_stone(7, 7, WHITE);
+        board.place_stone(7, 8, WHITE);
+        board.place_stone(6, 6, WHITE);
+
+        int wait_count = 0;
+        while (!done.load() && wait_count < 50) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            wait_count++;
+        }
+
+        assert(done.load());
+        assert(!controller.is_thinking());
+        SearchResult result = controller.get_result();
+        assert(result.best_move.pos.row == 7);
+        assert(result.best_move.pos.col == 7);
+        assert(result.score >= 99000);
+    }
+
+    std::cout << "test_controller_think_ignores_later_caller_board_edits passed "
+                 "(20 thinks, each answered from the position as handed over even "
+                 "though the caller blocked the winning square microseconds later)"
+              << std::endl;
+}
+
+void test_controller_second_think_uses_the_new_position() {
+    SearchController controller;
+
+    // A quiet position with no tactical answer, so the first think is still running
+    // when the second call arrives and has to be stopped and joined first.
+    Board quiet;
+    quiet.place_stone(7, 7, BLACK);
+    quiet.place_stone(7, 8, WHITE);
+    quiet.place_stone(8, 6, BLACK);
+    quiet.place_stone(6, 8, WHITE);
+    controller.start_search(quiet, BLACK, 12, 3000);
+    assert(controller.is_thinking());
+
+    // The second position is a forced five for WHITE. A snapshot that was not
+    // rewritten - or rewritten before the first worker was joined - answers the quiet
+    // position instead, and no white winning square exists there.
+    Board win;
+    win.place_stone(10, 4, WHITE);
+    win.place_stone(10, 5, WHITE);
+    win.place_stone(10, 6, WHITE);
+    win.place_stone(10, 7, WHITE);
+    win.place_stone(10, 3, BLACK);   // closes the left end: only (10,8) wins
+    win.place_stone(3, 3, BLACK);
+
+    std::atomic<int> completed(0);
+    controller.set_completion_callback([&](SearchResult result) {
+        if (result.best_move.pos.is_valid()) completed.fetch_add(1);
+    });
+
+    controller.start_search(win, WHITE, 4, 1500);
+
+    int wait_count = 0;
+    while (controller.is_thinking() && wait_count < 50) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        wait_count++;
+    }
+
+    assert(!controller.is_thinking());
+    assert(completed.load() >= 1);
+    SearchResult result = controller.get_result();
+    assert(result.best_move.pos.row == 10);
+    assert(result.best_move.pos.col == 8);
+    assert(result.score >= 99000);
+
+    std::cout << "test_controller_second_think_uses_the_new_position passed "
+                 "(the second hand-off rewrote the snapshot after joining the first "
+                 "worker; the delivered move is the new position's five)"
+              << std::endl;
+}
+
 int main() {
     std::cout << "Running search tests..." << std::endl;
 
@@ -8612,6 +8721,8 @@ int main() {
     test_controller_async();
     test_controller_stop();
     test_controller_restart_after_completion();
+    test_controller_think_ignores_later_caller_board_edits();
+    test_controller_second_think_uses_the_new_position();
     test_forced_move();
     test_fast_path_labels_fill_no_depth();
     test_search_result_fields_initialized_on_fast_paths();
