@@ -14,6 +14,7 @@
 4. 任何数字必须标「实测」或「未测/预估」。这是本仓库的文档纪律，写报告时会被检查。
 5. 卡住时先看 §5「已知坑清单」，那里是前几轮真踩过的。
 6. **有多种实现路线的地方看 §8**：每条岔路都写了首选、为什么只能选它、什么读数出现才换；§8.2 是「已被实测否掉的路线」，提这些路线之前先读出处。
+7. **每个单元都要自带回归用例，且每个用例都要有超时**，写法与逐单元清单见 §9。
 
 ---
 
@@ -661,6 +662,8 @@ git push origin master && git log --oneline -1 origin/master
 - [ ] 提交信息里有「规格章节 / 落点 / 读数 / 杀线 / 门禁」
 - [ ] 新机制带杀线，读数标了「实测」或「未测」
 - [ ] 新增用例有变异臂证据（报出行号）
+- [ ] 新增用例都有超时：搜索臂用节点帽，I/O/进程臂用 `ctest TIMEOUT` 或脚本 `timeout`
+- [ ] 新测试目标已加进 `CMakeLists.txt`、`foreach(... -UNDEBUG)` 与 `set_tests_properties(... TIMEOUT ...)`
 - [ ] 若走杀线：写清读数与理由，回收代码，**继续下一个单元**
 
 ---
@@ -738,6 +741,84 @@ git push origin master && git log --oneline -1 origin/master
 | 用「已占子键缓存」打 `pattern_score` | 前提错了：`pattern_score` 对空候选格调，已占子不进它 | 本文件 §4 丙-2 |
 
 > 这张表的用法：**任何人提出其中一条，先让他读对应出处**。不是不允许重新讨论，而是重新讨论必须带来新读数。
+
+---
+
+## 9. 测试与超时（每个单元自带回归用例）
+
+要求两条：**每个单元自己写回归用例**（不是验证一次就算），**每个用例都有超时**（挂住的测试比失败的测试更糟，它会把整条门禁拖死）。
+
+### 9.1 三层超时（当前只缺第一层，先补上）
+
+| 层 | 现在有没有 | 该怎么做 |
+| --- | --- | --- |
+| `ctest` 层（进程级） | **一个都没有**——`CMakeLists.txt` 里没有任何 `set_tests_properties(... TIMEOUT ...)`，死循环会让 `ctest` 永远挂着 | 见下面的片段，**第一个单元顺手补上** |
+| 测试进程内（搜索臂） | 部分有（`ScriptedClock` 是给「哪一层被截止」用的，不是兜底） | 搜索臂一律 `set_max_nodes(N)` ＋ 不 binding 的时限；**节点帽就是超时** |
+| 脚本层 | `tools/tactics_bench.sh` 没有 | 每个 budget 包一层 `timeout 300` |
+
+**`CMakeLists.txt` 末尾补这一段**（放在 `enable_testing()` 之后、`foreach` 之前）：
+
+```cmake
+# 每个测试都要有超时。没有 TIMEOUT 的 ctest 遇到死循环会永远挂着，
+# 而挂住的门禁比红掉的门禁更糟：人看不到红，只会看到「还在跑」。
+# 值取实测的 2 倍左右：既不会被一台忙机器误杀，也不让真 hang 拖十分钟。
+set_tests_properties(test_board     PROPERTIES TIMEOUT 120)
+set_tests_properties(test_pattern   PROPERTIES TIMEOUT 120)
+set_tests_properties(test_evaluator PROPERTIES TIMEOUT 120)
+set_tests_properties(test_search    PROPERTIES TIMEOUT 900)   # 实测 470 s
+set_tests_properties(test_position  PROPERTIES TIMEOUT 120)
+set_tests_properties(test_session   PROPERTIES TIMEOUT 60)
+set_tests_properties(test_server    PROPERTIES TIMEOUT 180)
+set_tests_properties(test_training  PROPERTIES TIMEOUT 300)   # 实测 13 s，memcheck 下 166 s
+```
+
+再兜一层：跑门禁时用 `ctest --timeout 900 --test-dir build`。
+
+### 9.2 超时值怎么定
+
+| 情形 | 用什么当超时 | 为什么 |
+| --- | --- | --- |
+| 搜索/评估类断言 | **节点帽**（`set_max_nodes`） | 墙钟会让读数随机器忙闲变化，同一断言今天绿明天红 |
+| 定深臂（d8 等） | 节点帽 ＋ 一个**不 binding** 的时限（如 60000 ms） | 只防死循环，不参与判定 |
+| I/O / 进程 / IPC 臂 | 墙钟（`std::chrono` 自检 或 `ctest` TIMEOUT） | 这类没有「节点」可数 |
+| 脚本门禁 | `timeout N cmd` | 脚本里任何一步都可能挂 |
+
+**超时了怎么办**：先分清「机器慢」还是「死循环」。
+- 机器慢 → 提高 `TIMEOUT`，但**不许提高判定用的时限**（那会改变读数）；
+- 死循环 → **加节点帽或加迭代上限**，不许只调大时间。把死循环包在一层更长的超时里，等于把 bug 藏起来。
+
+### 9.3 回归用例的写法（六条）
+
+1. **每个单元至少 3 条**：新增行为 1 条 ＋ 边界 1 条 ＋ **旧行为不变 1 条**（后者最容易被漏，也最重要）。
+2. **命名**：`test_<单元>_<钉的是什么>`，函数上方用中文注释写明它钉的是哪条规格（章节号或 `REVIEW_LOG` 轮次）。
+3. **钉值，不钉存在**：`assert(review.loss == 55268)` 而不是 `assert(review.loss > 0)`。本仓库的用例风格是硬数值，变了就要解释。
+4. **不依赖执行顺序与全局状态**：元素桩、全局单例用完要显式清空（`web_frontend_check` 的用例之间共享 `el()` 单例）。
+5. **失败信息要能定位**：`assert(cond)` 之外，复杂断言先算出 `got` 再比较，报错时能看出差多少。
+6. **必须有一条变异臂**：改错一条断言 → 期望非零退出并报出 `文件:行号` → 还原 → 复跑全绿。**没有变异臂证据的新用例，不算交付。**
+
+### 9.4 逐单元回归用例清单
+
+| 单元 | 落在哪 | 至少钉什么 | 超时 |
+| --- | --- | --- | --- |
+| 甲-3 复盘面板 | `test_server` ＋ `web_frontend_check.js` | 帧序列（≥1 progress、恰好 1 result）、思考中拒绝、面板默认隐藏、标记数、点击跳手 | 180 s / 脚本 |
+| 甲-4 门禁接线 | `tools/tactics_bench.sh` ＋ `readme_anchor_check` | 三档输出、anchor 0 problems | 脚本 `timeout 300` |
+| 乙-1 差分表 | 新 `tools/position_term_table` | 18,900 行、`match` 全 1；变异臂改「外三行」→ 出现 0 | 工具自检 ＋ 脚本 |
+| 乙-2 选点基准 | 新 `test_pinned` | 每副的 `move/score/nodes`；变异臂改 ±1 → 红 | 900 s（d8 慢） |
+| 丙-1 `ProofTable` | `test_search` | `UNKNOWN` 不入库、命中返回 `±(100000+dist)`、275 根等价 | 900 s |
+| 丙-2 `BoardValueCache` | `test_evaluator` | 18,900 组逐格等价、cap 不被缓存 | 120 s |
+| 丙-3 排序/威胁分离 | `test_search` | 针臂着法/分值/深度全同 | 900 s |
+| 丙-4 `finish_direction` LUT | `test_pattern` | 75,600 组逐组相同（1 组不一致即红） | 300 s（差分跑得久） |
+| 丁-1 S3 连续信号 | `test_training` | `w=0` 与今天逐字节相同、档数 > 5、同 seed 一致 | 300 s |
+| 丁-2 S4 蒸馏 | `test_training` | `teacher_*` 往返、旧记录读回为空、教师用独立 TT（`search_depth` 不被污染） | 300 s |
+| 丁-3 S6 按色系数 | `test_evaluator` | 等价臂（两侧同值 → 整树逐字节）、`eval(W) == -eval(B)`、旧文件读成同值 | 120 s |
+| 丁-4 平衡控制器 | `test_training` | Wilson 判据、一步一项、5 步封顶、回滚条件 | 300 s |
+| 丁-5 S1 交换规则 | `test_training` ＋ `test_server` | `none` 与今天逐字节、`swap` 的交换回合、非法规则被拒 | 300 s / 180 s |
+| 丁-6 S2 开局筛选 | `test_training` | 判据边界、落盘复用（同 `coeffs_sha` 不重筛） | 300 s |
+| 戊-1 H 进程模型 | 新 `test_broker`（或 shell 臂） | 半行写丢弃并重排、`SIGKILL` 后账对齐、绑核生效 | 脚本 `timeout 300` |
+| 戊-2 I 控制面 | `test_server` ＋ `web_frontend_check.js` | schema 形状、越界拒绝、三类 `when_live`、前端零硬编码 | 180 s |
+| 戊-3 K 一键训练 | `test_training` | 同 seed 两次相序列与 checkpoint 逐字节相同 | 300 s |
+
+> 新增测试目标（`test_pinned`、`test_broker`）记得做三件事：加进 `CMakeLists.txt`、加进末尾那个 `foreach(... -UNDEBUG)` 列表、**加一条 `set_tests_properties(... TIMEOUT ...)`**。
 
 ---
 
