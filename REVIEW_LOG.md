@@ -1979,6 +1979,114 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次136 引擎重构 J：把「记忆化能不能买到那 4.4 倍」量到底——上限 1.25 倍，而键宽 72 位的表根本不存在 — engine redesign stage J, is any memoisation shape able to reach §4 :549's 4.4x? the ceiling is 1.25x at unlimited memory, and the only call-free route left is a per-candidate kernel redesign (measurement round, no code changed)
+
+轮次135 把 `docs/ENGINE_REDESIGN.md:549` 那两格算成了一道算术（同一支 release 二进制：42,353.5 Ir／节点
+× 228k nps ⇒ 「≥ 1M nps」＝ Ir／节点 ≤ 9,660 ＝ 再便宜 **4.4 倍**）。用户选了「先量可行性」：不动 `src/`，
+先回答一个前置问题——**是否存在任何一种「少算一点」的形状能到 4.4 倍**，还是这个目标只能靠每候选格内核
+本身变便宜。本轮的答案是后者，而且是可数的后者。
+
+### Found
+
+- **搜索的候选格打分不走文档里那两个入口**。`Evaluator::evaluate_position_pair` 与
+  `evaluate_position_both` 在 `src/` 里**一个调用点都没有**（`grep` 四种调用形式全空，只有注释与
+  `tests/test_search.cpp:2674 / :5157 / :5172` 在用它们当对照）。真正在跑的是
+  `src/search/search_state.h:249-280` 的 `CandidateCache::cell`：每节点 72.97 次探问（Debug 口径的
+  callgrind；探问／重算之比是结构量，不随构建变），其中
+  **22.47 次需要重算**（一次 `recognize_position_both` + 两次 `evaluate_position_with_pattern`），
+  其余 50.5 次由该节点自己的记录代答。22.47 这一层是两个构建各自数到的同一个数（轮次134 的 Debug
+  callgrind 22.470／节点，本轮那支 `-O2` 计数臂 10,626,470 ÷ 472,923 = 22.4696）。
+- 本轮第一支护架就装错了一次：探针装在 `evaluate_position_pair` 入口，跑出来 `calls=0` 而两臂节点数
+  仍是出厂针。**0 不是读数，是那台仪器没说话**——按轮次127 立的 liveness 规矩，pin 与 0 同时出现就说明
+  函数不在路径上，这条改成了上面那一句发现，而不是记成一个零。
+- 可行性好的一半是真的：`cell` 的重算路径是 `(棋盘, 行, 列)` 的纯函数（系数在一次 think 内固定，
+  `search_state.h:271` 恒以 `BLACK` 问，两个颜色各得一份自己的图案），所以一张跨节点的「格子分」表
+  在**语义上**是可以架起来的——键就 8 字节，值就 4 字节。
+
+### 读数 1：release 构建上，每节点那 42,353 Ir 花在哪（`/tmp/i1/calls_release.out`，`ir_cg.out`）
+
+单臂 `quiet BLACK d6`（221,774 节点，pin 已核），`callgrind --cache-sim=no`，`--inclusive=no` 的**自身**开销：
+
+| 函数 | 占每节点 |
+| --- | --- |
+| `Evaluator::pattern_score` | 22.04 % |
+| `PatternRecognizer::finish_direction` | 15.61 % |
+| `PatternRecognizer::recognize_position_both` | 11.67 % |
+| `CandidateCache::cell` | 10.45 % |
+| `PositionPattern::analyze` | 5.99 % |
+| `PatternRecognizer::is_forbidden_from_pattern` | 5.69 % |
+| `Evaluator::candidate_value` | 4.07 % |
+| `MoveGenerator::generate` | 3.74 % |
+| `Board::is_empty(int,int)` | 3.21 % |
+| `Evaluator::evaluate_position_with_pattern` | 2.27 % |
+| `Evaluator::board_pair_value` | 1.85 % |
+| `Board::undo_last_move` | 1.30 % |
+| `AlphaBetaSearch::static_score` | 1.17 % |
+| `Board::update_active_empty` | 1.03 % |
+
+前十四行合计 **90.1 %**。这一张表替轮次135 那张 Debug 口径的表说话：**热点形状与构建无关**，
+`pattern_score` 与窗口解码族仍是主体（评估与图案识别，与 D-5／轮次131／轮次134 的答复同一条）。
+
+### 读数 2：记忆化的上限是 1.25 倍，而目标是 4.4 倍
+
+把「一次重算」的整族开销加起来——`recognize_position_both` 11.67 + `finish_direction` 15.61 +
+`pattern_score` 22.04 + `analyze` 5.99 + `is_forbidden_from_pattern` 5.69 + `candidate_value` 4.07 +
+`evaluate_position_with_pattern` 2.27 + `board_pair_value` 1.85 ＝ **69.19 %** 的每节点成本。
+轮次135 数过这个种群的重复率：`(棋盘,行,列)` 里 **28.6 %** 是本进程已经算过的（键完全同一：`cell` 恒以
+`BLACK` 问一次识别，识别次数＝重算次数＝22.47／节点，两臂针都过）。于是
+
+- **无上限内存的天花板**：0.286 × 69.19 % ＝ **19.8 %** 的每节点成本 ＝ **1.25 倍**。
+  代价是轮次135 量到的 759 万键／1.04 GB（本轮按语义重算一次：键 8 B + 值 4 B + 槽管理，
+  即便压到 12 B／槽也要 91 MB，且随搜索规模长，与 §2.8 `:433` 的解耦目标正对着干）。
+- **有界表只会更低**：128K／1M／2M 槽的直接映射表在 759 万个不同键的流上，命中率必然低于
+  无限表的 28.6 %（本轮没有再跑那三个数，因为**无上限已经是天花板**：上限都到不了目标的一半）。
+- **目标要的是砍掉 77.3 %**（留 ≤22.7 %）。整族 69.19 % 全删再加 `cell` 的 10.45 % 才 79.6 %——
+  那是「一个候选格都不评估」的搜索，不是更快的搜索。
+
+**所以：少算一点这一类办法（记忆化、共享表、缓存加大、记账换算法）在本树上买到 1.25 倍为止。**
+`:549` 的 4.4 倍只能来自一次候选格评估**本身**的便宜化。
+
+### 读数 3：那唯一剩下的形状，键宽是多少
+
+现在一次候选格重算＝8 次窗口解码（4 条方向 × 两色；两色读同两条线，`pattern.cpp` 的 `recognize_position_both`）
+＋一次 `analyze`＋2.61 次 `pattern_score`。要把它换成「一次查表」，键得装下这个格子的**四条线的窗口内容**：
+每条线窗口 18 位（`README` 4.1：`(own << 9) | blocked` 索引一张 2^18 的表），四方向联起来是 **72 位**，
+不是一张可以直接索引的表（2^72 槽）。能落地的只有「按线／按段做局部表再组合」，而那正是 README:624
+量过并放弃的增量形状。这一条不是本轮新增的猜测，是本轮把键宽写出来之后可以直接看到的：
+**文档给的 C 行已经全部落地，`:549` 需要的机制在文档里没有，而且它的两种可写形状（全量表 / 分线增量）
+分别被 72 位键宽与 README:624 的实测否掉过。**
+
+### 判：可行性量到底了，本轮不改一行代码，也不新造一个机制
+
+1. **记忆化一类关闭**：1.25 倍封顶（无上限内存口径），距 4.4 倍差 3.5 倍。这条不需要用户决定，
+   写下来是为了第三次别再量。
+2. **`:549` 剩下的唯一形状是一次有正确性风险的评估内核重做**，而它的两种写法各自已被否过一次
+   （72 位键宽 / README:624 的分线增量实测持平）。要不要**第三次**尝试——带 `:556` 第 3 条要求的
+   全 225 格 × 两色 × N 棋盘差分、逐条节点针对比——是一次设计授权，不是「下一个未实现的功能」。
+   本轮把它交到用户手上，并且现在手上有的东西是：目标因子 4.4、成本主体一张表、键宽一个数。
+3. **本轮真正新增的读数只有一条**（`evaluate_position_pair`／`both` 无生产调用点，热路径走
+   `CandidateCache::cell`）——它同时解释了为什么轮次135 那条 rejection 的算术对象需要更新，
+   也说明这两个公开入口现在只服务对照测试。这条不改代码，只在档里记着。
+
+### 门禁
+
+- `src/`、`tests/`、`web/`、`tools/`、`CMakeLists.txt` 与 `0e8119d` 逐字节相同（`git diff --stat 0e8119d -- …` 空）；
+  `git status` 除本节外只有那三个待用户发话的未跟踪 `docs/`。
+- `node tests/readme_anchor_check.js` **120 citations / 0 problems**；`wc -l README.md` 仍 **658 行**。
+- **ctest 不跑，理由写在档里**：树与轮次134 还原门禁里刚跑过 `8/8 / 463.68 s` 的那一棵相同，本轮没有
+  新代码可回归；这条如实记录，不当成通过。valgrind／memcheck 无可筛之物（同理）。
+- 本节拼在轮次135 表头之前（原 1982 行处），于是那一节及以下整段下移 108 行；`git diff --numstat`
+  ＝ 108 / 0，`wc -l REVIEW_LOG.md` 从 7814 到 7922。轮次135 档内那句「156 / 0」记的是它自己那次
+  提交 `bea702a` 的形状，本轮不改它；被本节推下去的 `REVIEW_LOG:2289` 那一类档内绝对针现在差 1258 行。
+
+### 仪器（全部在 `/tmp/i1/`，仓库外）
+
+`ir_driver.cpp` + `run_i3.sh` + `ir_cg.out`（release 单臂：针、指令数、三块墙钟）、
+`callgrind_annotate --inclusive=no`（读数 1 的自身开销表，`calls_release.out` 是本轮第一版解析器的记录，
+它的跨 `ob` 块串号问题由 annotate 的行替代，写在这里是为了下一轮别再用手 parsers 读 callgrind）、
+`j_patch.py` + `j_driver.cpp` + `run_j1.sh` + `run_j1.log`（那支护架打印 0 的一次，以及它换来的 Found 第 1 条）、
+轮次135 的 `redun.out`（重复率 28.6 %，读数 2 的分子）。
+
 ## 轮次135 引擎重构 I：§4 :549 那两格第一次被算成一笔可以判的账，而静态分够不着子树这件事不是钳造成的 — engine redesign stage I, the §4 :549 C-row throughput cells priced as an arithmetic target: the static-score slack, the repeat-work ceiling, and Ir/node against nps on one build (measurement round, no code changed)
 
 用户在轮次134 收口后选了「先做吞吐那一半」，方向是给评估换一个能给子树封顶的形状（也就是
