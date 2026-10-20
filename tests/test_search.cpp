@@ -8673,6 +8673,224 @@ void test_controller_second_think_uses_the_new_position() {
               << std::endl;
 }
 
+// F1, design doc 2.3.4 read at the one place it is applied: the layered branch of
+// SearchEngine::search. `TimeManager::allocate` has had its own unit table since the
+// A round pinned it, but a pure function with no caller proves nothing about a game -
+// and until this round it had no caller. These arms come in through the door a player
+// uses (a think with a wall clock and no named window) and read the decision off the
+// result.
+
+// Turns off everything in a think except the layered search, so the only clock in the
+// room is the one the test installed.
+static void quieten(SearchEngine& engine) {
+    engine.set_vcf_enabled(false);
+    engine.set_vct_enabled(false);
+    engine.set_book_enabled(false);
+    engine.set_resign_detection(false);
+}
+
+void test_the_engine_shapes_the_window_the_client_did_not_name() {
+    const Board board = quiet_think_board();
+    std::atomic<bool> stop(false);
+
+    auto think = [&](int prev_elapsed_ms, int named_soft, int named_nodes, int wall_ms,
+                     bool training = false) {
+        SearchEngine engine;
+        quieten(engine);
+        engine.set_prev_move_elapsed_ms(prev_elapsed_ms);
+        engine.set_soft_time_ms(named_soft);
+        engine.set_max_nodes(named_nodes);
+        engine.set_training(training);
+        return engine.search(board, WHITE, 2, wall_ms, stop);
+    };
+
+    // The window is 65 % of the wall *this* think had, and that wall is the caller's
+    // budget minus what the earlier phases of the same think spent - a quantity only
+    // the engine knows at the moment of shaping. Pinning the ratio rather than the
+    // number is what keeps this true on a loaded machine and under memcheck, where the
+    // identical think starts against a wall tens of ms shorter.
+    const SearchResult plain = think(0, 0, 0, 3000);
+    assert(plain.method == "alphabeta");
+    assert(plain.hard_ms > 0 && plain.hard_ms <= 3000);
+    assert(plain.soft_ms == plain.hard_ms * 65 / 100);
+    assert(plain.soft_ms < plain.hard_ms);
+    // Seven stones and a wide candidate window: neither of the position halves (a
+    // book stage, a handful of candidates) applies, so the default share stands.
+    assert(board.move_count() >= 6 && board.active_empty().size() > 6);
+
+    // A previous think that overran 80 % of its wall buys the next one half of it.
+    // The boundary itself (exactly 80 %) is pinned at the allocator table, where the
+    // number is an input rather than a reading of a clock that moved.
+    const SearchResult damped = think(plain.hard_ms * 8 / 10 + 1, 0, 0, 3000);
+    assert(damped.method == "alphabeta");
+    assert(damped.soft_ms == damped.hard_ms / 2);
+    assert(damped.soft_ms < plain.soft_ms);
+
+    // A named window is not shaped at all: it is the client's `--soft-time-ms`, and a
+    // session that asked for 900 gets 900. Not even clamped to the wall, because that
+    // is how it behaved before this round too - an unreachable window is inert, not
+    // wrong, since the hard deadline still cuts.
+    const SearchResult named = think(0, 900, 0, 3000);
+    assert(named.soft_ms == 900);
+    assert(named.hard_ms > 0 && named.hard_ms <= 3000);
+    // Damping does not reach past a client's own number either.
+    assert(think(plain.hard_ms, 900, 0, 3000).soft_ms == 900);
+
+    // A named node ceiling is the training regime, and there the time budget stands
+    // aside (doc 2.3.4 step 5). Stands aside means stands aside in both directions:
+    // the wall is NOT moved - `--timeout-ms` stays the fallback the D round asked for -
+    // and no window is invented from it.
+    const SearchResult trained = think(0, 0, 200000, 3000);
+    assert(trained.soft_ms == 0);
+    assert(trained.hard_ms > 0 && trained.hard_ms <= 3000);
+
+    // And the regime is said out loud, not guessed from a number: `gomoku_train` with
+    // its default `--timeout-ms 400` and no `--max-nodes` (self_play.h:15-18) is training
+    // too, and if the engine had to infer it from the node ceiling every think of the
+    // shipped training command would have been cut to 260 ms and the samples collected
+    // from a shallower search than the round asked for. Damping is inert here as well -
+    // the allocator returns before it reaches either correction.
+    const SearchResult declared = think(plain.hard_ms, 0, 0, 3000, /*training=*/true);
+    assert(declared.soft_ms == 0);
+    assert(declared.hard_ms > 0 && declared.hard_ms <= 3000);
+    // A think that is not declared training and names no nodes is a play think, so the
+    // flag has to default the other way or the shaping would never reach a player.
+    assert(think(0, 0, 0, 3000).soft_ms > 0);
+
+    // No wall clock at all: the depth-only think. `hard_ms` here is the 100 ms slice
+    // the phased branch gives AlphaBeta when the caller named no time (the pre-existing
+    // contract pinned by test_alphabeta_large_depth_bounded_by_slice_without_deadline),
+    // and shaping a window out of it would cut a depth-only think at 65 ms - which is
+    // exactly why the gate is `has_deadline` and not `hard_ms > 0`.
+    const SearchResult untime = think(0, 0, 0, 0);
+    assert(untime.soft_ms == 0);
+    assert(untime.hard_ms == 100);
+
+    std::cout << "test_the_engine_shapes_the_window_the_client_did_not_name passed ("
+              << "wall " << plain.hard_ms << " -> soft " << plain.soft_ms
+              << ", damped soft " << damped.soft_ms
+              << ", trained soft " << trained.soft_ms << ")" << std::endl;
+}
+
+// F2: the window chosen at the engine's door is the window the root loop stops at.
+// The two halves live in different classes - SearchEngine shapes, AlphaBetaSearch's
+// layer boundary spends - so "wired" is not the same as "honoured", and this is the
+// case that says the number that was decided is the number that was used.
+void test_the_window_the_engine_shapes_is_the_one_the_root_loop_stops_at() {
+    const Board board = quiet_think_board();
+    std::atomic<bool> stop(false);
+
+    // 100 ms per reading: the soft window is crossed a few readings into the first
+    // layers, while the hard wall - an absolute instant on the real steady clock,
+    // installed by set_deadline() - is out of reach of a clock that starts at 0 and
+    // creeps. That asymmetry is the point: soft is the only time reason this arm can
+    // report, so a time_hard here would mean the injection did not take.
+    ScriptedClock clock(100);
+    SearchResult shaped;
+    {
+        SearchEngine engine;
+        quieten(engine);
+        engine.set_clock(&clock);
+        shaped = engine.search(board, WHITE, 6, 3000, stop);
+    }
+    assert(shaped.method == "alphabeta");
+    assert(shaped.soft_ms > 0 && shaped.soft_ms == shaped.hard_ms * 65 / 100);
+    assert(shaped.stopped == "time_soft");
+    // A layer boundary, not mid-layer: the soft window is a decision about starting
+    // another iteration, so the layer below it stays intact and there is no partial.
+    assert(shaped.partial_depth == 0);
+    assert(shaped.depth >= 1 && shaped.depth < 6);
+    // The count a soft stop leaves behind is the completed layer's full one, which is
+    // what distinguishes "no layer was interrupted" from "layer 1 broke after its
+    // first candidate".
+    assert(shaped.root_moves_done == shaped.root_moves_total);
+    assert(shaped.root_moves_done > 0);
+
+    // Control, same wall, same depth request, same everything but a clock that never
+    // moves: nothing stops this think early, so the stop above was the window rather
+    // than the node ceiling that the 3000 ms wall also implies.
+    SteadyClock idle;
+    SearchResult whole;
+    {
+        SearchEngine engine;
+        quieten(engine);
+        engine.set_clock(&idle);
+        whole = engine.search(board, WHITE, 6, 3000, stop);
+    }
+    assert(whole.method == "alphabeta");
+    assert(whole.stopped == "none");
+    assert(whole.depth == 6);
+    assert(whole.soft_ms == shaped.soft_ms);
+
+    std::cout << "test_the_window_the_engine_shapes_is_the_one_the_root_loop_stops_at passed ("
+              << "window " << shaped.soft_ms << " of " << shaped.hard_ms
+              << " reached d" << shaped.depth << "/" << whole.depth
+              << ", readings " << clock.readings << ")" << std::endl;
+}
+
+// F3: the session is the only party that knows what the last think cost, and step 4
+// of the allocator needs that number. This pins the hand-off - recorded per committed
+// think, carried to the next one, cleared by a new game - without pretending to pin
+// the shaping, which F1 already did at the engine's door.
+void test_the_session_hands_the_next_think_what_the_last_one_cost() {
+    GameManager game;
+    game.set_player_color(BLACK);
+    game.set_config(1500, 3);
+
+    std::atomic<int> thinks{0};
+    std::atomic<int> first_cost{-1};
+    std::atomic<int> second_cost{-1};
+    game.set_move_callback([&](const Move& move, int, int elapsed_ms) {
+        assert(move.pos.is_valid());
+        (thinks.fetch_add(1) == 0 ? first_cost : second_cost).store(elapsed_ms);
+    });
+
+    // A fresh session has no previous think. 上一手耗时 is precisely the kind of number
+    // that would otherwise leak across the boundary and damp the first move of the next
+    // game by the last move of this one.
+    assert(game.prev_think_elapsed_ms() == 0);
+
+    game.make_move(7, 7);
+    for (int i = 0; i < 400 && thinks.load() < 1; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    assert(thinks.load() == 1);
+    assert(game.prev_think_elapsed_ms() == first_cost.load());
+
+    // The second AI think is armed by the human's next move, and by then the session
+    // has already recorded the first think's cost - so the witness after it is the
+    // *second* cost, not the first. One number, never two: the record is overwritten by
+    // whichever think last finished.
+    //
+    // The cell is the first empty one on the board rather than a literal, because the
+    // AI's reply to (7,7) is a stone the engine chooses and a hand-picked neighbour is
+    // how this case used to fail: make_move() on an occupied cell answers false and no
+    // second think ever starts.
+    int second_row = -1;
+    int second_col = -1;
+    for (int row = 0; row < BOARD_SIZE && second_row < 0; ++row) {
+        for (int col = 0; col < BOARD_SIZE && second_row < 0; ++col) {
+            if (game.board().is_empty(row, col)) {
+                second_row = row;
+                second_col = col;
+            }
+        }
+    }
+    assert(second_row >= 0 && game.make_move(second_row, second_col));
+    for (int i = 0; i < 400 && thinks.load() < 2; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    assert(thinks.load() == 2);
+    assert(game.prev_think_elapsed_ms() == second_cost.load());
+
+    game.reset();
+    assert(game.prev_think_elapsed_ms() == 0);
+
+    std::cout << "test_the_session_hands_the_next_think_what_the_last_one_cost passed ("
+              << "costs " << first_cost.load() << ", " << second_cost.load() << ")"
+              << std::endl;
+}
+
 int main() {
     std::cout << "Running search tests..." << std::endl;
 
@@ -8854,6 +9072,13 @@ int main() {
 
     // D2: the shard split on the quiet pose, against the arms B3 already pinned.
     test_a_sharded_table_searches_the_tree_an_unshared_one_searches();
+
+    // F, in the contract's order: what the engine decides when the client named only
+    // a wall, that the root loop spends exactly that, then the session's hand-off of
+    // the number the decision is shaped with.
+    test_the_engine_shapes_the_window_the_client_did_not_name();
+    test_the_window_the_engine_shapes_is_the_one_the_root_loop_stops_at();
+    test_the_session_hands_the_next_think_what_the_last_one_cost();
 
     std::cout << "All search tests passed!" << std::endl;
     return 0;

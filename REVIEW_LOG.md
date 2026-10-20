@@ -1979,6 +1979,216 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次132 引擎重构 F：§2.3.4 的分配器第一次有了调用方，而「训练模式」这件事必须由调用方说出口 — engine redesign stage F, the budget allocator gains its first caller
+
+规格 `docs/ENGINE_REDESIGN.md:241-260`（§2.3.4 预算分配器，五步）＋ `:583-584`（文件清单里
+`search_engine.h/.cpp` 的「`TimeManager` 预算分配」和 `time_manager.h/.cpp` 的「**新增** 预算分配」）
+＋ `:557`（§4 回归保障第 4 条：「注入 mock clock，验证 partial_depth / root_moves_done / stopped 在软硬时限、
+节点上限、用户中止三种情况下的取值」）。这一节是那张清单上**最后一条没有调用方的功能**：轮次131 收尾时的
+审计把 §2.7 的 LMR 判成不落地、把 §2.8 五条全部落地，剩下的只有「类写好了、测试钉好了、但 `SearchEngine`
+从来不调它」。
+
+### Found
+
+- `src/search/time_manager.h:16-19` 的注释自己就写着 「it still has no caller」，而 `grep -rn TimeManager::allocate`
+  的两个读者全在 `tests/test_search.cpp:4039/:4087`——A 轮给这个纯函数钉过一张五行表，函数本体从没进过一次真实思考。
+- 于是 `SearchLimits.soft_time_ms` 的唯一来源是客户端自己点名（`--soft-time-ms`）；默认配置下它是 0，
+  `alphabeta.cpp:616` 那句 `stats_.completed_depth >= 1 && ctx_.soft_time_up()` 永远不成立——
+  **软时限这条机制在树里，但没有生产者**。一次思考要么跑完深度，要么吃掉整面墙。
+- 第 4 步（上一手耗时 > 0.8×hard 就下调）连数据源都不存在：`GameManager` 记着每一手的 `elapsed_ms`，
+  却从来没有把它交给引擎。
+- **读调用图读出来的缺陷**：`TimeManager::allocate` 的第一步就是把 hard 乘 0.65，而默认训练配置是
+  `self_play.h:15-18` 的 `timeout_ms = 400` / `max_nodes = 0`（README.md:186 那条出厂命令两个都不点名）。
+  如果「训练模式」只按 `--max-nodes` 有没有点名来推断，默认训练跑的**每一手**都会被裁成 ~260 ms 的软窗，
+  采集样本的搜索深度从此由分配器决定——而这条改动在 D 轮记下的任何一条成本读数里都不会露出来。
+  判定 regime 的是调用方，不是引擎猜数字。
+
+### 实现
+
+1. `src/search/search_engine.cpp:320-331`：`limits.training = (max_nodes_ > 0 || training_)`，
+   并且只在 `limits.soft_time_ms == 0 && has_deadline` 时用 `TimeManager::allocate(...).soft_ms` 填窗口。
+   两道闸各自挡掉一种越权：客户端点了名就不改写，客户端没给墙钟就不发明窗口——
+   `time_limit_ms == 0` 那次思考的 `hard_ms` 是分相兜底的 100 ms（`search_engine.cpp:263-266`），
+   拿它当 65 % 的基准会把一次纯深度思考裁到 65 ms。
+2. `SearchResult.soft_ms` / `hard_ms`（`src/search/search_engine.h:41-49`）是这条决定的见证：
+   `elapsed_ms` 说的是这手想了多久，不是这手被允许想多久，两个数只在巧合时相等。
+   只报一个数等于没报，所以墙和窗一起出。
+3. `SearchEngine::set_clock`（`:141-147`）把 §4 第 4 条要的 mock clock 注入口从 `AlphaBetaSearch`
+   提到引擎门口：窗口在这一层**选出来**，在 AlphaBeta 的根循环**花掉**，只有时钟能从门口进去，
+   「选的那个数就是花的那个」才证得成。
+4. `GameManager`：`prev_think_elapsed_ms_` 原子量（`game_manager.h:204-208`）由思考线程在交回着法后写、
+   由 spawning 线程读进 `Budget{soft, nodes, prev_elapsed}` 按值带走（`game_manager.h:239-247`）；
+   两条思考路径（`ai_thinking_worker` / `request_hint`）都把它交给引擎，`reset()` 清零。
+5. `src/training/self_play.cpp:27-35`：`SelfPlay` 构造时给两台引擎 `set_training(true)`。
+   数据局、验证赛、fitness 局都从这一个构造函数过（`trainer.cpp:68` 的 `play_game`、
+   `:295` 的 `RetryExplorer`），所以一句话就把整个训练管线挡在外面。
+
+测试：`tests/test_search.cpp` 三条新算例插在 `int main()` 之前——F-1 把 shaping 的六个分支摆成一张表
+（默认 65 %、被上一手裁成一半、客户端点名原样通过、点名窗口不裁、节点帽那档、声明训练那档、
+没墙钟那档），断言全部写成 `soft == hard * 65 / 100` 这种**比值**而不是绝对毫秒数，因为
+`hard` 是「墙减去战术阶段已经花掉的」，同一条算例在满载机器和 memcheck 下会差几十毫秒；
+F-2 注入 `ScriptedClock(100)` 钉住「time_soft / partial 0 / 深度没跑满」，再用 `SteadyClock`
+作对照臂证明停它的是窗口而不是那面墙顺带的节点帽；F-3 走会话，钉 `move_callback` 交回的
+`elapsed_ms` 就是下一手拿到的 `prev_think_elapsed_ms`，以及 `reset()` 把它清干净。
+`tests/test_training.cpp` 一条：`SelfPlay` 之前引擎不是训练态、之后是，且训练对局里没有任何一手
+报 `time_soft`。
+
+### 读数
+
+**一、两条墙钟配置的 before/after（产品路径，战术相位开着，客户端不点软窗也不点节点帽）**
+
+仪器：`/tmp/f2/budget_probe.cpp` 用 `GreedySearch` 自对弈摆出 32 个中盘局面（4 个起点、每 6 手取一景），
+每个局面各跑文档点名的两档——`d6 / --timeout-ms 2000` 与 `d8 / 4000`——两臂各跑两遍并按遍交错
+（before₁、after₁、before₂、after₂，`/tmp/f2/{before,after}_i{1,2}.out`，合计 128 臂）。
+两臂是两棵树：before 是 HEAD `cca3f0a`（`TimeManager::allocate` 无调用方），after 是工作树；
+两边都用同一套 `-O2` 编译，因为两棵树的 `SearchResult` / `SearchEngine` 布局不同，
+混链 `.o` 是轮次里已经咬过一口的 ABI 坑。
+
+| 配置 | 臂数 | 到达请求深度 | 中位耗时 | 耗时和 | 节点和 | 停下的原因 |
+| --- | --- | --- | --- | --- | --- | --- |
+| d6 / 2 s before | 64 | 54（84.4 %） | 618 ms | 47,241 ms | 7,552,532 | none 62 / time_hard 2 |
+| d6 / 2 s after | 64 | 54（84.4 %） | 616 ms | 47,347 ms | 7,551,463 | none 62 / time_hard 2 |
+| d8 / 4 s before | 64 | 20（31.2 %） | 3,906 ms | 186,845 ms | 32,783,490 | none 28 / time_hard 30 / nodes 6 |
+| d8 / 4 s after | 64 | 20（31.2 %） | 3,010 ms | 175,730 ms | 30,896,728 | none 28 / time_hard 18 / time_soft 14 / nodes 4 |
+
+四条读数：
+
+1. **答案一条没变**：`method` / `best_move` / `score` 三栏在 128 臂上 0 处不同
+   （`compare_arms.py` 的头三行），到达深度每档也是 54 与 20 一模一样。这一条改的确实是
+   「什么时候收手」，不是「收到什么」。
+2. **窗口只在吃满墙的那一侧落下**：d6 档中位 618 ms，本来就在新窗（≈1,300 ms）以内，所以四列数字
+   全等，耗时和差的 106 ms 是噪声（+0.2 %）；d8 档 64 臂里 30 臂原本撞 `time_hard`，其中 14 臂
+   现在改由 `time_soft` 在层边界收手，中位耗时 3,906 → 3,010 ms（**−22.9 %**），
+   节点和 32,783,490 → 30,896,728（**−5.75 %**）。
+3. **软窗是比值不是绝对数**：after 一臂里 14 组 `(soft, hard)` 的 `soft/hard` 全部 = 0.650
+   （min 0.650 / max 0.650），例如 `(910, 1400)`、`(1279, 1968)`——不同机器、不同负载只会把
+   `hard` 挪走，不会把比例挪走，这就是 F-1 把断言写成比值的原因。
+4. **16 臂两个见证都留 0**，`method` 全是 `must_block`——正是 `search_engine.h:41-45` 注释里
+   那句「没起分层搜索的快路径报 0」；`must_block` 不该被窗口管，也不该有窗口。
+
+顺带把文档 `:548` 那行的本仪器读数记下：**这一组 32 景的 d6/2 s 完成率是 84.4 %（27/32 景）**，
+达不到那一行写的 ≥ 95 %；两臂同一个数，所以本轮既没把它推上去也没推下去。
+
+**二、三条新算例自己的打印**
+
+- F-1 `test_the_engine_shapes_the_window_the_client_did_not_name`：
+  `wall 3000 -> soft 1950, damped soft 1500, trained soft 0`；另外三档（点名 900 原样通过、
+  声明训练 `soft 0 / hard > 0`、没有墙钟的纯深度思考 `soft 0 / hard 100`）由断言钉住。
+- F-2 `test_the_window_the_engine_shapes_is_the_one_the_root_loop_stops_at`：
+  `window 1950 of 3000 reached d4/6, readings 56`——对照臂（`SteadyClock`）同一面墙跑到 d6 且
+  `stopped == none`，所以停 d4 的只能是那 1,950 ms。
+- F-3 `test_the_session_hands_the_next_think_what_the_last_one_cost`：
+  `costs 16, 26`（两手的 `elapsed_ms` 与 `prev_think_elapsed_ms` 逐手相等）。这一条最初用字面量
+  `(6,6)` 摆第二手，被引擎自己的第一手占掉而 `make_move` 返回 false——现在按棋盘取第一个空格。
+
+**三、memcheck 两臂（`--tool=memcheck -q --error-exitcode=9 --leak-check=full --track-origins=yes`，
+`-O0 -g -UNDEBUG` 的 Debug 臂，`wide` 模式）**
+
+| 臂 | 退出码 | 报告 | 树 |
+| --- | --- | --- | --- |
+| before（HEAD） | rc=0 | `-q` 下无输出＝零报告，且 `--errors-for-leak-kinds=definite` 没触发 | 146,187 节点、d6、best (8,8)、score −20704、`stopped=none` |
+| after（工作树） | rc=0 | 同上 | **同一棵树**：146,187 节点、d6、(8,8)、−20704、`soft=389983 / hard=599975` |
+| `tools/valgrind_check.sh memcheck test_training` | rc=0 | `clean reports=0 invalid_read=0 invalid_write=0 uninitialised=0 definite_leak=0 304s`（轮次130 记的 306 s 同级） | 训练管线：`self_play.cpp` 改了构造，这条是它的门禁 |
+
+`wide` 那一档是仪器自己的要求：墙钟抬到 600,000 ms，软窗就成了 389,983 ms——一次 d6 思考远远够不着，
+于是**两臂的树必须由构造保证相同**（比值还是 0.650，只是裁不到），memcheck 报的差错和 callgrind 报的
+指令差才都只可能是本轮代码自己的。两臂节点数一字不差就是这个前提的验收。
+
+`MoveBudget` 是三个 `int` 的 POD，`allocate()` 只做算术和 `std::min/max`，一条分配都没有；
+`SearchResult` 的两个新字段和 `GameManager` 的原子量把结构各撑大 4 字节，都在原本就属于它们的对象里
+（一次 think 的栈上返回值、一台会话一份）。所以本轮没有新的每节点分配压力，也没有新的共享写。
+
+**四、callgrind 两臂（同一棵树上的指令数）**
+
+| 臂 | PROGRAM TOTALS (Ir) | Ir/节点（146,187 节点） |
+| --- | --- | --- |
+| before | 33,132,621,872 | 226,645.47 |
+| after | 33,132,623,558 | 226,645.49 |
+
+差 **1,686 Ir = +0.000 005 1 %**。按函数逐个对表（`callgrind_annotate --threshold=100` 的两份全表，
+`/tmp/f2/cga100_{before,after}.txt`；这份表把 in-callee 也算一遍，所以行和 33,312,815,686 比 PROGRAM
+TOTALS 大，只用来看归因不看总量）：**1,650 → 1,653 个符号里只有 41 个动了**，净差 +1,703 Ir，
+而动的全是个每 think 一次的小项：
+
+| 符号 | before → after | 差 |
+| --- | --- | --- |
+| `__printf_buffer`（两行）+ `_itoa_word` + `__printf_buffer_write` | 1,530→1,742 等 | **+620**（**仪器自己**多打 `soft=` / `hard=` 两个整数） |
+| `std::chrono::__duration_cast_impl` + `steady_clock_ms` + `steady_clock::now` | — | **+365**（多一次读钟与换算，同样每 think 一次） |
+| `gomoku::TimeManager::allocate` | 0 → **105** | +105 |
+
+也就是说这一轮真正买到的运行时代价是 **每次思考 105 条指令**，其余的差是打印出来的数变多了——
+搜索一侧的行（`pattern.cpp` / `evaluator.cpp` / `board.*` / `search_state.h`）**一字没动**，
+因为两臂本来就是同一棵树。
+
+「哪个函数 CPU 卡比较久」的答案在这对臂上的形状（99 % 阈值表前五行，`/tmp/f2/cga_before.txt`）：
+
+| 函数 | 占比 |
+| --- | --- |
+| `std::array<DirectionPattern,4>::operator[]`（`-O0` 不内联，所以单独成行） | 18.87 % |
+| `Evaluator::pattern_score` | 10.53 % |
+| `std::array<std::array<std::array<ul,29>,4>,3>::operator[]`（三层各记一行） | 4.20 % ×3 |
+| `Board::line_bits` | 4.17 % |
+| `PatternRecognizer::recognize_position_both` | 3.27 % |
+
+热点仍然全在**评估与棋型识别**这一侧；`src/search/` 里排得最高的是 `alphabeta.cpp:sort_moves` 的两个
+lambda，各 0.06 %，而本轮代码所在的 `time_manager.cpp` 在 99 % 表里根本不出现。这与轮次130、131 记的
+答案同形且没有移动——注意这是 **Debug（-O0）臂**，所以 `std::array::operator[]` 会占掉 18.87 %，
+和出厂 -O2 构建的热点表不是一个刻度；本轮要的只是两臂互比，不是重排绝对热点。
+
+### 门禁
+
+- `cmake --build build -j 4` rc=0；`ctest` **8/8 / 471.49 s**（`test_search` 435.87 s、
+  `test_position` 7.90 s、`test_server` 16.78 s、`test_training` 10.77 s，其余三条 0.1 s 内）；
+  `node tests/web_frontend_check.js` **105/105**；`node tests/readme_anchor_check.js`
+  **120 citations / 0 problems**；README 仍 **658 行**——本轮没有动它：`soft_ms` / `hard_ms`
+  是 `SearchResult` 的内部字段，`thinking_progress` 帧的键由 §2.9 定稿，`docs/ENGINE_REDESIGN.md:446`
+  只给 `set_config` 加了 `soft_time_ms` / `max_nodes` 两个可选入参，那两个早就在。
+- `tests/test_search.cpp` 只在文件尾部加行（`int main()` 从 8676 → 8894 行，文件 8,860 → 9,085 行），
+  受引用的旧行号一条没动；`tests/test_training.cpp` 同样在中段插入（+35 行，注册紧跟
+  `test_self_play_zero_ceiling_arms_no_node_budget` 之后）。改动面是 `src/` 六个文件
+  （`search_engine.h/.cpp`、`time_manager.h`、`game_manager.h/.cpp`、`self_play.cpp`）＋ `tests/`
+  两个文件，合计 **8 files changed, 369 insertions(+), 4 deletions(-)**。
+
+### 判
+
+落地。这一条不是「更快」，而是**把已经在树里的机制接上**：软时限的判断（`alphabeta.cpp:616`）和
+它的见证（`stopped == time_soft`）都是 A 轮交付的，缺的是生产者。棋力方向上不引入新的搜索形状——
+128 臂的 `method` / 着法 / 分值三栏 0 处不同（读数 1），差别只出现在「同一面墙下更早收手」这一侧。
+
+诚实记下的后果：一局棋里 AI 每一手的可用时间从「整面墙」变成 65 %（强制局面和开局各再减半），
+所以同样一条 `--timeout-ms 3000` 现在给的是更浅的一层，而不是更久的一手。这是 §2.3.4 第 1-2 步的本意，
+但它对**提示**同样生效：`request_hint` 走的是同一条 shaping，一次提示可能比改动前少一层。
+
+### 没动的账
+
+- §1.3 P1 的验收行 `:549`（「单线程 ≥ 1M nps；depth 8 在 4s 内完成」）本轮读数依旧不达标：
+  这一组 32 景的 d8/4 s 完成率两臂都是 **31.2 %**（20/64 臂），单线程吞吐按 after 的节点和 / 耗时和
+  是 30,896,728 / 175,730 ms ≈ **17.6 万 nps**，离 1M 差一个量级还多。本轮改变的不只是这条读数的
+  成本，还有「4 s 到没到」的语义（软窗先停），所以四个数按 before/after 各记一次，不折算。
+- §2.8 D 行的三条读数（≥ 40 % 单轮降本、内存峰值与并发解耦、fitness 不再三档）：本轮把训练路径
+  原样挡在 shaping 外面，所以那三条的账没有前进也没有后退。
+- `limits.ponder` 依然没有消费者（`search_limits.h:68` 只有默认值测试读它）：本引擎没有对手着法流，
+  预置复用无从谈起，文档的这半个字段留着不接线，如实记。
+- `MoveBudget.hard_ms` / `.max_nodes` 由分配器算出来但被调用方丢掉——这是决定，不是遗漏：
+  一次思考的墙和节点帽由点名的那一方定，改了它「同一份输入两次成本不同」就没了。
+  `time_manager.h:16-21` 注释已按这个说法改写。
+- §2.3.4 第 3 步的残局分支（空位 < 30 把窗抬到 hard）在真实对局里够不着：225 格要落 196 子才剩 29 个空位，
+  只有和棋盘能走到；它由 A 轮那张表用一个合成的 196 子盘钉住，本轮不改这个语义。
+- §2.9 `:444` 写的 `SearchResult.interrupted` 字段没有加：`stopped` 已经是它的完整版
+  （`none` / `time_soft` / `time_hard` / `nodes` / `user` / `mate`），再加一个布尔是把同一个事实说两遍。
+
+### 仪器（每条读数怎么再跑一遍）
+
+- `/tmp/f2/build_arms.sh`：`git archive HEAD src | tar -x` 取 before 树，与工作树各按同一套编译参数出两台
+  probe（`OPT`/`tag` 两个环境变量决定 `-O2 -DNDEBUG` 的计时臂还是 `-O0 -g -UNDEBUG` 的 valgrind 臂）。
+- `/tmp/f2/budget_probe.cpp`：32 景 × `d6/2000` 与 `d8/4000`，`wide` 档只跑 `pose 00 d6 ms=600000`。
+  after 臂多印 `score= / soft= / hard=`（`WITNESS=1`），before 臂没有这两个字段可印，编译期就分叉。
+- `/tmp/f2/run_measure.sh`：交错四跑 → `compare_arms.py` → Debug 臂 → memcheck 两臂 →
+  `memcheck test_training` → callgrind 两臂，全程串行，不与任何其他负载同跑。
+- 原始输出：`{before,after}_i{1,2}.out`、`g4_compare.out`、`mc_{before,after}.out`、
+  `g7_memcheck_training.out`、`cg_{before,after}.out`、`cga_{before,after}.txt`、`cga100_*.txt`。
+
+
 ## 轮次131 引擎重构 E：§2.7 的最后一行第一次进树，64 臂上省到 −28.35 %，而两种赛制的验证赛都落不到「没有退化」——engine redesign stage E, late-move reduction (§2.7 :426): built, measured on twelve guards and two verification matches, judged 不落地
 
 规格 `docs/ENGINE_REDESIGN.md:426` 是 §2.7 那张增强表里**唯一一条既没实现也没被判过的**：

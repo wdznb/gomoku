@@ -38,6 +38,16 @@ struct SearchResult {
     int root_moves_done = 0;
     int root_moves_total = 0;
     int seldepth = 0;
+    // The soft window the AlphaBeta think was given, in milliseconds since the think
+    // started (design doc 2.3.4). Zero is honest about three different cases: a think
+    // with no clock at all, a think running on a named node budget, and every fast path
+    // that never started a layered search. Only AlphaBeta fills it.
+    int soft_ms = 0;
+    // The wall that window was shaped from - this phase's share of the caller's
+    // time_limit_ms after the tactical phases had spent part of it. Reported next to
+    // soft_ms because the shaping is a ratio, and a ratio with one number shown is a
+    // claim: 1950 says nothing about whether the engine was asked for 3000 or 4000.
+    int hard_ms = 0;
     std::string stopped = "none";
 };
 
@@ -117,6 +127,33 @@ public:
         has_hint_ = false;
     }
 
+    // Design doc 2.3.4 step 4. The budget the next think gets is shaped by what the
+    // last one actually cost: a think that ran past 80 % of its hard limit is a
+    // position this engine cannot read quickly, and asking the next one for the full
+    // soft window is how two consecutive timeouts look to the player. Only the owner
+    // of a sequence of thinks knows that number, so it hands it over; 0 - the
+    // default, and every caller that never says - means "no previous think", which
+    // leaves the shaping to the position alone.
+    void set_prev_move_elapsed_ms(int ms) { prev_move_elapsed_ms_ = ms > 0 ? ms : 0; }
+    int prev_move_elapsed_ms() const { return prev_move_elapsed_ms_; }
+
+    // Which regime the caller is in, said out loud rather than guessed from one of the
+    // numbers (design doc 2.3.4 step 5: 训练模式 - 时间预算不参与). A named node ceiling
+    // already implies it, but `gomoku_train` with its default `--timeout-ms 400` and no
+    // `--max-nodes` (self_play.h:15-18) is training too, and shaping a soft window out of
+    // that wall would quietly change the depth every collected sample was searched to.
+    void set_training(bool training) { training_ = training; }
+    bool training() const { return training_; }
+
+    // Whose clock the layered think reads its budget against. nullptr - the default,
+    // and every caller in production - keeps the steady clock. This exists for design
+    // doc §4's 「注入 mock clock」: the window is *chosen* in this class but only *spent*
+    // inside AlphaBeta's root loop, so a clock handed in at the engine's door is what
+    // proves the chosen number is the spent one. The tactical phases keep their own
+    // slices of the wall clock; the layer-boundary decision this is about lives in
+    // AlphaBeta's context.
+    void set_clock(const SearchClock* clock) { clock_ = clock; }
+
     // Proves the position lost by exhausting every reply against the opponent's
     // forced VCF. Returns quickly on the first reply that survives, so the cost
     // only grows in positions that are genuinely lost. Only ever sets
@@ -156,6 +193,9 @@ private:
     int alphabeta_max_depth_;
     int soft_time_ms_ = 0;
     int max_nodes_ = 0;
+    int prev_move_elapsed_ms_ = 0;
+    bool training_ = false;
+    const SearchClock* clock_ = nullptr;
 
     bool resign_detection_;
     int resign_node_limit_;

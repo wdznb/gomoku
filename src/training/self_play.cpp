@@ -24,6 +24,14 @@ SelfPlay::SelfPlay(SearchEngine& black_engine, SearchEngine& white_engine,
     // clamps to 0 inside the setter, which is the previous behavior.
     black_engine_.set_max_nodes(config_.max_nodes);
     white_engine_.set_max_nodes(config_.max_nodes);
+    // Design doc 2.3.4 step 5 says the time budget does not participate in 训练模式, and
+    // this is the one place every training think passes - data games, verification pairs
+    // and fitness games all come through here. The node ceiling alone could not say it:
+    // `--timeout-ms` with no `--max-nodes` is the default (self_play.h:15-18), and a soft
+    // window shaped from that wall would leave each collected sample searched to a depth
+    // the round did not ask for.
+    black_engine_.set_training(true);
+    white_engine_.set_training(true);
 }
 
 GameRecord SelfPlay::run(const std::vector<Move>& prefix,

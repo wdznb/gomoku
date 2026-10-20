@@ -16,7 +16,10 @@ struct MoveBudget {
 // Turns the caller's request into a budget. The engine handed fixed proportions
 // to VCF (35 %) and VCT (55 %) until B5 replaced them with the probe-gated
 // 20 %/30 % caps (search_engine.cpp:17-18); this is where those decisions were
-// meant to live instead, and it still has no caller.
+// meant to live instead. SearchEngine::search calls it for the soft window only -
+// the hard wall and the node ceiling stay where the caller put them, because a
+// think whose budget moved between two identical requests is not a reproducible
+// think.
 class TimeManager {
 public:
     // The side to move is not an input: the candidate set is colour-independent

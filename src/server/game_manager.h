@@ -148,13 +148,20 @@ public:
     void set_coefficients(const ThreatCoefficients& coeffs);
     // soft_time_ms / max_nodes are optional overrides: a negative value means
     // "whatever this session already has", so the two older callers and a client
-    // that names only the timeout keep the engine's own budget (0 = no soft window
-    // and the time-derived node ceiling).
+    // that names only the timeout keep the engine's own budget (0 on the soft window
+    // means the client named none, which is what lets SearchEngine shape one from the
+    // hard wall per design doc 2.3.4; 0 on the node ceiling keeps the time-derived
+    // ceiling).
     void set_config(int timeout_ms, int max_depth, int soft_time_ms = -1, int max_nodes = -1);
     int timeout_ms() const { return timeout_ms_; }
     int max_depth() const { return max_depth_; }
     int soft_time_ms() const { return soft_time_ms_; }
     int max_nodes() const { return max_nodes_; }
+    // What the last think of this session cost, which is the input the next think's
+    // soft window is shaped with. Read for the tests and the UI's own report of why a
+    // move came back when it did.
+    int prev_think_elapsed_ms() const { return prev_think_elapsed_ms_.load(); }
+
     void set_opening_book(const OpeningBook* book);
     
 private:
@@ -194,6 +201,10 @@ private:
     // remaining time derives.
     int soft_time_ms_ = 0;
     int max_nodes_ = 0;
+    // The searching thread writes this after a think hands back its move; the thread
+    // that spawns the next one reads it into the Budget it passes by value, which is
+    // why it is atomic rather than a plain int like the two above.
+    std::atomic<int> prev_think_elapsed_ms_{0};
 
     // What the session's last completed AlphaBeta think concluded, for the next
     // think of the same colour to reuse as a root candidate and an aspiration
@@ -225,8 +236,14 @@ private:
     struct Budget {
         int soft_time_ms = 0;
         int max_nodes = 0;
+        // What the previous think of this session cost, in milliseconds (design doc
+        // 2.3.4 step 4). Carried by value for the same reason as the two above: the
+        // spawning thread reads it, the searching thread writes it.
+        int prev_elapsed_ms = 0;
     };
-    Budget take_budget() const { return Budget{soft_time_ms_, max_nodes_}; }
+    Budget take_budget() const {
+        return Budget{soft_time_ms_, max_nodes_, prev_think_elapsed_ms_.load()};
+    }
     
     ProgressCallback progress_callback_;
     MoveCallback move_callback_;

@@ -1,5 +1,6 @@
 #include "search_engine.h"
 #include "move_generator.h"
+#include "time_manager.h"
 #include <chrono>
 #include <climits>
 
@@ -254,6 +255,7 @@ SearchResult SearchEngine::search(const Board& board, int color,
 
     if (alphabeta_enabled_ && !stop_flag.load()) {
         AlphaBetaSearch ab(evaluator_, *tt_alphabeta_);
+        if (clock_ != nullptr) ab.set_clock(clock_);
         // The absolute end-of-move deadline, not a slice: remaining_time below
         // is only this phase's share of the budget, so on its own it lets the
         // move overshoot by that whole share once the tactics phases spent it.
@@ -301,11 +303,38 @@ SearchResult SearchEngine::search(const Board& board, int color,
         // once it is past, at a layer boundary where the check costs nothing.
         limits.soft_time_ms = soft_time_ms_;
         limits.max_nodes = max_nodes_ > 0 ? max_nodes_ : node_budget;
+        // Design doc 2.3.4, and the first caller `TimeManager::allocate` ever had.
+        // Two regimes are told apart here: a client that named a soft window keeps it
+        // verbatim (the session's `--soft-time-ms`, or a test that wants a known
+        // cutoff), and one that named only the hard wall gets the window the position
+        // deserves - 65 % of the remainder, cut further for a handful of candidates,
+        // an opening and a previous think that overran, raised toward the hard limit in
+        // an endgame. Training stands aside from all of it (step 5: 时间预算不参与), and
+        // the caller says so - `set_training` - rather than the engine guessing from
+        // `--max-nodes` being set, because the default training run (self_play.h:15-18:
+        // a 400 ms wall, no node ceiling) would otherwise have every think cut to 260 ms
+        // and the collected samples searched to a shallower depth than they were.
+        // Standing aside means standing aside in both directions: the hard deadline
+        // stays exactly where it was, `--timeout-ms` still a fallback, and only the
+        // *shaping* of the soft window is declined. A caller that named no wall clock is
+        // left alone for the same reason in the other direction: no deadline was asked
+        // for, so no window gets invented for it.
+        limits.training = (max_nodes_ > 0 || training_);
+        if (limits.soft_time_ms == 0 && has_deadline) {
+            limits.soft_time_ms =
+                TimeManager::allocate(board, limits, prev_move_elapsed_ms_).soft_ms;
+        }
         limits.hint_move = hint_move_;
         limits.hint_score = hint_score_;
         limits.has_hint_score = has_hint_;
 
         Move ab_move = ab.search(board, color, limits, stop_flag);
+        // Which window this think was held to. The shaping above is a decision, and a
+        // decision with no witness is a claim: `elapsed_ms` says how long the think
+        // took, not how long it was allowed to take, and the two only coincide by
+        // accident.
+        result.soft_ms = limits.soft_time_ms;
+        result.hard_ms = limits.hard_time_ms;
 
         // A search that found nothing to search returns an invalid move. The
         // fallback answers from the candidate list this method still holds, and it

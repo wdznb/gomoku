@@ -91,6 +91,10 @@ void GameManager::reset() {
     analyses_.clear();
     position_pending_ = false;
     has_hint_ = false;
+    // A new game has no previous think, and 上一手耗时 is exactly the kind of number
+    // that would otherwise carry across the boundary and damp the first move of the
+    // next game by the last move of this one.
+    prev_think_elapsed_ms_.store(0);
 }
 
 bool GameManager::set_position(const Board& board) {
@@ -355,12 +359,14 @@ bool GameManager::request_hint(int timeout_ms, int max_depth) {
          budget]() mutable {
             engine_.set_soft_time_ms(budget.soft_time_ms);
             engine_.set_max_nodes(budget.max_nodes);
+            engine_.set_prev_move_elapsed_ms(budget.prev_elapsed_ms);
             if (reuse.valid) {
                 engine_.set_hint(reuse.move, reuse.score);
             } else {
                 engine_.clear_hint();
             }
             SearchResult result = engine_.search(board_snapshot, turn, max_depth, timeout_ms, stop_flag_);
+            prev_think_elapsed_ms_.store(result.elapsed_ms);
 
             // A user stop_thinking only raises stop_flag_, so delivering on the
             // discard flag alone still answers a stopped hint and releases the
@@ -458,6 +464,7 @@ void GameManager::ai_thinking_worker(int timeout_ms, int max_depth, Reuse reuse,
 
     engine_.set_soft_time_ms(budget.soft_time_ms);
     engine_.set_max_nodes(budget.max_nodes);
+    engine_.set_prev_move_elapsed_ms(budget.prev_elapsed_ms);
     if (reuse.valid) {
         engine_.set_hint(reuse.move, reuse.score);
     } else {
@@ -465,6 +472,7 @@ void GameManager::ai_thinking_worker(int timeout_ms, int max_depth, Reuse reuse,
     }
 
     SearchResult result = engine_.search(snapshot, ai_color_, max_depth, timeout_ms, stop_flag_);
+    prev_think_elapsed_ms_.store(result.elapsed_ms);
 
     if (result.resigned) {
         std::lock_guard<std::mutex> lock(thinking_mutex_);

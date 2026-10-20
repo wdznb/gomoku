@@ -4114,6 +4114,40 @@ void test_self_play_zero_ceiling_arms_no_node_budget() {
     std::cout << "test_self_play_zero_ceiling_arms_no_node_budget passed" << std::endl;
 }
 
+// The regime has to be said out loud rather than read off one of the numbers. The F
+// round's budget allocator is the first thing inside the engine that treats a wall clock
+// as a quantity to divide, and `--timeout-ms` with no `--max-nodes` is the shipped
+// training default (self_play.h:15-18; README.md:186 names neither). Shaping that wall
+// would have cut every think of the default run to 65 % of it and collected its samples
+// from a depth the round never asked for - the one change to the training pipeline that
+// would have been invisible in every existing cost reading.
+void test_self_play_declares_training_so_the_clock_does_not_shape_it() {
+    SearchEngine black;
+    SearchEngine white;
+    black.set_resign_detection(false);
+    white.set_resign_detection(false);
+    // An engine that no game owns is a play engine: the flag defaults off, which is what
+    // keeps the shaping reachable for a player.
+    assert(!black.training() && !white.training());
+
+    SelfPlayConfig settings = quick_play_config();
+    assert(settings.max_nodes == 0);
+    assert(settings.timeout_ms > 0);
+    SelfPlay play(black, white, settings);
+    assert(black.training() && white.training());
+
+    // The observable half of the same fact: a think that was shaped by the wall can stop
+    // for the window it was given, and a training think must never report that reason.
+    GameRecord record = play.run(std::vector<Move>(), nullptr, nullptr);
+    assert(!record.moves.empty());
+    for (const auto& entry : record.moves) {
+        assert(entry.stopped != "time_soft");
+    }
+
+    std::cout << "test_self_play_declares_training_so_the_clock_does_not_shape_it passed ("
+              << record.moves.size() << " moves, no soft stop)" << std::endl;
+}
+
 // A one-node ceiling is not a broken think: the interrupted layer hands back the root
 // move it had, so the game keeps going with a legal - if shallow - line. Zero completed
 // layers with a reported cut is the accounting design doc 2.3.3 asks for, and this is
@@ -5276,6 +5310,7 @@ int main() {
     test_self_play_node_budget_bounds_every_think();
     test_self_play_ms_budget_backs_up_a_generous_node_ceiling();
     test_self_play_zero_ceiling_arms_no_node_budget();
+    test_self_play_declares_training_so_the_clock_does_not_shape_it();
     test_self_play_one_node_ceiling_still_answers_legally();
     test_trainer_config_node_budget_reaches_both_game_paths();
     test_trainer_cli_max_nodes_probes();
