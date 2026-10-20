@@ -1,0 +1,9 @@
+{
+  "cards": {
+    "judged/normal": 2,
+    "proven/hard": 2
+  },
+  "coeffs_sha": "b7db6f41",
+  "generator": "analyze/1",
+  "schema": "tactics-index/1"
+}

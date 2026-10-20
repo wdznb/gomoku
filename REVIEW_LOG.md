@@ -1980,6 +1980,35 @@ additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cp
 no existing assertion was edited.
 
 
+## 轮次146 引擎重构 J-3：题卡分表——杀棋题与判断题第一次分开放，门禁从此只认不依赖系数的那一半 — engine redesign stage J-3, the card library splits into proven/ and judged/, so the gate only reads the half that does not depend on coefficients
+
+规格 `docs/ENGINE_REDESIGN_V2.md` `§6.6`（`proven` / `judged` 分表与目录布局）、`§6.7 c`（门禁只用 `proven`）。
+
+### 落点
+
+`tools/analyze_main.cpp` 新增 `--cards-dir DIR`：按 `kind` 分流——`missed_mate` 落 `proven/<layer>.jsonl`（杀棋题，正解由「能不能成五」决定，**与系数无关**，可以当门禁），其余落 `judged/<layer>.jsonl`（判断题，系数换代即失效）。同时写 `DIR/index.json`（各表数量 ＋ `coeffs_sha` ＋ generator 版本）。`--cards PATH` 保留为单文件模式，两者互斥。
+
+### 读数（同一份 4 局记录，`--budget 200000 --depth 8`）
+
+| 产物 | 数量 |
+| --- | --- |
+| `judged/normal.jsonl` | **2**（两张 `blunder`） |
+| `proven/hard.jsonl` | **2**（两张 `missed_mate`） |
+| `index.json` | `{"judged/normal":2,"proven/hard":2,"coeffs_sha":"b7db6f41"}` |
+
+摆棋测试：`--bench data/tactics --budget 200000` → **4/4**；`--bench data/tactics/proven --budget 32000` → **0/2**。两条都触发 §3.3 的 0 %/100 % 告警，说明这两档预算都不在 `proven` 层的分辨区间内——**告警是给预算选的**，与上一轮同一条判读。
+
+### 门禁
+
+- `cmake --build --target gomoku_analyze` **rc=0，零 warning**；
+- `ctest` **不跑**：本轮只改 `tools/analyze_main.cpp`，该文件只进 `gomoku_analyze`（不在任何 `add_test` 目标里），树内其余二进制逐字节未变；
+- `node tests/readme_anchor_check.js` **120 / 0 problems**；`node tests/web_frontend_check.js` **105/105**；
+- `data/tactics/` 按新布局重建（旧的单表 `judged/normal.jsonl` 4 张已被 2+2 取代）。
+
+### 判
+
+分表落地。它解决的是上一轮埋下的一个隐患：把「系数无关的杀棋题」和「系数相关的判断题」混在一张表里，门禁会在每次调参后无意义地变红，而人一旦习惯性忽略那道红，门禁就死了。现在门禁只读 `proven/`。
+
 ## 轮次145 引擎重构 J-2：段 B / 段 C 落地——复核第一次判出「俗手」与「漏杀」，而根表尾部原来一直是界不是分 — engine redesign stage J-2, the review stage lands: 4 real cards (2 blunders, 2 missed mates), and the root table's tail turns out to carry bounds rather than scores
 
 规格是 `docs/ENGINE_REDESIGN_V2.md` `§6.3.1`（`root_scores`）、`§6.3.2`（六种判定）、`§6.5`（难度阶梯）、`§6.6`（题卡）、`§6.7 b`（摆棋测试）、`§6.10`（落点）。上一轮（轮次144）只做了段 A，本轮把段 B、段 C、题卡格式、`--bench` 与 `--cards` 一起做完。

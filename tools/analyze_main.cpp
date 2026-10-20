@@ -14,6 +14,7 @@
 #include "training/params.h"
 #include "training/replay_analyzer.h"
 #include "training/tactics_card.h"
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -49,7 +50,9 @@ void print_usage() {
         "  --budget N           that budget (default 20000, nodes not milliseconds)\n"
         "  --depth D            depth cap for the review (default 8)\n"
         "  --gap N              lead over the second move that makes a 妙手 (default 3000)\n"
-        "  --cards PATH         append the surviving cards to PATH (JSONL)\n"
+        "  --cards PATH         append the surviving cards to one JSONL file\n"
+        "  --cards-dir DIR      route by kind: missed_mate -> proven/, rest -> judged/,\n"
+        "                       plus DIR/index.json (design doc 6.6)\n"
         "  --ladder-max N       top of the difficulty ladder (default 256000)\n"
         "\n"
         "bench (stage 6.7 b):\n"
@@ -222,6 +225,7 @@ int run_bench(const std::string& dir, const ThreatCoefficients& coeffs, int budg
 int main(int argc, char** argv) {
     std::string replay_path;
     std::string cards_path;
+    std::string cards_dir;
     std::string bench_dir;
     std::string params_path;
     std::string layer_floor = "normal";
@@ -256,6 +260,12 @@ int main(int argc, char** argv) {
             replay_path = value_for("--replay");
         } else if (arg == "--cards") {
             cards_path = value_for("--cards");
+            review = true;
+        } else if (arg == "--cards-dir") {
+            // 6.6 的目录布局：missed_mate 落 proven/（杀棋题，与系数无关，可当门禁），
+            // 其余落 judged/（判断题，系数换代即失效）。混在一张表里，门禁会在每次
+            // 调参后无意义地变红。
+            cards_dir = value_for("--cards-dir");
             review = true;
         } else if (arg == "--bench") {
             bench_dir = value_for("--bench");
@@ -338,6 +348,7 @@ int main(int argc, char** argv) {
     }
     const std::string fingerprint = coefficients_fingerprint(coeffs);
 
+    std::vector<TacticsCard> card_buffer;
     Totals totals;
     std::map<std::string, int> kinds;
     std::string line;
@@ -459,6 +470,8 @@ int main(int argc, char** argv) {
                 cards << card.to_json() << "\n";
                 cards.flush();
                 ++cards_written;
+            } else if (!cards_dir.empty()) {
+                card_buffer.push_back(card);
             }
             if (verbose && !json_out) {
                 std::cout << "        -> card " << card.id << "  layer " << card.layer
@@ -466,6 +479,39 @@ int main(int argc, char** argv) {
             }
         }
         ++game_index;
+    }
+
+    // 目录模式：按 (表, 层) 分组落盘，再写一份 index.json。分组在内存里做，
+    // 因为一次复盘的卡通常只有个位数，为它开一堆 ofstream 不划算。
+    if (!cards_dir.empty() && !card_buffer.empty()) {
+        namespace fs = std::filesystem;
+        std::map<std::string, std::vector<const TacticsCard*>> by_table_layer;
+        for (const TacticsCard& card : card_buffer) {
+            const std::string table = card.kind == "missed_mate" ? "proven" : "judged";
+            by_table_layer[table + "/" + card.layer].push_back(&card);
+        }
+        nlohmann::json index;
+        index["schema"] = "tactics-index/1";
+        index["generator"] = "analyze/1";
+        index["coeffs_sha"] = fingerprint;
+        nlohmann::json tables = nlohmann::json::object();
+        for (const auto& entry : by_table_layer) {
+            const fs::path path = fs::path(cards_dir) / (entry.first + ".jsonl");
+            fs::create_directories(path.parent_path());
+            std::ofstream out(path, std::ios::app);
+            if (!out) {
+                std::cerr << "cannot append to " << path.string() << "\n";
+                return 1;
+            }
+            for (const TacticsCard* card : entry.second) {
+                out << card->to_json() << "\n";
+            }
+            tables[entry.first] = static_cast<int>(entry.second.size());
+            cards_written += static_cast<int>(entry.second.size());
+        }
+        index["cards"] = tables;
+        std::ofstream idx(fs::path(cards_dir) / "index.json");
+        idx << index.dump(2) << "\n";
     }
 
     if (json_out) {
@@ -492,7 +538,8 @@ int main(int argc, char** argv) {
     if (review) {
         std::cout << "kinds:";
         for (const auto& entry : kinds) std::cout << "  " << entry.first << " " << entry.second;
-        std::cout << "\ncards written " << cards_written << " -> " << cards_path << "\n";
+        std::cout << "\ncards written " << cards_written << " -> "
+                  << (cards_dir.empty() ? cards_path : cards_dir) << "\n";
     }
     if (totals.games > 0) {
         std::cout << "candidates per game: "
