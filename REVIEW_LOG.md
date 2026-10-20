@@ -1980,6 +1980,109 @@ additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cp
 no existing assertion was edited.
 
 
+## 轮次139 引擎重构 M：§2.3–§2.9 与 §6 的 43 条机制逐条重新落点，32 条在跑、8 条异形、3 条已判不落地或按文档不做，另外把 `:548` 那一格的两套口径第一次对齐 — engine redesign stage M, every §2.3–§2.9 and §6 mechanism re-located file by file: 32 shipped, 8 shipped in a different shape, 3 measured-and-rejected or excluded by the doc, plus §4 :548's 2 s cell read on both rulers for the first time (audit round, no code changed)
+
+用户在本轮选了「再做一轮机制审计（只读，不改）」。审计的问题不是「还剩什么没写」——轮次135 已经答过
+一次——而是**上一次那份清单是不是靠记忆写的**。所以本轮每一条都重新 grep、重新看调用点，并把「注释里
+提到了」不算作实现（这条规矩来自轮次136：`evaluate_position_pair` 在文档里是打分入口，在树里一个生产
+调用点都没有）。落点表在 `/tmp/m1/audit.md`，本节只写结论与八条异形。
+
+### 结论
+
+- **43 条机制里 32 条在生产路径上跑**，而且每条都能给出「定义 + 生产调用点」两个位置；`src/` 与
+  `1e31d22` 逐字节相同，本轮一行代码没动。
+- **8 条是同物异形**（下面读数 1），其中 6 条早已在档（Step 3、tie-break 兜底、开局多样化默认关、
+  `SearchResult::interrupted`、`pattern_score` 的边界打折、分配器第 ② 条），2 条是本轮新写下来的
+  （层边界的 `min_depth`、分配器第 ② 条用的判据）。**没有一条异形是缺实现**——都在做同一件事，只是
+  形状与文档的伪码不同。
+- **3 条「未找到」全部是已判过或文档自己排除的**：LMR（轮次131 建后判不落地，代码已回收，本轮
+  `grep -rniE "lmr|late_move|reduction|reduce" src/` 只剩 vct.cpp:95 与 position_setup.h:64 两处无关词）、
+  威胁延伸（轮次121 B4 判不落地，最近的替代是 Tier1 永不截断）、`ponder`（无对手着法流，文档接口表里
+  那一个字段的声明在 `search_limits.h:68`，没有任何分支读它）。
+- **两条「生产无读者」要分开记**：`SearchStats.pv` / `SearchInfo.principal_variation` 一路写满
+  （`alphabeta.cpp:371/448/644` → `:483` → `search_engine.cpp:387`），但 `grep -rn principal_variation
+  src/server.cpp src/search/controller.cpp src/training/*.cpp web/` **为空**——只有
+  `tests/test_search.cpp:6256-6263 / :6296` 在断言它。这与轮次135 记过的 `tt_cutoffs`/`qnodes`/
+  `partial_best_move` 同一类：文档 §2.9 把它列成契约字段（「只增不改」），并没有承诺仓库内的消费者。
+
+### 读数 1：八条异形，逐条给位置与差异
+
+| 机制 | doc | 树内位置 | 差异 |
+| --- | --- | --- | --- |
+| §2.6 Step 3 局部 stand_pat | `:409-410` | `alphabeta.cpp:201` → `search_state.h:307`（`CandidateCache::board_score`） | 文档要「上一手四条线」的 delta；树里是对 `active_empty()` 全盘求和，只是每格的形状读 Step-2 记录 |
+| §2.4.5 三段式排序 | `:318-327` | `alphabeta.cpp:34`（`sort_moves`）：① TT/hint `:39-48`、② killer `:55-66`、③/④ 静态分与 history `:66+` | 三档都在，但**静态分排在 history 之前**，与文档列的顺序不同（实测决定的） |
+| §2.5.3 兜底不取 `root_moves[0]` | `:393` | `alphabeta.cpp:696-701` | 仍然取 `[0]`——因为 `sort_moves` 已按 (值, 中心距, 格号) 三元组排过，`[0]` 就是文档要的「按三元组取最优」 |
+| §2.5.4 棋型考虑连线空间 | `:395-397` | `evaluator.cpp:221-227`（`edge_penalty_term`），在 `:264-265` 进出 `evaluate_board_from` | 打折放在**全盘评估的一项**里，不在形状查表里，也没有 `open_ends` 字段 |
+| §2.8 #4 开局多样化 | `:436` | `trainer.cpp:135-147,169-216`、`main_trainer.cpp:58-67` | 采样是 `random_opening_line`，不是开局库加权；`match_opening_plies` 默认 **0**（关闭） |
+| §2.9 `SearchResult::interrupted` | `:444` | `search_engine.h:39-59` | 该成员不存在，中断由 `stopped` 一个字段承担 |
+| §2.3.4 分配器第 ② 条 | `:248` | `time_manager.cpp:69-71` | 判据是 `board.active_empty().size() <= 6`（**盘面空位数**），不是候选数 |
+| §2.3.2 层边界的 `min_depth` | `:219` | `alphabeta.cpp:605,617` → `search_state.h:433,449` | 层边界强制检查在，`soft_time_up()` 也在，但门槛写成常量 `completed_depth >= 1`；`SearchLimits`（`:63-73`，与文档接口表一致）**没有 `min_depth` 这一项** |
+
+最后两条是本轮新记的。它们的共同点值得说一句：文档伪码里的两个数字（`0.65` 与 `min_depth`），树里一个
+变成了「空位 ≤ 6 就砍半」的近似、一个变成了常量 1——**都不是没实现，是实现时没有把那个参数做成可调**。
+要不要把它们做成可配置，属于设计问题，本轮只登记。
+
+### 读数 2：`:548` 那一格第一次有了两个口径，而且它们不冲突
+
+文档 B 行的验收是「中盘典型局面 depth 6 在 2s 内完成率 ≥ 95 %」。档内有两套数，此前从没被放在一起：
+
+| 口径 | 仪器 | 读数 | 是否达 ≥ 95 % |
+| --- | --- | --- | --- |
+| 产品路径：`--timeout-ms 2000`、快路径开着、走 `SearchEngine` | 轮次132 的 `budget_probe`（64 臂 × 两遍） | **到达请求深度 84.4 %（54/64）**；停因 `none` 62 / `time_hard` 2；中位 618 ms | **否**（轮次132 自己写了「达不到那一行写的 ≥ 95 %」） |
+| 定深无钟：`max_depth = 6`、`hard/soft/max_nodes` 全 0、直接走 `AlphaBetaSearch` | 本轮把 轮次138 留在 `/tmp/i1/l3_sweep.out` 的 32 条 cap0 基线除以 轮次135 的 228,000 nps | **32/32 = 100 % 在 2 s 内**；中位 0.54 s、p90 0.99 s、最大 1.47 s；节点和 3,930,084（均值 122,815） | 是 |
+
+两条都对，说的是不同的东西：**d6 这棵树本身的花费在 2 s 预算之内（最大 1.47 s，还有 26 % 余量），
+而产品路径上那 10 个未达深度的臂里只有 2 个真的是墙钟停的**，其余 8 个报的是 `none`——与同轮读数 4
+说的 `must_block` 快路径臂（`method` 不是 `alphabeta`、两个深度见证留 0）是同一族：它们不是「超时」，
+是**根本没进分层搜索**。所以 B 行那一格要不要算达标，取决于「完成率」是否把快路径给出的答案计入；
+文档没写死，本轮不替它写死。没核到底的一条也照实写：那 8 个 `none` 臂究竟各是哪种 `method`，本轮
+没有重跑 `budget_probe`，是照 轮次132 的表推的。
+
+### 读数 3：§4 四行验收的当前状态（把三轮的账并到一处）
+
+| 行 | 验收列 | 现在的读数 | 出处 |
+| --- | --- | --- | --- |
+| A `:547` | UI 报中断层、选点可复现、新增算例 | 全部有算例在 `tests/test_search.cpp` 里，随 ctest 跑 | 轮次120／121 |
+| B `:548` | d6/2 s 完成率 ≥ 95 %；节点较 A 降 ≥ 50 % | 两口径见读数 2；节点那一半在 `quiet` 上实测过（138.02 s → 36.85 s） | 轮次132／轮次121 |
+| C `:549` | 单线程 ≥ 1M nps；depth 8 在 4s 内完成 | 两侧都有关账上限：内核 1.25 倍 vs 需要 4.4 倍；节点 1.34／2.03 倍 vs 需要 1.54／2.61 倍 | 轮次135／136／137／138 |
+| D `:550` | 单轮 −≥40 %；内存与并发解耦；fitness 不再三档 | 三条各有一支读数 | 轮次126／127／128 |
+
+本轮新增的只有 B 行第二口径。C 行的 4 s 那一格在 32 景上是 **20/32 达标（中位 3.24 s、p90 6.37 s、
+最大 10.56 s）**，这个数与 轮次138 在六臂针上量的 6.18 s／10.43 s 是同一件事的两个尺度。
+
+### 判
+
+- 本轮**不产生新工作项**。43 条里没有一条是「从未被实现、也从未被判过」的——这正是轮次131 那次审计
+  找 LMR 时用过的判据，这次重新跑一遍，答案是零。
+- 唯一未达标的验收行仍是 `:549`，而它现在两侧都有上限数，**下一步动作必须是用户授权的内核重做**，
+  不是实现轮。B 行那一格的口径歧义（快路径是否计入完成率）也在这一轮登记给用户，不由本轮擅自定。
+- 异形八条不动代码：把它们「改成与文档同形」需要的不是实现而是**改文档**（把伪码里的 ②③ 参数、
+  边界打折的位置、`interrupted` 字段按树里实际的样子写）。这属于文档维护，等用户发话。
+
+### 门禁
+
+- `src/`、`tests/`、`web/`、`tools/`、`CMakeLists.txt`、`data/` 与 `ae89de9` 逐字节相同；本轮唯一的
+  仓库改动就是这一节。`git status` 干净（那三个未跟踪 `docs/` 已按用户发话在 `ae89de9` 收进）。
+- `node tests/readme_anchor_check.js` **120 citations / 0 problems**；`node tests/web_frontend_check.js`
+  **105/105 passed**。
+- **ctest 不跑**：树没有新代码，仍是轮次134 还原门禁跑过 `8/8 / 463.68 s` 的那一棵；valgrind 同样没有
+  新对象可筛。
+- 本节拼在轮次138 表头之前（原 1982 行处），纯插入：`git diff --numstat` ＝ **103 / 0**，
+  `wc -l REVIEW_LOG.md` 从 8207 到 **8310**；被推下去的档内绝对针（`REVIEW_LOG:2289` → 轮次125 的
+  1.99 s 那一行，拼入前在 3832 行）拼入后在 **3935** 行，差 **1646** 行。
+
+### 没动的账
+
+- 那 8 个 `none` 臂的 `method` 分布没重测（要重跑 轮次132 的 `budget_probe`，两遍 × 64 臂）。
+- 「层边界的 `min_depth` 与分配器第 ② 条的空位判据要不要做成可配置」本轮只登记不实现。
+- `:549` 第一格（内核 4.4 倍）依旧没人能动，等授权。
+
+### 仪器（全部在 `/tmp/m1/`，仓库外）
+
+`audit.md`（43 行落点表，每条含定义与生产调用点两个位置）、读数 2 的两口径计算直接从
+`/tmp/i1/l3_sweep.out` 的 32 条 cap0 基线重算（`python3` 一次性脚本，节点除以 228,000 nps），
+读数 1 的每一条都可按表中 file:line 复查。
+
 ## 轮次138 引擎重构 L：静默尾巴的宽度第一次被数出来——把 Tier1 剪到「每节点只递归第一个强制着法」仍差 0.61 s，而整条尾巴关掉会让六枚针臂的得分全部翻脸 — engine redesign stage L, the quiescence tail's width counted: even the doc-forbidden one-child cap leaves depth 8 at 4.61 s, and switching the tail off entirely costs every pinned arm its score (measurement round, no code changed)
 
 轮次137 在「没动的账」里留了一格：**尾巴节点的可减比例本轮没量**。用户上一轮选的问法就是
