@@ -32,6 +32,12 @@ struct SearchInfo {
     int root_moves_done = 0;
     int root_moves_total = 0;
     int seldepth = 0;
+    // The last field design doc 2.9 :443 promises this row: how many nodes read
+    // something out of the table. `int` rather than the counter's own `uint64_t`
+    // because a hit is only recorded at a node the search visited, so
+    // `tt_hits <= nodes_searched` - the same bound this struct already relies on
+    // when it narrows the node count at alphabeta.cpp:480.
+    int tt_hits = 0;
     Move partial_best_move;
     StopReason stopped = StopReason::NONE;
 };

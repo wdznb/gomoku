@@ -130,6 +130,7 @@ GameRecord SelfPlay::run(const std::vector<Move>& prefix,
         entry.root_moves_total = result.root_moves_total;
         entry.seldepth = result.seldepth;
         entry.stopped = result.stopped;
+        entry.tt_hits = result.tt_hits;
         record.moves.push_back(entry);
 
         record.total_nodes += result.nodes_searched;

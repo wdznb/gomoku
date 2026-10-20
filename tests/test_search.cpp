@@ -8891,6 +8891,103 @@ void test_the_session_hands_the_next_think_what_the_last_one_cost() {
               << std::endl;
 }
 
+// G1, design doc 2.9 :443. The row promised `SearchInfo` a `tt_hits` and the counter has
+// been ticking since the reuse round - what was missing was the way out of the search, so
+// the one number that says "this think read the table" stopped at a progress frame and a
+// test. These arms pin the copy site rather than the counter: the frame and the returned
+// record must be two readings of one think, and the bound the field's `int` rests on
+// (a hit is recorded at a visited node, once per node at most - `alphabeta.cpp:364` is the
+// only call site) must hold on both a full think and the warm repeat of it.
+void test_the_table_reads_a_think_took_are_reported_out_of_the_search() {
+    const Board board = quiet_think_board();
+    Evaluator evaluator;
+    std::atomic<bool> stop(false);
+
+    SearchLimits limits;
+    limits.max_depth = 3;
+
+    TranspositionTable tt;
+    AlphaBetaSearch cold(evaluator, tt);
+    cold.search(board, WHITE, limits, stop);
+    const SearchStats cold_stats = cold.last_stats();
+    const SearchInfo cold_info = cold.last_search_info();
+    assert(cold_info.tt_hits == static_cast<int>(cold_stats.tt_hits));
+    assert(cold_info.tt_hits > 0);
+    assert(cold_info.tt_hits <= cold_info.nodes_searched);
+
+    AlphaBetaSearch warm(evaluator, tt);
+    warm.search(board, WHITE, limits, stop);
+    const SearchStats warm_stats = warm.last_stats();
+    const SearchInfo warm_info = warm.last_search_info();
+    assert(warm_info.tt_hits == static_cast<int>(warm_stats.tt_hits));
+    assert(warm_info.tt_hits > 0);
+    assert(warm_info.tt_hits <= warm_info.nodes_searched);
+
+    // And the reuse is visible *as* reuse. Node count alone cannot tell "this position is
+    // simple" from "this position was already proved", which is the distinction the whole
+    // reuse subsystem lives for; cross-multiplying keeps it in integers: the share of
+    // nodes answered from the table has to rise when the table is warm.
+    assert(warm_info.nodes_searched < cold_info.nodes_searched);
+    assert(static_cast<long long>(warm_info.tt_hits) * cold_info.nodes_searched >
+           static_cast<long long>(cold_info.tt_hits) * warm_info.nodes_searched);
+
+    // The engine's own door, which is the only route the session and the replay use.
+    SearchEngine engine;
+    quieten(engine);
+    const SearchResult first = engine.search(board, WHITE, 3, 600000, stop);
+    const SearchResult second = engine.search(board, WHITE, 3, 600000, stop);
+    assert(first.method == "alphabeta" && first.tt_hits > 0);
+    assert(first.tt_hits <= first.nodes_searched);
+    assert(second.tt_hits > 0 && second.nodes_searched < first.nodes_searched);
+    // A think that never started a layered search reports 0, like soft_ms does: the
+    // number describes a table read, and there was no table read to describe.
+    SearchEngine blocked;
+    blocked.set_alphabeta_enabled(false);
+    blocked.set_resign_detection(false);
+    const SearchResult forced = blocked.search(board, WHITE, 3, 600000, stop);
+    assert(forced.method != "alphabeta");
+    assert(forced.tt_hits == 0);
+
+    std::cout << "test_the_table_reads_a_think_took_are_reported_out_of_the_search passed ("
+              << "cold " << cold_info.nodes_searched << " nodes / " << cold_info.tt_hits
+              << " reads, warm " << warm_info.nodes_searched << " / " << warm_info.tt_hits
+              << "; engine " << first.tt_hits << " -> " << second.tt_hits << ")" << std::endl;
+}
+
+// G2: the session is the consumer. The number only earns its keep if the replay a player
+// opens later still says how much of that think was a table read.
+void test_the_session_records_the_table_reads_it_kept() {
+    GameManager game;
+    game.set_player_color(BLACK);
+    game.set_config(3000, 4);
+
+    std::atomic<int> ai_moves{0};
+    game.set_move_callback([&](const Move&, int, int) { ai_moves.fetch_add(1); });
+
+    assert(game.make_move(7, 7));
+    for (int i = 0; i < 400 && ai_moves.load() < 1; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    assert(ai_moves.load() == 1);
+
+    const ReplaySnapshot replay = game.replay_snapshot();
+    assert(replay.moves.size() == 2);
+    // The stone a human placed has no think behind it, so it reports no reads - the same
+    // honest zero the fast paths report.
+    assert(replay.moves[0].method == "human");
+    assert(replay.moves[0].tt_hits == 0);
+    assert(replay.moves[1].method == "alphabeta");
+    assert(replay.moves[1].tt_hits > 0);
+    // The bound holds across the whole hand-off chain (SearchStats -> SearchInfo ->
+    // SearchResult -> MoveAnalysis), which is the part that can silently re-word itself
+    // when a field is inserted in the middle of a position-initialised struct.
+    assert(replay.moves[1].tt_hits <= replay.moves[1].nodes);
+
+    std::cout << "test_the_session_records_the_table_reads_it_kept passed ("
+              << replay.moves[1].nodes << " nodes, " << replay.moves[1].tt_hits
+              << " table reads)" << std::endl;
+}
+
 int main() {
     std::cout << "Running search tests..." << std::endl;
 
@@ -9079,6 +9176,10 @@ int main() {
     test_the_engine_shapes_the_window_the_client_did_not_name();
     test_the_window_the_engine_shapes_is_the_one_the_root_loop_stops_at();
     test_the_session_hands_the_next_think_what_the_last_one_cost();
+
+    // G, in the contract's order: the field leaving the search, then the session keeping it.
+    test_the_table_reads_a_think_took_are_reported_out_of_the_search();
+    test_the_session_records_the_table_reads_it_kept();
 
     std::cout << "All search tests passed!" << std::endl;
     return 0;

@@ -5237,6 +5237,70 @@ void test_trainer_cli_match_opening_probes() {
 }
 
 
+// G3, design doc 2.9 :443 along its last leg. The table-read count only earns its keep if
+// it survives the two archives it is written into, and if a record written before the key
+// existed still reads back - as "no reads recorded", not as a broken file.
+void test_game_record_keeps_the_table_read_count() {
+    GameRecord record;
+    record.winner = BLACK;
+    record.reason = GameEndReason::FIVE;
+    record.max_depth = 3;
+    for (int i = 0; i < 3; ++i) {
+        MoveRecord entry;
+        entry.move = Move(7 + i, 7, i % 2 == 0 ? BLACK : WHITE);
+        entry.score = 50 * i;
+        entry.depth = 3;
+        entry.nodes = 4000 + i;
+        entry.elapsed_ms = 30 + i;
+        entry.method = "alphabeta";
+        entry.seldepth = 4 + i;
+        entry.stopped = "none";
+        entry.tt_hits = 900 + i;
+        record.moves.push_back(entry);
+    }
+
+    const std::string text = record.to_json();
+    assert(text.find("\"tt_hits\"") != std::string::npos);
+
+    std::string error;
+    GameRecord restored;
+    assert(GameRecord::from_json(text, restored, error));
+    assert(restored.moves.size() == 3);
+    for (int i = 0; i < 3; ++i) {
+        assert(restored.moves[i].tt_hits == 900 + i);
+        // The neighbours of the new key must not have shifted: an inserted field in a
+        // field-by-field copy is how a round-trip starts reading `seldepth` as `tt_hits`.
+        assert(restored.moves[i].seldepth == 4 + i);
+        assert(restored.moves[i].stopped == "none");
+        assert(restored.moves[i].nodes == 4000 + i);
+    }
+
+    // The same file as the round before the key existed: the reader has to default it,
+    // the way it already defaults `partial_depth` and friends for a pre-accounting record.
+    std::string legacy = text;
+    const std::string needle = ",\"tt_hits\":";
+    size_t cut = legacy.find(needle);
+    assert(cut != std::string::npos);
+    while (cut != std::string::npos) {
+        size_t end = cut + needle.size();
+        while (end < legacy.size() && std::isdigit(static_cast<unsigned char>(legacy[end]))) ++end;
+        legacy.erase(cut, end - cut);
+        cut = legacy.find(needle);
+    }
+    assert(legacy.find("\"tt_hits\"") == std::string::npos);
+
+    GameRecord from_legacy;
+    assert(GameRecord::from_json(legacy, from_legacy, error));
+    assert(from_legacy.moves.size() == 3);
+    for (const auto& entry : from_legacy.moves) {
+        assert(entry.tt_hits == 0);
+        assert(entry.seldepth != 0);
+    }
+
+    std::cout << "test_game_record_keeps_the_table_read_count passed (3 plies kept, "
+              << "and a key-less record read 0)" << std::endl;
+}
+
 int main() {
     std::cout << "Running training tests..." << std::endl;
 
@@ -5311,6 +5375,7 @@ int main() {
     test_self_play_ms_budget_backs_up_a_generous_node_ceiling();
     test_self_play_zero_ceiling_arms_no_node_budget();
     test_self_play_declares_training_so_the_clock_does_not_shape_it();
+    test_game_record_keeps_the_table_read_count();
     test_self_play_one_node_ceiling_still_answers_legally();
     test_trainer_config_node_budget_reaches_both_game_paths();
     test_trainer_cli_max_nodes_probes();

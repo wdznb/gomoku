@@ -506,7 +506,8 @@ void GameManager::ai_thinking_worker(int timeout_ms, int max_depth, Reuse reuse,
                                              result.nodes_searched, result.elapsed_ms,
                                              result.method, result.partial_depth,
                                              result.root_moves_done, result.root_moves_total,
-                                             result.seldepth, result.stopped});
+                                             result.seldepth, result.stopped,
+                                             result.tt_hits});
             // The session remembers this think for the next one of the same colour.
             // Only AlphaBeta's number is a position value: the tactical and forced
             // paths report a sentinel, and centring a window on one of those buys

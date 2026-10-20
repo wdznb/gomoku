@@ -486,6 +486,7 @@ SearchInfo AlphaBetaSearch::to_info(const SearchStats& stats) {
     info.root_moves_done = stats.root_moves_done;
     info.root_moves_total = stats.root_moves_total;
     info.seldepth = stats.seldepth;
+    info.tt_hits = static_cast<int>(stats.tt_hits);
     info.partial_best_move = stats.partial_best_move;
     info.stopped = stats.stopped;
     return info;

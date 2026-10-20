@@ -70,6 +70,7 @@ std::string GameRecord::to_json() const {
             {"root_moves_total", record.root_moves_total},
             {"seldepth", record.seldepth},
             {"stopped", record.stopped},
+            {"tt_hits", record.tt_hits},
         });
     }
     root["moves"] = move_array;
@@ -163,6 +164,7 @@ bool GameRecord::from_json(const std::string& text, GameRecord& out, std::string
         move_record.seldepth = read_int("seldepth", 0);
         move_record.stopped = entry.contains("stopped") && entry["stopped"].is_string()
                                   ? entry["stopped"].get<std::string>() : "none";
+        move_record.tt_hits = read_int("tt_hits", 0);
         record.moves.push_back(move_record);
     }
 

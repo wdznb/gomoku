@@ -199,6 +199,7 @@ MoveRecord record_of(const MoveAnalysis& analysis) {
     entry.root_moves_total = analysis.root_moves_total;
     entry.seldepth = analysis.seldepth;
     entry.stopped = analysis.stopped;
+    entry.tt_hits = analysis.tt_hits;
     return entry;
 }
 
@@ -215,6 +216,7 @@ MoveAnalysis analysis_of(const MoveRecord& entry) {
     analysis.root_moves_total = entry.root_moves_total;
     analysis.seldepth = entry.seldepth;
     analysis.stopped = entry.stopped;
+    analysis.tt_hits = entry.tt_hits;
     return analysis;
 }
 
@@ -1058,6 +1060,7 @@ void GameServer::handle_request_replay(std::shared_ptr<WebSocketSession> session
         entry["root_moves_total"] = analysis.root_moves_total;
         entry["seldepth"] = analysis.seldepth;
         entry["stopped"] = analysis.stopped;
+        entry["tt_hits"] = analysis.tt_hits;
         moves_json.push_back(entry);
     }
     // The stones a hand-set position laid down. Without them the move list is not

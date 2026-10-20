@@ -379,6 +379,7 @@ SearchResult SearchEngine::search(const Board& board, int color,
         result.root_moves_done = info.root_moves_done;
         result.root_moves_total = info.root_moves_total;
         result.seldepth = info.seldepth;
+        result.tt_hits = info.tt_hits;
         result.stopped = stop_reason_name(info.stopped);
         // The line the committed layer proved, the same field the two tactics phases
         // already answer with. Until the search kept a variation there was nothing to

@@ -38,6 +38,11 @@ struct MoveAnalysis {
     int root_moves_total = 0;
     int seldepth = 0;
     std::string stopped = "none";
+    // Last of the fields, because two sites build this struct by position
+    // (`MoveAnalysis{move, score, depth, …}` at game_manager.cpp:209 and :505) and an
+    // inserted field would silently re-word every one of them. Design doc 2.9 :443's
+    // table-read count, kept so a 复盘 can tell a reused think from a re-proved one.
+    int tt_hits = 0;
 };
 
 // Everything the replay view needs, captured in one lock so the move list and

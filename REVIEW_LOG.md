@@ -1979,6 +1979,138 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次133 引擎重构 G：§2.9 那一行的最后一个字段走出了搜索 — engine redesign stage G, the last field of the §2.9 contract row leaves the search
+
+规格 `docs/ENGINE_REDESIGN.md:443`：§2.9 接口契约表给 `SearchInfo` 记了六个新增字段——
+`partial_depth`、`seldepth`、`stopped`、`pv`、`tt_hits`、`root_moves_done/total`。
+这轮的审计（一次逐机制的 grep，不是回忆）得到的结论是：前五个早就一路走到了 `SearchResult`、
+`MoveAnalysis`、`thinking_progress` 帧和 `web/app.js`，**只有 `tt_hits` 停在搜索里面**。
+配合 §1.3 P2（「每次思考无法复用上次结果」）读，这一格不是装饰：§2.4 整个复用子系统的成败，
+玩家和 复盘 唯一能看见的证据就是这个数。
+
+### Found
+
+- 计数从 A6 就在一跳一跳地加：`search_state.h:463` 的 `count_tt_hit()`，全仓**唯一一个调用点**
+  `alphabeta.cpp:364`（ alphabeta 节点的置换表探针，一节点最多一次）。它被 `refresh_counters()`
+  抬进 `SearchStats.tt_hits`（`alphabeta.cpp:498`），到此为止。
+- `git show HEAD:tests/test_search.cpp | grep -n tt_hits` 显示这一轮的改动之前，这个数的读者
+  **全在测试里**（`:4014/:4226/:4234/:8221/:8353/:8394`）：生产侧一个读者都没有。
+  `to_info()`（`alphabeta.cpp:477`）逐字段抄了 `SearchStats` 十二行，抄的就是 §2.9 那一行，
+  唯独漏了它——所以契约表上写着的字段，实际是**表面对不上**。
+- `thinking_progress` 帧也不带它。这不是漏：§2.3.3 :~232 的帧样例和 §2.9 :445 的帧行都没点这个键，
+  本轮因此**没有**动帧的键表（动它要 README 跟着改，而文档没要求）。
+
+### 实现
+
+一条从计数到归档的链，八处：
+
+| 位置 | 做的事 |
+| --- | --- |
+| `src/search/alphabeta.h:34-40` | `SearchInfo` 末尾加 `int tt_hits`，注释说明为什么是 `int`：一命中必是一被访问的节点，所以 `tt_hits <= nodes_searched`，与这个结构自己给 `nodes_searched` 用的收窄（`alphabeta.cpp:480`）是同一条界 |
+| `src/search/alphabeta.cpp:489` | `to_info()` 补上那一行漏的抄写 |
+| `src/search/search_engine.h:39-45` + `search_engine.cpp:382` | `SearchResult.tt_hits`，会话与 复盘 唯一走的路 |
+| `src/server/game_manager.h:41-49` + `game_manager.cpp:505-510` | `MoveAnalysis.tt_hits`——**加在最后而不是中间**，因为两处 `MoveAnalysis{…}` 是按位置初始化的，插一个字段会把后面每一个位置都改读 |
+| `src/server/server.cpp:202/219/1063` | `record_of` / `analysis_of` 两个桥各补一行，复盘 JSON 多出 `"tt_hits"` |
+| `src/training/game_record.h:36-40` + `game_record.cpp:73/167` | `MoveRecord` 同名字段；写的时候多一个键，读的时候 `read_int("tt_hits", 0)`——**和 `partial_depth` 一族同样的向后兼容**：改动之前落盘的对局记录照样读得回来，读成「没记下命中」而不是坏文件 |
+| `src/training/self_play.cpp:133` | 训练侧的每一手也填这个数，否则会话有、训练档没有，同一个字段两种真相 |
+
+测试三条：
+- `test_the_table_reads_a_think_took_are_reported_out_of_the_search`（`tests/test_search.cpp`）：
+  同一次思考的 `SearchStats` 与 `SearchInfo` 必须一字不差；界 `0 < tt_hits <= nodes_searched`
+  在冷、暖两臂都成立；引擎门口（`SearchEngine::search`）同样成立；关掉分层搜索的那一臂
+  走 `greedy`，两个见证都报 0。
+- `test_the_session_records_the_table_reads_it_kept`：一局真实会话以后，
+  `replay_snapshot()` 里人手那一手 0、AI 那一手 > 0 且 `<= nodes`。
+- `test_game_record_keeps_the_table_read_count`（`tests/test_training.cpp`）：三手的记录
+  写出去读回来 `tt_hits` 逐手相等，**并且它左右两个邻居（`seldepth`、`nodes`）不许跟着挪位**；
+  再把生成的 JSON 里 `,"tt_hits":N` 这一段删干净，模拟改动之前落盘的旧文件，
+  读回来必须是 0 而不是失败。
+
+### 读数
+
+一、这条链子买到的第一眼（`quiet_think_board`，`d3`，一张表两次思考）：
+
+| 臂 | 节点 | 表上读到 | 占比 |
+| --- | --- | --- | --- |
+| 冷 | 5,943 | 102 | 1.72 % |
+| 暖（同一张表） | 96 | **96** | 100 % |
+
+引擎门口同一台仪器读成 `5,943/102 → 96/96`；会话那一臂 `4,312` 节点 / `299` 命中。
+「暖的那一次便宜」这件事以前只能用节点数反推，现在它是**直接看见的**：96 个节点里 96 个
+是表上的答案，这就是 §2.4 想要的那个证据。
+
+二、成本——**同一份探针源码，两棵树各编一遍**（`/tmp/g1/tt_probe.cpp` 里读这个字段的行全部关在
+`#if TT_WITNESS` 里，控制臂 = `cda12d4`，本轮臂 = 工作树，两边都是 `-O0 -g -UNDEBUG`，
+`/tmp/g1/run_valgrind.sh`）。两臂先自证同树：`ARM nodes cold=5943 warm=96`、`ENGINE 5943 -> 96`、
+`SESSION 4312` 三个数一字不差。
+
+| 仪器 | 控制臂 | 本轮臂 | 差 |
+| --- | --- | --- | --- |
+| memcheck | 0 error / 0 definite leak，28,362 次分配 / 26,917,460 B | 0 error / 0 definite leak，**28,364 次 / 26,917,560 B** | +2 次分配、+100 B |
+| callgrind | 5,741,259,197 Ir | 5,741,264,445 Ir | **+5,248 Ir = +0.000 091 %** |
+| `memcheck test_training`（归档那一头的常规门禁） | — | `clean reports=0 invalid_read=0 invalid_write=0 uninitialised=0 definite_leak=0` / 306 s | 与轮次132 记的 304 s 同级 |
+
+差的 5,248 落在哪儿，是逐符号对出来的（`callgrind_annotate --threshold=100` 两份全表）：
+**没有任何一行超过 +152 Ir**，动的 36 行全是结构体拷贝那一类 plumbing——
+`SearchStats` 的拷贝构造 +152、`vector<Move>` 的拷贝 +148、`vector<MoveAnalysis>::operator[]` +115、
+`uninitialized_copy<Move*>` +110；两行分配器（`operator new` +32、`malloc` +60）对上那 +2 次分配。
+读法：`MoveAnalysis` 每条目大了 4 字节，快照按值拷贝时 `vector` 跨了一个大小级，
+于是多分配了一次、多拷了几个字节的表头；这与轮次132 那条「每 think 一个常数」是同一类成本，
+**与树的大小无关**，而且这一轮树本身一个节点都没多走。
+
+归档那一头的成本可以直接算：`to_json` 每手多写的是 `,"tt_hits":900`——11 个字符的键名加 1-10 位数字，
+本轮那条测试记录是 **14 字节／每手**。一盘 40 手的对局记录多 ~560 B。
+
+「哪个函数 CPU 卡比较久」这轮的答案没有移动。探针臂（`-O0`，所以 `std::array` 的下标自己成一行）
+的前几行仍然是评估与棋型识别：`std::array<DirectionPattern,4>::operator[]` 20.62 %、
+`Evaluator::pattern_score` 11.74 %、`Board::line_bits` 6.88 %、两行 29 格线表的
+`std::array<…>::operator[]` 各 4.61 %、`recognize_position_both` 3.09 %
+（`/tmp/g1/cga_new.txt`）。本轮碰到的 `to_info` 一共 **3,573 Ir / 5 次调用**（≈715 Ir 一次，
+含它要做的十三个字段抄写），在 99 % 阈值表里排不进去。
+
+### 门禁
+
+- `cmake --build build -j 4` rc=0；`ctest` **8/8 / 470.58 s**（`test_search` 434.24 s、
+  `test_position` 7.85 s、`test_server` 17.54 s、`test_training` 10.77 s）；
+  `node tests/web_frontend_check.js` **105/105**；`node tests/readme_anchor_check.js`
+  **120 citations / 0 problems**；README 仍 **658 行**（本轮没动它：帧的键表按文档原样，
+  复盘 JSON 多一个键不改变 README 描述过的协议）。
+- 新算例都插在 `int main()` 之前，`tests/test_search.cpp` 的旧行号不受影响的部分逐条核过。
+- valgrind 三处全绿（读数二）：两臂 memcheck `0 error / 0 definite leak`，
+  `memcheck test_training` `clean / reports=0 / 306 s`，callgrind 两臂同树
+  5,741,259,197 → 5,741,264,445 Ir。
+- TSan：本轮**不适用**，理由说清楚——加的都是各条链自己拥有的 `int`（`SearchInfo` 是
+  `to_info()` 的返回值，`SearchResult` 是一次 think 的返回值，`MoveAnalysis` 在
+  `thinking_mutex_` 底下写，`MoveRecord` 是记录本体的字段），没有新的跨线程对象，
+  也没有新的共享写。
+
+### 判
+
+落地。这一条不改变搜索到的树（两臂节点数一字不差，见下），只把已经在算的数送到该去的地方；
+风险面全在「字段加在哪儿」，所以三条测试里有两条专门钉这个：按位置初始化的结构不许插字段，
+JSON 读侧必须容忍缺键。
+
+### 没动的账
+
+- 帧的键表没加 `tt_hits`：文档 §2.3.3 / §2.9 两处点名的帧字段里没有它，加了就是一次没人要求的
+  协议变更（README 要跟着改，前端要跟着消费）。等有人要一边想一边看复用率时再说。
+- `SearchStats.tt_cutoffs` / `qnodes` 与 `SearchInfo.partial_best_move` 同样只有测试在读——
+  文档没有给它们承诺读者（`:443` 那行只点了 `tt_hits`），本轮**没有**顺手接；
+  一次只补一张表上写着的一格，是这一轮的范围。
+- `limits.ponder`、`MoveBudget.hard_ms/max_nodes`、`SearchResult.interrupted` 三条维持轮次132 的判断。
+- §4 :549 的 C 行两格（≥1M nps；d8 在 4 s 内）与 :550 的 D 行三条读数，本轮一条也没前进：
+  这条链子每 think 多做的是一次数位拷贝和一手 JSON 键，不是搜索。
+
+### 仪器（怎么再跑一遍）
+
+- `/tmp/g1/tt_probe.cpp`：一份源码、`TT_WITNESS` 两个取值；控制臂链 `cda12d4` 的对象，
+  本轮臂链工作树对象，两边同一套 `-O0 -g -UNDEBUG`。
+- `/tmp/g1/run_valgrind.sh`：两臂各跑一遍自证同树 → memcheck 两臂 → callgrind 两臂 →
+  `memcheck test_training`。产物：`run_{base,new}.out`、`mc_{base,new}.out`、`mc2_*.txt`
+  （摘掉 `-q` 的重跑，堆行在这里）、`cg_{base,new}.out`、`cga*.txt`、`mc_test_training.out`。
+- 三条新算例随 `ctest` 跑：`test_search`（两条）与 `test_training`（一条）。
+
+
 ## 轮次132 引擎重构 F：§2.3.4 的分配器第一次有了调用方，而「训练模式」这件事必须由调用方说出口 — engine redesign stage F, the budget allocator gains its first caller
 
 规格 `docs/ENGINE_REDESIGN.md:241-260`（§2.3.4 预算分配器，五步）＋ `:583-584`（文件清单里

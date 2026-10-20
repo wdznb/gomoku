@@ -38,6 +38,11 @@ struct SearchResult {
     int root_moves_done = 0;
     int root_moves_total = 0;
     int seldepth = 0;
+    // How many of this think's nodes read a bound or a move out of the table (design
+    // doc 2.9 :443, the last field on that row). The number a player's 复盘 needs to tell
+    // "this reuse worked" from "this think re-proved everything": `nodes_searched` says
+    // how much was searched, `tt_hits` says how much of it was not re-searched.
+    int tt_hits = 0;
     // The soft window the AlphaBeta think was given, in milliseconds since the think
     // started (design doc 2.3.4). Zero is honest about three different cases: a think
     // with no clock at all, a think running on a named node budget, and every fast path
