@@ -9,8 +9,9 @@
 #   tools/tactics_bench.sh [题库目录]        默认 data/tactics
 #   BUDGETS="2000 8000 32000" tools/tactics_bench.sh
 #
-# 题库怎么来：gomoku_analyze --replay <records.jsonl> --review --budget 200000 \
-#                              --depth 8 --cards data/tactics/judged/normal.jsonl
+# 题库怎么来（甲-1 之后 --cards 变成了 --cards-dir，写的是目录不是单个文件）：
+#   gomoku_analyze --replay <records.jsonl> --review --budget 200000 --depth 8 \
+#                  --cards-dir data/tactics
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -24,14 +25,29 @@ if [ ! -x "$BIN" ]; then
 fi
 if [ ! -d "$BENCH_DIR" ]; then
     echo "no tactics directory at $BENCH_DIR" >&2
-    echo "produce one first: $BIN --replay <records.jsonl> --review --budget 200000 --depth 8 --cards $BENCH_DIR/judged/normal.jsonl" >&2
+    echo "produce one first: $BIN --replay <records.jsonl> --review --budget 200000 --depth 8 --cards-dir $BENCH_DIR" >&2
     exit 2
 fi
 
+# 每一档都包一层 timeout（指导书 §9.1 的第三层）：脚本里任何一步都可能挂，而挂住的
+# 门禁读不到红，只会让人以为「还在跑」。300 s 是这档实测（三档共 8 s）的 30 倍余量。
+BUDGET_TIMEOUT="${BUDGET_TIMEOUT:-300}"
+run_log=$(mktemp)
+trap 'rm -f "$run_log"' EXIT
 for budget in $BUDGETS; do
     echo "== solve_rate@$budget =="
     # --layer easy 是「全都要」：easy 是地板，题库里比它高的层也会被算进来。
-    "$BIN" --bench "$BENCH_DIR" --budget "$budget" --layer easy | grep -E "solve_rate|layer |WARN" || true
+    if timeout "$BUDGET_TIMEOUT" "$BIN" --bench "$BENCH_DIR" --budget "$budget" --layer easy \
+            > "$run_log" 2>&1; then
+        grep -E "solve_rate|layer |WARN" "$run_log" || true
+    else
+        rc=$?
+        if [ "$rc" = 124 ]; then
+            echo "  RED: 预算 $budget 这一档在 ${BUDGET_TIMEOUT}s 内没跑完 —— 读数缺失，按红处理"
+        else
+            echo "  RED: 预算 $budget 这一档退出码 $rc —— 读数缺失，按红处理"
+        fi
+    fi
 done
 
 cat <<'NOTE'

@@ -145,3 +145,10 @@ echo "  cd build && ./gomoku_train --help"
 echo ""
 echo "Then open http://localhost:8080 in your browser"
 echo ""
+
+# 构建完成后建议再走一步题库门禁（设计文档 ENGINE_REDESIGN_V2.md §6.7 c）：
+#   tools/tactics_bench.sh            # 三档 solve_rate，与上一 tag 逐档比，掉 > 2 个百分点即红
+# 它不在这里执行：这一步要跑真搜索（实测三档共 8 s），而且 build.sh 是「编译」的入口，
+# 把门禁塞进构建脚本只会让人在赶时间时整脚本跳过。与 readme_anchor_check、
+# web_frontend_check 并列，属于提交前的固定三步。
+

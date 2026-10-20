@@ -1980,6 +1980,35 @@ additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cp
 no existing assertion was edited.
 
 
+## 轮次149 引擎重构 V2 甲-4：题库门禁第一次接进流程，脚本自己也有了超时 — V2 stage 甲-4: tactics_bench.sh gets a per-budget wall-clock cap and a stated baseline, build.sh points at it, README gains the one line that makes the gate discoverable
+
+指导书 §4 甲-4 的三件事，外加 §9.1 第三层欠的那一件（`tools/tactics_bench.sh` 原来没有任何超时）。**本轮不动 `src/`**，所以按纪律 5 不跑 `ctest`，理由写在提交信息里。
+
+### 落点
+
+| 文件 | 改动 |
+| --- | --- |
+| `tools/tactics_bench.sh:31-52` | 每一档预算包一层 `timeout ${BUDGET_TIMEOUT:-300}`，退出码 124 与其它非零各打一行 **RED：读数缺失，按红处理**；`mktemp` ＋ `trap ... EXIT` 收临时文件 |
+| `tools/tactics_bench.sh:11-13`、`:24` | 过时的出题提示改成甲-1 之后的形状：`--cards-dir data/tactics`（原来还写着 `--cards .../judged/normal.jsonl`，那个 CLI 已经不接受了） |
+| `build.sh` 末尾 | 一段**注释**指路「构建完成后走 `tools/tactics_bench.sh`」，明确写它不在这里执行的原因：这一步要跑真搜索，而且构建脚本不是门禁 |
+| `README.md` 末尾 | 追加「题库门禁」一节：三档命令、判据（与上一 tag 逐档比，掉 > 2 个百分点即红）、以及 0 %/100 % 的告警不算红那句。**只追加不插入**：`readme_anchor_check` 扫的是 `README:NNN` 绝对行号引用，插一行会把后面所有引用推走 |
+
+### 读数
+
+- `tools/tactics_bench.sh data/tactics`（实测，与指导书 §4 甲-4 验收写的那三档基线逐字相同）：
+  `solve_rate@4000 = 0/4 (0.0%)`、`@8000 = 0/4`、`@32000 = 0/4`，分档 `hard 0/2`、`normal 0/2`，`skipped 0`，三档各带一句 §3.3 的 0 %/100 % 告警。题库就是那四张卡（`data/tactics/proven/hard.jsonl` 2 张 ＋ `judged/normal.jsonl` 2 张）。
+- 超时的仪器：`BUDGET_TIMEOUT=1 BUDGETS=256000 tools/tactics_bench.sh` → 打印
+  `RED: 预算 256000 这一档在 1s 内没跑完 —— 读数缺失，按红处理`，脚本照常跑完而不是挂住。这条就是「挂住的门禁读不到红」的反面仪器。
+
+### 门禁
+
+- `node tests/readme_anchor_check.js` **122 citations / 0 problems**（README 只追加，未移位）；`bash -n tools/tactics_bench.sh` 通过。
+- `ctest` 不跑：`src/`、`tests/` 一位未动（`git diff --numstat` 只有 `tools/`、`build.sh`、`README.md` 与本节）。
+
+### 判
+
+甲-4 落地。一句实话登记在这儿：这道门禁现在**还没有可比的上一 tag 读数**——三档全是 0 %，而 §6.7 c 的判据是「比上一 tag 掉多少」，一个恒为 0 的序列能证明的只有「搜索器一张题都解不出来」，不是「题卡质量没退步」。本轮把它接进流程、给了超时与 RED 语义，是为了下一轮（乙-1 之后或者丁-1 的连续信号之后）第一次有非零读数时，这条门禁已经站在原地。
+
 ## 轮次148 引擎重构 V2 甲-3＋§9.1：复盘面板的协议与前端第一次跑通，而 ctest 层的超时也是这一轮补的 — V2 stage 甲-3: `analyze_request` / `analyze_progress` / `analyze_result` reach the wire, the 复盘 marks land on the existing evaluation curve, and §9.1's per-suite ctest TIMEOUT (the missing first of the three timeout layers) goes in with it
 
 用户这一轮的发话是「严格按 `docs/ENGINE_REDESIGN_V2.md` 与 `docs/IMPLEMENTATION_GUIDE.md`，针对每一个功能写代码和测试，回归＋验收过了就推远程」。指导书 §3.2 列的 17 个待做单元里第一个是 **甲-3 复盘面板**，§9.1 又说「ctest 层超时一个都没有，第一个单元顺手补上」——本轮就是这两件事。

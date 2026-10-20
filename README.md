@@ -656,3 +656,8 @@ MIT License
 ## 联系方式
 
 如有问题或建议，请提交 Issue。
+
+## 题库门禁
+
+`tools/tactics_bench.sh`（默认读 `data/tactics`）按 4000 / 8000 / 32000 三档预算各报一次 `solve_rate`；判据是「与上一 tag 的读数逐档比，任何一档掉超过 2 个百分点即红」，0 % 与 100 % 的告警不算红（那是预算选错了，换一档再读）。设计出处：`docs/ENGINE_REDESIGN_V2.md` §6.7 c。
+
