@@ -391,3 +391,16 @@ body.compact #region-left,
 body.compact #region-right {
     padding: 4px;
 }
+
+/* 复盘面板（甲-3）。复用既有的 .field/.btn-tiny 体系，只加三类：面板壳、标题、
+   判定行。曲线上的标记画在 canvas 里，不需要 CSS 类，mark-* 只给列表行上色。 */
+.panel { margin-top: 8px; padding: 6px 8px; border: 1px solid #e0e0e0; border-radius: 4px; }
+.panel-title { font-size: 12px; color: #6b6b6b; margin-bottom: 4px; }
+.verdict-row { font-size: 12px; padding: 2px 0; cursor: pointer; }
+.verdict-row:hover { background: #f4f4f4; }
+.mark-blunder { color: #c0392b; }
+.mark-brilliant { color: #27ae60; }
+.mark-missed_mate { color: #e67e22; }
+.mark-counterexample { color: #8e44ad; }
+.mark-forced { color: #9a9a9a; }
+.mark-unlisted { color: #7f8c8d; }

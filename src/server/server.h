@@ -4,6 +4,8 @@
 #include "game_manager.h"
 #include "session_store.h"
 #include "../optimization/opening_book.h"
+#include "../training/game_record.h"
+#include "../training/replay_analyzer.h"
 #include <boost/beast/core.hpp>
 #include <boost/beast/websocket.hpp>
 #include <boost/beast/http.hpp>
@@ -12,12 +14,14 @@
 #include <boost/asio/steady_timer.hpp>
 #include <boost/asio/signal_set.hpp>
 #include <nlohmann/json.hpp>
+#include <atomic>
 #include <filesystem>
 #include <memory>
 #include <map>
 #include <mutex>
 #include <queue>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace gomoku {
@@ -122,6 +126,27 @@ private:
         // The last flushed payload with its timestamps zeroed: unchanged means
         // nothing to write, which is what keeps a quiet session off the disk.
         std::string saved_payload;
+        // 复盘面板（设计文档 v2 §6.9，指导书甲-3）：一局一条后台分析线程。
+        // `analyze_stop` is shared rather than a member because the thread reads it
+        // through a copy: even if an exit path ever forgot to join, the flag it pokes
+        // stays alive, so the worst case is a late frame, not a dangling write.
+        std::shared_ptr<std::atomic<bool>> analyze_stop = std::make_shared<std::atomic<bool>>(false);
+        std::thread analyze_thread;
+        // Set by the io thread when it arms a review, cleared at the join point. A
+        // second `analyze_request` while it is up is refused, not queued: the panel
+        // shows one review at a time, and a queue would let a tab that clicks twice
+        // search the same game twice.
+        bool analyzing = false;
+
+        // Destroying a TrackedGame with a live analysis thread left on it would run
+        // ~std::thread on a joinable thread, which is std::terminate - the whole
+        // process, not this session. Every exit path also calls stop_analyze earlier so
+        // the frames stop, but this is the one that cannot be forgotten by a future
+        // path.
+        ~TrackedGame() {
+            analyze_stop->store(true);
+            if (analyze_thread.joinable()) analyze_thread.join();
+        }
     };
 
     net::io_context ioc_;
@@ -182,6 +207,9 @@ private:
     void handle_set_config(std::shared_ptr<WebSocketSession> session, const json& msg);
     void handle_restart(std::shared_ptr<WebSocketSession> session);
     void handle_resume(std::shared_ptr<WebSocketSession> session, const json& msg);
+    // 复盘面板的请求帧（§6.9）：读参数、取整局快照、起一条后台分析线程。玩家正在
+    // 让 AI 思考时直接拒绝，不排队——复盘要跑真搜索，而那一局的时间属于这一手。
+    void handle_analyze_request(std::shared_ptr<WebSocketSession> session, const json& msg);
     
     json board_to_json(const Board& board);
     
@@ -198,6 +226,33 @@ private:
     // while it walks the table.
     std::shared_ptr<TrackedGame> entry_locked(WebSocketSession* session);
     std::shared_ptr<TrackedGame> open_session(const SessionSnapshot* from);
+
+    // Everything the analysis thread needs, copied out by the io thread before it
+    // arms the thread: the record is a snapshot of the replay list, the coefficients
+    // are the ones this session plays with, and the two configs are the frame's own
+    // numbers. Nothing here points back at the game or the server.
+    struct AnalysisRequest {
+        GameRecord record;
+        ThreatCoefficients coeffs;
+        ScreenConfig screen;
+        ReviewConfig review;
+        int max_candidates = 12;   // §5.3 analyze_max_candidates：段 C 最多给几手定难度
+        std::string coeffs_sha;
+    };
+
+    // 段 A 筛候选 → 段 B 逐手复核（一手一帧 analyze_progress）→ 段 C 给产题的那几手
+    // 定难度层 → 一帧 analyze_result。它从不取 games_mutex_，也不碰 GameManager，所以
+    // io 线程可以在持有这把锁时 join 它；它只在两手之间读停旗，一手就是一次定节点预算
+    // 的搜索（§9.2：节点帽就是超时，复盘这一路没有墙钟）。
+    static void run_analysis(std::weak_ptr<WebSocketSession> socket,
+                             std::shared_ptr<std::atomic<bool>> stop_flag,
+                             AnalysisRequest request);
+
+    // Stop and join this session's analysis thread. Called with games_mutex_ held by
+    // whoever is taking the socket or the entry away: detach_socket, the idle sweep and
+    // stop(). Leaving it armed would let a thread keep sending into a socket that
+    // already belongs to another tab.
+    static void stop_analyze(TrackedGame& entry);
     void attach_socket(const std::shared_ptr<WebSocketSession>& session,
                        const std::shared_ptr<TrackedGame>& entry);
     void send_session_state(const std::shared_ptr<WebSocketSession>& session,

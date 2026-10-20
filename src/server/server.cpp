@@ -1,13 +1,16 @@
 #include "server.h"
 #include "position_json.h"
 #include "training/json_int.h"
+#include "training/tactics_card.h"
 #include <iostream>
 #include <fstream>
 #include <sstream>
 #include <csignal>
 #include <chrono>
 #include <cctype>
+#include <algorithm>
 #include <atomic>
+#include <map>
 #include <random>
 
 namespace gomoku {
@@ -619,6 +622,13 @@ void GameServer::stop() {
     // Whatever the ten-second tick has not written yet goes out now, so a
     // Ctrl+C between two moves does not lose the move that was already played.
     flush_all();
+    // 退出前把每一局的复盘线程收回来。线程只在两手之间读停旗，所以这里最多等一手的
+    // 一次定预算搜索；不等它就把 sessions_ 拆掉，等于在 joinable 的 std::thread 上
+    // 析构，那是 std::terminate —— 整个进程，不是这一局。
+    {
+        std::lock_guard<std::mutex> lock(games_mutex_);
+        for (const auto& pair : sessions_) stop_analyze(*pair.second);
+    }
     beast::error_code ec;
     acceptor_.close(ec);
     flush_timer_.cancel();
@@ -730,6 +740,10 @@ void GameServer::handle_message(std::shared_ptr<WebSocketSession> session, const
         handle_resign(session);
     } else if (type == "stop_thinking") {
         handle_stop_thinking(session);
+    } else if (type == "analyze_request") {
+        // 复盘面板（设计文档 v2 §6.9）：会话级帧，所以它走的是上面那条
+        // ensure_attached 的路径，不进 :705 那个「不需要会话」的白名单。
+        handle_analyze_request(session, msg);
     } else if (type == "set_config") {
         handle_set_config(session, msg);
     } else if (type == "ping") {
@@ -1328,6 +1342,9 @@ void GameServer::detach_socket(WebSocketSession* session) {
     if (entry.attached != session) return;
     entry.attached = nullptr;
     entry.detached_ms = now_ms();
+    // 复盘线程发的是「这一局我看完了」，而这句话现在属于另一个标签页（或者谁都不属于），
+    // 所以在停 AI 之前先把它收回来。它从不取 games_mutex_，因此这里 join 不会与 io 线程互等。
+    stop_analyze(entry);
     // The player's voice goes with the socket, and a search still running is
     // writing into it, so it is stopped and joined before the callbacks drop.
     // The game itself is left exactly where the last committed stone put it:
@@ -1631,12 +1648,14 @@ void GameServer::on_flush_tick() {
             // SAME token, while README:487 asks for a new game with a new token;
             // dropping the entry leaves the token unknown both on disk and in memory,
             // so the next resume falls through to open_session(nullptr).
+            stop_analyze(entry);
             it = sessions_.erase(it);
             continue;
         }
         // Back onto the shelf. The file is current (flush_entry just settled
         // it), so what is dropped is the engine, not the game: the token still
         // resumes, by rebuilding from that file.
+        stop_analyze(entry);
         cold_sessions_[entry.token] = shelved;
         it = sessions_.erase(it);
     }
@@ -1743,6 +1762,199 @@ void GameServer::setup_game_callbacks(std::shared_ptr<WebSocketSession> session,
             if (auto entry = entry_locked(session.get())) flush_entry(entry);
         });
     });
+}
+
+// ── 甲-3 复盘面板：协议侧（设计文档 v2 §6.9，指导书甲-3）──────────────────
+namespace {
+// 三档默认值就是 §5.3 的 analyze_depth / analyze_budget / analyze_max_candidates，
+// 一个不多一个不少。越界按本仓库别处的老规矩折回可表达的范围而不是报错：这三只数字
+// 没有「猜错客户端意图」的代价，客户端要 99 层和要 20 层想的是同一件事——往深里想。
+constexpr int kAnalyzeDefaultDepth = 8;
+constexpr int kAnalyzeDefaultBudget = 20000;
+constexpr int kAnalyzeDefaultCandidates = 12;
+
+int clamp_analyze_depth(int depth) {
+    if (depth < 1) return 1;
+    if (depth > 20) return 20;      // 页面能表达的最大深度
+    return depth;
+}
+
+int clamp_analyze_budget(int budget) {
+    if (budget < 1000) return 1000;
+    if (budget > 256000) return 256000;   // §6.5 难度阶梯的顶
+    return budget;
+}
+
+int clamp_analyze_candidates(int candidates) {
+    if (candidates < 0) return 0;
+    if (candidates > 64) return 64;
+    return candidates;
+}
+
+// 后台线程发一帧。socket 已经走了就什么都不做——复盘是「看一眼」的东西，不是玩家
+// 点了就欠他的结果，所以失联不报错也不重试。
+void send_analysis_frame(const std::weak_ptr<WebSocketSession>& socket, const json& frame) {
+    if (auto session = socket.lock()) session->send(frame);
+}
+}  // namespace
+
+void GameServer::handle_analyze_request(std::shared_ptr<WebSocketSession> session, const json& msg) {
+    std::lock_guard<std::mutex> lock(games_mutex_);
+    const std::shared_ptr<TrackedGame> entry = entry_locked(session.get());
+    if (!entry) return;
+
+    // 复盘要跑真搜索，一局一条线程，所以「AI 正在想这一手」时不接（§6.9 第 1 条写的
+    // 就是「一局结束后」）。不排队：面板一次只展示一份复盘，排队等于同一局搜两遍。
+    if (entry->game->is_ai_thinking()) {
+        send_error(session, "AI 正在思考这一手，复盘会偷走它的时钟；等它落定再点复盘。");
+        return;
+    }
+    if (entry->analyzing) {
+        send_error(session, "这一局的复盘还在跑，等它回来再点。");
+        return;
+    }
+
+    // 摆棋开的局读不出同一个盘面：段 B 的 position_before 从空盘一手一手摆回去，而
+    // 摆棋的 base 子不在手数里（README:575 就是这条：这样的局只活在会话文件里，不进
+    // 训练流）。复盘用的正是同一条摆法，所以照同一口径拒绝，不猜。
+    const SessionSnapshot snap = snapshot_of(*entry);
+    if (!snap.base.empty()) {
+        send_error(session, "摆棋开的局不能复盘：从空盘摆不回这一局。");
+        return;
+    }
+    if (snap.record.moves.empty()) {
+        send_error(session, "这一局还没有可以复盘的手。");
+        return;
+    }
+
+    AnalysisRequest request;
+    request.record = snap.record;
+    request.coeffs = use_loaded_coefficients_ ? coefficients_ : ThreatCoefficients{};
+    request.coeffs_sha = coefficients_fingerprint(request.coeffs);
+    request.review.max_depth = clamp_analyze_depth(get_int_or(msg, "depth", kAnalyzeDefaultDepth));
+    request.review.budget = clamp_analyze_budget(get_int_or(msg, "budget", kAnalyzeDefaultBudget));
+    request.max_candidates =
+        clamp_analyze_candidates(get_int_or(msg, "max_candidates", kAnalyzeDefaultCandidates));
+
+    entry->analyze_stop->store(false);
+    entry->analyzing = true;
+    // 上一份必然已经 join（analyzing 只在 join 时清），所以这里赋值不会撞到一个
+    // joinable 的 std::thread 上——那会直接 std::terminate。
+    entry->analyze_thread = std::thread(&GameServer::run_analysis,
+                                       std::weak_ptr<WebSocketSession>(session),
+                                       entry->analyze_stop,
+                                       std::move(request));
+}
+
+void GameServer::run_analysis(std::weak_ptr<WebSocketSession> socket,
+                              std::shared_ptr<std::atomic<bool>> stop_flag,
+                              AnalysisRequest request) {
+    const ReplayAnalyzer analyzer(request.screen);
+    const ReplayReviewer reviewer(request.coeffs, request.review);
+    const GameScreen screen = analyzer.screen(request.record);
+
+    // 段 B 只复核段 A 挑出来的手；一帧一手，为的是让人看到「第 23 / 60 手」而不是
+    // 一个转圈的图标（§6.9 第 1 条）。
+    std::vector<int> candidates;
+    for (const PlyScreen& ply : screen.plies) {
+        if (ply.candidate) candidates.push_back(ply.ply);
+    }
+    const int total = static_cast<int>(candidates.size());
+
+    std::map<int, PlyReview> reviewed;
+    int done = 0;
+    for (const int ply : candidates) {
+        if (stop_flag->load()) return;
+        PlyReview result = reviewer.review(request.record, ply);
+        // 段 C 只给产题的那几手量难度：一手最多六次定预算搜索，全都量等于把一局棋的
+        // 复盘变成十分钟。max_candidates 就是 §5.3 那一格，按失分从大到小排。
+        reviewed[ply] = std::move(result);
+        ++done;
+        json frame;
+        frame["type"] = "analyze_progress";
+        frame["done"] = done;
+        frame["total"] = total;
+        send_analysis_frame(socket, frame);
+    }
+
+    // 难度层只给「值得出题」的那些手，且不超过 max_candidates 手；其余手不跑阶梯，
+    // layer 记 unrated，而不是假称它简单。
+    std::vector<std::pair<int, int>> ladder_order;   // (loss, ply)，从掉得最狠的开始
+    for (const auto& entry : reviewed) {
+        const std::string& kind = entry.second.kind;
+        if (kind == "none" || kind == "unlisted") continue;
+        ladder_order.emplace_back(std::abs(entry.second.loss), entry.first);
+    }
+    std::sort(ladder_order.begin(), ladder_order.end(),
+              [](const std::pair<int, int>& a, const std::pair<int, int>& b) {
+                  return a.first > b.first;
+              });
+    int layered = 0;
+    std::map<int, int> solve_budgets;
+    for (const auto& ranked : ladder_order) {
+        if (layered >= request.max_candidates) break;
+        if (stop_flag->load()) return;
+        const PlyReview& result = reviewed[ranked.second];
+        Board board;
+        if (reviewer.position_before(request.record, result.ply, board)) {
+            // 段 C 问的是「这道题要多少节点才解得出来」，答案按正解（本手最好的那着）算。
+            solve_budgets[result.ply] =
+                reviewer.difficulty(board, result.side, result.best).solve_budget;
+        }
+        ++layered;
+    }
+
+    // 每手一项，与非候选手一起发回去：前端的标记是按下标贴到胜率曲线上的，缺一项就
+    // 会贴错手（指导书甲-3 第 3 条把几何钉死了，这里就把对齐交给帧本身）。
+    const PlyReview unreviewed;
+    json moves = json::array();
+    int cards = 0;
+    for (size_t ply = 0; ply < request.record.moves.size(); ++ply) {
+        const MoveRecord& played = request.record.moves[ply];
+        const auto found = reviewed.find(static_cast<int>(ply));
+        const bool judged = found != reviewed.end();
+        const PlyReview& result = judged ? found->second : unreviewed;
+        const auto budget_it = solve_budgets.find(static_cast<int>(ply));
+        const int solve_budget = budget_it == solve_budgets.end() ? 0 : budget_it->second;
+
+        json item;
+        item["ply"] = static_cast<int>(ply);
+        item["kind"] = judged ? result.kind : std::string("none");
+        item["played"] = json::array({played.move.pos.row, played.move.pos.col});
+        item["best"] = judged && result.best.pos.is_valid()
+                           ? json::array({result.best.pos.row, result.best.pos.col})
+                           : json::array({-1, -1});
+        item["loss"] = judged ? result.loss : 0;
+        item["gap"] = judged ? result.gap : 0;
+        // unrated 是诚实的那一个：没跑阶梯的手不假装它简单。
+        item["layer"] = !judged ? std::string("unrated")
+                                : (solve_budget > 0 ? TacticsCard::layer_for(solve_budget)
+                                                    : std::string("unrated"));
+        if (judged && result.kind != "none" && result.kind != "unlisted") ++cards;
+        moves.push_back(std::move(item));
+    }
+
+    json frame;
+    frame["type"] = "analyze_result";
+    frame["moves"] = std::move(moves);
+    frame["coeffs_sha"] = request.coeffs_sha;
+    frame["cards"] = cards;
+    frame["total_plies"] = screen.total_plies;
+    frame["candidates"] = total;
+    frame["reviewed"] = static_cast<int>(reviewed.size());
+    send_analysis_frame(socket, frame);
+}
+
+void GameServer::stop_analyze(TrackedGame& entry) {
+    entry.analyze_stop->store(true);
+    if (entry.analyze_thread.joinable()) {
+        entry.analyze_thread.join();
+    }
+    entry.analyzing = false;
+    // Ready for the next request: the flag the thread pokes is the one it already
+    // holds a copy of, and a stale true would make the next review stop on its very
+    // first ply.
+    entry.analyze_stop->store(false);
 }
 
 }

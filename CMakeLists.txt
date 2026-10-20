@@ -40,14 +40,20 @@ set(GOMOKU_CORE_SOURCES
     src/optimization/opening_book.cpp
 )
 
+# 复盘与题卡的解析器：段 A/B/C 与卡片格式。训练流要用它，服务端甲-3 的复盘面板也要用
+# 它，所以单列一份，免得 server 为了两个类把整条训练流水线一起编进去。
+set(GOMOKU_TACTICS_SOURCES
+    src/training/replay_analyzer.cpp
+    src/training/tactics_card.cpp
+)
+
 set(GOMOKU_TRAINING_SOURCES
     src/training/params.cpp
     src/training/game_record.cpp
     src/training/elo.cpp
     src/training/self_play.cpp
     src/training/data_collector.cpp
-    src/training/replay_analyzer.cpp
-    src/training/tactics_card.cpp
+    ${GOMOKU_TACTICS_SOURCES}
     src/training/genetic.cpp
     src/training/hill_climbing.cpp
     src/training/trainer.cpp
@@ -62,6 +68,8 @@ set(GOMOKU_SOURCES
     # Sessions persist in the training record format, so the server owns that
     # reader/writer rather than keeping a second schema for the same moves.
     src/training/game_record.cpp
+    # 复盘面板（甲-3）：段 A/B/C 的解析器，服务端自己跑，不走训练流水线。
+    ${GOMOKU_TACTICS_SOURCES}
     src/server/server.cpp
     src/server/game_manager.cpp
     src/server/position_json.cpp
@@ -237,6 +245,8 @@ add_executable(test_server
     ${GOMOKU_CORE_SOURCES}
     src/training/params.cpp
     src/training/game_record.cpp
+    # 复盘面板（甲-3）：段 A/B/C 的解析器，服务端自己跑，不走训练流水线。
+    ${GOMOKU_TACTICS_SOURCES}
     src/server/server.cpp
     src/server/game_manager.cpp
     src/server/position_json.cpp
@@ -276,6 +286,19 @@ else()
     target_compile_options(test_training PRIVATE -Wall -Wextra -Wno-template-body -Wno-template-id-cdtor)
 endif()
 add_test(NAME test_training COMMAND test_training)
+
+# Every suite gets a process-level timeout. A ctest run without TIMEOUT hangs forever on a dead loop, and a
+# hung gate is worse than a red one: the reader never sees a failure, only "still running". The values are
+# about twice the measured cost, so a busy machine cannot kill a real green run and a real hang still dies
+# inside a couple of minutes rather than inside ten. (Implementation guide §9.1.)
+set_tests_properties(test_board     PROPERTIES TIMEOUT 120)
+set_tests_properties(test_pattern   PROPERTIES TIMEOUT 120)
+set_tests_properties(test_evaluator PROPERTIES TIMEOUT 120)
+set_tests_properties(test_search    PROPERTIES TIMEOUT 900)   # 实测 470 s
+set_tests_properties(test_position  PROPERTIES TIMEOUT 120)
+set_tests_properties(test_session   PROPERTIES TIMEOUT 60)
+set_tests_properties(test_server    PROPERTIES TIMEOUT 180)
+set_tests_properties(test_training  PROPERTIES TIMEOUT 300)   # 实测 13 s，memcheck 下 166 s
 
 # All eight suites rely on plain assert(); a Release/RelWithDebInfo -DNDEBUG
 # would compile every assert away while ctest still reports green, so undo it

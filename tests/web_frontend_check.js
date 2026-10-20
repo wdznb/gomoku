@@ -3766,6 +3766,188 @@ check('ENG-A7 搜完了的思考与不带这几个键的老服务器都不写中
            + el('turn-info').textContent);
 });
 
+// ── 甲-3 复盘面板（设计文档 v2 §6.9，指导书甲-3 的前端三条）────────────────
+// 与协议侧同一形状：帧一到，标记贴在既有的胜率曲线上，点标记跳手，「摆棋测试」把那一手
+// 之前的局面交回 set_position。曲线的几何一位都不许动，所以这里只数标记。
+const REVIEW_MOVES = [[7, 7, BLACK], [8, 8, WHITE], [7, 8, BLACK], [9, 9, WHITE]];
+
+function reviewGame() {
+    const game = newGame();
+    game.moveHistory = REVIEW_MOVES.map(m => ({ row: m[0], col: m[1], color: m[2] }));
+    game.analysis = REVIEW_MOVES.map(() => ({
+        method: 'alphabeta', score: 100, depth: 6, nodes: 20000, elapsed_ms: 500,
+    }));
+    game.baseStones = [];
+    // 一局正在进行的形状：showReplayMove 有一条「这盘还没开始」的守卫
+    // （gameStatus waiting 且没选边时拒绝跳手），复盘本来就是对着下完的局点的。
+    game.gameStatus = 'playing';
+    game.playerColor = BLACK;
+    game.verdicts = [];
+    game.verdictFocus = null;
+    game.analyzing = false;
+    const sent = [];
+    game.sendMessage = (msg) => { sent.push(msg); return true; };
+    return { game, sent };
+}
+
+// 一份四条判定里只有两条「有话」的复盘结果：第 3 手俗手、第 4 手妙手，其余 none。
+function analyzeResultFrame() {
+    return {
+        type: 'analyze_result',
+        coeffs_sha: 'b7db6f41',
+        cards: 2,
+        total_plies: 4,
+        candidates: 2,
+        reviewed: 2,
+        moves: [
+            { ply: 0, kind: 'none', played: [7, 7], best: [-1, -1], loss: 0, gap: 0, layer: 'unrated' },
+            { ply: 1, kind: 'none', played: [8, 8], best: [-1, -1], loss: 0, gap: 0, layer: 'unrated' },
+            { ply: 2, kind: 'blunder', played: [7, 8], best: [6, 8], loss: 8000, gap: 3000, layer: 'normal' },
+            { ply: 3, kind: 'brilliant', played: [9, 9], best: [10, 9], loss: 0, gap: 4200, layer: 'hard' },
+        ],
+    };
+}
+
+function evalClick(game) {
+    const listeners = el('eval-graph')._listeners.filter(l => l.type === 'click');
+    assert(listeners.length > 0, 'the eval canvas registers no click handler');
+    return (clientX) => listeners[listeners.length - 1].handler({ clientX, clientY: 32 });
+}
+
+function markCalls() {
+    const ctx = el('eval-graph').getContext();
+    const rects = [];
+    const texts = [];
+    ctx.fillRect = (x, y, w, h) => { rects.push({ x, y, w, h }); };
+    ctx.fillText = (text, x, y) => { texts.push({ text, x, y }); };
+    return { rects, texts };
+}
+
+check('甲-3 面板藏着，点「复盘」发一帧 analyze_request 并按住按钮', () => {
+    const { game, sent } = reviewGame();
+    el('analyze-panel').hidden = true;         // index.html 上的 hidden 属性
+    el('btn-analyze').disabled = false;
+    el('btn-setup-test').disabled = true;
+    game.requestAnalyze();
+    assert(sent.length === 1, 'one analyze_request, got: ' + sent.length);
+    const frame = JSON.parse(JSON.stringify(sent[0]));
+    assert(frame.type === 'analyze_request', 'the frame type, got: ' + frame.type);
+    assert(frame.depth === 6 || frame.depth === 8,
+           'depth follows the page\u2019s own setting, got: ' + frame.depth);
+    assert(frame.budget === 20000, 'the budget is §5.3\u2019s default, got: ' + frame.budget);
+    assert(el('analyze-panel').hidden === false, 'the panel opened');
+    assert(el('btn-analyze').disabled === true, 'and the button is held down while it runs');
+    game.requestAnalyze();
+    assert(sent.length === 1, 'a second click sends nothing while a review is in flight');
+});
+
+check('甲-3 analyze_progress 把「第几手 / 共几手」写进面板状态行', () => {
+    const { game } = reviewGame();
+    game.analyzing = true;
+    game.handleServerMessage({ type: 'analyze_progress', done: 1, total: 2 });
+    assert(el('analyze-status').textContent === '复盘 1 / 2 手',
+           'progress line, got: ' + el('analyze-status').textContent);
+    game.handleServerMessage({ type: 'analyze_progress', done: 2, total: 2 });
+    assert(el('analyze-status').textContent === '复盘 2 / 2 手',
+           'and it counts up, got: ' + el('analyze-status').textContent);
+});
+
+check('甲-3 analyze_result 之后曲线上的标记数等于带判定的手数', () => {
+    const { game } = reviewGame();
+    game.analyzing = true;
+    const calls = markCalls();
+    game.drawEvalGraph();
+    const before = calls.rects.length + calls.texts.filter(t => t.text !== '评估（黑棋视角）').length;
+    assert(before === 0, 'no verdicts means no marks, got: ' + before);
+
+    game.handleServerMessage(analyzeResultFrame());
+    const marks = calls.rects.filter(r => r.w === 5)
+        .concat(calls.texts.filter(t => t.text === '★'));
+    assert(marks.length === 2, 'two marks for two verdicts, got: ' + marks.length);
+    // 俗手在第 3 手（下标 2）：x = 200 * 2.5 / 4 = 125，方块画在标记带上。
+    const blunder = calls.rects.find(r => r.w === 5 && Math.abs(r.x - 122.5) < 1e-9);
+    assert(blunder !== undefined, 'the blunder square sits at its own ply x, got: '
+                                  + JSON.stringify(calls.rects));
+    assert(el('btn-analyze').disabled === false, 'the button comes back with the result');
+    const rows = el('analyze-list')._children.length;
+    assert(rows === 2, 'one list row per verdict, got: ' + rows);
+    assert(el('analyze-status').textContent.indexOf('2 / 4 手有判定') >= 0,
+           'the summary counts marked plies, got: ' + el('analyze-status').textContent);
+});
+
+check('甲-3 点标记跳到那一手，点没有标记的地方不动', () => {
+    const { game } = reviewGame();
+    game.handleServerMessage(analyzeResultFrame());
+    const click = evalClick(game);
+    game.replayIndex = null;
+    click(100);                       // x=100 是下标 2 的那一列（200*(2+0.5)/4）
+    assert(game.replayIndex === 2, 'the mark jumps to its ply, got: ' + game.replayIndex);
+    assert(game.verdictFocus === 2, 'and 摆棋测试 now knows which one', game.verdictFocus);
+    assert(el('btn-setup-test').disabled === false, 'so the test button unlocks');
+    game.replayIndex = null;
+    click(25);                        // 下标 0 那一段是「none」，没有标记
+    assert(game.replayIndex === null, 'a click on an unmarked ply does nothing, got: '
+                                      + game.replayIndex);
+});
+
+check('甲-3 摆棋测试把点中之前的局面交回 set_position', () => {
+    const { game, sent } = reviewGame();
+    game.handleServerMessage(analyzeResultFrame());
+    evalClick(game)(100);             // 第 3 手（下标 2）
+    game.startSetupTest();
+    assert(sent.length === 1, 'one set_position, got: ' + sent.length);
+    const board = sent[0].position.board;
+    assert(sent[0].type === 'set_position', 'type, got: ' + sent[0].type);
+    // 前缀只有两手：(7,7) 黑 与 (8,8) 白；点中的那一手自己不算进去（那是给玩家试的）。
+    const stones = [];
+    for (let r = 0; r < 15; ++r) for (let c = 0; c < 15; ++c) if (board[r][c]) stones.push([r, c, board[r][c]]);
+    assert(stones.length === 2, 'the position stops before the marked ply, got: '
+                                 + JSON.stringify(stones));
+    assert(stones[0][0] === 7 && stones[0][1] === 7 && stones[0][2] === BLACK, 'black 1');
+    assert(stones[1][0] === 8 && stones[1][1] === 8 && stones[1][2] === WHITE, 'white 2');
+});
+
+check('甲-3 没有复盘时，曲线的折线与红点和以前逐点相同（旧行为不变）', () => {
+    const { game } = reviewGame();
+    game.analysis = game.analysis.map(a => ({ ...a, score: 1200 }));       // 未夹取的一边
+    const calls = markCalls();
+    const arcs = [];
+    const lines = [];
+    const ctx = el('eval-graph').getContext();
+    ctx.arc = (x, y, r) => { arcs.push({ x, y, r }); };
+    ctx.moveTo = (x, y) => { lines.push({ x, y }); };
+    ctx.lineTo = (x, y) => { lines.push({ x, y }); };
+    game.drawEvalGraph();
+    // 不只是数量：把四个点的坐标逐点钉死。桩画布是 200×64，所以
+    // x = 200*(i+0.5)/4，y = 32 - (1200/2000)*(32-6) = 16.4（limit 与夹取都写在 §6.9 注意 1）。
+    // 曲线是黑棋视角：白棋那一手的分被翻过去，所以 y 在 16.4 / 47.6 之间跳。
+    const expect = [25, 75, 125, 175].map((x, i) => ({ x, y: i % 2 === 0 ? 16.4 : 47.6 }));
+    const curve = lines.slice(2);        // 前两个是中线的 moveTo/lineTo
+    assert(curve.length === 4, 'the polyline is four points, got: ' + curve.length);
+    curve.forEach((point, i) => {
+        assert(Math.abs(point.x - expect[i].x) < 1e-9 && Math.abs(point.y - expect[i].y) < 1e-9,
+               'point ' + i + ' is at ' + JSON.stringify(point) + ', want '
+               + JSON.stringify(expect[i]));
+    });
+    assert(arcs.length === 0, 'a 1200 score is not saturated, so no dot: ' + arcs.length);
+    // 2 段是那条中线（moveTo/lineTo 各一次），4 段才是折线本身。
+    assert(lines.length === 6, 'and the polyline keeps its four points plus the mid line,'
+                               + ' got: ' + lines.length);
+    assert(calls.rects.filter(r => r.w === 5).length === 0,
+           'no marks without a review, got: ' + calls.rects.length);
+
+    // 一份长度不匹配的旧判定（换局之后）也必须什么都不画。
+    game.verdicts = [{ ply: 0, kind: 'blunder', loss: 1 }];
+    arcs.length = 0;
+    lines.length = 0;
+    calls.rects.length = 0;
+    game.drawEvalGraph();
+    assert(arcs.length === 0 && lines.length === 6,
+           'the curve is untouched by a stale review, got: ' + arcs.length + '/' + lines.length);
+    assert(calls.rects.filter(r => r.w === 5).length === 0,
+           'and a stale verdict list draws no mark');
+});
+
 let failed = 0;
 for (const result of results) {
     console.log(`${result.ok ? 'PASS' : 'FAIL'} ${result.label}` +

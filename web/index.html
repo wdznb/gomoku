@@ -32,6 +32,18 @@
         </div>
         <canvas id="eval-graph"></canvas>
         <div id="replay-info" class="replay-info"></div>
+        <!-- 复盘面板（设计文档 v2 §6.9，指导书甲-3）：人机模式里的一个动作，不是第三个
+             模式。开局藏着，点「复盘」才出来；标记画在上面那块既有的胜率曲线上。 -->
+        <section id="analyze-panel" class="panel" hidden>
+            <div class="panel-title">复盘</div>
+            <div class="replay-controls">
+                <button id="btn-analyze" class="btn btn-tiny" title="跑一遍段 A 与段 B">复盘</button>
+                <button id="btn-setup-test" class="btn btn-tiny" disabled
+                        title="把点中的那一手之前的局面摆到棋盘上">摆棋测试</button>
+            </div>
+            <div id="analyze-status" class="replay-info"></div>
+            <div id="analyze-list" class="move-list"></div>
+        </section>
     </aside>
 
     <aside id="region-right">

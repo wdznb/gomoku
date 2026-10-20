@@ -1980,6 +1980,78 @@ additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cp
 no existing assertion was edited.
 
 
+## 轮次148 引擎重构 V2 甲-3＋§9.1：复盘面板的协议与前端第一次跑通，而 ctest 层的超时也是这一轮补的 — V2 stage 甲-3: `analyze_request` / `analyze_progress` / `analyze_result` reach the wire, the 复盘 marks land on the existing evaluation curve, and §9.1's per-suite ctest TIMEOUT (the missing first of the three timeout layers) goes in with it
+
+用户这一轮的发话是「严格按 `docs/ENGINE_REDESIGN_V2.md` 与 `docs/IMPLEMENTATION_GUIDE.md`，针对每一个功能写代码和测试，回归＋验收过了就推远程」。指导书 §3.2 列的 17 个待做单元里第一个是 **甲-3 复盘面板**，§9.1 又说「ctest 层超时一个都没有，第一个单元顺手补上」——本轮就是这两件事。
+
+### 落点
+
+| 位置 | 是谁 |
+| --- | --- |
+| `CMakeLists.txt:294-301` | 八个套件的 `set_tests_properties(... TIMEOUT ...)`，值按指导书 §9.1：`test_search 900`（实测 470 s）、`test_server 180`、`test_training 300`、`test_session 60`、其余 120 |
+| `CMakeLists.txt:45-49` | 新的 `GOMOKU_TACTICS_SOURCES`（`replay_analyzer.cpp` ＋ `tactics_card.cpp`），被训练流（`:56`）、服务端（`:72`）与 `test_server`（`:249`）三处链走——段 A/B/C 的解析器现在服务端也要用，不为此把整条训练流水线塞进 server |
+| `src/server/server.h:108-149` | `TrackedGame` 长出 `analyze_stop`（`shared_ptr<atomic<bool>>`，线程拿的是副本）／`analyze_thread`／`analyzing`，以及一个**析构函数**；`src/server/server.h:212` 是 handler 声明，`:234-255` 是 `AnalysisRequest`／`run_analysis`／`stop_analyze` |
+| `src/server/server.cpp:743` | 分发链上的 `analyze_request`（会话级帧，不动 `:705` 那个「不需要会话」的白名单） |
+| `src/server/server.cpp:1801` | `handle_analyze_request`：思考中拒绝、复盘进行中拒绝、摆棋局拒绝、空局拒绝，然后取 `snapshot_of` 的副本起线程 |
+| `src/server/server.cpp:1849-1946` | `run_analysis`：段 A 筛候选 → 段 B 一手一帧 `analyze_progress` → 段 C 只给产题的那几手跑难度阶梯（上限 `max_candidates`）→ 一帧逐手对齐的 `analyze_result` |
+| `src/server/server.cpp:1948` | `stop_analyze`：置停 → join → 复位停旗 |
+| `src/server/server.cpp:630`、`:1347`、`:1651`、`:1658` | 四个 join 点：`stop()`、`detach_socket()`、idle sweep 的两处 `sessions_.erase` |
+| `web/app.js:83-89`、`:388-390`、`:973-996`、`:998-1120`、`:1902-1905` | 三个字段、三条监听（复盘／摆棋测试／曲线点击）、`drawEvalGraph` 末尾追加的标记段、`evalMarkStyle`/`requestAnalyze`/`handleAnalyzeProgress`/`handleAnalyzeResult`/`renderVerdictList`/`handleEvalClick`/`startSetupTest`、两个 `case` |
+| `web/index.html:37-46`、`web/style.css:395-408` | `#analyze-panel`（默认 `hidden`，两个按钮＋状态行＋列表）与 `.panel`／`.verdict-row`／`.mark-*` |
+
+### 读数 1：ctest 层的超时是通电的，而且是这一轮门禁能重跑的前提
+
+`/tmp/tmo` 里一支最小项目：一个 `sleep 30` 的用例配 `TIMEOUT 3`，ctest 报 **`(Timeout)` 并判失败**。同一形状现在写在 `build/CTestTestfile.cmake` 里（八条 `set_tests_properties`，`TIMEOUT "120"`…`"900"`）。指导书 §9.1 说「挂住的门禁比红掉的门禁更糟」——本轮之后，挂住的用例会自己死。
+
+- 带超时的整条 `ctest`：**8/8 / 510.82 s**（`test_search` 470 s 那格仍在 900 s 的帽内，余量近一倍）。
+
+### 读数 2：协议侧——一手一帧，最后一帧逐手对齐
+
+`tests/test_server.cpp` 新增三条（都在 `Harness` ＋ `drain_frames` 上跑，不新开端口不新开线程模型）：
+
+| 用例 | 实测读数 |
+| --- | --- |
+| `test_analyze_progress_then_exactly_one_result_per_ply` | 段 A 挑出 **2 手候选**（第 6、7 手，摆幅 −10,000 与 −8,000），于是 **2 帧 `analyze_progress`**（`done` 逐帧 +1、`total` 恒为 2）与 **恰好 1 帧 `analyze_result`**；`moves` 长度 **10 = 对局手数**，`candidates == reviewed == progress`，`coeffs_sha == coefficients_fingerprint(ThreatCoefficients{})` |
+| 同上的第 8 手 | `kind == "none"` 且 `layer == "unrated"`：这一手棋盘上就有成五的着法，`SearchEngine` 走快路径、`root_scores` 是空的，段 B 按 `replay_analyzer.cpp:216` 那条「快路径对它们没话说」不出判定。**这一臂整局的 `cards` 读数是 0（实测）**，不是预估 |
+| `test_analyze_is_refused_while_the_ai_is_thinking` | AI 在想的时候发请求：收到的帧是 `move_made, error`，**`error` 恰好 1 帧、`analyze_*` 0 帧**（不排队） |
+| `test_analyze_refuses_the_positions_it_cannot_rebuild_and_the_games_it_cannot_read` | 空局（一子未落）与摆棋开的局各回 **1 帧 `error`、0 帧 `analyze_*`**；后者钉的是「段 B 从空盘一手一手摆回去，而 base 子不在手数里」——与 `README:575` 那条「这种局只活在会话文件里」同一口径 |
+
+变异臂（纪律 4）：把 `result["moves"].size() == 10` 改成 `== 11` → `rc=134`，报 `tests/test_server.cpp:2934`；还原后 `All server tests passed`。
+
+### 读数 3：前端——标记是追加的，曲线的几何一位没动
+
+`tests/web_frontend_check.js` 末尾追加 **6 条**（原 105 条一位未改）：
+
+- 面板默认 `hidden`；点「复盘」发出**一帧** `analyze_request`（`budget=20000`，`depth` 跟页面的深度设置走），面板出现、按钮按住，**第二次点不再发**；
+- 两帧 `analyze_progress` 把状态行写成 `复盘 1 / 2 手` → `复盘 2 / 2 手`；
+- 一份两条判定的 `analyze_result` 落地后，曲线上的标记数 **== 2**（俗手方块在 `x=200*(2+0.5)/4=125` 那列，妙手星形在 175），列表行数 **== 2**，状态行写 `2 / 4 手有判定（题库 2 张，系数 b7db6f41）`；
+- 点 `clientX=100`（下标 2 那一列）→ `replayIndex == 2`、`verdictFocus == 2`、「摆棋测试」解锁；点 `clientX=25`（`kind=="none"`，没有标记）→ **不跳手**；
+- 「摆棋测试」发的是既有协议里的 `set_position`，盘面是**点中之手之前**的两子前缀（(7,7) 黑、(8,8) 白），点中的那一手自己不算进去；
+- 旧行为不变：`score=1200` 的四手局，折线四点逐点钉死为 `x∈{25,75,125,175}`、`y∈{16.4,47.6,16.4,47.6}`（黑棋视角翻转），红点 **0 个**（1200 没饱和），无复盘／判定长度不匹配时都画不出标记。
+
+`web_frontend_check: **111/111 passed**`。
+
+**杀线（指导书甲-3 验收最后一条）**：故意把 `drawEvalGraph` 的 `limit` 从 2000 改成 2001 → 红的正是本轮新写的第 6 条（`point 0 is at y 16.407796101949025, want 16.4`），改回后 111/111。**同时记一笔与指导书预期不同的实测：既有那 105 条一位都不红**——它们对 ±2000 那个夹取常数不敏感（W3 那类用例钉的是「饱和与否」，不是未饱和点的 y 值），所以这条杀线只有加上本轮第 6 条才真的成立。
+
+### 读数 4：并发与内存——新线程干净，脏的是别人家的一条时间假设
+
+- **TSan**（`build-tsan`，`tools/valgrind_check.sh tsan test_server`）：`rc=66`，**1 条 data race**。逐帧读完，读写两端全在 `test_hint_answer_for_a_superseded_position` 里（读点 `game_manager.cpp:437` 的 `Board::move_count()`，写点是主线程的 `undo`／`restore_game`），也就是 `REVIEW_LOG:1275` 记过的那对 hint 线程已知账。**`run_analysis` 与 `analyze_*` 在报告里出现 0 次**（`grep -c run_analysis /tmp/v2/tsan_err.txt` = 0）：本轮新增的那条线程只读自己拷出来的 `GameRecord`，发帧走 `WebSocketSession::send` 的 `net::post`，不碰 `GameManager`、不碰 `games_mutex_`。
+- **memcheck（`build-vg`）——本轮新登记一条仪表账**：带上甲-3 那三条用例，`test_server` 在 memcheck 下 **2/2 次都停在 `tests/test_server.cpp:1734` 的 `assert(hint_results == 0)`**（`rc=134`，valgrind **报告 0 条**、definite leak 0）；把那三条从 `main` 里编译掉，同一个二进制**跑完 rc=0、报告 0 条**。这条用例在 `main` 里排在甲-3 之前 17 行（`:3082`），不可能被后跑的代码「执行到」，所以差的只是二进制布局与线程调度；它的前提是「棋子在搜索还在跑的时候被退回」，而 memcheck 慢 20-50 倍，这类靠时间差成立的前提本来就站不住。**判：hint 路径的一条既有时间假设，不是甲-3 的缺陷**；`reports=0` 说明本轮新增的线程没有引入任何未初始化读、越界或泄漏。跟进项（下一轮单独做）：把这条用例改成不依赖时间差的判定（`docs/STRESS_TEST_RULES.md` §5 的「按既存记录」同一处理方式）。
+- **析构那一格**：`TrackedGame` 现在带 `std::thread` 成员，所以本轮给它写了析构函数置停＋join——在 joinable 的 `std::thread` 上析构是 `std::terminate`，是整个进程不是这一局；四个 join 点（`stop()`、`detach_socket()`、idle sweep 两处）在它之前，析构只是最后那道谁都可能忘也忘不掉的保险。
+
+### 门禁
+
+- `node tests/readme_anchor_check.js` **122 citations / 0 problems**（本轮新增两条 `README:575` 引用，都落在文档真正写那句话的行上；从 120 涨到 122）；
+- `node tests/web_frontend_check.js` **111/111**；
+- `cmake --build build -j4` 零新增警告；`ctest --test-dir build` **8/8 / **508.47 s**（`test_search` 470.28 s，正好是 900 s 帽的 1.9 倍余量；`test_server` 从 7 s 涨到 16.91 s，因为甲-3 的三条用例各起一次真复核）**（本轮动了 `src/`，按纪律 5 必须跑全量；这也是八个套件第一次带 TIMEOUT 跑）；
+- TSan 与 memcheck 见读数 4，两者不与任何负载跑重叠（`docs/STRESS_TEST_RULES.md` §5）。
+
+### 没动的账
+
+- 甲-3 的「加入题库」按钮（§6.9 第 6 条）没做：它写的是 `data/tactics/judged/…`，而指导书甲-3 的验收里面板只有「复盘」与「摆棋测试」两个按钮——多写一个自动入题的口子是越范围。
+- 段 C 的难度层在这一路的实测里没被任何一手命中（`cards=0`），因为那局的两手候选都是快路径答的。难度层与 `layer` 的端到端读数属于 `test_training` 里已有的段 C 用例，本轮不重测。
+- 17 个单元里剩下的 16 个（甲-4、乙-1..2、丙-1..4、丁-1..6、戊-1..3）按 §3.2 的顺序继续。
+
 ## 轮次147 引擎重构 J-4：样本长出 teacher_move——label 与老师第一次分开记，且没有老师的旧文件逐字节不变 — engine redesign stage J-4, TrainingSample gains teacher_move: the label and the teacher are separate fields, and a sample without a teacher still writes the old shape byte for byte
 
 规格 `docs/ENGINE_REDESIGN_V2.md` `§6.7 a`（题卡 → 训练样本）。上一轮甲-2 曾把三个文件一起改、锚点失败后仍同步，导致半成品进树并回滚；本轮按「一次一个文件、`&&` 串联、失败即不推送」重做，三步各自编译通过后才走下一步。

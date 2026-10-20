@@ -19,6 +19,7 @@
 #include "search/alphabeta.h"
 #include "search/search_engine.h"
 #include "training/game_record.h"
+#include "training/tactics_card.h"
 #include "server/session_store.h"
 
 #include <boost/beast/core.hpp>
@@ -2864,6 +2865,192 @@ void test_set_config_keeps_the_two_optional_budgets() {
     std::cout << "test_set_config_keeps_the_two_optional_budgets passed" << std::endl;
 }
 
+
+// ── 甲-3 复盘面板：协议侧（设计文档 v2 §6.9，指导书甲-3 的验收三条）────────────
+// 一局「读得回来」的记录才有一手可复盘：段 A 对 reason==INVALID 直接返回零候选
+// （replay_analyzer.cpp:86），而 snapshot_of 只在 status==GAME_OVER 时才写下胜负，
+// 所以这一组用例都从 five_restore 出发——这与 §6.9 第 1 句「一局结束后」是同一件事。
+GameRestore analyze_restore() {
+    GameRestore restore;
+    restore.player_color = BLACK;
+    restore.status = GameStatus::GAME_OVER;
+    restore.winner = WHITE;
+    restore.reason = "five";
+    // 双方都差一子成五，黑先走：黑 (9,2)-(9,5)、白 (7,2)-(7,5)。第 8 手黑棋没有收自己的
+    // (9,6) 而是走了个安静的 (0,12)，白棋第 9 手 (7,6) 成五——所以段 B 在这一手看到的
+    // 正解是 (9,6)（自己成五），失分是「+100000 对 -100000」。第 6、7 手两侧都在收自己的
+    // 四，没有「该做而不做」的手。
+    const Position cells[10] = {{9, 2}, {7, 2}, {9, 3}, {7, 3}, {9, 4},
+                                {7, 4}, {9, 5}, {7, 5}, {0, 12}, {7, 6}};
+    // 段 A 的摆幅按 (-score_{i+1}) - score_i 算，两侧都不在将杀带里才有资格响，所以
+    // 记录里第 8、9 手的分值写成 5,000 / 5,000：黑棋以为自己是 +5,000，白棋接着也是
+    // +5,000（它的视角），摆幅 -10,000 就是 BIG_SWING。开局六手之内按 §6.4 判据 1 剔除。
+    const int scores[10] = {100, 120, 150, 200, 300, 600, 1500, 1400, 5000, 5000};
+    for (int i = 0; i < 10; ++i) {
+        MoveAnalysis analysis;
+        analysis.move = Move(cells[i].row, cells[i].col, i % 2 == 0 ? BLACK : WHITE);
+        analysis.method = "alphabeta";
+        analysis.score = scores[i];
+        analysis.depth = 6;
+        analysis.nodes = 20000;
+        restore.moves.push_back(analysis);
+    }
+    return restore;
+}
+
+void test_analyze_progress_then_exactly_one_result_per_ply() {
+    const auto dir = scratch("r148_analyze_sessions");
+    Harness h(dir, std::string());
+    assert(h.entry->game->restore_game(analyze_restore()));
+    size_t seen = 0;
+
+    h.server.handle_analyze_request(h.socket,
+                                    json{{"depth", 1}, {"budget", 1000}, {"max_candidates", 1}});
+
+    int progress = 0;
+    json result;
+    bool got_result = false;
+    // 等的是「一条线程跑完一次定预算搜索」，按 §9.2 这一臂只能用墙钟；240 s 的帽
+    // 在裸跑时是 40 倍余量，在 memcheck 下也不至于误杀。
+    for (int i = 0; i < 2400 && !got_result; ++i) {
+        for (const std::string& frame : drain_frames(h.server, h.socket, seen)) {
+            const json parsed = json::parse(frame, nullptr, false);
+            if (parsed.is_discarded() || !parsed.contains("type")) continue;
+            const std::string type = parsed["type"].get<std::string>();
+            if (type == "analyze_progress") {
+                ++progress;
+                assert(parsed["total"] == parsed["done"] == 0 ||
+                       parsed["done"].get<int>() <= parsed["total"].get<int>());
+            } else if (type == "analyze_result") {
+                got_result = true;
+                result = parsed;
+            } else {
+                std::cout << "  [r148a3] unexpected frame during a review: " << type << std::endl;
+                assert(false);
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+    assert(got_result);
+    // 每手一项，与非候选手一起：前端的标记是按下标贴到曲线上的，缺一项就贴错手。
+    assert(result["moves"].size() == 10);
+    // 进度帧的 total 就是结果帧的 candidates，而 reviewed == 实际复核过的手数。
+    assert(result["candidates"] == result["reviewed"]);
+    assert(result["reviewed"] == progress);
+    assert(result["coeffs_sha"] == coefficients_fingerprint(ThreatCoefficients{}));
+    int marked = 0;
+    for (const json& item : result["moves"]) {
+        assert(item.contains("ply") && item.contains("kind") && item.contains("played"));
+        assert(item.contains("best") && item.contains("loss") && item.contains("gap"));
+        assert(item.contains("layer"));
+        const std::string kind = item["kind"].get<std::string>();
+        if (kind != "none") ++marked;
+        if (item["ply"] < 6) assert(kind == "none");   // 开局六手之内是剔除区，不贴标记
+        if (item["ply"] == 8) {
+            // 钉的是「段 B 对快路径的手没话说」这一条（§6.3.1 的根表规则，轮次145 落进
+            // replay_analyzer.cpp:216 那句 return）：第 8 手黑棋盘上就有成五的着法，
+            // SearchEngine 的快路径直接答，root_scores 是空的，所以判定不许是俗手，
+            // layer 也不许是难度层——它俩都只能是「没说过话」的那一个值。
+            assert(kind == "none");
+            assert(item["layer"] == "unrated");
+            assert(item["played"][0] == 0 && item["played"][1] == 12);
+        }
+        if (kind == "none") assert(item["layer"] == "unrated" || item["layer"] == "easy" ||
+                                    item["layer"] == "normal" || item["layer"] == "hard");
+    }
+    assert(marked == 0);
+    assert(result["cards"] == 0);
+    std::cout << "test_analyze_progress_then_exactly_one_result_per_ply passed (" << progress
+              << " progress frames, 1 result, " << result["moves"].size() << " plies, "
+              << result["candidates"] << " candidates, " << marked << " marked)" << std::endl;
+
+    // 跑完的会话还能继续下：复盘不留任何状态在 entry 上。
+    h.server.handle_analyze_request(h.socket, json{{"depth", 1}, {"budget", 1000}});
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    h.server.handle_undo(h.socket);
+    assert(h.entry->game->status() == GameStatus::PLAYING);
+    h.server.stop_analyze(*h.entry);
+}
+
+void test_analyze_is_refused_while_the_ai_is_thinking() {
+    const auto dir = scratch("r148_analyze_busy");
+    Harness h(dir, std::string());
+    // 三子的 quiet 局面 + 长预算：AI 那一边一定还在想（没有五、没有必挡，快路径不响）。
+    h.entry->game->set_config(120000, 20);
+    assert(h.entry->game->restore_game(playing_restore(2)));
+    size_t seen = 0;
+    assert(h.server.entry_locked(h.socket.get()) != nullptr);
+    h.server.handle_make_move(h.socket, json{{"row", 5}, {"col", 5}});
+    const bool busy = h.entry->game->is_ai_thinking();
+    std::cout << "  [r148a3] busy=" << (busy ? "yes" : "no") << std::endl;
+    assert(busy);
+
+    // 思考中的复盘请求：回一帧 error，且不点分析线程——一条 analyze_* 帧都不许有。
+    h.server.handle_analyze_request(h.socket, json{{"depth", 2}, {"budget", 1000}});
+    const std::vector<std::string> frames = drain_frames(h.server, h.socket, seen);
+    int analyze_frames = 0;
+    int errors = 0;
+    std::string kinds;
+    for (const std::string& frame : frames) {
+        const json parsed = json::parse(frame, nullptr, false);
+        if (parsed.is_discarded() || !parsed.contains("type")) continue;
+        const std::string type = parsed["type"].get<std::string>();
+        kinds += (kinds.empty() ? "" : ",") + type;
+        if (type.rfind("analyze_", 0) == 0) ++analyze_frames;
+        if (type == "error") ++errors;
+    }
+    std::cout << "  [r148a3] frames while busy: " << kinds << std::endl;
+    assert(errors == 1);
+    assert(analyze_frames == 0);
+    h.entry->game->halt_search();
+    h.server.stop_analyze(*h.entry);
+    drain_frames(h.server, h.socket, seen);
+}
+
+void test_analyze_refuses_the_positions_it_cannot_rebuild_and_the_games_it_cannot_read() {
+    const auto dir = scratch("r148_analyze_empty");
+    {
+        // 一子未落：没有可复盘的手，回 error，不发 analyze_*。
+        Harness h(dir, std::string());
+        size_t seen = 0;
+        h.server.handle_analyze_request(h.socket, json{{"depth", 2}, {"budget", 1000}});
+        const std::vector<std::string> frames = drain_frames(h.server, h.socket, seen);
+        assert(frames.size() == 1);
+        const json reply = json::parse(frames[0]);
+        assert(reply["type"] == "error");
+        assert(h.entry->game->status() == GameStatus::WAITING);
+    }
+    {
+        // 摆棋开的局：base 子不在手数里，段 B 从空盘一手一手摆不回这一局（README:575
+        // 同一条：这种局只活在会话文件里，不进训练流）。这里照同一口径拒绝。
+        Harness h(dir, std::string());
+        GameRestore restored = analyze_restore();
+        restored.base = {Move(3, 3, BLACK), Move(11, 11, WHITE)};
+        restored.moves.clear();
+        const Position tail[2] = {{4, 4}, {5, 5}};
+        for (int i = 0; i < 2; ++i) {
+            MoveAnalysis analysis;
+            analysis.move = Move(tail[i].row, tail[i].col, i % 2 == 0 ? BLACK : WHITE);
+            analysis.method = "alphabeta";
+            analysis.score = 8000;
+            analysis.depth = 6;
+            restored.moves.push_back(analysis);
+        }
+        restored.status = GameStatus::GAME_OVER;
+        assert(h.entry->game->restore_game(restored));
+        size_t seen = 0;
+        h.server.handle_analyze_request(h.socket, json{{"depth", 2}, {"budget", 1000}});
+        const std::vector<std::string> frames = drain_frames(h.server, h.socket, seen);
+        assert(frames.size() == 1);
+        const json reply = json::parse(frames[0]);
+        assert(reply["type"] == "error");
+        assert(reply["message"].get<std::string>().find("摆棋") != std::string::npos);
+    }
+    std::cout << "test_analyze_refuses_the_positions_it_cannot_rebuild_and_the_games_it_cannot_read"
+              << " passed (empty game and 摆棋 game both answer one error frame, no analyze_*)"
+              << std::endl;
+}
+
 int main() {
     std::cout << "Running server tests..." << std::endl;
 
@@ -2908,6 +3095,11 @@ int main() {
     test_thinking_progress_carries_partial_fields();
     test_replay_roundtrip_keeps_new_fields();
     test_set_config_keeps_the_two_optional_budgets();
+
+    test_analyze_progress_then_exactly_one_result_per_ply();
+    test_analyze_is_refused_while_the_ai_is_thinking();
+    test_analyze_refuses_the_positions_it_cannot_rebuild_and_the_games_it_cannot_read();
+
 
     std::cout << "All server tests passed!" << std::endl;
     return 0;

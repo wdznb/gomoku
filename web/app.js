@@ -78,6 +78,13 @@ class GomokuGame {
         this.analysis = [];
         // True when the loaded record already covers the game's ending.
         this.analysisEnded = false;
+        // 复盘面板（设计文档 v2 §6.9，指导书甲-3）：analyze_result 的逐手判定，与
+        // moveHistory / analysis 下标对齐。没有复盘时是空数组，曲线一个标记也不画。
+        this.verdicts = [];
+        // 从点下「复盘」到结果回来之间为真：一条会话只跑一份复盘，按钮得按住。
+        this.analyzing = false;
+        // 最后点中的标记在哪一手，「摆棋测试」把棋盘摆到这一手之前。
+        this.verdictFocus = null;
         // Set when a `session` reply asked for the record of a resumed game: the
         // replay that answers it paints the live board, not a scrubbed one.
         this.resumeApplied = false;
@@ -377,6 +384,10 @@ class GomokuGame {
         this.canvas.addEventListener('click', (e) => this.handleCanvasClick(e));
 
         document.getElementById('btn-replay').addEventListener('click', () => this.requestReplay());
+        // 复盘面板（甲-3）：面板默认藏着，点「复盘」才出来；曲线上的标记点击走跳手。
+        document.getElementById('btn-analyze').addEventListener('click', () => this.requestAnalyze());
+        document.getElementById('btn-setup-test').addEventListener('click', () => this.startSetupTest());
+        document.getElementById('eval-graph').addEventListener('click', (e) => this.handleEvalClick(e));
         document.getElementById('btn-replay-first').addEventListener('click', () => this.showReplayMove(0));
         document.getElementById('btn-replay-prev').addEventListener('click', () => this.stepReplay(-1));
         document.getElementById('btn-replay-next').addEventListener('click', () => this.stepReplay(1));
@@ -958,6 +969,156 @@ class GomokuGame {
                 ctx.fill();
             }
         }
+
+        // 复盘标记（甲-3）：这一段只在既有绘制之后追加，折线与红点的几何一位没动。
+        // 方块走 fillRect、星/菱/点走 fillText，唯独不用 arc——arc 是红点的仪器，
+        // W3 那条用例数的就是它的次数。
+        if (this.verdicts.length === this.analysis.length) {
+            for (let i = 0; i < this.verdicts.length; ++i) {
+                const verdict = this.verdicts[i];
+                if (!verdict || verdict.kind === 'none') continue;
+                const style = this.evalMarkStyle(verdict.kind);
+                if (!style) continue;
+                const x = width * (i + 0.5) / this.analysis.length;
+                ctx.fillStyle = style.color;
+                if (style.bar) {
+                    // 唯一应手：一整条竖线，表示「这里没有第二可走」。
+                    ctx.fillRect(x - 0.5, 0, 1, height);
+                } else if (style.glyph) {
+                    ctx.font = '9px sans-serif';
+                    ctx.fillText(style.glyph, x - 4, height - 3);
+                } else {
+                    ctx.fillRect(x - 2.5, height - 8, 5, 5);
+                }
+            }
+        }
+    }
+
+    // 六种判定各一种画法（§6.9 第 2 条给了四种，剩下两种是 unlisted 与漏杀）。
+    evalMarkStyle(kind) {
+        switch (kind) {
+            case 'blunder': return { color: '#c0392b' };
+            case 'brilliant': return { color: '#27ae60', glyph: '★' };
+            case 'missed_mate': return { color: '#e67e22', glyph: '◆' };
+            case 'counterexample': return { color: '#8e44ad' };
+            case 'forced': return { color: '#9a9a9a', bar: true };
+            case 'unlisted': return { color: '#7f8c8d', glyph: '·' };
+            default: return null;
+        }
+    }
+
+    requestAnalyze() {
+        if (this.analyzing) return;
+        if (!this.moveHistory.length) {
+            this.updateStatus('这一局还没有可以复盘的手。', 'error');
+            return;
+        }
+        // 深度与预算跟页面已经有的两个设置走：复盘不是新的一套参数，玩家不该再学一次。
+        const depth = Number(document.getElementById('depth').value) || 8;
+        const sent = this.sendMessage({ type: 'analyze_request', depth, budget: 20000 });
+        if (!sent) return;
+        this.analyzing = true;
+        this.verdicts = [];
+        this.verdictFocus = null;
+        document.getElementById('analyze-panel').hidden = false;
+        document.getElementById('btn-analyze').disabled = true;
+        document.getElementById('btn-setup-test').disabled = true;
+        this.updateAnalyzeStatus('复盘开始…');
+    }
+
+    updateAnalyzeStatus(text) {
+        document.getElementById('analyze-status').textContent = text;
+    }
+
+    handleAnalyzeProgress(msg) {
+        const total = Number(msg.total) || 0;
+        const done = Number(msg.done) || 0;
+        // §6.9 第 1 条：「第 23 / 60 手」。total 是段 A 挑出来的候选手数，不是全盘手数。
+        this.updateAnalyzeStatus(`复盘 ${done} / ${total} 手`);
+    }
+
+    handleAnalyzeResult(msg) {
+        const moves = Array.isArray(msg.moves) ? msg.moves : [];
+        this.verdicts = moves;
+        this.analyzing = false;
+        document.getElementById('btn-analyze').disabled = this.takenOver;
+        this.renderVerdictList(msg);
+        this.drawEvalGraph();
+    }
+
+    renderVerdictList(msg) {
+        const list = document.getElementById('analyze-list');
+        list.innerHTML = '';
+        list._children.length = 0;
+        let marked = 0;
+        this.verdicts.forEach((item, i) => {
+            if (!item || item.kind === 'none') return;
+            ++marked;
+            const row = document.createElement('div');
+            row.className = 'verdict-row mark-' + item.kind;
+            const move = this.moveHistory[i];
+            const who = move && move.color === BLACK ? '黑' : '白';
+            const played = item.played ? `(${item.played[0] + 1},${item.played[1] + 1})` : '?';
+            const best = item.best && item.best[0] >= 0
+                ? `(${item.best[0] + 1},${item.best[1] + 1})` : '?';
+            // §6.9 第 4 条的大白话一行：哪一手、谁走的、掉多少、最好的是哪格、差多少。
+            row.textContent = `第 ${i + 1} 手 ${who} ${played} · ${this.verdictName(item.kind)}`
+                + ` · 掉 ${item.loss} 分 · 正解 ${best}（差 ${item.gap}）· ${item.layer}`;
+            row._onClick = () => { this.showReplayMove(i); this.verdictFocus = i;
+                                   document.getElementById('btn-setup-test').disabled = false; };
+            list.appendChild(row);
+        });
+        this.updateAnalyzeStatus(marked === 0
+            ? `复盘完成：${this.verdicts.length} 手里没有要说的（段 B 对快路径的手没话说）`
+            : `复盘完成：${marked} / ${this.verdicts.length} 手有判定`
+              + `（题库 ${msg.cards || 0} 张，系数 ${msg.coeffs_sha || '未知'}）`);
+    }
+
+    verdictName(kind) {
+        switch (kind) {
+            case 'blunder': return '俗手';
+            case 'brilliant': return '妙手';
+            case 'missed_mate': return '漏杀';
+            case 'counterexample': return '反例';
+            case 'forced': return '唯一应手';
+            case 'unlisted': return '不在根表里';
+            default: return kind;
+        }
+    }
+
+    handleEvalClick(e) {
+        if (this.verdicts.length !== this.analysis.length || !this.analysis.length) return;
+        const canvas = document.getElementById('eval-graph');
+        const width = Math.max(60, canvas.clientWidth || 200);
+        const rect = canvas.getBoundingClientRect();
+        const x = e.clientX - rect.left;
+        // 标记的 x 是 width * (i + 0.5) / n，反算回去就是 floor(x * n / width)。
+        const index = Math.floor(x * this.analysis.length / width);
+        if (index < 0 || index >= this.analysis.length) return;
+        const verdict = this.verdicts[index];
+        if (!verdict || verdict.kind === 'none') return;   // 没有标记的地方不跳
+        this.verdictFocus = index;
+        this.showReplayMove(index);
+        document.getElementById('btn-setup-test').disabled = false;
+    }
+
+    // 摆棋测试（§6.9 第 5 条）：把点中的那一手之前的局面交给既有的 摆棋 通道，
+    // 让玩家自己坐上去走一遍。发的是已经存在的 set_position，不新开协议。
+    startSetupTest() {
+        if (this.verdictFocus === null) return;
+        const board = emptyMatrix();
+        for (const stone of this.baseStones) board[stone.row][stone.col] = stone.color;
+        for (let i = 0; i < this.verdictFocus; ++i) {
+            const m = this.moveHistory[i];
+            if (m) board[m.row][m.col] = m.color;
+        }
+        const sent = this.sendMessage({
+            type: 'set_position',
+            position: { version: 1, type: 'gomoku_position',
+                        encoding: { black: 1, white: 2, empty: 0 },
+                        board: board.map((row) => row.slice()) },
+        });
+        if (sent) this.updateAnalyzeStatus(`把第 ${this.verdictFocus + 1} 手之前的局面摆上去了`);
     }
     
     handleCanvasClick(e) {
@@ -1627,6 +1788,10 @@ class GomokuGame {
     }
     
     resetGame() {
+        // 换一局就是另一份棋：上一份复盘的判定不属于这一局（曲线也不属于）。
+        this.verdicts = [];
+        this.verdictFocus = null;
+        this.analyzing = false;
         this.board = emptyMatrix();
         this.moveHistory = [];
         this.currentTurn = BLACK;
@@ -1730,6 +1895,12 @@ class GomokuGame {
                 break;
             case 'game_restarted':
                 this.resetGame();
+                break;
+            case 'analyze_progress':
+                this.handleAnalyzeProgress(msg);
+                break;
+            case 'analyze_result':
+                this.handleAnalyzeResult(msg);
                 break;
             case 'error':
                 // A refused 确认 leaves the setup open with its working copy intact:
