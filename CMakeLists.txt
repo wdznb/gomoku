@@ -308,6 +308,24 @@ add_test(NAME test_training COMMAND test_training)
 # hung gate is worse than a red one: the reader never sees a failure, only "still running". The values are
 # about twice the measured cost, so a busy machine cannot kill a real green run and a real hang still dies
 # inside a couple of minutes rather than inside ten. (Implementation guide §9.1.)
+# 乙-2 的常驻选点臂。单独一个套件：d8 两臂在 -O2 上各 6 s 与 10 s，塞进 test_search
+# （实测 470 s）只会让人开始跳过 ctest。
+add_executable(test_pinned
+    tests/test_pinned.cpp
+    ${GOMOKU_CORE_SOURCES}
+)
+target_include_directories(test_pinned PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/tests)
+target_link_libraries(test_pinned PRIVATE Threads::Threads nlohmann_json::nlohmann_json)
+if(UNIX)
+    target_link_libraries(test_pinned PRIVATE pthread)
+endif()
+if(MSVC)
+    target_compile_options(test_pinned PRIVATE /W4)
+else()
+    target_compile_options(test_pinned PRIVATE -Wall -Wextra -Wno-template-body -Wno-template-id-cdtor)
+endif()
+add_test(NAME test_pinned COMMAND test_pinned)
+
 set_tests_properties(test_board     PROPERTIES TIMEOUT 120)
 set_tests_properties(test_pattern   PROPERTIES TIMEOUT 120)
 set_tests_properties(test_evaluator PROPERTIES TIMEOUT 120)
@@ -316,12 +334,14 @@ set_tests_properties(test_position  PROPERTIES TIMEOUT 120)
 set_tests_properties(test_session   PROPERTIES TIMEOUT 60)
 set_tests_properties(test_server    PROPERTIES TIMEOUT 180)
 set_tests_properties(test_training  PROPERTIES TIMEOUT 300)   # 实测 13 s，memcheck 下 166 s
+set_tests_properties(test_pinned    PROPERTIES TIMEOUT 900)   # 六臂定深，d8 那两臂最慢
 
-# All eight suites rely on plain assert(); a Release/RelWithDebInfo -DNDEBUG
+# Every suite relies on plain assert(); a Release/RelWithDebInfo -DNDEBUG
 # would compile every assert away while ctest still reports green, so undo it
 # for the test targets only.
 foreach(gomoku_test_target test_board test_pattern test_evaluator test_search
-                           test_position test_session test_server test_training)
+                           test_position test_session test_server test_training
+                           test_pinned)
     if(MSVC)
         target_compile_options(${gomoku_test_target} PRIVATE /UNDEBUG)
     else()

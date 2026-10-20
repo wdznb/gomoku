@@ -1980,6 +1980,48 @@ additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cp
 no existing assertion was edited.
 
 
+## 轮次151 引擎重构 乙-2：选点基准第一次住进树里——`test_pinned` 六臂钉着着法、分值与节点数，其中两臂逐位复现轮次138 的出厂针 — engine redesign stage 乙-2: the choice-consistency arms become a resident suite; six arms pin move/score/nodes, and the two depth-8 ones reproduce 轮次138's factory pins (1,408,083 and 2,378,724 nodes) exactly
+
+指导书 §4 乙-2，对应 v2 §7 回归保障 1（v1.0 `:554`）。此前这些读数只存在于 `REVIEW_LOG` 的 `/tmp` 仪表里，树内没有常驻臂——任何人改引擎，要等到下一次专门跑仪表才知道选点变了。
+
+### 落点
+
+| 文件 | 是谁 |
+| --- | --- |
+| `tests/test_pinned.cpp`（新） | 三条 case：六臂的着法／分值／节点数（`:86` 那一条）、棋盘集本身（42 副、两副满线盘的「四条线的并」、pos24 的 24 子、quiet 的 4 子）、以及节点帽的双重证明 |
+| `CMakeLists.txt:313-327` | 目标 `test_pinned`（链 `GOMOKU_CORE_SOURCES`，`-I src -I tests`）与它的 `add_test` |
+| `CMakeLists.txt:337`＋`:342-345` | 乙-2 三件事里另外两件：`set_tests_properties(test_pinned PROPERTIES TIMEOUT 900)`，和进末尾那个 `-UNDEBUG` 的 `foreach` 列表 |
+| `tests/pinned_positions.h` | 用乙-1 建的那一份棋盘集，不再复制 |
+
+### 读数（六臂，`build/` 未优化树上跑，全部实测）
+
+| 臂 | 着法 | 分值 | 节点 | 方法／深度 | 这一行的数从哪来 |
+| --- | --- | --- | --- | --- | --- |
+| `quiet BLACK d8` | (8,7) | 77,842 | **1,408,083** | alphabeta／8 | 轮次138 出厂针，本轮在 `-O2` 与未优化两棵树上都逐位复现 |
+| `pos24 BLACK d8` | (7,4) | 99,999 | **2,378,724** | alphabeta／8 | 同上 |
+| `quiet BLACK d6` | (8,7) | 71,992 | 221,774 | alphabeta／6 | 与 `test_search.cpp:6841` 那张表同行 |
+| `quiet WHITE d6` | (6,7) | 97,044 | 156,428 | alphabeta／6 | 同上 |
+| `pos24 BLACK d6` | (7,4) | 99,999 | 300,347 | alphabeta／6 | 本轮实测（`-O2`，`/tmp/v2/pin_measure`） |
+| `pos24 WHITE d6` | (10,7) | 99,999 | 175,088 | alphabeta／6 | 同上 |
+
+- **成本为什么要单独一个套件**：六臂在 `-O2` 上是 **44 s**，在 `build/`（`CMAKE_BUILD_TYPE` 为空，实际 `-O0`）上是 **241.5 s**；900 s 的帽给出 3.7 倍余量。指导书 §4 乙-2 的注意写的是同一件事——塞进 `test_search`（实测 470 s）只会让人开始跳过 `ctest`。
+- **节点帽既是控制也不参与答案**（第三条 case）：宽帽 8,000,000 与「不给帽」在 `quiet BLACK d6` 上逐字同答（(8,7)、71,992、221,774）；把帽压到 20,000，同一臂就 `stopped == "nodes"`、节点数 20,000、深度掉到 4。所以这条臂上的帽不是装饰，而判定用的时限 600 s 全程不参与（§9.2）。
+
+### 变异臂（纪律 4）
+
+把 `quiet BLACK d8` 的期望节点数 `1,408,083` 改成 `1,408,084`（±1）→ **`rc=134`**，报
+`tests/test_pinned.cpp:86: Assertion 'result.nodes_searched == arm.nodes' failed`；还原后 `cmp` 逐字节相同，重跑全绿。
+
+### 门禁
+
+- `ctest` **9/9 passed / **744.28 s**（`test_search` 470.28、新加的 `test_pinned` 240.19、其余六套共 21.5 s）**——**套件数从 8 变 9**，所以指导书 §2.1 里那句「期望 8/8」从今天起读作 9/9；`CMakeLists.txt:339` 那句注释「All eight suites」也改成「Every suite」。
+- `node tests/readme_anchor_check.js` **122 citations / 0 problems**；`node tests/web_frontend_check.js` **111/111**；`cmake --build build -j4` 零警告。
+- 本轮不动 `src/`：`git diff --numstat` 只有 `CMakeLists.txt`、`tests/` 与本节。
+
+### 判
+
+`:554` 那一格的「常驻」这一半有了。登记两处边界：① 这些臂钉的是**默认候选宽度（24/8）下的出厂形状**，`test_search.cpp:6841` 那张表钉同一形状，两处若有一处改动就会红，这是重复而不是冲突——重复的理由是那张表还兼着别的事（快路径与 resign 的两行）；② pos24 两臂的分值是 99,999（将杀带里），所以它们的「节点数」对搜索顺序极其敏感，将来丙-1／丙-3 这类改动一旦让答案变深，这两行会第一个红，那是设计意图，不是脆弱。
+
 ## 轮次150 引擎重构 乙-1：位置项与贴边项第一次有了 18,900 行的差分表——v1.0 `:556` 欠的那张账交上了 — engine redesign stage 乙-1: a per-cell differential table for the position and edge terms, 42 boards × 225 cells × 2 colours = 18,900 rows, all match=1, and the guide's own mutation (edge band 2 → 3) turns 17,525 of them red
 
 指导书 §4 乙-1。v1.0 `:556` 那一格写的是「评估函数改动（位置项、增量缓存）与旧实现逐格比对，方法沿用全 225 格 × 两色 × 42 棋盘」；轮次140 验收时登记过：增量缓存那一半有 C1-4／C2-1／C3-2 三条普查用例，**位置项这一半只交了三条定向用例，没交这张表**。本轮补表。
