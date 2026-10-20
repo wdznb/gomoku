@@ -9,7 +9,9 @@
 // 那是下一刀的事。拒绝比假装能跑好——脚本必须知道自己在跑哪一段。
 #include "core/board.h"
 #include "core/evaluator.h"
+#include "core/pattern.h"
 #include "search/search_engine.h"
+#include "training/data_collector.h"
 #include "training/game_record.h"
 #include "training/params.h"
 #include "training/replay_analyzer.h"
@@ -220,6 +222,57 @@ int run_bench(const std::string& dir, const ThreatCoefficients& coeffs, int budg
     return 0;
 }
 
+// 6.7 a：把题库导成训练样本。样本的 label 是「当时走的那手」，teacher 是「复核
+// 认为该走的那手」——两者分开记，谁也不能覆盖谁（否则蒸馏就变成自我循环）。
+int export_samples(const std::string& dir, const std::string& out_path, int limit) {
+    std::vector<TacticsCard> cards;
+    int parse_errors = 0;
+    if (!load_cards(dir, cards, parse_errors)) {
+        std::cerr << "cannot read " << dir << "\n";
+        return 1;
+    }
+    PatternRecognizer::init();
+    DataCollector collector;
+    std::ofstream out(out_path, std::ios::app);
+    if (!out) {
+        std::cerr << "cannot append to " << out_path << "\n";
+        return 1;
+    }
+    int written = 0;
+    int skipped = 0;
+    for (const TacticsCard& card : cards) {
+        if (limit > 0 && written >= limit) break;
+        Board board;
+        bool legal = true;
+        for (const Move& stone : card.stones) {
+            if (!stone.pos.is_valid() || !board.is_empty(stone.pos)) {
+                legal = false;
+                break;
+            }
+            board.place_stone(stone.pos.row, stone.pos.col, stone.color);
+        }
+        if (!legal || !card.played.pos.is_valid() || !card.answer.pos.is_valid()) {
+            ++skipped;
+            continue;
+        }
+        TrainingSample sample;
+        sample.features = collector.extract_features(board, card.side);
+        sample.move = card.played;
+        sample.teacher_move = card.answer;
+        sample.teacher_source = "replay";
+        sample.search_score = card.best_score;
+        sample.search_depth = card.depth;
+        sample.nodes = card.budget;
+        sample.game_id = card.source_index;
+        sample.move_index = card.ply;
+        out << sample.to_json() << "\n";
+        ++written;
+    }
+    std::cout << "samples written " << written << " (skipped " << skipped << ") -> "
+              << out_path << "\n";
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -227,6 +280,7 @@ int main(int argc, char** argv) {
     std::string cards_path;
     std::string cards_dir;
     std::string bench_dir;
+    std::string samples_path;
     std::string params_path;
     std::string layer_floor = "normal";
     bool json_out = false;
@@ -302,9 +356,9 @@ int main(int argc, char** argv) {
         } else if (arg == "--ladder-max") {
             int_for("--ladder-max", review_config.ladder_max);
         } else if (arg == "--export-samples") {
-            std::cerr << "--export-samples needs TrainingSample::teacher_move (design doc 6.7 a) "
-                         "and is not built yet. Refusing rather than pretending.\n";
-            return kExitUsage;
+            // 6.7 a：从题卡导出训练样本，teacher_move = 卡上的正解。导出不需要引擎——
+            // 卡自带 stones 与 answer，所以它能在任何机器上离线重跑。
+            samples_path = value_for("--export-samples");
         } else {
             std::cerr << "Unknown argument " << arg << "\n";
             print_usage();
@@ -321,6 +375,13 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (!samples_path.empty()) {
+        if (bench_dir.empty()) {
+            std::cerr << "--export-samples needs --bench DIR to read cards from" << "\n";
+            return kExitUsage;
+        }
+        return export_samples(bench_dir, samples_path, limit);
+    }
     if (!bench_dir.empty()) {
         return run_bench(bench_dir, coeffs, review_config.budget, review_config.max_depth,
                          layer_floor, limit, verbose);

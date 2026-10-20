@@ -5709,6 +5709,48 @@ void test_replay_reviewer_prices_a_difficulty_ladder() {
     assert(ladder.failed_at < ladder.solve_budget);
 }
 
+
+// ---- 设计文档 6.7 a：样本的 teacher_move ----
+// 两件事：label 与 teacher 必须分开记；没有老师的样本必须与旧格式逐字节相同。
+
+void test_training_sample_keeps_a_teacher_move() {
+    TrainingSample sample;
+    sample.features.assign(DataCollector::FEATURE_COUNT, 0.0f);
+    sample.value = 1.0f;
+    sample.move = Move(9, 6, WHITE);
+    sample.teacher_move = Move(8, 9, WHITE);
+    sample.teacher_source = "replay";
+
+    const std::string text = sample.to_json();
+    TrainingSample back;
+    std::string error;
+    assert(TrainingSample::from_json(text, back, error));
+    assert(back.teacher_move.pos.row == 8 && back.teacher_move.pos.col == 9);
+    assert(back.teacher_move.color == WHITE);
+    assert(back.teacher_source == "replay");
+    // 老师不许覆盖 label：move 仍是当时走的那一手。
+    assert(back.move.pos.row == 9 && back.move.pos.col == 6);
+}
+
+void test_training_sample_without_a_teacher_keeps_the_old_shape() {
+    TrainingSample sample;
+    sample.features.assign(DataCollector::FEATURE_COUNT, 0.0f);
+    sample.value = 0.0f;
+    sample.move = Move(7, 7, BLACK);
+
+    const std::string text = sample.to_json();
+    // 没有老师就不许写键：否则旧读法会把「有老师但为空」当成新样本。
+    assert(text.find("teacher_move") == std::string::npos);
+    assert(text.find("teacher_source") == std::string::npos);
+
+    TrainingSample back;
+    std::string error;
+    assert(TrainingSample::from_json(text, back, error));
+    assert(!back.teacher_move.pos.is_valid());
+    assert(back.teacher_source.empty());
+}
+
+
 int main() {
     std::cout << "Running training tests..." << std::endl;
 
@@ -5826,6 +5868,8 @@ int main() {
     test_replay_reviewer_refuses_an_illegal_replay();
     test_replay_reviewer_scores_its_own_choice_as_lossless();
     test_replay_reviewer_prices_a_difficulty_ladder();
+    test_training_sample_keeps_a_teacher_move();
+    test_training_sample_without_a_teacher_keeps_the_old_shape();
 
     std::cout << "All training tests passed" << std::endl;
     return 0;

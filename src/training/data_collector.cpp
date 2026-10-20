@@ -186,6 +186,13 @@ std::string TrainingSample::to_json() const {
     root["weight"] = weight;
     root["game_id"] = game_id;
     root["move_index"] = move_index;
+    // 只在有老师时写：没有老师的样本必须与旧格式逐字节相同。
+    if (teacher_move.pos.is_valid()) {
+        root["teacher_move"] = {{ "row", teacher_move.pos.row },
+                                { "col", teacher_move.pos.col },
+                                { "color", teacher_move.color == BLACK ? "black" : "white" }};
+    }
+    if (!teacher_source.empty()) root["teacher_source"] = teacher_source;
     return root.dump();
 }
 
@@ -232,6 +239,20 @@ bool TrainingSample::from_json(const std::string& text, TrainingSample& out, std
     if (!read_id("move_index", sample.move_index)) {
         error = "sample move_index must be an integer";
         return false;
+    }
+    // 老师着法：可选。旧样本没有这个键，读回是无效着法 = 没有老师。
+    if (root.contains("teacher_move") && root["teacher_move"].is_object()) {
+        const json& teacher = root["teacher_move"];
+        if (teacher.contains("row") && teacher.contains("col")) {
+            const int row = teacher["row"].get<int>();
+            const int col = teacher["col"].get<int>();
+            const int color = teacher.value("color", std::string("black")) == "white"
+                                  ? WHITE : BLACK;
+            sample.teacher_move = Move(row, col, color);
+        }
+    }
+    if (root.contains("teacher_source") && root["teacher_source"].is_string()) {
+        sample.teacher_source = root["teacher_source"].get<std::string>();
     }
     // The move is the label the features describe, so a sample without one is not
     // a sample; only the engine numbers may fall back to defaults.

@@ -20,6 +20,10 @@ struct TrainingSample {
     float weight = 1.0f;
     int game_id = -1;
     int move_index = -1;
+    // 设计文档 6.7 a：深搜蒸馏的老师着法。可选字段——旧样本没有这两个键，
+    // 读回是无效着法 / 空串 = 没有老师，行为与今天一致。
+    Move teacher_move;
+    std::string teacher_source;
 
     std::string to_json() const;
     static bool from_json(const std::string& text, TrainingSample& out, std::string& error);

@@ -1980,6 +1980,46 @@ additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cp
 no existing assertion was edited.
 
 
+## 轮次147 引擎重构 J-4：样本长出 teacher_move——label 与老师第一次分开记，且没有老师的旧文件逐字节不变 — engine redesign stage J-4, TrainingSample gains teacher_move: the label and the teacher are separate fields, and a sample without a teacher still writes the old shape byte for byte
+
+规格 `docs/ENGINE_REDESIGN_V2.md` `§6.7 a`（题卡 → 训练样本）。上一轮甲-2 曾把三个文件一起改、锚点失败后仍同步，导致半成品进树并回滚；本轮按「一次一个文件、`&&` 串联、失败即不推送」重做，三步各自编译通过后才走下一步。
+
+### 落点
+
+| 文件 | 改动 |
+| --- | --- |
+| `src/training/data_collector.h` | `TrainingSample` 加 `Move teacher_move` / `std::string teacher_source`（可选字段） |
+| `src/training/data_collector.cpp` | `to_json` **只在有老师时**写两个键；`from_json` 按可选读，缺失 = 无效着法 / 空串 |
+| `tools/analyze_main.cpp` | `--export-samples PATH`：从 `--bench DIR` 的题卡导样本，`move` = 当时走的那手、`teacher_move` = 卡上正解、`teacher_source = "replay"`，特征走 `DataCollector::extract_features` |
+| `tests/test_training.cpp` | 2 条用例（teacher 往返 ＋ 无老师保持旧形状） |
+
+### 读数（`--bench data/tactics --export-samples`）
+
+```
+samples written 4 (skipped 0)
+keys: features, game_id, move, move_index, nodes, search_depth, search_score,
+      teacher_move, teacher_source, value, weight
+teacher {row:8, col:9, color:white}   move {row:9, col:6, color:white}   features 52
+```
+
+一条样本里 `move` 与 `teacher_move` 不同，正是那张 `blunder` 卡的形状：当时走了 9,6，复核认为该走 8,9。
+
+### 用例与变异臂
+
+- `test_training_sample_keeps_a_teacher_move`：往返后 `teacher_move` 与 `teacher_source` 都在，且 **`move` 没有被老师覆盖**；
+- `test_training_sample_without_a_teacher_keeps_the_old_shape`：没有老师时 JSON 里**不许出现**这两个键（否则旧读法会把「有老师但为空」当成新样本），读回是无效着法 ＋ 空串；
+- 变异臂：把 `teacher_move.pos.row == 8` 改成 `== 7` → **rc=134**，报 `test_training.cpp:5728`；还原后全绿。
+
+### 门禁
+
+- `cmake --build --target test_training / gomoku_analyze` **rc=0，零新增 warning**；
+- `ctest` **8/8 passed，506.19 s**（test_training 13.15 s）；
+- `node tests/readme_anchor_check.js` **120 / 0 problems**；`node tests/web_frontend_check.js` **105/105**。
+
+### 判
+
+样本层落地。两条纪律写进了代码注释：**老师不许覆盖 label**（否则蒸馏退化成自我循环）、**没有老师就不写键**（否则新旧文件不可区分）。`teacher_source` 留了 `"replay"` 这个取值，等 §3.2 S4 的深搜蒸馏接进来时会写 `"distill"`——两个来源必须能分开统计，否则「题库样本有没有用」这个问题永远答不了。
+
 ## 轮次146 引擎重构 J-3：题卡分表——杀棋题与判断题第一次分开放，门禁从此只认不依赖系数的那一半 — engine redesign stage J-3, the card library splits into proven/ and judged/, so the gate only reads the half that does not depend on coefficients
 
 规格 `docs/ENGINE_REDESIGN_V2.md` `§6.6`（`proven` / `judged` 分表与目录布局）、`§6.7 c`（门禁只用 `proven`）。
