@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdlib>
 #include <iostream>
 #include <random>
 #include <thread>
@@ -171,6 +172,143 @@ void test_active_empty_incremental_undo() {
     assert(A.active_empty().size() == BOARD_SIZE * BOARD_SIZE);
 
     std::cout << "test_active_empty_incremental_undo passed" << std::endl;
+}
+
+// A8 (design doc 2.5.1): candidate tiering needs the two facts the board already
+// maintains privately — how many stones stand within Chebyshev distance 2 of a cell,
+// and whether that cell is in the candidate list at all. Both are now readable, so
+// the incremental bookkeeping can be differentially tested against a recount for the
+// first time; before this round only a full-board rebuild and a hash could be compared.
+void test_neighbor_count_at_matches_a_recount() {
+    auto recount = [](const Board& board, Position pos) {
+        int count = 0;
+        for (int dr = -2; dr <= 2; ++dr) {
+            for (int dc = -2; dc <= 2; ++dc) {
+                const int nr = pos.row + dr, nc = pos.col + dc;
+                if (!board.is_valid(nr, nc)) continue;
+                if (board.get(nr, nc) != EMPTY) ++count;
+            }
+        }
+        return count;
+    };
+    auto all_match = [&](const Board& board) {
+        for (int r = 0; r < BOARD_SIZE; ++r) {
+            for (int c = 0; c < BOARD_SIZE; ++c) {
+                const Position p(r, c);
+                if (!board.is_empty(p)) continue;
+                assert(board.neighbor_count_at(p) == recount(board, p));
+            }
+        }
+    };
+
+    Board board;
+    all_match(board);  // empty board: every cell reads zero
+
+    // A cluster in the middle and two stones stranded in the corners, so the
+    // 5x5 window is tested at the board edge as well as inside the field.
+    const int placements[][3] = {
+        {7, 7, BLACK}, {8, 8, WHITE}, {6, 6, BLACK}, {7, 9, WHITE},
+        {5, 7, BLACK}, {0, 0, WHITE}, {14, 14, BLACK}, {14, 0, WHITE},
+    };
+    const int n = static_cast<int>(sizeof(placements) / sizeof(placements[0]));
+    for (int i = 0; i < n; ++i) {
+        board.place_stone(placements[i][0], placements[i][1], placements[i][2]);
+        all_match(board);  // every ply, not just the final position
+    }
+
+    // The undo path decrements instead of rebuilding, which is where a stale count
+    // would show up.
+    while (board.move_count() > 0) {
+        board.undo_last_move();
+        all_match(board);
+    }
+
+    // Out of bounds answers zero rather than reading outside the array.
+    assert(board.neighbor_count_at(Position(-1, 3)) == 0);
+    assert(board.neighbor_count_at(Position(15, 15)) == 0);
+
+    std::cout << "test_neighbor_count_at_matches_a_recount passed" << std::endl;
+}
+
+void test_is_active_agrees_with_the_candidate_list() {
+    Board board;
+    // Before any stone: the list is the whole board, so membership is total.
+    for (int r = 0; r < BOARD_SIZE; ++r) {
+        for (int c = 0; c < BOARD_SIZE; ++c) {
+            assert(board.is_active(Position(r, c)));
+        }
+    }
+
+    const int placements[][3] = {
+        {7, 7, BLACK}, {7, 8, WHITE}, {8, 7, BLACK}, {1, 1, WHITE}, {13, 13, BLACK},
+    };
+    const int n = static_cast<int>(sizeof(placements) / sizeof(placements[0]));
+    for (int i = 0; i < n; ++i) {
+        board.place_stone(placements[i][0], placements[i][1], placements[i][2]);
+    }
+
+    auto in_list = [&](Position p) {
+        const std::vector<Position>& list = board.active_empty();
+        return std::find(list.begin(), list.end(), p) != list.end();
+    };
+    for (int r = 0; r < BOARD_SIZE; ++r) {
+        for (int c = 0; c < BOARD_SIZE; ++c) {
+            const Position p(r, c);
+            assert(board.is_active(p) == in_list(p));
+            if (!board.is_empty(p)) assert(!board.is_active(p));  // a stone is never a candidate
+            if (board.neighbor_count_at(p) == 0) assert(!board.is_active(p));
+        }
+    }
+
+    // A corner no stone of this layout stands within 2 of: both rules agree it is
+    // out, and neither answer is about the list's order.
+    assert(!board.is_active(Position(14, 0)));
+    assert(board.neighbor_count_at(Position(14, 0)) == 0);
+
+    // Undo down to the single centre stone. Its 5x5 box minus the stone itself is
+    // the candidate set, named independently of anything the board reports.
+    while (board.move_count() > 1) board.undo_last_move();
+    int expected = 0;
+    for (int r = 0; r < BOARD_SIZE; ++r) {
+        for (int c = 0; c < BOARD_SIZE; ++c) {
+            const bool in_box = std::abs(r - 7) <= 2 && std::abs(c - 7) <= 2;
+            const bool is_stone = (r == 7 && c == 7);
+            assert(board.is_active(Position(r, c)) == (in_box && !is_stone));
+            assert(board.is_active(Position(r, c)) == in_list(Position(r, c)));
+            if (in_box && !is_stone) ++expected;
+        }
+    }
+    assert(static_cast<int>(board.active_empty().size()) == expected);  // 24 cells
+
+    assert(!board.is_active(Position(-1, 0)));
+    assert(!board.is_active(Position(0, 15)));
+
+    std::cout << "test_is_active_agrees_with_the_candidate_list passed" << std::endl;
+}
+
+void test_has_last_move_distinguishes_an_empty_board() {
+    Board board;
+    // last_move() on an empty board is a default Move whose position is (-1,-1);
+    // that is the sentinel this accessor replaces.
+    assert(!board.has_last_move());
+    assert(!board.last_move().pos.is_valid());
+
+    assert(board.place_stone(0, 0, BLACK));
+    assert(board.has_last_move());
+    assert(board.last_move().pos == Position(0, 0));
+
+    // Undoing down to the empty board restores the no-last-move answer, and with it
+    // the (-1,-1) sentinel — the two states a caller used to have to guess apart.
+    while (board.move_count() > 0) board.undo_last_move();
+    assert(!board.has_last_move());
+    assert(!board.last_move().pos.is_valid());
+
+    // An undo of an empty board is a no-op, not a negative move count.
+    board.undo_last_move();
+    assert(!board.has_last_move());
+    assert(board.move_count() == 0);
+
+    std::cout << "test_has_last_move_distinguishes_an_empty_board passed" << std::endl;
 }
 
 void test_zobrist_hash() {
@@ -356,6 +494,9 @@ int main() {
     test_diagonal_five();
     test_active_empty();
     test_active_empty_incremental_undo();
+    test_neighbor_count_at_matches_a_recount();
+    test_is_active_agrees_with_the_candidate_list();
+    test_has_last_move_distinguishes_an_empty_board();
     test_line_bitboard_tracks_cells();
     test_run_length_matches_walk();
     test_zobrist_hash();

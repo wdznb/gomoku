@@ -1,4 +1,6 @@
 #include "search_engine.h"
+#include "move_generator.h"
+#include "time_manager.h"
 #include <chrono>
 #include <climits>
 
@@ -6,22 +8,30 @@ namespace gomoku {
 
 namespace {
 
-// AlphaBeta keeps the tail of the move budget: while VCF/VCT shared the whole
-// deadline, an expensive tactical phase left AlphaBeta only the 100 ms floor
-// and a depth-0 fallback (README:343 wants deeper searches to get more time).
-constexpr int kVcfBudgetPercent = 35;
-constexpr int kVctBudgetPercent = 55;
+// Design doc 2.3.4's 「独立上限」 row: the tactical phases are keyed off the threat
+// probe below, so when they do run they are running on a position with work for
+// them, and they no longer need the share an unconditional VCF/VCT had to be given
+// "just in case" - 35% and 55% of the move, which left AlphaBeta the tail of a
+// deadline README:343 wants spent on deeper search. 20/30 keeps the same ordering
+// (VCT gets the wider slice of the two) and leaves the main search at least 70% of
+// the budget even when both phases fire.
+constexpr int kVcfBudgetPercent = 20;
+constexpr int kVctBudgetPercent = 30;
 
 }
 
 SearchEngine::SearchEngine()
-    : book_enabled_(true),
+    : owned_tt_(std::make_unique<TranspositionTable>()),
+      tt_alphabeta_(owned_tt_.get()),
+      book_enabled_(true),
       vcf_enabled_(true), vct_enabled_(true), alphabeta_enabled_(true),
       vcf_max_depth_(20), vct_max_depth_(12), alphabeta_max_depth_(8),
       resign_detection_(true), resign_node_limit_(400000) {}
 
-SearchEngine::SearchEngine(const ThreatCoefficients& coeffs)
+SearchEngine::SearchEngine(const ThreatCoefficients& coeffs, TranspositionTable* table)
     : evaluator_(coeffs), greedy_(coeffs),
+      owned_tt_(table ? nullptr : std::make_unique<TranspositionTable>()),
+      tt_alphabeta_(table ? table : owned_tt_.get()),
       book_enabled_(true),
       vcf_enabled_(true), vct_enabled_(true), alphabeta_enabled_(true),
       vcf_max_depth_(20), vct_max_depth_(12), alphabeta_max_depth_(8),
@@ -35,13 +45,20 @@ void SearchEngine::set_coefficients(const ThreatCoefficients& coeffs) {
 SearchResult SearchEngine::search(const Board& board, int color,
                                    int max_depth, int time_limit_ms,
                                    std::atomic<bool>& stop_flag) {
-    auto start = std::chrono::high_resolution_clock::now();
+    // One clock for the whole move, and it is the one the phases already run on:
+    // AlphaBeta's budget and the end-of-move deadline are steady_clock, so
+    // stamping these figures from high_resolution_clock put two timescales into
+    // one progress stream. Where the realtime clock is slewed against the
+    // monotonic one (a VM, WSL) the gap - tens of milliseconds here - shows up
+    // wherever a layer stops, and a layer frame can then read higher than the
+    // terminal frame of the same think.
+    auto start = std::chrono::steady_clock::now();
     SearchResult result;
     // The one wall clock the caller is owed: each phase times itself, but the
     // replay panel and ai_move.thinking_time_ms report a single number per move.
     auto elapsed_since_start = [start]() {
         return static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::high_resolution_clock::now() - start).count());
+            std::chrono::steady_clock::now() - start).count());
     };
 
     auto root_moves = board.active_empty();
@@ -188,8 +205,17 @@ SearchResult SearchEngine::search(const Board& board, int color,
     auto search_deadline = search_start
                            + std::chrono::milliseconds(has_deadline ? time_limit_ms : 0);
 
-    if (vcf_enabled_ && !stop_flag.load()) {
-        VCFSearch vcf(evaluator_, tt_alphabeta_);
+    // Design doc 2.3.4: one O(候选数) pass decides whether this position has any
+    // tactical work in it before a think pays for a tactical search. The probe
+    // enumerates the same squares and applies the same legal-move test as the two
+    // phases' own root passes, so own_four is exactly "VCF has a move to try" and
+    // own_three exactly "VCT has one" - a skipped phase was a phase that would have
+    // answered UNKNOWN out of an empty list. See threat_probe() for the three facts
+    // and why opp_four gates nothing here.
+    const ThreatProbe probe = threat_probe(board, color);
+
+    if (vcf_enabled_ && probe.own_four && !stop_flag.load()) {
+        VCFSearch vcf(evaluator_, *tt_alphabeta_);
         if (has_deadline) {
             vcf.set_deadline(search_start + std::chrono::milliseconds(
                 static_cast<long long>(time_limit_ms) * kVcfBudgetPercent / 100));
@@ -210,8 +236,8 @@ SearchResult SearchEngine::search(const Board& board, int color,
         // will naturally find the best defensive move.
     }
 
-    if (vct_enabled_ && !stop_flag.load()) {
-        VCTSearch vct(evaluator_, tt_alphabeta_);
+    if (vct_enabled_ && probe.own_three && !stop_flag.load()) {
+        VCTSearch vct(evaluator_, *tt_alphabeta_);
         if (has_deadline) {
             vct.set_deadline(search_start + std::chrono::milliseconds(
                 static_cast<long long>(time_limit_ms) * kVctBudgetPercent / 100));
@@ -228,27 +254,30 @@ SearchResult SearchEngine::search(const Board& board, int color,
     }
 
     if (alphabeta_enabled_ && !stop_flag.load()) {
-        AlphaBetaSearch ab(evaluator_, tt_alphabeta_);
+        AlphaBetaSearch ab(evaluator_, *tt_alphabeta_);
+        if (clock_ != nullptr) ab.set_clock(clock_);
         // The absolute end-of-move deadline, not a slice: remaining_time below
         // is only this phase's share of the budget, so on its own it lets the
         // move overshoot by that whole share once the tactics phases spent it.
         if (has_deadline) ab.set_deadline(search_deadline);
         int remaining_time = time_limit_ms;
-        auto elapsed = std::chrono::high_resolution_clock::now() - start;
-        int used_ms = static_cast<int>(
-            std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count());
+        const int used_ms = elapsed_since_start();
         remaining_time -= used_ms;
         if (remaining_time < 100) remaining_time = 100;
         // Iteration-level frames for the client: the frame at the end of this
         // function only lands once the whole search is over, which is too late
         // for its 终止 button. The member is copied out first so the hook carries
-        // its own value. AlphaBeta times only its own phase, so the tactics phases
-        // it came after are added on: one clock for the per-depth frames and the
-        // terminal frame below, and a constant offset keeps the sequence non-decreasing.
+        // its own value. A frame is stamped from the move clock at the moment it
+        // is emitted, not by adding this phase's own timing onto the pre-search
+        // segment: two truncated durations added together can land 1 ms above the
+        // single reading the terminal frame takes, and a progress stream that goes
+        // backwards is worse than one whose first frame is a few ms late.
         const ProgressCallback progress_cb = progress_callback_;
         if (progress_cb) {
-            ab.set_progress_callback([progress_cb, used_ms](int depth, int nodes, int elapsed_ms) {
-                progress_cb(depth, nodes, elapsed_ms + used_ms);
+            ab.set_progress_callback([progress_cb, elapsed_since_start](const SearchStats& stats) {
+                SearchStats frame = stats;
+                frame.elapsed_ms = elapsed_since_start();
+                progress_cb(frame);
             });
         }
 
@@ -260,24 +289,75 @@ SearchResult SearchEngine::search(const Board& board, int color,
         // is computed in 64-bit and clamped: a huge trainer --timeout-ms made
         // remaining_time * 200 overflow int negative, tripping node_limit_ on
         // the very first node and silently falling back to root_moves[0].
-        ab.set_node_limit(static_cast<int>(std::min<long long>(
-            static_cast<long long>(remaining_time) * 200LL, INT_MAX)));
+        const int node_budget = static_cast<int>(std::min<long long>(
+            static_cast<long long>(remaining_time) * 200LL, INT_MAX));
 
-        int depth = (max_depth > 0) ? max_depth : alphabeta_max_depth_;
-        Move ab_move = ab.search(board, color, depth, remaining_time, stop_flag);
+        SearchLimits limits;
+        limits.max_depth = (max_depth > 0) ? max_depth : alphabeta_max_depth_;
+        limits.hard_time_ms = remaining_time;
+        // Zero means the client named nothing, which keeps the behavior this engine
+        // had before: no soft window at all (the whole hard deadline is usable) and
+        // the time-derived node ceiling. A named node budget replaces that ceiling
+        // outright - the only way a think can cost the same twice on a loaded machine
+        // - and a named soft deadline stops the search from starting another layer
+        // once it is past, at a layer boundary where the check costs nothing.
+        limits.soft_time_ms = soft_time_ms_;
+        limits.max_nodes = max_nodes_ > 0 ? max_nodes_ : node_budget;
+        // Design doc 2.3.4, and the first caller `TimeManager::allocate` ever had.
+        // Two regimes are told apart here: a client that named a soft window keeps it
+        // verbatim (the session's `--soft-time-ms`, or a test that wants a known
+        // cutoff), and one that named only the hard wall gets the window the position
+        // deserves - 65 % of the remainder, cut further for a handful of candidates,
+        // an opening and a previous think that overran, raised toward the hard limit in
+        // an endgame. Training stands aside from all of it (step 5: 时间预算不参与), and
+        // the caller says so - `set_training` - rather than the engine guessing from
+        // `--max-nodes` being set, because the default training run (self_play.h:15-18:
+        // a 400 ms wall, no node ceiling) would otherwise have every think cut to 260 ms
+        // and the collected samples searched to a shallower depth than they were.
+        // Standing aside means standing aside in both directions: the hard deadline
+        // stays exactly where it was, `--timeout-ms` still a fallback, and only the
+        // *shaping* of the soft window is declined. A caller that named no wall clock is
+        // left alone for the same reason in the other direction: no deadline was asked
+        // for, so no window gets invented for it.
+        limits.training = (max_nodes_ > 0 || training_);
+        if (limits.soft_time_ms == 0 && has_deadline) {
+            limits.soft_time_ms =
+                TimeManager::allocate(board, limits, prev_move_elapsed_ms_).soft_ms;
+        }
+        limits.hint_move = hint_move_;
+        limits.hint_score = hint_score_;
+        limits.has_hint_score = has_hint_;
+
+        Move ab_move = ab.search(board, color, limits, stop_flag);
+        // Which window this think was held to. The shaping above is a decision, and a
+        // decision with no witness is a claim: `elapsed_ms` says how long the think
+        // took, not how long it was allowed to take, and the two only coincide by
+        // accident.
+        result.soft_ms = limits.soft_time_ms;
+        result.hard_ms = limits.hard_time_ms;
 
         // A search that found nothing to search returns an invalid move. The
-        // fallback takes the first legal candidate root_moves still holds rather
-        // than greedy_.search, which reads the same active_empty() window and
-        // hands back the centre point when that window has no legal cell.
+        // fallback answers from the candidate list this method still holds, and it
+        // picks by the same keys the root tie-break uses below the value - nearer
+        // the centre, then the lower cell index - rather than by whichever legal
+        // cell the list happens to state first. The list it states first is
+        // meaningful most of the time, but not here: this branch is reached from a
+        // BLACK player whose whole active window is forbidden, and the points
+        // recovered outside that window come back in row-major order, so the old
+        // rule answered with the top-left of the board.
         if (!ab_move.pos.is_valid() || !board.is_empty(ab_move.pos.row, ab_move.pos.col)) {
             Move fallback;
+            int fallback_dist = 0;
             for (const auto& pos : root_moves) {
                 if (!board.is_empty(pos.row, pos.col)) continue;
                 if (color == BLACK &&
                     PatternRecognizer::is_forbidden(board, pos.row, pos.col, BLACK)) continue;
-                fallback = Move(pos, color);
-                break;
+                const int dist = center_distance(pos);
+                if (!fallback.pos.is_valid() || dist < fallback_dist ||
+                    (dist == fallback_dist && pos.to_index() < fallback.pos.to_index())) {
+                    fallback = Move(pos, color);
+                    fallback_dist = dist;
+                }
             }
             result.best_move = fallback;
             result.method = fallback.pos.is_valid() ? "greedy" : "no_legal_move";
@@ -291,16 +371,20 @@ SearchResult SearchEngine::search(const Board& board, int color,
         result.depth = info.depth;
         result.nodes_searched = info.nodes_searched;
         result.method = "alphabeta";
-        // Depth 0 means not one iteration finished and AlphaBeta fell back to
-        // root_moves[0]; calling that alphabeta showed depth 0 / score 0 in the
-        // replay panel (README:530 lists greedy as a method).
-        if (info.depth == 0) {
-            result.method = "greedy";
-            // A renamed fast path is not AlphaBeta: README:531 leaves depth/nodes
-            // unset for every other method, and this hand completed no layer.
-            result.depth = 0;
-            result.nodes_searched = 0;
-        }
+        // A think that completed no layer keeps the alphabeta label and says why
+        // it stopped. Relabelling it "greedy" made an interrupted think and a
+        // position with nothing to search indistinguishable, and zeroing the node
+        // count hid the work that had been done (design doc 2.3.3).
+        result.partial_depth = info.partial_depth;
+        result.root_moves_done = info.root_moves_done;
+        result.root_moves_total = info.root_moves_total;
+        result.seldepth = info.seldepth;
+        result.tt_hits = info.tt_hits;
+        result.stopped = stop_reason_name(info.stopped);
+        // The line the committed layer proved, the same field the two tactics phases
+        // already answer with. Until the search kept a variation there was nothing to
+        // put here (design doc 2.4.4: SearchInfo::pv was never written by anything).
+        result.principal_variation = info.principal_variation;
 
         // AlphaBeta's own count starts with that phase and covers only it; the
         // caller is owed the whole move, so the measure is taken below - after the
@@ -316,9 +400,7 @@ SearchResult SearchEngine::search(const Board& board, int color,
         }
 
         if (resign_detection_ && !stop_flag.load() && !result.resigned) {
-            auto elapsed_after_ab = std::chrono::high_resolution_clock::now() - start;
-            int total_used_ms = static_cast<int>(
-                std::chrono::duration_cast<std::chrono::milliseconds>(elapsed_after_ab).count());
+            int total_used_ms = elapsed_since_start();
             int probe_budget_ms = time_limit_ms - total_used_ms;
             // Reserve enough time for the callback / network commit; without
             // this the resign probe (VCF depth 20, node cap 400k) can run for
@@ -336,7 +418,7 @@ SearchResult SearchEngine::search(const Board& board, int color,
                 int probe_nodes = static_cast<int>(
                     std::min<long long>(resign_node_limit_, time_scaled_nodes));
 
-                VCFSearch loss_probe(evaluator_, tt_alphabeta_);
+                VCFSearch loss_probe(evaluator_, *tt_alphabeta_);
                 loss_probe.set_node_limit(probe_nodes);
                 if (has_deadline) loss_probe.set_deadline(search_deadline);
 
@@ -352,8 +434,14 @@ SearchResult SearchEngine::search(const Board& board, int color,
 
         const int whole_elapsed_ms = elapsed_since_start();
         result.elapsed_ms = whole_elapsed_ms;
+        // The closing frame is the whole think, not the last layer: it repeats the
+        // accounting each layer frame repeated, and its clock is stamped after the
+        // resign probe so the elapsed the client sees covers the probe's share of
+        // the budget too. depth/nodes keep their old meanings.
         if (progress_callback_) {
-            progress_callback_(info.depth, info.nodes_searched, whole_elapsed_ms);
+            SearchStats final_frame = ab.last_stats();
+            final_frame.elapsed_ms = whole_elapsed_ms;
+            progress_callback_(final_frame);
         }
 
         return result;

@@ -12,49 +12,106 @@ namespace gomoku {
 
 namespace {
 
+// One row per key a parameter file may name, and the only place a key's name,
+// its field, its tunable gene and its range are stated. The five parallel
+// surfaces this replaced (the writer's key list, the reader's names[]/fields[]/
+// present[], the bound switch, the field_of switch) had to be edited in step or
+// drift silently: field_of's `default:` aliased an unlisted gene onto
+// position_weight_scale, so a parameter added to the enum but not to the switch
+// was trainable, savable under the wrong name, and unloadable.
+//
 // Bounds bracket the hand-tuned defaults by roughly a factor of four in each
 // direction. Wide enough that the search can actually find better ratios, narrow
 // enough that no tunable can cross the 100000 mate threshold on its own.
-ParamBound default_bound_for(TunableParam param) {
-    switch (param) {
-        case TunableParam::LIVE_FOUR:             return {1500, 40000};
-        case TunableParam::RUSH_FOUR:             return {300, 15000};
-        case TunableParam::LIVE_THREE:            return {150, 8000};
-        case TunableParam::SLEEPY_THREE:          return {30, 2000};
-        case TunableParam::LIVE_TWO:              return {10, 1000};
-        case TunableParam::SLEEPY_TWO:            return {1, 500};
-        case TunableParam::DOUBLE_FOUR:           return {10000, 90000};
-        case TunableParam::DOUBLE_THREE:          return {5000, 90000};
-        case TunableParam::FOUR_THREE:            return {5000, 90000};
-        case TunableParam::POSITION_WEIGHT_SCALE: return {0, 20};
-        default:                                  return {1, 100};
+// edge_penalty's ceiling is set by a structural promise rather than by that rule
+// of thumb: eight closed ends (four directions, two ends each) at the largest
+// legal value still cost less than the cheapest legal 活四, so the discount
+// cannot push a 活四 below a 眠三 for any parameter set, trained or hand-tuned.
+// Against 冲四 the same promise holds only at the calibrated defaults, where a
+// file may not train rush_four down to its 300 floor.
+//
+// The two rule constants carry the range their explicit guards below enforce;
+// tunable == TunableParam::COUNT is what keeps them out of the vector view.
+struct ParamSpec {
+    const char* name;
+    int ThreatCoefficients::*field;
+    TunableParam tunable;
+    ParamBound bound;
+};
+
+constexpr ParamSpec kParams[] = {
+    {"five", &ThreatCoefficients::five, TunableParam::COUNT, {2, 100000}},
+    {"live_four", &ThreatCoefficients::live_four, TunableParam::LIVE_FOUR, {1500, 40000}},
+    {"rush_four", &ThreatCoefficients::rush_four, TunableParam::RUSH_FOUR, {300, 15000}},
+    {"live_three", &ThreatCoefficients::live_three, TunableParam::LIVE_THREE, {150, 8000}},
+    {"sleepy_three", &ThreatCoefficients::sleepy_three, TunableParam::SLEEPY_THREE, {30, 2000}},
+    {"live_two", &ThreatCoefficients::live_two, TunableParam::LIVE_TWO, {10, 1000}},
+    {"sleepy_two", &ThreatCoefficients::sleepy_two, TunableParam::SLEEPY_TWO, {1, 500}},
+    {"double_four", &ThreatCoefficients::double_four, TunableParam::DOUBLE_FOUR, {10000, 90000}},
+    {"double_three", &ThreatCoefficients::double_three, TunableParam::DOUBLE_THREE, {5000, 90000}},
+    {"four_three", &ThreatCoefficients::four_three, TunableParam::FOUR_THREE, {5000, 90000}},
+    {"forbidden_penalty", &ThreatCoefficients::forbidden_penalty, TunableParam::COUNT, {1, 99999}},
+    {"position_weight_scale", &ThreatCoefficients::position_weight_scale,
+     TunableParam::POSITION_WEIGHT_SCALE, {0, 20}},
+    {"distance_to_stones", &ThreatCoefficients::distance_to_stones,
+     TunableParam::DISTANCE_TO_STONES, {0, 4}},
+    {"edge_penalty", &ThreatCoefficients::edge_penalty, TunableParam::EDGE_PENALTY, {0, 150}},
+    {"cand_width_root", &ThreatCoefficients::cand_width_root, TunableParam::CAND_WIDTH_ROOT,
+     {2, 64}},
+    {"cand_width_deep", &ThreatCoefficients::cand_width_deep, TunableParam::CAND_WIDTH_DEEP,
+     {2, 32}},
+};
+
+constexpr int kParamCount = static_cast<int>(sizeof(kParams) / sizeof(kParams[0]));
+
+// Index loops rather than range-for: these run during constant evaluation, and
+// an older toolchain's constexpr support stops short of the relaxation that
+// allows range-for there.
+constexpr int rows_for_gene(int gene) {
+    int found = 0;
+    for (int i = 0; i < kParamCount; ++i) {
+        if (static_cast<int>(kParams[i].tunable) == gene) ++found;
     }
+    return found;
+}
+
+constexpr bool tunable_table_complete() {
+    for (int gene = 0; gene < static_cast<int>(TunableParam::COUNT); ++gene) {
+        if (rows_for_gene(gene) != 1) return false;
+    }
+    return true;
+}
+
+static_assert(tunable_table_complete(),
+              "every TunableParam needs exactly one row in kParams");
+
+const ParamSpec& spec_for(TunableParam param) {
+    for (const ParamSpec& spec : kParams) {
+        if (spec.tunable == param) return spec;
+    }
+    // Unreachable: the static_assert above proves every gene has a row.
+    return kParams[0];
+}
+
+ParamBound default_bound_for(TunableParam param) {
+    return spec_for(param).bound;
 }
 
 int& field_of(ThreatCoefficients& coeffs, TunableParam param) {
-    switch (param) {
-        case TunableParam::LIVE_FOUR:             return coeffs.live_four;
-        case TunableParam::RUSH_FOUR:             return coeffs.rush_four;
-        case TunableParam::LIVE_THREE:            return coeffs.live_three;
-        case TunableParam::SLEEPY_THREE:          return coeffs.sleepy_three;
-        case TunableParam::LIVE_TWO:              return coeffs.live_two;
-        case TunableParam::SLEEPY_TWO:            return coeffs.sleepy_two;
-        case TunableParam::DOUBLE_FOUR:           return coeffs.double_four;
-        case TunableParam::DOUBLE_THREE:          return coeffs.double_three;
-        case TunableParam::FOUR_THREE:            return coeffs.four_three;
-        case TunableParam::POSITION_WEIGHT_SCALE: return coeffs.position_weight_scale;
-        default:                                  return coeffs.position_weight_scale;
-    }
+    return coeffs.*(spec_for(param).field);
+}
+
+const char* name_of(TunableParam param) {
+    return spec_for(param).name;
 }
 
 }
 
 std::vector<int> CoefficientVector::to_vector(const ThreatCoefficients& coeffs) {
-    ThreatCoefficients copy = coeffs;
     std::vector<int> values;
     values.reserve(TUNABLE_COUNT);
     for (int i = 0; i < TUNABLE_COUNT; ++i) {
-        values.push_back(field_of(copy, static_cast<TunableParam>(i)));
+        values.push_back(coeffs.*(spec_for(static_cast<TunableParam>(i)).field));
     }
     return values;
 }
@@ -94,6 +151,11 @@ void CoefficientVector::sanitize(ThreatCoefficients& coeffs) {
     coeffs.double_four = std::max(coeffs.double_four, live_four);
     coeffs.double_three = std::max(coeffs.double_three, live_four);
     coeffs.four_three = std::max(coeffs.four_three, live_four);
+
+    // A deeper layer may not widen past the root: the root sees the whole
+    // neighbourhood once, and every ply below it pays for that width again. Capped
+    // from the top so a trained root width of 4 pulls the whole ladder with it.
+    coeffs.cand_width_deep = std::min(coeffs.cand_width_deep, coeffs.cand_width_root);
 }
 
 void CoefficientVector::sanitize_vector(std::vector<int>& values) {
@@ -107,21 +169,12 @@ ParamBound CoefficientVector::bound_for(TunableParam param) {
 }
 
 std::string CoefficientVector::to_json_string(const ThreatCoefficients& coeffs) {
+    json body;
+    for (const ParamSpec& spec : kParams) {
+        body[spec.name] = coeffs.*(spec.field);
+    }
     json root;
-    root["coefficients"] = {
-        {"five", coeffs.five},
-        {"live_four", coeffs.live_four},
-        {"rush_four", coeffs.rush_four},
-        {"live_three", coeffs.live_three},
-        {"sleepy_three", coeffs.sleepy_three},
-        {"live_two", coeffs.live_two},
-        {"sleepy_two", coeffs.sleepy_two},
-        {"double_four", coeffs.double_four},
-        {"double_three", coeffs.double_three},
-        {"four_three", coeffs.four_three},
-        {"forbidden_penalty", coeffs.forbidden_penalty},
-        {"position_weight_scale", coeffs.position_weight_scale},
-    };
+    root["coefficients"] = std::move(body);
     return root.dump();
 }
 
@@ -140,8 +193,8 @@ bool CoefficientVector::from_json_string(const std::string& text, ThreatCoeffici
     }
 
     // A present `coefficients` that is not an object is a malformed file, not an
-    // absent one: falling through to the root would find none of the twelve names
-    // there and report a successful load of nothing but the defaults.
+    // absent one: falling through to the root would find none of the names kParams
+    // states and report a successful load of nothing but the defaults.
     const json* body = &root;
     if (root.contains("coefficients")) {
         if (!root["coefficients"].is_object()) {
@@ -152,39 +205,38 @@ bool CoefficientVector::from_json_string(const std::string& text, ThreatCoeffici
     }
 
     ThreatCoefficients coeffs;
-    static const char* names[] = {"five", "live_four", "rush_four", "live_three",
-                                  "sleepy_three", "live_two", "sleepy_two",
-                                  "double_four", "double_three", "four_three",
-                                  "forbidden_penalty", "position_weight_scale"};
-    int* fields[] = {&coeffs.five, &coeffs.live_four, &coeffs.rush_four, &coeffs.live_three,
-                     &coeffs.sleepy_three, &coeffs.live_two, &coeffs.sleepy_two,
-                     &coeffs.double_four, &coeffs.double_three, &coeffs.four_three,
-                     &coeffs.forbidden_penalty, &coeffs.position_weight_scale};
-
     int matched = 0;
     // The keys the file states itself; the cross-key checks below refuse to
-    // rewrite a value the file wrote, never a default (present[] follows names[]).
-    bool present[12] = {};
-    for (int i = 0; i < 12; ++i) {
-        if (!body->contains(names[i])) continue;
+    // rewrite a value the file wrote, never a default (present[] follows kParams).
+    bool present[kParamCount] = {};
+    for (int i = 0; i < kParamCount; ++i) {
+        const ParamSpec& spec = kParams[i];
+        if (!body->contains(spec.name)) continue;
         ++matched;
         present[i] = true;
-        const json& value = (*body)[names[i]];
+        const json& value = (*body)[spec.name];
         if (!value.is_number_integer()) {
-            error = std::string(names[i]) + " must be an integer";
+            error = std::string(spec.name) + " must be an integer";
             return false;
         }
         // Cast-not-throw: an integer wider than 32 bits must be rejected, because
         // the truncated low half would be a value the file never stated.
         int parsed = 0;
         if (!read_json_int(value, parsed)) {
-            error = std::string(names[i]) + " is outside the range of a 32-bit integer";
+            error = std::string(spec.name) + " is outside the range of a 32-bit integer";
             return false;
         }
-        *fields[i] = parsed;
+        coeffs.*(spec.field) = parsed;
     }
+    // Did the file state this gene's value, or is it the compiled-in default?
+    auto stated = [&](TunableParam param) {
+        for (int i = 0; i < kParamCount; ++i) {
+            if (kParams[i].tunable == param) return present[i];
+        }
+        return false;
+    };
 
-    // A file that names none of the twelve is not a subset of the defaults, it is
+    // A file that names none of them is not a subset of the defaults, it is
     // the wrong file; loading it would report success while training nothing.
     if (matched == 0) {
         error = "no known coefficient key found in the file";
@@ -194,8 +246,8 @@ bool CoefficientVector::from_json_string(const std::string& text, ThreatCoeffici
     // ignored while the real coefficient kept its default.
     for (auto it = body->begin(); it != body->end(); ++it) {
         bool known = false;
-        for (int i = 0; i < 12; ++i) {
-            if (it.key() == names[i]) {
+        for (const ParamSpec& spec : kParams) {
+            if (it.key() == spec.name) {
                 known = true;
                 break;
             }
@@ -231,18 +283,13 @@ bool CoefficientVector::from_json_string(const std::string& text, ThreatCoeffici
     // out-of-range tunable into its bound and the loader would still report
     // success (README:155 wants a refusal). The clamping stays for the
     // optimizers, whose own moves are always generated inside the bounds.
-    static const char* tunable_names[] = {"live_four", "rush_four", "live_three",
-                                          "sleepy_three", "live_two", "sleepy_two",
-                                          "double_four", "double_three", "four_three",
-                                          "position_weight_scale"};
-    for (int i = 0; i < TUNABLE_COUNT; ++i) {
-        TunableParam param = static_cast<TunableParam>(i);
-        ParamBound bound = default_bound_for(param);
-        const int value = field_of(coeffs, param);
-        if (value < bound.min_value || value > bound.max_value) {
-            error = std::string(tunable_names[i]) + " " + std::to_string(value) +
-                    " is outside the allowed range [" + std::to_string(bound.min_value) +
-                    ", " + std::to_string(bound.max_value) + "]";
+    for (const ParamSpec& spec : kParams) {
+        if (spec.tunable == TunableParam::COUNT) continue;
+        const int value = coeffs.*(spec.field);
+        if (value < spec.bound.min_value || value > spec.bound.max_value) {
+            error = std::string(spec.name) + " " + std::to_string(value) +
+                    " is outside the allowed range [" + std::to_string(spec.bound.min_value) +
+                    ", " + std::to_string(spec.bound.max_value) + "]";
             return false;
         }
     }
@@ -250,62 +297,34 @@ bool CoefficientVector::from_json_string(const std::string& text, ThreatCoeffici
     // Files state these outright; sanitize()'s repairs are for optimizer
     // candidates. Only a value the file actually wrote can be "rewritten": a
     // relation whose other end was never named is left to sanitize(), which is
-    // what keeps a partial file legal.
-    const bool wrote_live_four = present[1];
-    const bool wrote_rush_four = present[2];
-    const bool wrote_live_three = present[3];
-    const bool wrote_sleepy_three = present[4];
-    const bool wrote_live_two = present[5];
-    const bool wrote_sleepy_two = present[6];
-    const bool wrote_double_four = present[7];
-    const bool wrote_double_three = present[8];
-    const bool wrote_four_three = present[9];
-    if (coeffs.rush_four > coeffs.live_four && wrote_rush_four) {
-        error = std::string("rush_four ") + std::to_string(coeffs.rush_four) +
-                " must not exceed live_four " + std::to_string(coeffs.live_four) +
-                (wrote_live_four ? "" : "（对端是默认值）");
-        return false;
-    }
-    if (coeffs.live_three > coeffs.rush_four && wrote_live_three) {
-        error = std::string("live_three ") + std::to_string(coeffs.live_three) +
-                " must not exceed rush_four " + std::to_string(coeffs.rush_four) +
-                (wrote_rush_four ? "" : "（对端是默认值）");
-        return false;
-    }
-    if (coeffs.sleepy_three > coeffs.live_three && wrote_sleepy_three) {
-        error = std::string("sleepy_three ") + std::to_string(coeffs.sleepy_three) +
-                " must not exceed live_three " + std::to_string(coeffs.live_three) +
-                (wrote_live_three ? "" : "（对端是默认值）");
-        return false;
-    }
-    if (coeffs.live_two > coeffs.sleepy_three && wrote_live_two) {
-        error = std::string("live_two ") + std::to_string(coeffs.live_two) +
-                " must not exceed sleepy_three " + std::to_string(coeffs.sleepy_three) +
-                (wrote_sleepy_three ? "" : "（对端是默认值）");
-        return false;
-    }
-    if (coeffs.sleepy_two > coeffs.live_two && wrote_sleepy_two) {
-        error = std::string("sleepy_two ") + std::to_string(coeffs.sleepy_two) +
-                " must not exceed live_two " + std::to_string(coeffs.live_two) +
-                (wrote_live_two ? "" : "（对端是默认值）");
-        return false;
-    }
-    if (coeffs.double_four < coeffs.live_four && wrote_double_four) {
-        error = std::string("double_four ") + std::to_string(coeffs.double_four) +
-                " must be at least live_four " + std::to_string(coeffs.live_four) +
-                (wrote_live_four ? "" : "（对端是默认值）");
-        return false;
-    }
-    if (coeffs.double_three < coeffs.live_four && wrote_double_three) {
-        error = std::string("double_three ") + std::to_string(coeffs.double_three) +
-                " must be at least live_four " + std::to_string(coeffs.live_four) +
-                (wrote_live_four ? "" : "（对端是默认值）");
-        return false;
-    }
-    if (coeffs.four_three < coeffs.live_four && wrote_four_three) {
-        error = std::string("four_three ") + std::to_string(coeffs.four_three) +
-                " must be at least live_four " + std::to_string(coeffs.live_four) +
-                (wrote_live_four ? "" : "（对端是默认值）");
+    // what keeps a partial file legal. `must_not_exceed` picks which end
+    // sanitize() moves - the ladder caps the weaker threat, the combination
+    // floors raise the pair, and the width cap lowers the deeper layer.
+    struct CrossRule {
+        TunableParam asked;
+        TunableParam against;
+        bool must_not_exceed;
+    };
+    const CrossRule rules[] = {
+        {TunableParam::RUSH_FOUR, TunableParam::LIVE_FOUR, true},
+        {TunableParam::LIVE_THREE, TunableParam::RUSH_FOUR, true},
+        {TunableParam::SLEEPY_THREE, TunableParam::LIVE_THREE, true},
+        {TunableParam::LIVE_TWO, TunableParam::SLEEPY_THREE, true},
+        {TunableParam::SLEEPY_TWO, TunableParam::LIVE_TWO, true},
+        {TunableParam::DOUBLE_FOUR, TunableParam::LIVE_FOUR, false},
+        {TunableParam::DOUBLE_THREE, TunableParam::LIVE_FOUR, false},
+        {TunableParam::FOUR_THREE, TunableParam::LIVE_FOUR, false},
+        {TunableParam::CAND_WIDTH_DEEP, TunableParam::CAND_WIDTH_ROOT, true},
+    };
+    for (const CrossRule& rule : rules) {
+        if (!stated(rule.asked)) continue;
+        const int asked = field_of(coeffs, rule.asked);
+        const int other = field_of(coeffs, rule.against);
+        if (rule.must_not_exceed ? (asked <= other) : (asked >= other)) continue;
+        error = std::string(name_of(rule.asked)) + " " + std::to_string(asked) +
+                (rule.must_not_exceed ? " must not exceed " : " must be at least ") +
+                name_of(rule.against) + " " + std::to_string(other) +
+                (stated(rule.against) ? "" : "（对端是默认值）");
         return false;
     }
 

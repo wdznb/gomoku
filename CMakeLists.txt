@@ -31,9 +31,11 @@ set(GOMOKU_CORE_SOURCES
     src/search/greedy.cpp
     src/search/vcf.cpp
     src/search/vct.cpp
+    src/search/move_generator.cpp
     src/search/alphabeta.cpp
     src/search/search_engine.cpp
     src/search/controller.cpp
+    src/search/time_manager.cpp
     src/optimization/transposition.cpp
     src/optimization/opening_book.cpp
 )
@@ -151,18 +153,10 @@ add_test(NAME test_evaluator COMMAND test_evaluator)
 
 add_executable(test_search
     tests/test_search.cpp
-    src/core/board.cpp
-    src/core/pattern.cpp
-    src/core/evaluator.cpp
-    src/core/transforms.cpp
-    src/search/greedy.cpp
-    src/search/vcf.cpp
-    src/search/vct.cpp
-    src/search/alphabeta.cpp
-    src/search/search_engine.cpp
-    src/search/controller.cpp
-    src/optimization/transposition.cpp
-    src/optimization/opening_book.cpp
+    # The engine as one unit, like the other engine-facing targets: a hand-copied
+    # list here meant a new src/search source could be compiled into the server
+    # and silently absent from the suite that tests it.
+    ${GOMOKU_CORE_SOURCES}
     src/server/game_manager.cpp
 )
 target_include_directories(test_search PRIVATE ${CMAKE_SOURCE_DIR}/src)

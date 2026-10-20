@@ -13,6 +13,9 @@ namespace gomoku {
 struct SelfPlayConfig {
     int max_depth = 4;
     int timeout_ms = 400;
+    // Nodes one think may spend, armed on both engines when a SelfPlay is built.
+    // 0 leaves each think on the ceiling the remaining time derives.
+    int max_nodes = 0;
     // A training game usually ends long before the board fills; without a cap a
     // mirrored, never-progressing pair could run for 225 plies per sample.
     int max_moves = 80;

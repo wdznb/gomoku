@@ -30,8 +30,14 @@ void SearchController::start_search(const Board& board, int color,
     stop_flag_.store(false);
     thinking_.store(true);
 
+    // One Board copy for the whole hand-off, taken after the join above so the worker
+    // that is still running cannot be reading the member. The thread holds a
+    // reference_wrapper, not a second Board, so nothing else in this path gets
+    // transposed (design doc 2.8 #5).
+    search_board_ = board;
     search_thread_ = std::make_unique<std::thread>(
-        &SearchController::search_worker, this, board, color, max_depth, time_limit_ms);
+        &SearchController::search_worker, this, std::cref(search_board_), color,
+        max_depth, time_limit_ms);
 }
 
 void SearchController::stop() {
@@ -52,8 +58,8 @@ void SearchController::set_coefficients(const ThreatCoefficients& coeffs) {
     engine_.set_coefficients(coeffs);
 }
 
-void SearchController::search_worker(Board board, int color,
-                                      int max_depth, int time_limit_ms) {
+void SearchController::search_worker(const Board& board, int color,
+                                     int max_depth, int time_limit_ms) {
     SearchResult result = engine_.search(board, color, max_depth, time_limit_ms, stop_flag_);
 
     {

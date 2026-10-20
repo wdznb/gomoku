@@ -8,6 +8,7 @@
 #include "game_record.h"
 #include "genetic.h"
 #include "hill_climbing.h"
+#include "sprt.h"
 #include <functional>
 #include <random>
 #include <string>
@@ -30,6 +31,11 @@ struct TrainingConfig {
     // are the knobs that decide how long a run takes.
     int search_depth = 4;
     int timeout_ms = 400;
+    // Nodes one think may spend during training matches. Zero keeps today's cost
+    // model, where the ceiling is what the remaining milliseconds derive. A named
+    // value makes a ply cost the same on an idle and a loaded machine, and
+    // timeout_ms then only backs the think up if it runs long.
+    int max_nodes = 0;
     int max_moves = 60;
     bool resign_enabled = true;
 
@@ -46,12 +52,50 @@ struct TrainingConfig {
     int verification_games = 8;
     // A candidate must beat the champion by this score to be promoted.
     double accept_score = 0.56;
+    // The Elo gap a match's results are tested against (design doc 2.8 #3). Both
+    // doors above are ceilings now: a match stops at a pair boundary as soon as
+    // the sequential test leaves the bounds, so an eight-game verification costs
+    // four games when the candidate loses both colours twice. 0 plays every pair
+    // the counts ask for, which is what both flags meant before. sprt.h carries
+    // the arithmetic that makes 300 the smallest default the ceiling can reach.
+    int sprt_elo = 300;
+    // Plies of a fixed opening every match pair replays before it starts thinking
+    // (design doc 2.8 #4). Each pair takes one position from a fixed set and plays it
+    // once with each colour, which cancels that position's first-move advantage inside
+    // the pair and lets different pairs probe different positions.
+    //
+    // The shipped default is 0 - the mechanism is armed but off - because the doc's
+    // promise ("let the coefficients, not the first move, decide") measures backwards
+    // on this engine. Screened at depth 4 / 400 ms with both engines holding the same
+    // coefficients, 45 of the first 48 four-ply lines end with one colour winning every
+    // game: at that strength a four-stone position is usually already a forced win, so
+    // the colour swap does not turn the pair into a coefficient test, it turns the
+    // forced win into a pair that scores exactly 0.5 whoever is better. The full run
+    // agrees - plies 4 raised the share of fitness matches pinned at 0.5 from the
+    // control's 32.5 % to 38.8 % and the colour-decided pair share to 66.9 %. 0 is the
+    // pre-#4 contract and the arm those readings are compared against; a named count is
+    // the way to probe a position class the screen has not ruled out yet.
+    //
+    // When it is armed, four plies is the floor, not a guess: legal_moves() walks only
+    // the cells near a stone, so with BLACK on the centre the reply is 24 neighbourhood
+    // cells folded into 5 symmetry classes - the generator's whole 2-ply vocabulary -
+    // and the eight set indices in fact land on 4 of them. At four plies the eight
+    // indices give eight positions that stay distinct after folding the symmetries.
+    int match_opening_plies = 0;
 
     // Self-play games generated per round purely to collect training data.
     int data_games = 4;
     int data_threads = 2;
     int data_opening_plies = 2;
     bool collect_data = true;
+    // Slots in the one transposition table every data worker shares (design doc 2.8
+    // #1's 进程级共享 TT；0 turns sharing off and each worker keeps its own). The
+    // default is a worker's own table size, 2^18 x 28B ~= 7.3MB, because that is what
+    // makes the claim true rather than bigger: sharing at this size costs 7.3MB once
+    // instead of 7.3MB per --threads, and the doc's 2^22 example would need 16
+    // concurrent workers before it beat the tables it replaces. Naming a larger number
+    // buys hit rate on a machine with the memory for it.
+    int shared_tt_entries = 1 << 18;
 
     uint64_t seed = 20261011;
 
@@ -69,11 +113,29 @@ struct TrainerRound {
     double champion_fitness = 0.0;
     double candidate_fitness = 0.0;
     double verification_score = 0.0;
+    // What the sequential test had to say about the match that produced that
+    // score, and how many games it needed to say it. OPEN means the ceiling was
+    // reached with no decision and --accept-score was the rule that fired; the
+    // game count is the match's own, not the run's running total.
+    SprtVerdict verification_verdict = SprtVerdict::OPEN;
+    double verification_llr = 0.0;
+    int verification_match_games = 0;
     bool accepted = false;
     int games_played = 0;
     int samples_collected = 0;
     double champion_elo = 0.0;
     double candidate_elo = 0.0;
+};
+
+// One match's answer. `score` is what the optimisers rank candidates on and what
+// the Elo table books; the three fields after it are the sequential test's own
+// reading of the same games, kept so a round can show *why* a candidate was
+// promoted instead of only the fraction that cleared the bar.
+struct MatchOutcome {
+    double score = 0.0;
+    int games = 0;
+    SprtVerdict verdict = SprtVerdict::OPEN;
+    double llr = 0.0;
 };
 
 // 3.6 training main loop: optimise coefficients, prove the result over the table
@@ -102,24 +164,47 @@ public:
     int rounds_completed() const { return rounds_completed_; }
     const TrainingConfig& config() const { return config_; }
 
+    // The table the data workers are handed, or nullptr when --shared-tt 0 left each
+    // worker with its own. Reading it from outside is how a test tells a shared table
+    // from a table that merely happens to be the same size.
+    TranspositionTable* shared_transposition_table() const { return shared_tt_.get(); }
+
     // One-line progress summary, used by the CLI and by resume messages.
     std::string status_text() const;
 
     // A short random opening so parallel workers do not all replay one line.
     static std::vector<Move> random_opening_line(int plies, uint64_t seed);
 
+    // How many distinct openings a match rotates through. Pairs index into the set
+    // by (round + pair), so a candidate measured in the same round as the champion
+    // is measured on the same positions, and the four pairs a
+    // --verification-games 8 match plays each get a different opening. Eight is a
+    // budget, not a ceiling: at four plies the generator keeps producing new
+    // positions well past it (16 indices land on 16 classes even after folding the
+    // symmetries). A small set is chosen so a long run comes back to positions it
+    // has already measured instead of never measuring one twice.
+    static constexpr int kMatchOpeningSet = 8;
+
+    // The opening one match pair is played from, fixed by its index in that set:
+    // legal by construction (it is generated move by move out of the same
+    // legal_moves() the replay validates against) and identical for every run.
+    static std::vector<Move> match_opening_line(int index, int plies);
+
     bool save_checkpoint(const std::string& path, std::string& error) const;
     bool load_checkpoint(const std::string& path, std::string& error);
 
 private:
     double measure_fitness(const ThreatCoefficients& coefficients);
+    MatchOutcome score_match(const ThreatCoefficients& candidate,
+                             const ThreatCoefficients& reference, int games);
     double play_match(const ThreatCoefficients& candidate, const ThreatCoefficients& reference,
                       int games);
     // Score for whoever holds the stones passed as `black_owner` (1 = the
     // candidate, 2 = the reference). `played` says whether the game happened at
     // all: a discarded INVALID one is not a draw and leaves the denominator.
+    // Both games of a pair get the same `opening`, once with each colour.
     double play_game(SearchEngine& black, SearchEngine& white, int black_owner,
-                     bool* played = nullptr);
+                     const std::vector<Move>& opening, bool* played = nullptr);
     SearchEngine& prepare(SearchEngine& engine) const;
     int generate_data_games(int games, int threads);
 
@@ -129,6 +214,9 @@ private:
     EloSystem elo_;
     CoefficientFitness fitness_override_;
     LogFn log_;
+    // Built once for the whole Trainer when --shared-tt names a size, so the flag that
+    // decides whether a probe takes a shard lock is set before any worker exists.
+    std::unique_ptr<TranspositionTable> shared_tt_;
     int games_played_ = 0;
     size_t samples_collected_ = 0;
     int rounds_completed_ = 0;

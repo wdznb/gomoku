@@ -18,7 +18,21 @@ std::vector<Move> legal_moves(const Board& board, int color) {
 
 SelfPlay::SelfPlay(SearchEngine& black_engine, SearchEngine& white_engine,
                    const SelfPlayConfig& config)
-    : black_engine_(black_engine), white_engine_(white_engine), config_(config) {}
+    : black_engine_(black_engine), white_engine_(white_engine), config_(config) {
+    // search() names only a depth and a millisecond limit, so the engine field is
+    // the only route a node ceiling has into the next think. A non-positive value
+    // clamps to 0 inside the setter, which is the previous behavior.
+    black_engine_.set_max_nodes(config_.max_nodes);
+    white_engine_.set_max_nodes(config_.max_nodes);
+    // Design doc 2.3.4 step 5 says the time budget does not participate in 训练模式, and
+    // this is the one place every training think passes - data games, verification pairs
+    // and fitness games all come through here. The node ceiling alone could not say it:
+    // `--timeout-ms` with no `--max-nodes` is the default (self_play.h:15-18), and a soft
+    // window shaped from that wall would leave each collected sample searched to a depth
+    // the round did not ask for.
+    black_engine_.set_training(true);
+    white_engine_.set_training(true);
+}
 
 GameRecord SelfPlay::run(const std::vector<Move>& prefix,
                          std::vector<PlyChoices>* out_choices,
@@ -99,6 +113,10 @@ GameRecord SelfPlay::run(const std::vector<Move>& prefix,
         }
 
         board.place_stone(chosen.pos, color);
+        // Per committed ply, not per think: the records this ply's search wrote stay
+        // in the table for the rest of the game, so a transposition later in the same
+        // game can still find them.
+        engine.transposition_table().advance_generation();
 
         MoveRecord entry;
         entry.move = chosen;
@@ -107,6 +125,12 @@ GameRecord SelfPlay::run(const std::vector<Move>& prefix,
         entry.nodes = result.nodes_searched;
         entry.elapsed_ms = result.elapsed_ms;
         entry.method = result.method;
+        entry.partial_depth = result.partial_depth;
+        entry.root_moves_done = result.root_moves_done;
+        entry.root_moves_total = result.root_moves_total;
+        entry.seldepth = result.seldepth;
+        entry.stopped = result.stopped;
+        entry.tt_hits = result.tt_hits;
         record.moves.push_back(entry);
 
         record.total_nodes += result.nodes_searched;

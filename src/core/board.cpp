@@ -320,4 +320,14 @@ std::vector<Position> Board::get_candidate_moves() const {
     return active_empty_;
 }
 
+int Board::neighbor_count_at(Position pos) const {
+    if (!is_valid(pos)) return 0;
+    return neighbor_count_[pos.to_index()];
+}
+
+bool Board::is_active(Position pos) const {
+    if (!is_valid(pos)) return false;
+    return active_index_[pos.to_index()] >= 0;
+}
+
 }

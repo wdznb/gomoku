@@ -65,6 +65,12 @@ std::string GameRecord::to_json() const {
             {"nodes", record.nodes},
             {"elapsed_ms", record.elapsed_ms},
             {"method", record.method},
+            {"partial_depth", record.partial_depth},
+            {"root_moves_done", record.root_moves_done},
+            {"root_moves_total", record.root_moves_total},
+            {"seldepth", record.seldepth},
+            {"stopped", record.stopped},
+            {"tt_hits", record.tt_hits},
         });
     }
     root["moves"] = move_array;
@@ -148,6 +154,17 @@ bool GameRecord::from_json(const std::string& text, GameRecord& out, std::string
         move_record.elapsed_ms = read_int("elapsed_ms", 0);
         move_record.method = entry.contains("method") && entry["method"].is_string()
                                  ? entry["method"].get<std::string>() : "";
+        // The layered accounting is metadata, unlike winner and reason: a record
+        // from before it existed is not a broken record, it just has no answer for
+        // "which layer was cut", and the honest reading of that is a think that
+        // finished.
+        move_record.partial_depth = read_int("partial_depth", 0);
+        move_record.root_moves_done = read_int("root_moves_done", 0);
+        move_record.root_moves_total = read_int("root_moves_total", 0);
+        move_record.seldepth = read_int("seldepth", 0);
+        move_record.stopped = entry.contains("stopped") && entry["stopped"].is_string()
+                                  ? entry["stopped"].get<std::string>() : "none";
+        move_record.tt_hits = read_int("tt_hits", 0);
         record.moves.push_back(move_record);
     }
 

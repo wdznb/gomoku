@@ -58,14 +58,15 @@ SearchEngine& Trainer::prepare(SearchEngine& engine) const {
 }
 
 double Trainer::play_game(SearchEngine& black, SearchEngine& white, int black_owner,
-                          bool* played) {
+                          const std::vector<Move>& opening, bool* played) {
     SelfPlayConfig settings;
     settings.max_depth = config_.search_depth;
     settings.timeout_ms = config_.timeout_ms;
+    settings.max_nodes = config_.max_nodes;
     settings.max_moves = config_.max_moves;
 
     SelfPlay play(black, white, settings);
-    GameRecord record = play.run(std::vector<Move>(), nullptr, nullptr);
+    GameRecord record = play.run(opening, nullptr, nullptr);
     const bool valid = record.reason != GameEndReason::INVALID;
     if (played) *played = valid;
     // Same yardstick as the data side: an INVALID game is discarded, so it
@@ -85,12 +86,22 @@ double Trainer::play_game(SearchEngine& black, SearchEngine& white, int black_ow
 double Trainer::play_match(const ThreatCoefficients& candidate,
                            const ThreatCoefficients& reference,
                            int games) {
+    return score_match(candidate, reference, games).score;
+}
+
+MatchOutcome Trainer::score_match(const ThreatCoefficients& candidate,
+                                  const ThreatCoefficients& reference,
+                                  int games) {
+    MatchOutcome outcome;
     if (fitness_override_) {
         const double candidate_score = fitness_override_(candidate);
         const double reference_score = fitness_override_(reference);
-        if (candidate_score > reference_score + 1e-12) return 1.0;
-        if (candidate_score < reference_score - 1e-12) return 0.0;
-        return 0.5;
+        if (candidate_score > reference_score + 1e-12) outcome.score = 1.0;
+        else if (candidate_score < reference_score - 1e-12) outcome.score = 0.0;
+        else outcome.score = 0.5;
+        // An injected objective plays no games, so there is no record to test and
+        // the --accept-score bar stays the only rule that can promote.
+        return outcome;
     }
 
     // Fresh engines per evaluation, not a reused pair: a transposition table entry
@@ -102,30 +113,57 @@ double Trainer::play_match(const ThreatCoefficients& candidate,
     prepare(candidate_engine);
     prepare(reference_engine);
 
+    SprtConfig settings;
+    settings.effect_elo = config_.sprt_elo;
+    SprtTest test(settings);
+
     // Every pairing runs twice with the colours swapped, so a candidate cannot
     // pass on the strength of having the first move. Odd requests round UP to
-    // the next even count, as the config comment promises.
+    // the next even count, as the config comment promises; and since design doc
+    // 2.8 #3 both counts are ceilings, because the test below can end the match
+    // at a pair boundary before they are spent.
     const int pairs = std::max(1, (games + 1) / 2);
     double score = 0.0;
     int played_games = 0;
     for (int i = 0; i < pairs; ++i) {
+        // One position per pair, replayed identically for both colours: the pair
+        // then measures the same opening once from each side, so what that opening
+        // gives the first mover cancels inside the pair instead of deciding it.
+        // Rotating the position by round and pair index is what stops every match
+        // of a run from asking the same question about the same two stones
+        // (design doc 2.8 #4).
+        const std::vector<Move> opening =
+            match_opening_line(rounds_completed_ + i, config_.match_opening_plies);
         bool valid = false;
-        const double first = play_game(candidate_engine, reference_engine, 1, &valid);
+        const double first =
+            play_game(candidate_engine, reference_engine, 1, opening, &valid);
         if (valid) {
             score += first;
             ++played_games;
+            test.add_game(first);
         }
         valid = false;
-        const double second = play_game(reference_engine, candidate_engine, 2, &valid);
+        const double second =
+            play_game(reference_engine, candidate_engine, 2, opening, &valid);
         if (valid) {
             score += second;
             ++played_games;
+            test.add_game(second);
         }
+        // Polled between pairs, never between the two games of one pair: one
+        // game measures who moved first as much as who plays better, and a test
+        // allowed to stop on it would promote the colour advantage README's
+        // 颜色通吃 record is about - the reason the bar sits above half at all.
+        test.end_pair();
+        if (test.stop_requested()) break;
     }
+    outcome.games = played_games;
+    outcome.llr = test.llr();
+    outcome.verdict = test.verdict();
     // A discarded game has no result to average, so it leaves the denominator
     // rather than counting as a half; one that never got played cannot promote.
-    if (played_games == 0) return 0.0;
-    return score / played_games;
+    outcome.score = played_games == 0 ? 0.0 : score / played_games;
+    return outcome;
 }
 
 std::vector<Move> Trainer::random_opening_line(int plies, uint64_t seed) {
@@ -167,6 +205,17 @@ std::vector<Move> Trainer::random_opening_line(int plies, uint64_t seed) {
     return line;
 }
 
+std::vector<Move> Trainer::match_opening_line(int index, int plies) {
+    if (plies <= 0) return {};
+    // Fixed by index, not by --seed: two candidates measured in the same round have
+    // to be handed the same positions, and a set that moved with the run's seed
+    // would make the pairing depend on a number the optimiser does not care about.
+    // Wrapping is what makes this a set at all - past kMatchOpeningSet the rotation
+    // reuses the same lines instead of inventing an unbounded number of them.
+    const int wrapped = ((index % kMatchOpeningSet) + kMatchOpeningSet) % kMatchOpeningSet;
+    return random_opening_line(plies, static_cast<uint64_t>(wrapped) + 1);
+}
+
 int Trainer::generate_data_games(int games, int threads) {
     if (games <= 0 || fitness_override_) return 0;
     // Nothing to write means nothing to play for: without either output path
@@ -201,6 +250,21 @@ int Trainer::generate_data_games(int games, int threads) {
     DataCollector collector;
     const ThreatCoefficients current_champion = champion();
 
+    // Design doc 2.8 #1. Built here rather than in the constructor so a --no-data run
+    // never pays for a table it would not touch, and filled before any worker exists so
+    // the shared flag is never written once threads are running.
+    if (config_.shared_tt_entries > 0 && !shared_tt_) {
+        shared_tt_ = std::make_unique<TranspositionTable>(
+            static_cast<size_t>(config_.shared_tt_entries), true);
+    }
+    // The 失效口径 the round before this one asked for: a record is a score computed
+    // under the coefficients that were active when it was written, and the champion may
+    // have been replaced since the last batch. Emptying the table at the head of each
+    // batch is the one rule that needs no stamp on the entry and no comparison of
+    // coefficient sets - and it is cheap, because a batch is a round and the table is
+    // 7.3MB.
+    if (shared_tt_) shared_tt_->clear();
+
     for (int t = 0; t < worker_count; ++t) {
         // t is captured by value: the loop advances while the workers are already
         // running, so a reference capture would hand several workers the same
@@ -211,12 +275,21 @@ int Trainer::generate_data_games(int games, int threads) {
                                   (0x9E3779B97F4A7C15ull *
                                    (static_cast<uint64_t>(rounds_completed_ + 1) * 131 + t + 1));
 
-            SearchEngine engine(current_champion);
+            // Every worker of this batch prices positions with current_champion, so one
+            // table between them is the same information each of them would have paid
+            // 7.3MB to hold on its own. It is named on the constructor rather than set
+            // afterwards, because a worker that allocated its own table first would
+            // still have allocated it - see SearchEngine's note on the peak. The
+            // fitness side (play_match) keeps per-engine tables on purpose: there the
+            // two sides hold two different coefficient sets at once, and sharing that
+            // would score a candidate with the reference's numbers.
+            SearchEngine engine(current_champion, shared_tt_.get());
             prepare(engine);
 
             SelfPlayConfig settings;
             settings.max_depth = config_.search_depth;
             settings.timeout_ms = config_.timeout_ms;
+            settings.max_nodes = config_.max_nodes;
             settings.max_moves = config_.max_moves;
 
             RetryExplorer explorer(engine, engine, settings);
@@ -341,9 +414,21 @@ TrainerRound Trainer::run_round() {
     candidate.forbidden_penalty = result.champion.forbidden_penalty;
     result.candidate = candidate;
 
-    result.verification_score =
-        play_match(candidate, result.champion, config_.verification_games);
-    result.accepted = result.verification_score >= config_.accept_score;
+    const MatchOutcome check =
+        score_match(candidate, result.champion, config_.verification_games);
+    result.verification_score = check.score;
+    result.verification_verdict = check.verdict;
+    result.verification_llr = check.llr;
+    result.verification_match_games = check.games;
+    // The test's answer is the promotion rule whenever it has one: an ACCEPT is
+    // the same evidence the score bar was going to ask for, reached in fewer
+    // games, and a REJECT says the record is worse than the fraction it averaged
+    // to. Only an open match - the ceiling spent with the ratio still inside both
+    // bounds - falls back to --accept-score, which is the bar README's colour
+    // advantage record is measured against.
+    result.accepted = check.verdict == SprtVerdict::ACCEPT ||
+                      (check.verdict == SprtVerdict::OPEN &&
+                       check.score >= config_.accept_score);
 
     const size_t candidate_index = versions_.size();
     const int candidate_id = elo_.add_player(version_name(candidate_index));
@@ -375,7 +460,10 @@ TrainerRound Trainer::run_round() {
     rounds_completed_++;
     if (log_) {
         log_("round " + std::to_string(result.round) + ": verification score " +
-             std::to_string(result.verification_score) + " -> " +
+             std::to_string(result.verification_score) + " (sprt " +
+             sprt_verdict_name(result.verification_verdict) + ", llr " +
+             std::to_string(result.verification_llr) + ", " +
+             std::to_string(result.verification_match_games) + " games) -> " +
              (result.accepted ? "promoted" : "kept champion") + ", champion elo " +
              std::to_string(result.champion_elo));
     }

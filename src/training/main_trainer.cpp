@@ -36,15 +36,47 @@ void print_usage(const char* program) {
         "                              N+1 evaluations per round (12)\n"
         "  --depth N                   Search depth during training games (4)\n"
         "  --timeout-ms N              Per-move thinking budget in ms (400)\n"
+        "  --max-nodes N               Per-move node ceiling; 0 lets the ms budget\n"
+        "                              set the ceiling, a positive number makes each\n"
+        "                              ply cost the same whatever the machine is\n"
+        "                              doing, with --timeout-ms as the fallback (0)\n"
         "  --max-moves N               Ply cap for a training game (60)\n"
-        "  --fitness-games N           Games used to score one candidate (2)\n"
-        "  --verification-games N      Games a candidate must beat the champion\n"
-        "                              over before promotion (8)\n"
+        "  --fitness-games N           Games used to score one candidate, unless\n"
+        "                              the sequential test ends the match first (2)\n"
+        "  --verification-games N      Ceiling on the games a candidate must beat the\n"
+        "                              champion over before promotion (8)\n"
         "  --accept-score X            Promotion threshold, >0.5 and <=1.0 (0.56)\n"
+        "  --sprt-elo N                Elo gap a match's record is tested against: the\n"
+        "                              two counts above stop being fixed the moment the\n"
+        "                              log-likelihood ratio leaves +/-2.94, which at this\n"
+        "                              default needs both colours lost twice (reject at\n"
+        "                              4 games) or six games won (accept at 6) inside an\n"
+        "                              8-game ceiling. 300 is the roundest gap whose win\n"
+        "                              side can also finish early, so a smaller one mostly\n"
+        "                              just plays every pair (300; 0 turns the test off,\n"
+        "                              which --no-sprt also does)\n"
+        "  --match-opening-plies N     Plies of the fixed opening every match pair\n"
+        "                              replays, then plays once with each colour, so a\n"
+        "                              position's first-move advantage cancels inside\n"
+        "                              the pair (design doc 2.8 #4). Two plies cannot\n"
+        "                              diversify - one centre stone leaves five reply\n"
+        "                              classes, fewer than the set has slots - hence\n"
+        "                              four when armed. Off by default (0), because a\n"
+        "                              mirror screen of 48 such lines at depth 4 found\n"
+        "                              45 already won by one colour: the swap then turns\n"
+        "                              the forced win into a 0.5 pair, not into a test\n"
+        "                              of the coefficients\n"
         "  --data-games N              Self-play games kept as training data (4)\n"
         "  --threads N                 Parallel data-collection workers (2)\n"
+        "  --shared-tt N               Slots in the one transposition table the\n"
+        "                              data workers share; the table is this size\n"
+        "                              whatever --threads says. 0 gives every worker\n"
+        "                              a table of its own (design doc 2.8 #1's\n"
+        "                              N x 7.3MB layout) (262144)\n"
         "  --no-data                   Collect no self-play data (search only)\n"
         "  --no-resign                 Never resign during training games\n"
+        "  --no-sprt                   Play every pair the two counts above ask for:\n"
+        "                              turn the sequential test off (--sprt-elo 0)\n"
         "  --seed N                    RNG seed (20261011)\n"
         "  --params PATH               Starting coefficients (built-in defaults)\n"
         "                              (not together with --resume)\n"
@@ -206,6 +238,11 @@ int main(int argc, char** argv) {
                 // The bounds are the guard below's business (--timeout-ms at least
                 // 1, --max-moves at least 2), so this parses any integer written.
                 config.timeout_ms = require_int("--timeout-ms", i, argc, argv, INT_MIN);
+            } else if (flag == "--max-nodes") {
+                // Zero is this knob's own answer - "the ms budget sets the ceiling" -
+                // so unlike the counts where 0 is a run that silently does nothing,
+                // it has to parse. Only negatives are refused.
+                config.max_nodes = require_int("--max-nodes", i, argc, argv, 0);
             } else if (flag == "--max-moves") {
                 config.max_moves = require_int("--max-moves", i, argc, argv, INT_MIN);
             } else if (flag == "--fitness-games") {
@@ -214,10 +251,26 @@ int main(int argc, char** argv) {
                 config.verification_games = require_int("--verification-games", i, argc, argv);
             } else if (flag == "--accept-score") {
                 config.accept_score = require_double("--accept-score", i, argc, argv);
+            } else if (flag == "--sprt-elo") {
+                // Zero is this knob's own answer - "no sequential test, play every
+                // pair" - so it parses where the game counts would not, and only
+                // negatives are refused.
+                config.sprt_elo = require_int("--sprt-elo", i, argc, argv, 0);
+            } else if (flag == "--no-sprt") {
+                config.sprt_elo = 0;
+            } else if (flag == "--match-opening-plies") {
+                // Zero is a real answer here too - "no opening, empty board" - so
+                // negatives alone are refused; the ceiling is the --max-moves guard.
+                config.match_opening_plies =
+                    require_int("--match-opening-plies", i, argc, argv, 0);
             } else if (flag == "--data-games") {
                 config.data_games = require_int("--data-games", i, argc, argv);
             } else if (flag == "--threads") {
                 config.data_threads = require_int("--threads", i, argc, argv);
+            } else if (flag == "--shared-tt") {
+                // Zero is a real answer here - "no shared table" - so only negatives are
+                // refused, and the size ceiling is checked with the other guards below.
+                config.shared_tt_entries = require_int("--shared-tt", i, argc, argv, 0);
             } else if (flag == "--no-data") {
                 config.collect_data = false;
             } else if (flag == "--no-resign") {
@@ -263,6 +316,28 @@ int main(int argc, char** argv) {
     if (config.search_depth < 1 || config.timeout_ms < 1 || config.max_moves < 2) {
         std::cerr << "Error: --depth, --timeout-ms and --max-moves must be positive"
                   << " (--max-moves at least 2)" << std::endl;
+        return 1;
+    }
+    // An entry is 28 bytes, so 2^22 slots is the ~117MB table design doc 2.8 #1 names
+    // as its own example, and it is already larger than the N per-engine tables this
+    // flag replaces at any --threads this box runs (N x 7.3MB). Asking for more does not
+    // buy reuse, it asks the process to allocate a table no search will fill - and past
+    // a point that allocation is what ends the run, since nothing here catches it.
+    if (config.shared_tt_entries > (1 << 22)) {
+        std::cerr << "Error: --shared-tt must be at most 4194304 slots (~117MB), got "
+                  << config.shared_tt_entries << " (0 gives each worker its own table)"
+                  << std::endl;
+        return 1;
+    }
+    // A match replays the opening and then plays out from that position, so a count
+    // that reaches the ply cap leaves no searched ply in the game: both colours of
+    // every pair would be the same two replayed stones and the score would measure
+    // nothing. Refuse the combination instead of quietly truncating it -- pass
+    // --match-opening-plies 0 to play a truncated game on purpose.
+    if (config.match_opening_plies >= config.max_moves) {
+        std::cerr << "Error: --match-opening-plies must stay below --max-moves, got "
+                  << config.match_opening_plies << " with --max-moves "
+                  << config.max_moves << " (0 plays from an empty board)" << std::endl;
         return 1;
     }
 
@@ -353,7 +428,10 @@ int main(int argc, char** argv) {
     std::cout << "\nTraining finished: " << trainer.status_text() << "\n";
     for (const auto& round : history) {
         std::cout << "  round " << round.round << ": score " << round.verification_score
-                  << " -> " << (round.accepted ? "promoted" : "rejected") << "\n";
+                  << " (" << sprt_verdict_name(round.verification_verdict) << " after "
+                  << round.verification_match_games << " games, llr "
+                  << round.verification_llr << ") -> "
+                  << (round.accepted ? "promoted" : "rejected") << "\n";
     }
 
     std::cout << "\nRatings:\n";

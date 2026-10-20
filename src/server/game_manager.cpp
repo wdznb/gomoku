@@ -26,6 +26,23 @@ int clamp_max_depth(int max_depth) {
     if (max_depth > 20) return 20;
     return max_depth;
 }
+
+// The soft deadline is the point a think stops starting another layer, so a value
+// at or above the hard one asks for nothing the hard one does not already give:
+// keep it inside the window it is meant to cut short. Zero stays zero, which is
+// the engine's "no soft window" answer rather than a deadline of no length.
+int clamp_soft_time_ms(int soft_time_ms, int hard_time_ms) {
+    if (soft_time_ms <= 0) return 0;
+    if (soft_time_ms > hard_time_ms) return hard_time_ms;
+    return soft_time_ms;
+}
+
+// A node budget is what makes a think cost the same twice, and unlike the timeout
+// it cannot be turned into unbounded work by a big value: the hard deadline still
+// applies. Zero means the time-derived ceiling this engine has always used.
+int clamp_max_nodes(int max_nodes) {
+    return max_nodes > 0 ? max_nodes : 0;
+}
 }
 
 GameManager::GameManager() 
@@ -37,9 +54,9 @@ GameManager::GameManager()
     // The engine only fires its own progress hook; forward it to whichever
     // consumer installed a GameManager progress_callback_ so the client's
     // "thinking_progress" messages actually flow.
-    engine_.set_progress_callback([this](int depth, int nodes, int elapsed_ms) {
+    engine_.set_progress_callback([this](const SearchStats& stats) {
         if (progress_callback_) {
-            progress_callback_(depth, nodes, elapsed_ms);
+            progress_callback_(stats);
         }
     });
 }
@@ -73,6 +90,11 @@ void GameManager::reset() {
     game_over_reason_.clear();
     analyses_.clear();
     position_pending_ = false;
+    has_hint_ = false;
+    // A new game has no previous think, and 上一手耗时 is exactly the kind of number
+    // that would otherwise carry across the boundary and damp the first move of the
+    // next game by the last move of this one.
+    prev_think_elapsed_ms_.store(0);
 }
 
 bool GameManager::set_position(const Board& board) {
@@ -93,6 +115,7 @@ bool GameManager::set_position(const Board& board) {
     game_over_reason_.clear();
     analyses_.clear();
     position_pending_ = true;
+    has_hint_ = false;
     return true;
 }
 
@@ -127,6 +150,7 @@ bool GameManager::restore_game(const GameRestore& restore) {
     winner_ = restore.status == GameStatus::GAME_OVER ? restore.winner : EMPTY;
     game_over_reason_ = restore.status == GameStatus::GAME_OVER ? restore.reason : std::string();
     position_pending_ = restore.position_pending;
+    has_hint_ = false;
     return true;
 }
 
@@ -179,6 +203,9 @@ bool GameManager::make_move(int row, int col) {
     }
     // Playing a stone is the other way out of a hand-set position.
     position_pending_ = false;
+    // The human's stone ages the table the same way the AI's does: one move, one
+    // step, whichever side played it.
+    engine_.transposition_table().advance_generation();
     analyses_.push_back(MoveAnalysis{Move(row, col, turn), 0, 0, 0, 0, "human"});
     
     if (status_ == GameStatus::WAITING) {
@@ -223,6 +250,9 @@ bool GameManager::undo(int& out_move_count, GameStatus& out_status) {
     for (int i = 0; i < undone && !analyses_.empty(); ++i) {
         analyses_.pop_back();
     }
+    // A hint from the position that was just unpicked no longer describes a
+    // position the session will search.
+    has_hint_ = false;
     
     if (board_.move_count() == 0) {
         status_ = GameStatus::WAITING;
@@ -312,10 +342,31 @@ bool GameManager::request_hint(int timeout_ms, int max_depth) {
     int turn = current_turn();
     Board board_snapshot = board_;
     const int snapshot_move_count = board_snapshot.move_count();
+    // Captured on this thread and copied into the worker: see start_ai_thinking.
+    Reuse reuse;
+    {
+        std::lock_guard<std::mutex> lock(thinking_mutex_);
+        reuse = take_hint(turn);
+    }
+
+    // The budget is the session's, but 求招 carries its own timeout and that is the
+    // hard deadline the soft window has to fit inside.
+    Budget budget = take_budget();
+    budget.soft_time_ms = clamp_soft_time_ms(budget.soft_time_ms, timeout_ms);
 
     hint_thread_ = std::make_unique<std::thread>(
-        [this, board_snapshot, turn, timeout_ms, max_depth, snapshot_move_count]() mutable {
+        [this, board_snapshot, turn, timeout_ms, max_depth, snapshot_move_count, reuse,
+         budget]() mutable {
+            engine_.set_soft_time_ms(budget.soft_time_ms);
+            engine_.set_max_nodes(budget.max_nodes);
+            engine_.set_prev_move_elapsed_ms(budget.prev_elapsed_ms);
+            if (reuse.valid) {
+                engine_.set_hint(reuse.move, reuse.score);
+            } else {
+                engine_.clear_hint();
+            }
             SearchResult result = engine_.search(board_snapshot, turn, max_depth, timeout_ms, stop_flag_);
+            prev_think_elapsed_ms_.store(result.elapsed_ms);
 
             // A user stop_thinking only raises stop_flag_, so delivering on the
             // discard flag alone still answers a stopped hint and releases the
@@ -331,6 +382,16 @@ bool GameManager::request_hint(int timeout_ms, int max_depth) {
                 {
                     std::lock_guard<std::mutex> commit_guard(thinking_mutex_);
                     move_count_now = board_.move_count();
+                    // The same test the answer is delivered on: when the board is
+                    // still the position this hint was computed from, the next 求招
+                    // on it is searching exactly what this one just searched, so it
+                    // starts from this conclusion.
+                    if (move_count_now == snapshot_move_count) {
+                        hint_move_ = result.best_move;
+                        hint_score_ = result.score;
+                        hint_color_ = turn;
+                        has_hint_ = (result.method == "alphabeta");
+                    }
                 }
                 if (move_count_now != snapshot_move_count) {
                     hint_callback_(Move(), 0);
@@ -355,6 +416,8 @@ void GameManager::start_ai_thinking(int timeout_ms, int max_depth) {
     if (hint_thread_ && hint_thread_->joinable()) {
         hint_thread_->join();
     }
+    // Both workers are joined above, so any hint one of them wrote is visible here.
+    Reuse reuse;
     
     // If the game is being opened by the AI (human picked WHITE, or an undo
     // emptied the board while ai_color_ == BLACK), status_ is still WAITING.
@@ -366,6 +429,10 @@ void GameManager::start_ai_thinking(int timeout_ms, int max_depth) {
         if (status_ == GameStatus::WAITING) {
             status_ = GameStatus::PLAYING;
         }
+        // Read under the same lock the workers write the hint under, and handed to
+        // the new thread by value: from here on, only that thread talks to the
+        // engine.
+        reuse = take_hint(ai_color_);
     }
 
     stop_flag_.store(false);
@@ -375,7 +442,8 @@ void GameManager::start_ai_thinking(int timeout_ms, int max_depth) {
     max_depth_ = max_depth;
     
     search_thread_ = std::make_unique<std::thread>(
-        &GameManager::ai_thinking_worker, this, timeout_ms, max_depth);
+        &GameManager::ai_thinking_worker, this, timeout_ms, max_depth, reuse,
+        take_budget());
 }
 
 void GameManager::start_ai_thinking() {
@@ -386,14 +454,25 @@ void GameManager::stop_thinking() {
     stop_flag_.store(true);
 }
 
-void GameManager::ai_thinking_worker(int timeout_ms, int max_depth) {
+void GameManager::ai_thinking_worker(int timeout_ms, int max_depth, Reuse reuse,
+                                     Budget budget) {
     Board snapshot;
     {
         std::lock_guard<std::mutex> lock(thinking_mutex_);
         snapshot = board_;
     }
 
+    engine_.set_soft_time_ms(budget.soft_time_ms);
+    engine_.set_max_nodes(budget.max_nodes);
+    engine_.set_prev_move_elapsed_ms(budget.prev_elapsed_ms);
+    if (reuse.valid) {
+        engine_.set_hint(reuse.move, reuse.score);
+    } else {
+        engine_.clear_hint();
+    }
+
     SearchResult result = engine_.search(snapshot, ai_color_, max_depth, timeout_ms, stop_flag_);
+    prev_think_elapsed_ms_.store(result.elapsed_ms);
 
     if (result.resigned) {
         std::lock_guard<std::mutex> lock(thinking_mutex_);
@@ -418,9 +497,25 @@ void GameManager::ai_thinking_worker(int timeout_ms, int max_depth) {
             status_ == GameStatus::PLAYING &&
             current_turn() == ai_color_ &&
             board_.place_stone(result.best_move.pos, ai_color_)) {
+            // The table's clock steps once per committed stone, not once per think:
+            // the records this think wrote stay in the table for the moves that
+            // follow, which is what lets a later think meet the same position by a
+            // different move order and read them.
+            engine_.transposition_table().advance_generation();
             analyses_.push_back(MoveAnalysis{result.best_move, result.score, result.depth,
                                              result.nodes_searched, result.elapsed_ms,
-                                             result.method});
+                                             result.method, result.partial_depth,
+                                             result.root_moves_done, result.root_moves_total,
+                                             result.seldepth, result.stopped,
+                                             result.tt_hits});
+            // The session remembers this think for the next one of the same colour.
+            // Only AlphaBeta's number is a position value: the tactical and forced
+            // paths report a sentinel, and centring a window on one of those buys
+            // nothing but widened re-searches.
+            hint_move_ = result.best_move;
+            hint_score_ = result.score;
+            hint_color_ = ai_color_;
+            has_hint_ = (result.method == "alphabeta");
             move_callback_(result.best_move, result.score, result.elapsed_ms);
 
             check_game_over();
@@ -463,9 +558,14 @@ void GameManager::set_opening_book(const OpeningBook* book) {
     engine_.set_opening_book(book);
 }
 
-void GameManager::set_config(int timeout_ms, int max_depth) {
+void GameManager::set_config(int timeout_ms, int max_depth,
+                             int soft_time_ms, int max_nodes) {
     timeout_ms_ = clamp_timeout_ms(timeout_ms);
     max_depth_ = clamp_max_depth(max_depth);
+    // An unnamed override keeps what the session already had: the same rule the
+    // frame reader applies, so set_config is the one place that decides a budget.
+    if (soft_time_ms >= 0) soft_time_ms_ = clamp_soft_time_ms(soft_time_ms, timeout_ms_);
+    if (max_nodes >= 0) max_nodes_ = clamp_max_nodes(max_nodes);
 }
 
 }

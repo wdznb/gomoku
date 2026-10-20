@@ -44,3 +44,15 @@ data/sessions/
 
 # Dependencies downloaded by build.sh (cmake-free path clones nlohmann/json here)
 deps/
+
+# Valgrind gate build (tools/valgrind_check.sh), kept separate from build/
+build-vg/
+callgrind.out.*
+massif.out.*
+vgcore.*
+
+# TSan build (tools/valgrind_check.sh tsan mode), kept separate from build/ and build-vg/
+build-tsan/
+
+# Stress client built by tools/stress/build_stress.sh (not a production artifact)
+tools/stress/ws_stress

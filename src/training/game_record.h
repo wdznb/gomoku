@@ -18,6 +18,10 @@ enum class GameEndReason {
     INVALID,       // the record could not be replayed legally
 };
 
+// One ply as it was searched. The last five fields are the layered accounting a
+// think reports (how far it got before it stopped, and why); a record written
+// before they existed has no keys for them and reads back as a think that
+// finished at the depth and node count it states.
 struct MoveRecord {
     Move move;
     int score = 0;
@@ -25,6 +29,15 @@ struct MoveRecord {
     int nodes = 0;
     int elapsed_ms = 0;
     std::string method;
+    int partial_depth = 0;
+    int root_moves_done = 0;
+    int root_moves_total = 0;
+    int seldepth = 0;
+    std::string stopped = "none";
+    // Appended, not inserted: `MoveRecord` is written and read by name through JSON, but
+    // the session's bridge (server.cpp:189/:205) copies it field by field, and design doc
+    // 2.9 :443's table-read count has to survive a save/restore to be worth reporting.
+    int tt_hits = 0;
 };
 
 struct GameRecord {
