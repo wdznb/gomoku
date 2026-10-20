@@ -1980,6 +1980,36 @@ additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cp
 no existing assertion was edited.
 
 
+## 轮次150 引擎重构 乙-1：位置项与贴边项第一次有了 18,900 行的差分表——v1.0 `:556` 欠的那张账交上了 — engine redesign stage 乙-1: a per-cell differential table for the position and edge terms, 42 boards × 225 cells × 2 colours = 18,900 rows, all match=1, and the guide's own mutation (edge band 2 → 3) turns 17,525 of them red
+
+指导书 §4 乙-1。v1.0 `:556` 那一格写的是「评估函数改动（位置项、增量缓存）与旧实现逐格比对，方法沿用全 225 格 × 两色 × 42 棋盘」；轮次140 验收时登记过：增量缓存那一半有 C1-4／C2-1／C3-2 三条普查用例，**位置项这一半只交了三条定向用例，没交这张表**。本轮补表。
+
+### 落点
+
+| 文件 | 是谁 |
+| --- | --- |
+| `tests/pinned_positions.h`（新） | 常驻棋盘集：`pinned_census_boards()` 42 副（40 副伪随机 ＋ 两副占满每一条过中心的线）与 `pinned_pos24()`。乙-2 的 `test_pinned` 也读这一份 |
+| `tools/position_term_table.cpp`（新） | 差分表仪器。`#define private public` 只在**这一支工具里**开（`evaluator.h:117-118` 那两个成员是 private，仓库既有先例是测试 TU 打开，绝不污染 `src/`）；每格真的放一颗子再比，所以改一格权重只会让那一格的行变红 |
+| `CMakeLists.txt:166-180` | 目标 `position_term_table`，链 `GOMOKU_CORE_SOURCES`（照 `gomoku_analyze` 的写法），`-I src -I tests` |
+| `data/diff/position_term.csv`（新，606,042 字节） | 表本体：表头 ＋ **18,900 行数据**，列是 `board,row,col,color,position_term,edge_penalty_term,recomputed_position_term,recomputed_edge_penalty_term,match` |
+
+「重算」那两列不调用 `Evaluator` 的任何成员函数：权重按 §2.5.2 的定义在工具里另写一遍（中心 `BOARD_SIZE/2`、曼哈顿距离线性衰减），贴边按「外两行／外两列各算一次，角上是 2」另写一遍。差分要有意义，两边就必须是两个来源。
+
+### 读数（全部实测）
+
+- `build/position_term_table --out data/diff/position_term.csv` → `rows=18900 boards=42 mismatches=0`、`all 18900 rows match`、`rc=0`；`awk -F, 'NR>1 && $9!=1'` 数到 **0 行**。第一行是 `0,0,0,black,1152,1500,1152,1500,1`。
+- **变异臂（指导书乙-1 验收点名的那一刀）**：把 `src/core/evaluator.cpp:221-232` 的「外两行/列」（`row <= 1 || row >= BOARD_SIZE - 2`）改成「外三行/列」→ 工具 `rc=1`，打印 `MISMATCH: 17525 of 18900 rows disagree with the by-definition sum`。还原后 `cmp` 确认 `evaluator.cpp` 逐字节相同，重跑回到 0 条不符。
+- 这一刀为什么一次翻掉 17,525 行而不是几十行：贴边项是整个盘面的求和，而普查里 42 副盘的子绝大多数落在边带附近，band 一宽就几乎每一行的和都动。表按格出行的意义在另一侧——**每一行都真的把那颗子摆上去再比**，所以「只改 `(r,c)` 这一格的权重」只会让落在该格上有子的那些行变红，这正是这张表要在下次改评估器时起的作用。
+
+### 门禁
+
+- `cmake --build build -j4` 全目标通过、零新增警告；`ctest` **8/8 / 496.37 s**（`test_search` 470.28、`test_server` 7.20）（本轮**没动 `src/` 生产代码**——变异臂改过一处、已逐字节还原——加的是 `tools/` 一支新工具、`tests/` 一个头文件与 `CMakeLists.txt`，仍按纪律 5 跑全量，因为 `CMakeLists.txt` 动了）。
+- `node tests/readme_anchor_check.js` **122 citations / 0 problems**；`node tests/web_frontend_check.js` **111/111**。
+
+### 判
+
+`:556` 位置项这一半从此有表可比。登记两点边界：这张表**不测增量的另一条路径**（`evaluate_position_with_pattern` 那条走的是 C2 的 `CandidateCache`，已由 C2-1 的 8,382 空格逐格两色比对钉住），也不改变任何读数——它存在的价值就是「下一次有人动评估器时，18,900 行里哪一格变了」。
+
 ## 轮次149 引擎重构 V2 甲-4：题库门禁第一次接进流程，脚本自己也有了超时 — V2 stage 甲-4: tactics_bench.sh gets a per-budget wall-clock cap and a stated baseline, build.sh points at it, README gains the one line that makes the gate discoverable
 
 指导书 §4 甲-4 的三件事，外加 §9.1 第三层欠的那一件（`tools/tactics_bench.sh` 原来没有任何超时）。**本轮不动 `src/`**，所以按纪律 5 不跑 `ctest`，理由写在提交信息里。

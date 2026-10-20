@@ -2919,8 +2919,8 @@ void test_analyze_progress_then_exactly_one_result_per_ply() {
             const std::string type = parsed["type"].get<std::string>();
             if (type == "analyze_progress") {
                 ++progress;
-                assert(parsed["total"] == parsed["done"] == 0 ||
-                       parsed["done"].get<int>() <= parsed["total"].get<int>());
+                assert(parsed["total"] == 2 &&
+                       parsed["done"] == progress);
             } else if (type == "analyze_result") {
                 got_result = true;
                 result = parsed;

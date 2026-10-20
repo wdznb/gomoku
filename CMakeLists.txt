@@ -161,6 +161,23 @@ else()
     target_compile_options(gomoku_analyze PRIVATE -Wall -Wextra -O2 -Wno-template-body -Wno-template-id-cdtor)
 endif()
 
+# 位置项 / 贴边项的差分表（v2 §7 回归保障 3）。它不是测试目标，是一台仪器：跑一次
+# 写 data/diff/position_term.csv，18,900 行逐格比对，任何一格不一致就非零退出。
+add_executable(position_term_table
+    tools/position_term_table.cpp
+    ${GOMOKU_CORE_SOURCES}
+)
+target_include_directories(position_term_table PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/tests)
+target_link_libraries(position_term_table PRIVATE Threads::Threads nlohmann_json::nlohmann_json)
+if(UNIX)
+    target_link_libraries(position_term_table PRIVATE pthread)
+endif()
+if(MSVC)
+    target_compile_options(position_term_table PRIVATE /W4)
+else()
+    target_compile_options(position_term_table PRIVATE -Wall -Wextra -O2 -Wno-template-body -Wno-template-id-cdtor)
+endif()
+
 enable_testing()
 
 add_executable(test_board
