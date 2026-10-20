@@ -8,6 +8,8 @@
 #include "training/elo.h"
 #include "training/self_play.h"
 #include "training/data_collector.h"
+#include "training/replay_analyzer.h"
+#include "training/tactics_card.h"
 #include "training/genetic.h"
 #include "training/hill_climbing.h"
 #include "training/sprt.h"
@@ -5301,6 +5303,412 @@ void test_game_record_keeps_the_table_read_count() {
               << "and a key-less record read 0)" << std::endl;
 }
 
+// ---- 设计文档 §6.2 段 A：零搜索筛查 ----
+// 这六个用例钉的是「段 A 只做筛查」这件事的每一条边界：摆幅的算术、开局判据、
+// 摆幅判据、flat_game、读不回来的记录、以及深度塌陷与将杀带穿越这两条容易被
+// 前一条判据抢走的。段 B 的妙手 / 俗手判定**故意**没有用例——它要 root_scores。
+
+void test_replay_swing_reads_from_the_mover_side() {
+    GameRecord record;
+    record.winner = BLACK;
+    record.reason = GameEndReason::FIVE;
+    const int scores[4] = {100, 200, 50, 0};
+    for (int i = 0; i < 4; ++i) {
+        MoveRecord entry;
+        entry.move = Move(7, 7 + i, i % 2 == 0 ? BLACK : WHITE);
+        entry.score = scores[i];
+        entry.depth = 4;
+        entry.method = "alphabeta";
+        record.moves.push_back(entry);
+    }
+
+    // 黑走完第一手，白报 +200，所以黑掉了 300。
+    assert(ReplayAnalyzer::swing_at(record, 0) == -300);
+    assert(ReplayAnalyzer::swing_at(record, 1) == -250);
+    assert(ReplayAnalyzer::swing_at(record, 2) == -50);
+    // 最后一手没有下一手；越界的两种取法也一样。
+    assert(ReplayAnalyzer::swing_at(record, 3) == 0);
+    assert(ReplayAnalyzer::swing_at(record, -1) == 0);
+    assert(ReplayAnalyzer::swing_at(record, 4) == 0);
+
+    // 反过来：对手报 -8000，说明自己这一手赚了 8000（再减掉自己当时那 100）。
+    record.moves[1].score = -8000;
+    assert(ReplayAnalyzer::swing_at(record, 0) == 7900);
+}
+
+void test_replay_screen_drops_the_opening_but_keeps_a_forced_reply() {
+    GameRecord record;
+    record.winner = WHITE;
+    record.reason = GameEndReason::FIVE;
+    for (int i = 0; i < 8; ++i) {
+        MoveRecord entry;
+        entry.move = Move(7, 7 + (i % 3), i % 2 == 0 ? BLACK : WHITE);
+        entry.score = 0;
+        entry.depth = 4;
+        entry.method = "alphabeta";
+        record.moves.push_back(entry);
+    }
+
+    ScreenConfig config;
+    config.opening_plies = 6;
+    ReplayAnalyzer analyzer(config);
+    GameScreen screen = analyzer.screen(record);
+    assert(screen.total_plies == 8);
+    assert(screen.opening == 6);
+    assert(screen.candidates == 0);
+    assert(screen.flat == 1);  // §6.4：候选手少于 2 手的一局不产题卡
+    assert(screen.plies[0].reason == ScreenReason::OPENING);
+    assert(screen.plies[7].reason == ScreenReason::NOISE);
+
+    // 开局里的一手如果是必挡，它就不是「无意义的前期手」：位置判据放过它。
+    record.moves[3].method = "must_block";
+    screen = analyzer.screen(record);
+    assert(screen.opening == 5);
+    assert(screen.plies[3].candidate);
+    assert(screen.plies[3].reason == ScreenReason::METHOD_SHIFT);
+}
+
+void test_replay_screen_flags_a_big_swing() {
+    GameRecord record;
+    record.winner = BLACK;
+    record.reason = GameEndReason::FIVE;
+    const int scores[3] = {0, -8000, 0};
+    for (int i = 0; i < 3; ++i) {
+        MoveRecord entry;
+        entry.move = Move(7, 7 + i, i % 2 == 0 ? BLACK : WHITE);
+        entry.score = scores[i];
+        entry.depth = 4;
+        entry.method = "alphabeta";
+        record.moves.push_back(entry);
+    }
+
+    ScreenConfig config;
+    config.opening_plies = 0;  // 关掉位置判据，只留摆幅
+    ReplayAnalyzer analyzer(config);
+    const GameScreen screen = analyzer.screen(record);
+    assert(screen.plies[0].swing == 8000);
+    assert(screen.plies[0].candidate);
+    assert(screen.plies[0].reason == ScreenReason::BIG_SWING);
+    // 最后一手没有摆幅，所以它落回 NOISE 而不是被当成「没事发生」的候选。
+    assert(screen.plies[2].reason == ScreenReason::NOISE);
+}
+
+void test_replay_screen_calls_a_flat_game_flat() {
+    GameRecord record;
+    record.winner = BLACK;
+    record.reason = GameEndReason::FIVE;
+    for (int i = 0; i < 8; ++i) {
+        MoveRecord entry;
+        entry.move = Move(7, 7 + (i % 3), i % 2 == 0 ? BLACK : WHITE);
+        entry.score = 0;
+        entry.depth = 4;
+        entry.method = "alphabeta";
+        record.moves.push_back(entry);
+    }
+
+    ScreenConfig config;
+    config.opening_plies = 0;
+    ReplayAnalyzer analyzer(config);
+    GameScreen screen = analyzer.screen(record);
+    assert(screen.candidates == 0);
+    assert(screen.noise == 8);
+    assert(screen.flat == 1);
+
+    // 一手大摆幅就够让它不再是 flat：§6.4 的门槛是 2 手，这里正好落在边界上。
+    record.moves[2].score = -9000;
+    screen = analyzer.screen(record);
+    assert(screen.candidates == 2);
+    assert(screen.flat == 0);
+}
+
+void test_replay_screen_refuses_an_invalid_record() {
+    GameRecord record;
+    record.winner = BLACK;
+    record.reason = GameEndReason::INVALID;
+    MoveRecord entry;
+    entry.move = Move(7, 7, BLACK);
+    entry.score = 50000;
+    entry.method = "alphabeta";
+    record.moves.push_back(entry);
+
+    ReplayAnalyzer analyzer;
+    const GameScreen screen = analyzer.screen(record);
+    assert(screen.total_plies == 1);
+    assert(screen.plies.empty());  // 一手都不产
+    assert(screen.candidates == 0);
+    assert(screen.flat == 1);
+}
+
+void test_replay_screen_sees_a_depth_dip_and_a_mate_crossing() {
+    // 深度塌陷：四手都平，但第 2 手只搜到 3 层（中位 6）-> 引擎当时不确定。
+    GameRecord record;
+    record.winner = BLACK;
+    record.reason = GameEndReason::FIVE;
+    const int depths[4] = {6, 6, 3, 6};
+    for (int i = 0; i < 4; ++i) {
+        MoveRecord entry;
+        entry.move = Move(7, 7 + i, i % 2 == 0 ? BLACK : WHITE);
+        entry.score = 0;
+        entry.depth = depths[i];
+        entry.method = "alphabeta";
+        record.moves.push_back(entry);
+    }
+
+    ScreenConfig config;
+    config.opening_plies = 0;
+    ReplayAnalyzer analyzer(config);
+    GameScreen screen = analyzer.screen(record);
+    assert(screen.plies[2].reason == ScreenReason::DEPTH_DIP);
+
+    // 将杀带穿越：分数从 95000 掉到 100。MATE_CROSS 现在排在 BIG_SWING 之前
+    // （具体判据压过泛化判据），所以不用再抬阈值才能看见它。
+    record.moves[0].score = 95000;
+    record.moves[1].score = 100;
+    record.moves[2].depth = 6;
+    ScreenConfig mate_config;
+    mate_config.opening_plies = 0;
+    mate_config.swing_threshold = 200000;
+    ReplayAnalyzer mate_analyzer(mate_config);
+    screen = mate_analyzer.screen(record);
+    assert(screen.plies[0].reason == ScreenReason::MATE_CROSS);
+}
+
+void test_replay_screen_keeps_tactical_plies_out_of_the_generic_judgments() {
+    // 三条守卫都是从第一份真实记录里读出来的（REVIEW_LOG 轮次144），一条一个断言：
+    //   1) 战术手的 depth 是 0，那是结构性的，不许落进 DEPTH_DIP；
+    //   2) 将杀带内两侧的摆幅是饱和分的假差值（实测 -199000），不许落进 BIG_SWING；
+    //   3) 具体判据（连续必挡 / 战术层接管）压过泛化判据（摆幅大）。
+    ScreenConfig config;
+    config.opening_plies = 0;
+    ReplayAnalyzer analyzer(config);
+
+    // 守卫 1：vcf 的 depth 0 比中位浅 4 层，但战术手不参与深度判据。
+    GameRecord guard1;
+    guard1.winner = BLACK;
+    guard1.reason = GameEndReason::FIVE;
+    const int depths1[4] = {4, 4, 0, 0};
+    const char* methods1[4] = {"alphabeta", "alphabeta", "vcf", "vcf"};
+    for (int i = 0; i < 4; ++i) {
+        MoveRecord entry;
+        entry.move = Move(7, 7 + i, i % 2 == 0 ? BLACK : WHITE);
+        entry.score = 0;
+        entry.depth = depths1[i];
+        entry.method = methods1[i];
+        guard1.moves.push_back(entry);
+    }
+    GameScreen screen = analyzer.screen(guard1);
+    assert(screen.plies[2].reason == ScreenReason::NONE);
+
+    // 守卫 2：两侧都在将杀带内，摆幅 -199000，但这不是形势的摆幅。
+    guard1.moves[0].score = 100000;
+    guard1.moves[1].score = 99000;
+    screen = analyzer.screen(guard1);
+    assert(screen.plies[0].reason != ScreenReason::BIG_SWING);
+    assert(screen.plies[0].reason == ScreenReason::NONE);
+
+    // 守卫 3：连续两手必挡，第二手同时带着 -199000 的摆幅，标签必须是 must_block_run。
+    GameRecord guard3;
+    guard3.winner = BLACK;
+    guard3.reason = GameEndReason::FIVE;
+    const char* methods3[4] = {"alphabeta", "must_block", "must_block", "vcf"};
+    const int scores3[4] = {0, 99000, 100000, 0};
+    const int depths3[4] = {4, 0, 0, 0};
+    for (int i = 0; i < 4; ++i) {
+        MoveRecord entry;
+        entry.move = Move(7, 7 + i, i % 2 == 0 ? BLACK : WHITE);
+        entry.score = scores3[i];
+        entry.depth = depths3[i];
+        entry.method = methods3[i];
+        guard3.moves.push_back(entry);
+    }
+    screen = analyzer.screen(guard3);
+    assert(screen.plies[0].reason == ScreenReason::METHOD_SHIFT);
+    assert(screen.plies[1].reason == ScreenReason::MUST_BLOCK_RUN);
+
+    // 守卫 4：一手安静的 alphabeta 紧接一手 vcf。摆幅 0，但「战术层在这里接管」
+    // 本身就是信号，不许被 NOISE 吃掉。两侧都在将杀带内，所以摆幅确实是 0。
+    GameRecord guard4;
+    guard4.winner = BLACK;
+    guard4.reason = GameEndReason::FIVE;
+    const char* methods4[4] = {"alphabeta", "alphabeta", "vcf", "vcf"};
+    const int scores4[4] = {0, -100000, 100000, 100000};
+    for (int i = 0; i < 4; ++i) {
+        MoveRecord entry;
+        entry.move = Move(7, 7 + i, i % 2 == 0 ? BLACK : WHITE);
+        entry.score = scores4[i];
+        entry.depth = 4;
+        entry.method = methods4[i];
+        guard4.moves.push_back(entry);
+    }
+    screen = analyzer.screen(guard4);
+    assert(screen.plies[1].swing == 0);
+    assert(screen.plies[1].reason == ScreenReason::METHOD_SHIFT);
+    assert(screen.plies[1].candidate);
+}
+
+// ---- 设计文档 §6.5–§6.7：段 B / 段 C / 题卡 ----
+// 这六个用例钉的是「判定与格式」，不是「棋力」：段 B 的正确性在真实记录上量
+// （REVIEW_LOG 轮次145），这里只保证每条判据的算术与序列化不会悄悄变形。
+
+void test_tactics_card_round_trips_every_field() {
+    TacticsCard card;
+    card.id = "g3-p17";
+    card.layer = "normal";
+    card.kind = "blunder";
+    card.side = WHITE;
+    card.ply = 17;
+    card.stones = {Move(7, 7, BLACK), Move(7, 8, WHITE), Move(8, 8, BLACK)};
+    card.last_move = card.stones.back();
+    card.answer = Move(8, 9, WHITE);
+    card.alt_answers = {Move(6, 6, WHITE)};
+    card.best_score = 3100;
+    card.played_score = -1900;
+    card.second_score = -1100;
+    card.gap = 4200;
+    card.loss = 5000;
+    card.budget = 20000;
+    card.depth = 8;
+    card.played = Move(9, 6, WHITE);
+    card.second = Move(5, 5, WHITE);
+    card.method = "alphabeta";
+    card.solve_budget = 16000;
+    card.failed_at = 8000;
+    card.coeffs_sha = "a3f1b2c4";
+    card.source_game = "run_x/records.jsonl";
+    card.source_index = 42;
+
+    const std::string text = card.to_json();
+    TacticsCard back;
+    std::string error;
+    assert(TacticsCard::from_json(text, back, error));
+    assert(back.id == card.id);
+    assert(back.layer == card.layer);
+    assert(back.kind == card.kind);
+    assert(back.side == card.side);
+    assert(back.ply == card.ply);
+    assert(back.stones.size() == 3);
+    assert(back.stones[1].pos.row == 7 && back.stones[1].pos.col == 8);
+    assert(back.stones[1].color == WHITE);
+    assert(back.answer.pos.row == 8 && back.answer.pos.col == 9);
+    assert(back.alt_answers.size() == 1);
+    assert(back.best_score == 3100 && back.played_score == -1900);
+    assert(back.gap == 4200 && back.loss == 5000);
+    assert(back.played.pos.col == 6 && back.second.pos.row == 5);
+    assert(back.method == "alphabeta");
+    assert(back.solve_budget == 16000 && back.failed_at == 8000);
+    assert(back.coeffs_sha == "a3f1b2c4");
+    assert(back.source_game == card.source_game && back.source_index == 42);
+
+    // 缺字段要拒绝，不许静默补默认值：一张没有正解的卡不能进题库。
+    TacticsCard broken;
+    assert(!TacticsCard::from_json("{\"id\":\"x\"}", broken, error));
+}
+
+void test_tactics_layer_boundaries_match_the_doc() {
+    // §6.5：<= 8k easy、<= 64k normal、其余 hard；0（梯子跑完也没解出）算 hard。
+    assert(TacticsCard::layer_for(0) == "hard");
+    assert(TacticsCard::layer_for(1000) == "easy");
+    assert(TacticsCard::layer_for(8000) == "easy");
+    assert(TacticsCard::layer_for(8001) == "normal");
+    assert(TacticsCard::layer_for(64000) == "normal");
+    assert(TacticsCard::layer_for(64001) == "hard");
+    assert(TacticsCard::layer_at_least("hard", "normal"));
+    assert(!TacticsCard::layer_at_least("easy", "normal"));
+    assert(TacticsCard::layer_at_least("normal", "normal"));
+}
+
+void test_coefficient_fingerprint_is_stable_and_sensitive() {
+    ThreatCoefficients a;
+    const std::string first = coefficients_fingerprint(a);
+    assert(first.size() == 8);
+    assert(coefficients_fingerprint(a) == first);  // 稳定
+
+    ThreatCoefficients b = a;
+    b.live_three += 1;
+    assert(coefficients_fingerprint(b) != first);  // 对改动敏感
+}
+
+void test_replay_reviewer_refuses_an_illegal_replay() {
+    GameRecord record;
+    record.winner = BLACK;
+    record.reason = GameEndReason::FIVE;
+    MoveRecord first;
+    first.move = Move(7, 7, BLACK);
+    record.moves.push_back(first);
+    MoveRecord second;
+    second.move = Move(7, 7, WHITE);  // 同一格
+    record.moves.push_back(second);
+
+    ReplayReviewer reviewer(ThreatCoefficients{});
+    Board board;
+    assert(reviewer.position_before(record, 1, board));   // 只摆第一手
+    assert(!reviewer.position_before(record, 2, board));  // 第二手撞格
+}
+
+void test_replay_reviewer_scores_its_own_choice_as_lossless() {
+    // 段 B 的精确复算路径：先问引擎自己走哪一手，再把那一手当「实际走的那手」
+    // 交给复核。loss 必须是 0，且不许被判成俗手——这条抓的是「拿界当精确分」
+    // 那一类错误（第一版 12 手全 loss 0/gap 0，看着像对，其实是没算）。
+    const Position opening[6] = {{7, 7}, {7, 8}, {8, 8}, {6, 6}, {9, 9}, {8, 7}};
+    Board board;
+    for (int i = 0; i < 6; ++i) {
+        board.place_stone(opening[i].row, opening[i].col, i % 2 == 0 ? BLACK : WHITE);
+    }
+    SearchEngine engine(ThreatCoefficients{});
+    engine.set_book_enabled(false);
+    engine.set_max_nodes(20000);
+    std::atomic<bool> stop{false};
+    const SearchResult think = engine.search(board, BLACK, 6, 60000, stop);
+    assert(think.best_move.pos.is_valid());
+    assert(!think.root_scores.empty());
+    assert(think.root_scores.front().exact);  // 第一手被问时下界是 -INF，所以必精确
+
+    GameRecord record;
+    record.winner = BLACK;
+    record.reason = GameEndReason::FIVE;
+    for (int i = 0; i < 6; ++i) {
+        MoveRecord entry;
+        entry.move = Move(opening[i].row, opening[i].col, i % 2 == 0 ? BLACK : WHITE);
+        entry.method = "replay";
+        record.moves.push_back(entry);
+    }
+    MoveRecord played;
+    played.move = think.best_move;
+    played.method = "alphabeta";
+    record.moves.push_back(played);
+
+    ReplayReviewer reviewer(ThreatCoefficients{});
+    const PlyReview review = reviewer.review(record, 6);
+    assert(review.root_moves > 0);
+    assert(review.kind != "blunder");
+    assert(review.kind != "unlisted");
+    assert(review.loss == 0);
+}
+
+void test_replay_reviewer_prices_a_difficulty_ladder() {
+    // 段 C：同一个局面，预算越大越可能解出正解；解出的那一档必须 >= 上一次失败的档。
+    const Position opening[4] = {{7, 7}, {7, 8}, {8, 8}, {6, 6}};
+    Board board;
+    for (int i = 0; i < 4; ++i) {
+        board.place_stone(opening[i].row, opening[i].col, i % 2 == 0 ? BLACK : WHITE);
+    }
+    SearchEngine engine(ThreatCoefficients{});
+    engine.set_book_enabled(false);
+    engine.set_max_nodes(50000);
+    std::atomic<bool> stop{false};
+    const SearchResult think = engine.search(board, BLACK, 6, 60000, stop);
+    assert(think.best_move.pos.is_valid());
+
+    ReviewConfig config;
+    config.ladder_min = 1000;
+    config.ladder_max = 64000;
+    ReplayReviewer reviewer(ThreatCoefficients{}, config);
+    const LadderResult ladder = reviewer.difficulty(board, BLACK, think.best_move);
+    assert(ladder.solve_budget > 0);          // 正解是它自己走出来的，必然解得出
+    assert(ladder.solve_budget <= 64000);
+    assert(ladder.failed_at < ladder.solve_budget);
+}
+
 int main() {
     std::cout << "Running training tests..." << std::endl;
 
@@ -5402,6 +5810,22 @@ int main() {
     test_match_pair_replays_its_opening_and_discards_an_illegal_one();
     test_a_match_rotates_through_the_opening_set();
     test_trainer_cli_match_opening_probes();
+
+    // J 阶段段 A（设计文档 6.2）：摆幅算术、开局判据、摆幅判据、flat_game、
+    // 坏记录、深度塌陷与将杀穿越。
+    test_replay_swing_reads_from_the_mover_side();
+    test_replay_screen_drops_the_opening_but_keeps_a_forced_reply();
+    test_replay_screen_flags_a_big_swing();
+    test_replay_screen_calls_a_flat_game_flat();
+    test_replay_screen_refuses_an_invalid_record();
+    test_replay_screen_sees_a_depth_dip_and_a_mate_crossing();
+    test_replay_screen_keeps_tactical_plies_out_of_the_generic_judgments();
+    test_tactics_card_round_trips_every_field();
+    test_tactics_layer_boundaries_match_the_doc();
+    test_coefficient_fingerprint_is_stable_and_sensitive();
+    test_replay_reviewer_refuses_an_illegal_replay();
+    test_replay_reviewer_scores_its_own_choice_as_lossless();
+    test_replay_reviewer_prices_a_difficulty_ladder();
 
     std::cout << "All training tests passed" << std::endl;
     return 0;

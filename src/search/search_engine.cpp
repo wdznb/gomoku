@@ -380,6 +380,7 @@ SearchResult SearchEngine::search(const Board& board, int color,
         result.root_moves_total = info.root_moves_total;
         result.seldepth = info.seldepth;
         result.tt_hits = info.tt_hits;
+        result.root_scores = info.root_scores;
         result.stopped = stop_reason_name(info.stopped);
         // The line the committed layer proved, the same field the two tactics phases
         // already answer with. Until the search kept a variation there was nothing to
@@ -455,6 +456,16 @@ SearchResult SearchEngine::search(const Board& board, int color,
     return result;
 }
 
+int SearchEngine::exact_root_score(const Board& board, int color, Move move, int max_depth,
+                                   int node_cap, std::atomic<bool>& stop_flag) {
+    if (!move.pos.is_valid() || !board.is_empty(move.pos)) return -1000000;
+    Board child = board;
+    child.place_stone(move.pos.row, move.pos.col, color);
+    const int depth = max_depth > 1 ? max_depth - 1 : 1;
+    const SearchResult result = ponder_search(child, opponent(color), depth, node_cap, stop_flag);
+    return -result.score;
+}
+
 SearchResult SearchEngine::ponder_search(const Board& board, int color, int max_depth,
                                          int node_cap, std::atomic<bool>& stop_flag) {
     SearchResult result;
@@ -484,6 +495,7 @@ SearchResult SearchEngine::ponder_search(const Board& board, int color, int max_
     result.root_moves_total = info.root_moves_total;
     result.seldepth = info.seldepth;
     result.tt_hits = info.tt_hits;
+    result.root_scores = info.root_scores;
     result.stopped = stop_reason_name(info.stopped);
     result.principal_variation = info.principal_variation;
     result.method = "alphabeta";

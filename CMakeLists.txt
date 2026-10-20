@@ -46,6 +46,8 @@ set(GOMOKU_TRAINING_SOURCES
     src/training/elo.cpp
     src/training/self_play.cpp
     src/training/data_collector.cpp
+    src/training/replay_analyzer.cpp
+    src/training/tactics_card.cpp
     src/training/genetic.cpp
     src/training/hill_climbing.cpp
     src/training/trainer.cpp
@@ -124,6 +126,32 @@ add_custom_command(TARGET gomoku_train POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory
     ${CMAKE_SOURCE_DIR}/data $<TARGET_FILE_DIR:gomoku_train>/data
 )
+
+# Replay analysis (design doc ENGINE_REDESIGN_V2.md 6.10). Stage A only for now:
+# it reads records and screens plies. The engine is linked as one unit anyway,
+# because stage B's fixed-budget re-search will need it and a hand-picked list
+# here is the mistake test_search already records.
+add_executable(gomoku_analyze
+    tools/analyze_main.cpp
+    ${GOMOKU_CORE_SOURCES}
+    ${GOMOKU_TRAINING_SOURCES}
+)
+
+target_include_directories(gomoku_analyze PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(gomoku_analyze PRIVATE
+    Threads::Threads
+    nlohmann_json::nlohmann_json
+)
+
+if(UNIX)
+    target_link_libraries(gomoku_analyze PRIVATE pthread)
+endif()
+
+if(MSVC)
+    target_compile_options(gomoku_analyze PRIVATE /W4)
+else()
+    target_compile_options(gomoku_analyze PRIVATE -Wall -Wextra -O2 -Wno-template-body -Wno-template-id-cdtor)
+endif()
 
 enable_testing()
 

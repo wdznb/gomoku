@@ -481,6 +481,7 @@ SearchInfo AlphaBetaSearch::to_info(const SearchStats& stats) {
     info.score = stats.score;
     info.best_move = stats.best_move;
     info.principal_variation = stats.pv;
+    info.root_scores = stats.root_scores;
     info.elapsed_ms = stats.elapsed_ms;
     info.partial_depth = stats.partial_depth;
     info.root_moves_done = stats.root_moves_done;
@@ -642,6 +643,17 @@ Move AlphaBetaSearch::search(const Board& board, int color, const SearchLimits& 
             // out of short-circuited subtrees, and a line the player can read is
             // worth more than a long one the search did not finish.
             pv_.copy_out(0, &stats_.pv);
+            // 同一张表，同一个提交点：只有完整层能交出根着法分值。排序用 A6 的
+            // 三元组（分值 → 距中心 → 格号），所以「表里第一行」与「搜索选的那一手」
+            // 对同一分的两种读法永远一致。
+            stats_.root_scores = layer_scores_;
+            std::sort(stats_.root_scores.begin(), stats_.root_scores.end(),
+                      [](const RootMoveScore& a, const RootMoveScore& b) {
+                          return RootScore(a.move, a.score) > RootScore(b.move, b.score);
+                      });
+            if (static_cast<int>(stats_.root_scores.size()) > kRootScoreReportLimit) {
+                stats_.root_scores.resize(kRootScoreReportLimit);
+            }
             // A layer that finished replaces any earlier cut-short record.
             stats_.partial_depth = 0;
             stats_.partial_best_move = Move();
@@ -752,11 +764,15 @@ NodeResult AlphaBetaSearch::search_root_layer(Board& board,
     Move layer_best_move;
     bool layer_sound = true;
     stats_.root_moves_done = 0;
+    layer_scores_.clear();
 
     for (const auto& move : root_moves) {
         if (ctx_.hard_stopped()) break;
 
         board.place_stone(move.pos.row, move.pos.col, color);
+        // 这一手被问之前的下界。搜完若 score > alpha_before，它就是精确值；否则
+        // 只是「不比当时最好更好」的界。
+        const int alpha_before = layer_alpha;
 
         // A root child sits one ply from the root, whatever the layer's depth is.
         // Full window, not the one-point question the tree asks (design doc 2.7's
@@ -821,6 +837,8 @@ NodeResult AlphaBetaSearch::search_root_layer(Board& board,
             if (line_valid) pv_.extend(0, move, 1);
             else pv_.clear(0);
         }
+        // 这一手的最终分值（含平局探针的重问）就是它在这张表里的位置。
+        layer_scores_.push_back(RootMoveScore{move, score, score > alpha_before});
         if (score > layer_alpha) layer_alpha = score;
         // What the interrupted layer would have played, kept as it is built: the
         // player sees it, the returned move never comes from it.

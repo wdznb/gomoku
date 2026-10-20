@@ -1980,6 +1980,406 @@ additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cp
 no existing assertion was edited.
 
 
+## 轮次145 引擎重构 J-2：段 B / 段 C 落地——复核第一次判出「俗手」与「漏杀」，而根表尾部原来一直是界不是分 — engine redesign stage J-2, the review stage lands: 4 real cards (2 blunders, 2 missed mates), and the root table's tail turns out to carry bounds rather than scores
+
+规格是 `docs/ENGINE_REDESIGN_V2.md` `§6.3.1`（`root_scores`）、`§6.3.2`（六种判定）、`§6.5`（难度阶梯）、`§6.6`（题卡）、`§6.7 b`（摆棋测试）、`§6.10`（落点）。上一轮（轮次144）只做了段 A，本轮把段 B、段 C、题卡格式、`--bench` 与 `--cards` 一起做完。
+
+用户这一轮的指令是「严格按照文档要做的功能，依次全部做完并验证测试，不用过问我」＋「每个功能做完并测试通过后，直接推送远程」。
+
+### 落点
+
+| 文件 | 行数 | 是什么 |
+| --- | --- | --- |
+| `src/search/search_limits.h` | +18 | `RootMoveScore{move, score, exact}`、`kRootScoreReportLimit = 8`、`SearchStats::root_scores` |
+| `src/search/alphabeta.h/.cpp` | +7 / +18 | `layer_scores_` 逐手收集；完整层排序（A6 三元组）＋截断后搬进 stats；`SearchInfo` 镜像 |
+| `src/search/search_engine.h/.cpp` | +9 / +12 | `SearchResult::root_scores` 两处映射；`exact_root_score()`（走 ponder 窄路） |
+| `src/training/tactics_card.h/.cpp` | 70 / 205（新） | §6.6 的卡 ＋ JSON ＋ `coefficients_fingerprint` |
+| `src/training/replay_analyzer.h/.cpp` | 161 / 327 | 追加 `ReviewConfig` / `PlyReview` / `LadderResult` / `ReplayReviewer` |
+| `tools/analyze_main.cpp` | 509 | `--review` / `--cards` / `--bench` / `--layer` / `--params`；`--export-samples` 仍拒绝 |
+| `tests/test_training.cpp` | +424 | 段 A 7 条 ＋ 段 B/C/卡 6 条 |
+
+### 读数 1：同一份记录，两档复核强度，产出从 0 张变成 4 张
+
+`/tmp/r144/records.jsonl`（4 局 / 86 手，来自轮次144 那一轮训练），12 个候选手：
+
+| 复核强度 | 判定分布 | 产卡 | 墙钟 |
+| --- | --- | --- | --- |
+| `--budget 20000 --depth 6` | `none 12` | **0** | 秒级 |
+| `--budget 200000 --depth 8` | `blunder 2 / missed_mate 2 / none 8` | **4** | **21.8 s**（12 手，含精确复算与难度阶梯） |
+
+**这条读数否掉了文档的一个隐含假设**：§6.9 写的是「一局结束后发起复盘」，默认了「复盘总是能看出东西」。实际上，自对弈记录里的每一手都是**当时的引擎自己选的**——复核者与它同强时，结论必然是「走对了」，一张卡也产不出。只有复核者更强（这里预算 ×10、深度 +2）才看得见当时的错。
+
+于是新增一条约束（已写进 §6.8）：**复核者必须比被复核者强**，而且记录里必须带那一局用了什么强度（§3.5 的三口径纪律同样适用），否则「0 张卡」会被误读成「这局下得好」。
+
+### 读数 2：摆棋测试在同一批卡上
+
+| 预算 | `solve_rate` | 分层 |
+| --- | --- | --- |
+| 8,000 | **0/4 (0.0 %)** | hard 0/2、normal 0/2 |
+| 200,000 | **4/4 (100.0 %)** | hard 2/2、normal 2/2 |
+
+与段 C 标出的区间自洽（一张卡的 `difficulty` 是 `(32000, 64000]`，`layer = normal`；两张 `missed_mate` 落到 `hard`）。两档都正确触发了 §3.3 的「0 % 或 100 % = 分层失败」告警——**那条告警是给预算选的，不是给题选的**：同一个题库，8k 太浅、200k 太深，中间那档才是尺。这正是 §3.3 要 `solve_rate@{2k,8k,32k}` 三档而不是一档的原因，本轮只跑了首尾两档。
+
+### 三个发现（都是真数据逼出来的，都已写回文档）
+
+| # | 现象 | 根因 | 修法 |
+| --- | --- | --- | --- |
+| 1 | 12 手全 `loss 0 / gap 0`，看着像「引擎与自己完全一致」 | **根表尾部是界不是分**：根层给后续着法的窗口下界是「当前最好」，一次失败低返回的界往往正好等于 alpha。第一版拿表里的分数直接做差，等于拿 alpha 减 alpha | `RootMoveScore.exact = (score > alpha_before)`；新增 `SearchEngine::exact_root_score()`（ponder 窄路），段 B 只对「最好的」与「走的那手」各付一次精确复算；`gap` 只在有精确值的着法里找次优，**没有证据就不宣称妙手** |
+| 2 | 修完精确分以后，12 手全判成 `forced` | 「只有一手安全」被实现成「只有一手有精确分」，而根表尾部本来就没有精确分 → `safe_moves` 恒为 1 | `forced` 额外要求「至少一手别的着法有精确分且它不安全」（`review.second.pos.is_valid()`）；没有证据就落回 `none` |
+| 3 | 20k/6 复核 0 张卡 | 复核者与被复核者同强 | §6.8 新增「复核者必须比被复核者强」；`--budget/--depth` 的默认值因此不该与训练局同档 |
+
+发现 1 与 2 是同一类错误的两面：**「界」与「精确值」混用**。段 B 的每个判定都以「差多少」为轴，所以这条纪律要写死：任何进判定的分数，必须能回答「它是精确值还是界」。
+
+### 用例（`tests/test_training.cpp`，+6 条，累计 13 条与复盘相关）
+
+- `test_tactics_card_round_trips_every_field`：卡的每一个字段（含 `stones` 三元组、`evidence`、`difficulty`、`coeffs_sha`、`source`）往返；缺 `answer` 的卡必须被拒绝（一张没有正解的卡不能进题库）；
+- `test_tactics_layer_boundaries_match_the_doc`：8k / 64k 两个边界的闭开区间，以及 `solve_budget = 0` 归 `hard`；
+- `test_coefficient_fingerprint_is_stable_and_sensitive`：同一套系数指纹稳定、改一个量就变；
+- `test_replay_reviewer_refuses_an_illegal_replay`：撞格的记录 `position_before` 返回 false；
+- `test_replay_reviewer_scores_its_own_choice_as_lossless`：先问引擎它自己走哪手，再把那一手交给复核 → `loss == 0` 且不是 `blunder` / `unlisted`（这条直接抓发现 1 那类「没算」）；
+- `test_replay_reviewer_prices_a_difficulty_ladder`：梯子必须解出、且 `failed_at < solve_budget`。
+
+### 门禁
+
+- `ctest` **8/8 passed，493.69 s**（test_training 12.90 s）
+- `node tests/readme_anchor_check.js` **120 citations / 0 problems**
+- `node tests/web_frontend_check.js` **105/105 passed**
+- 新增/改动的编译单元零新增警告
+- `git diff --stat`：`CMakeLists.txt +28`、`tests/test_training.cpp +424`、`src/search/* +64`、`docs/ENGINE_REDESIGN.md +12`（轮次142 的状态声明）、`REVIEW_LOG.md`（本节）；新文件三个共 792 行
+
+### 判
+
+段 B / 段 C 按文档落地，并第一次产出了**真卡**：2 张俗手（`loss 55268`）、2 张漏杀，难度区间与摆棋测试的读数互相印证。三处修正都不是设计时想到的，而是「跑第一份真数据」跑出来的——与轮次144 的五个判据修正同一个模式：**这一段代码的难点不在搜索，在「分数是什么」**。
+
+还没做的（都在 §6.10 / §7 的 J 里）：`proven` / `judged` 分表与目录布局、`--export-samples`（要 `TrainingSample::teacher_move`）、`tools/tactics_bench.sh`、复盘面板。
+
+## 轮次144 引擎重构 J-1：复盘筛查第一次落地，而第一份真实记录把五条判据全改了一遍 — engine redesign stage J-1, stage A of the replay funnel lands (zero-search screening) and the first real record rewrites five of its judgments
+
+规格是 `docs/ENGINE_REDESIGN_V2.md` `§6.2`（两段式漏斗的段 A）、`§6.3.2`（四把尺与六种判定）、`§6.4`（「自动剔除前期无意义棋子」的两条判据）、`§6.10`（落点清单）与 `§7` 的 J 阶段。文档自己说 J「只依赖 E，不依赖 F/G/H，这是它能先开工的原因」，所以本轮就先把段 A 做出来，拿第一个读数去验 §6.2 那条「A 段 60 手 → 5–12 手」的前提。
+
+用户这一轮的指令是「这个是 linux 主机，ssh wdz@192.168.44.129，代码在 ~/Desktop/workspace/gomoku，请帮我严格按照你的设计文档写代码」。全部代码写在远端 Linux 主机上（Ubuntu / kernel 7.0.0-38 / 6 vCPU / cmake 4.2.3 / g++ 15.2.0），**没有一行是先在 Windows 上写好再拷过去的**。
+
+### 落点
+
+| 文件 | 行数 | 是什么 |
+| --- | --- | --- |
+| `src/training/replay_analyzer.h` | 100（新） | `ScreenReason` / `PlyScreen` / `GameScreen` / `ScreenConfig` / `ReplayAnalyzer`；头注释写清段 A **不做**什么（不判妙手俗手、不判 gap） |
+| `src/training/replay_analyzer.cpp` | 165（新） | 摆幅算术、中位深度、判定链、两条剔除 |
+| `tools/analyze_main.cpp` | 251（新） | `gomoku_analyze --replay`；`--bench` / `--export-samples` **明确拒绝**并说明要 `root_scores`，不假装能跑 |
+| `CMakeLists.txt` | +27 | `replay_analyzer.cpp` 进 `GOMOKU_TRAINING_SOURCES`；新增 `gomoku_analyze` 目标（链整个引擎，理由写在注释里） |
+| `tests/test_training.cpp` | +254 | 7 条用例（6 条筛子 ＋ 1 条四条守卫） |
+
+### 读数 1：第一个真实读数——漏斗通了，但数据源是瓶颈
+
+`gomoku_train --rounds 1 --data-games 4 --depth 4 --timeout-ms 400 --population 2 --generations 1`，产出 `/tmp/r144/records.jsonl`（4 局 / 86 手），再 `gomoku_analyze --replay`：
+
+| 量 | 实测 | 文档预估 |
+| --- | --- | --- |
+| 筛出率 | **14.0 %**（12 / 86） | 「A 段 60 手 → 5–12 手」 |
+| 每局候选 | **2.5**（两局 5 手、两局 0 手） | 5–12 |
+| `flat_game` | **2 / 4 = 50 %** | 只要求「记一条计数」 |
+| `replay` 手 | **46 / 86 = 53 %** | 没预料到 |
+| 判定分布 | big_swing 8 / method_shift 2 / mate_cross 2 / noise 6 / opening 8 / replayed 46 | — |
+| 方法分布（记录本身） | `replay` 46 / `alphabeta` 28 / `vcf` 8 / `must_block` 4；深度 {0: 58, 4: 28} | — |
+
+**一半的 ply 是 `replay`**：`RetryExplorer` 回退后重放的开局前缀，不是引擎的决定。这份样本里只有 match 局（game 0/2）是整局真搜的，两局 data 局几乎全是重试续跑（21/22 手是 replay）。所以：
+
+- §6.8 的「一局 60 手」在这台机器这个数据源上不成立，实测 **21–22 手**；
+- 段 A 的产出量由**对局来源**决定，不由阈值决定——要产题库，得先让 data 局记整局，或者只喂 match 局。
+
+### 读数 2：五条判据被真实数据改了五处
+
+这不是设计时想到的，是跑第一份记录跑出来的。每一条都写进了 `§6.3.3`：
+
+| # | 现象 | 修法 |
+| --- | --- | --- |
+| 1 | 记录里 `vcf` 8 手、`must_block` 4 手，报告却是 `method_shift 0 / must_block_run 0`——战术手同时带巨大摆幅，标签全被 `BIG_SWING` 抢走 | **具体判据压过量级判据**：`must_block_run > method_shift > mate_cross > big_swing > depth_dip` |
+| 2 | 出现 `swing = -199000` | 饱和分的假差值（100000 → 99000）。`BIG_SWING` 现在要求**两侧都不在将杀带内** |
+| 3 | `depth_dip` 落在 `vcf` 手上 | 战术手 `depth = 0` 是结构性的（不进 alphabeta），深度判据只对非战术手生效 |
+| 4 | 一手 `replay` 被标成 `method_shift` | 新增剔除类 `REPLAYED`（`replay` / `book` 不含决策），摆幅再大也不是候选 |
+| 5 | 战术层接管的那一手被判成 `NOISE`（两侧都在将杀带内 → 摆幅 0） | `NOISE` 增加「下一手不是战术手」——摆幅 0 不等于没信息 |
+
+修前修后的同一份记录：`24 (27.9%) / method_shift 0 / must_block_run 0 / depth_dip 2` → **`12 (14.0%) / method_shift 2 / depth_dip 0 / replayed 46`**。筛出率降了一半，而**降下去的那一半全是假阳性**（饱和分与重放手）。
+
+### 变异臂：断言真的在跑
+
+我的 7 条用例是纯 `assert`（不打印），所以先证明它们被执行：把 `swing_at(record, 0) == -300` 改成 `== -301`，增量重建 `test_training`，运行 **rc=134**，报 `test_training.cpp:5325: test_replay_swing_reads_from_the_mover_side(): Assertion ... failed`，随后从备份还原并复跑全绿。这与轮次141 的 M1–M4 是同一条纪律：**没有反证的新用例不算用例**。
+
+### 用例（`tests/test_training.cpp`，7 条）
+
+- `test_replay_swing_reads_from_the_mover_side`：`(-score_{i+1}) - score_i` 的符号与越界（`-1` / `last` / `last+1`），以及「对手报 -8000 = 自己赚了 7900」那一格；
+- `test_replay_screen_drops_the_opening_but_keeps_a_forced_reply`：开局 6 手全剔，但开局里的 `must_block` 不被剔（§6.4 的「别误伤唯一应手」）；
+- `test_replay_screen_flags_a_big_swing`：`opening_plies = 0` 时只留摆幅判据；最后一手没有摆幅，落回 `NOISE`；
+- `test_replay_screen_calls_a_flat_game_flat`：0 候选 → flat=1；一手大摆幅让它变 2 候选 → flat=0（§6.4 的边界就在 2）；
+- `test_replay_screen_refuses_an_invalid_record`：`reason == INVALID` 的记录一手都不产；
+- `test_replay_screen_sees_a_depth_dip_and_a_mate_crossing`：深度塌陷（中位 6、该手 3）与将杀带穿越各一格；
+- `test_replay_screen_keeps_tactical_plies_out_of_the_generic_judgments`：四条守卫各一个断言（战术手不落 DEPTH_DIP、将杀带内不落 BIG_SWING、连续必挡压过摆幅、接管点不被 NOISE 吃掉）。
+
+段 B 的妙手 / 俗手判定**故意**没有用例——它要 `root_scores`，还没落地，写了就是拿空壳骗绿。
+
+### 门禁
+
+- `ctest` **8/8 passed，500.86 s**（`test_search` 468.87 s、`test_server` 13.18 s、`test_training` 10.83 s、`test_position` 7.80 s、`test_session` 0.03 s）
+- `node tests/readme_anchor_check.js` **120 citations / 0 problems**
+- `node tests/web_frontend_check.js` **105/105 passed**
+- `cmake --build` 对新增三个文件**零警告**（构建日志里仅有的两条 warning 是既有的 `data_collector.cpp:95` 与 `test_training.cpp:3593`）
+- `git diff --stat`：`CMakeLists.txt +27`、`tests/test_training.cpp +254`、`REVIEW_LOG.md`（本节）、`docs/ENGINE_REDESIGN.md +12`（轮次142 的状态声明）；新文件三个共 516 行
+
+### 判
+
+段 A 按文档落地了，而它的**第一个读数否掉了文档自己的两个前提**：一是「一局 60 手」（实测 21–22），二是「5–12 手/局」（实测 2.5，且一半的局是 flat）。两处都已写回 `§6.2.1` / `§6.8`，并注明「不许拿预估当读数」。
+
+更要紧的是那五条判据修正：它们说明**段 A 的难点不在搜索，在标签**——同一手可以同时命中五条判据，谁当标签决定了题库的构成。所以 `§6.3.3` 留了一句纪律：「任何一条新判据进链，都要先回答它和已有判据同时命中时谁更能解释这一手」。
+
+下一步（段 B）的第一件事不是写复核，而是 `root_scores`（`§6.3.1`）——没有它，妙手与俗手都判不了，`--bench` / `--export-samples` 也只能继续拒绝。
+
+## 轮次143 架构再审（四问）：v2.1 立项——VCF 波前扩展判为「单根不做、跨根做」，战术层证明不入表被读成缺陷，黑白分离系数与复盘题库两条新主线进设计 — architecture re-review round: v2.1 answers the fourth question (replay analysis and a tactical problem library), rules the user's VCF wavefront proposal right in the batch and wrong inside one think, reads B5's "VCF/VCT never touch the shared table" as a defect rather than as a proof of equivalence, and adds per-colour coefficient sets plus a two-stage replay funnel
+
+用户这一轮要「基于 `ENGINE_REDESIGN.md` 和 `REVIEW_LOG.md` 重新评审架构并更新设计文档」，并列出实现过程中最突出的几个问题：① 单线程 ≥ 1M nps 做不到，瓶颈在 `pattern_score` 与 `finish_direction`，架构能否再优化，**并明确问「某些小逻辑重复性场景（如 VCF）可改成 GPU 异步加速，如波前扩展」**；② 深度 6 以上胜率一边倒、谁先手谁赢；③ 自我训练改多进程 / 绑核 / GPU，配后台进程管理，玩家同一网页可切换两种模式，参数随时改、有大白话与范围建议值、可预览，**一键训练并按胜率自动调威胁系数、黑白分开**；④ 复盘分析：自动剔除前期无意义手、快速定位妙手俗手、把棋盘收进训练库、训练时摆棋测试能否找到那一步。
+
+本轮**无生产代码改动**：`src/`、`tests/`、`web/`、`tools/`、`CMakeLists.txt`、`README.md`、`data/` 与 `3266dfc` 逐字节相同。仓库改动只有一份文档：`docs/ENGINE_REDESIGN_V2.md` 从 451 行改写为 998 行（v2.0 → v2.1，旧结论一条没删，差异表在附录 B；其中 879 行是第一轮定稿，第二轮的两处更正与 §2.6 的定价把它推到 998）。
+
+### 读进来的东西（评审的输入面）
+
+| 面 | 量 | 用途 |
+| --- | --- | --- |
+| `docs/ENGINE_REDESIGN.md` v1.0 | 608 行，逐节读完 | 43 条机制的原始规格；`:434`／`:592` 两处被注释按绝对行号引用，因此**本文件一个字节都没动** |
+| `docs/ENGINE_REDESIGN_V2.md` v2.0 | 451 行，逐节读完 | 三问的旧结论；本轮改写的基线 |
+| `REVIEW_LOG.md` 轮次121–142 | 逐节读 A2/A3/A4/A5/A6/A7/A8、B1–B5、C1–C4、D-1–D-5、E/F/G/H/I/J/K/L/M/N 与轮次142 | 全部读数的出处；本轮的每一个数字都能指回某一轮 |
+| 源码事实核对 | `params.h`、`evaluator.h`、`vcf.h`、`search_engine.cpp:190-250`、`move_generator.cpp:103-143`、`data_collector.h`、`game_record.h`、`trainer.h` | 判「改得动改不动」用的；文档里写的每个字段都在这些文件里核过 |
+
+### 判一：GPU 与波前扩展——用户的方案对了一半
+
+用户问的是「VCF 这类小逻辑重复场景能不能改 GPU 异步 / 波前扩展」。这句话拆成两个断言，分别判：
+
+| 断言 | 判 | 依据 |
+| --- | --- | --- |
+| VCF 是「小逻辑重复场景」 | **部分成立** | 每层只做一件事（找冲四 → 找唯一挡点），逻辑确实小且重复 |
+| 改成波前扩展就能上 GPU | **单次思考内不成立，批处理内成立** | 见下面四行 |
+
+单根 VCF 的树形不是宽树，是窄而深的强制链。四个量合起来就把这条路堵死了：
+
+| 量 | 值 | 后果 |
+| --- | --- | --- |
+| 每层宽度 | 1–3（冲四候选），对手应手多为 1（`find_block_move` 就是靠这一点工作） | 波前一层只有 1–3 个任务，GPU 占用率 ≈ 0 |
+| 层间依赖 | 严格（第 k+1 层的棋盘只能由第 k 层落子产生） | 无法流水，每层等一次往返 |
+| 每层工作量 | 一次 `recognize_position_both` × 候选数 ≈ **6.78 µs**（轮次121 B5 的探针实测） | 一层 ≈ 1.5 个 CPU 节点的钱，小于一次 kernel 往返（5–20 µs 量级，未实测） |
+| 提前退出 | `search_impl` 找到第一条胜线就返回 | 波前必须跑完整层才知道有没有胜线，**丢掉早退** |
+
+**所以 v2.1 的裁决是**：单根内的波前**不做**（写进文档，避免下一轮再被提一次）；跨根波前**做**，而且**先在 CPU 上做**——`WavefrontBatch` 吃一批互不依赖的根，同一层一起算，共享已预热的 LUT 与一份 `CandidateCache`。它有三个真实的消费者：复盘批处理（一局 60 手 × 千局 = 10^4 个根）、训练数据采集、开局筛选。GPU 侧的 `BatchEvaluator` 退到 O6，只留「探测不到设备就走 CPU」这一条路径，杀线是三档 B（256 / 1024 / 4096）跑不过 CPU 就整项作废。
+
+### 判二：B5 那句「VCF/VCT 不读写共享置换表」是缺陷，不是等价性证明
+
+轮次121 B5 为了让「门控不改变答案」成立，量到一件结构性事实：`VCFSearch` / `VCTSearch` 只把 `TranspositionTable&` 绑在成员上，`vcf.cpp` / `vct.cpp` 里**没有任何一次 probe/store**。那一轮把它当作「275 根 diff 为空」的原因之一，判为好事（隔离性好）。
+
+本轮把它当缺陷读：**战术层证明过的杀，主搜索一点都不知道**。后果是同一份证明被买三次——VCF 返回 `UNKNOWN` 时 AlphaBeta 从同一个根把同一棵强制树再爬一遍；下一手对手按主变应了一手，主搜索对已经证明过的局面一无所知。所以 v2.1 新增 **O5：`ProofTable`**（2^16 × 24 B ≈ 1.5 MB，只写 `WIN` / `PROVEN_LOSS`，`UNKNOWN` 一律不写，代龄按手推进），并给出三条杀线，其中第三条是「任何一臂出现着法或分值变化即回滚」——证明表的语义是「同一个答案换一条路径」，出现新答案就是 bug。
+
+这一条同时修正了 v2.0 的一个编号问题：v2.0 的 O5（GPU 批量后端）改称 **O6**，把 O5 让给更便宜的那一项。
+
+### 判三：棋力——四条修法不够，缺的是一把不饱和的尺
+
+v2.0 的 S1–S4（规则级交换 / 开局筛选 / 连续信号 / 深搜蒸馏）都在修「信号」，但没修「尺」。轮次129 的 45/48 不是引擎太强，是**标尺饱和**：两个候选系数都强到把同一开局算成必胜时，胜率永远是 1.0 与 0.0，与系数好坏无关。门槛 0.56 因此形同虚设。
+
+v2.1 因此加两条：
+
+- **S5：用题库的解题率替代胜率当棋力尺。** `solve_rate@{2k,8k,32k}` 三档 ＋ 分层 ＋ `first_ply_hit`，黑白分开统计。它不会饱和，因为题目本身按难度分层，弱引擎只解得出简单层。成本预估：40 题 × 8k / 228,000 nps ≈ **1.4 s**（可做门禁，不进 `ctest`——`ctest` 已 486 s，再塞会让人开始跳过它）。
+- **S6：黑白分离的系数 ＋ 平衡控制器。** 用户要的「黑白分开调」，架构上必须拆成两件事：`CoefficientPair`（数据结构）＋ 有界的单步修正（控制器）。三条不变量：① `eval(W) == -eval(B)` 按构造成立；② 两侧同值时整棵树与今天逐字节相同；③ **威胁阶梯两侧必须同阶（±20 %）**——否则「白方」就是另一个引擎，Elo 失去意义。控制器用 Wilson 区间判「偏了没有」（避免把 8 局噪声当信号），每轮最多一步、累计 5 步、`solve_rate` 掉 2 点即回滚。**一句话纪律：按色系数是「让训练赛不一边倒」的手段，不是「让引擎更强」的手段，强度只认题库。**
+
+### 判四：复盘与题库——四件事是一条流水线，而且第一段一次搜索都不用
+
+用户第四问的四件事（剔废手 / 找妙手俗手 / 进训练库 / 摆棋测试）不是四个功能，是一条流水线的四个出口。关键判断：**不需要新搜索算法**。`GameRecord` 已经逐手记了 `score` / `depth` / `nodes` / `method` / `stopped`（`game_record.h:25-41`），所以第一段筛查**零搜索**；只有被筛出来的那几手才用定预算复核（不是定时钟——轮次121 B5 量到 `time_limit_ms = 0` 会兜到 100 ms，不定量）。
+
+三段漏斗：A 零搜索（60 手 → 5–12 手）→ B 定预算复核（→ 1–4 张卡）→ C 难度标定（节点预算几何阶梯，命中即停）。判定用四把尺（摆幅 / 次优差 / 唯一应手 / 将杀距离），出六种卡：俗手、妙手、唯一应手、反例、漏杀、无意义。
+
+两处必须写清的设计：
+
+1. **「妙手」必须排除「被迫正确」**：只有一步能走的局面里走对了不叫妙手。不排除的话题库会塞满 `must_block`，`solve_rate` 立刻饱和——正好撞上 S5 的杀线。
+2. **`proven` 与 `judged` 必须分表**：杀棋题的正解由「能不能成五」决定，与系数无关，跨系数换代依然有效，可以当门禁；判断题的正解由系数决定，换代即失效。混在一张表里，门禁会在每次调参后无意义地变红。卡片因此必须带 `coeffs_sha`。
+
+成本（**全部预估，未测**）：B 段 0.63 s/局、C 段 1.6 s/局、合计 2.2 s/局单线程（1000 局 ≈ 37 min，4 worker ≈ 9 min）、摆棋门禁 1.4 s。四条杀线：筛出率 > 40 % 抬阈值；复核后判定率 < 10 % 不许进 C 段；`proven` 层全 0 或全 1 该层作废；加样本后 `solve_rate` 不升则题卡只留展示。
+
+### 文档落了什么（v2.0 451 行 → v2.1 879 行 → 补记后 998 行）
+
+| 位置 | 内容 | 性质 |
+| --- | --- | --- |
+| 头表 ＋ §0 | 三问 → **四问**，四问四答 | 改写 |
+| §1.4 | **新增**：战术层的账（275 根 method 分布、探针 6.78 µs/根、VCF/VCT 不入表） | 新增 |
+| §2.3 | **新增 O5**：战术证明入库 | 新增 |
+| §2.4 | **新增**：波前扩展的正面答复（单根不做 / 跨根做 / 三档 B 杀线） | 新增 |
+| §2.5 | G5 口径 ＋ **「nps 与节点数不许混报」** | 加一条纪律 |
+| §3.3 / §3.4 | **新增 S5**（题库当尺）、**S6**（按色系数 ＋ 平衡闭环） | 新增 |
+| §4.5.2 / §4.5.5 / §4.7 | 加 `train_autopilot` / `analyze_*` 帧；预览加 `solve_rate@8k`；门禁加第 6 条 | 扩充 |
+| §4.8 | **新增**：一键训练五相状态机（PREPARE/COLLECT/OPTIMIZE/VERIFY/BALANCE） | 新增 |
+| §5 | 三组参数 → **四组**；每张表加「建议档」列；加 `train_balance_step` / `train_teacher_depth` / `train_autopilot` / `analyze_*` / `tactics_*` / `proof_table_bits` | 扩充 |
+| §6 | **新增整章**：复盘分析与战术题库（10 小节，含格式、判定表、成本、杀线、落点清单） | 新增 |
+| §7 | 加 **J / K / L** 三阶段，并给出建议顺序 `E → J → F → G → H → I → K → L` | 扩充 |
+| §8 / §9 | 加五行风险、加两件拍板（S6 与「J 先开工」） | 扩充 |
+| 附录 A / B | 读数出处加六行；**新增差异表** | 新增 |
+
+`docs/ENGINE_REDESIGN.md` **未改动**：`:434`／`:592` 被 `tests/test_training.cpp` 按绝对行号引用，`:600-608` 的「已被 v2.0 取代」状态声明仍然成立（v2.1 只是 v2.0 的续写，不改那份声明的指向）。
+
+### 问题账（本轮真踩到的）
+
+| # | 事 | 处理 |
+| --- | --- | --- |
+| 1 | 长文档一次性 `Write` 会丢 `content`（轮次142 踩过，本轮开局即预防） | 全程分 8 块 heredoc 追加，每块后 `wc -l` 核行数；无一块丢失 |
+| 2 | v2.0 的 O5 已被占用，新增的证明入库想用同一个编号 | 新增项占 O5、旧的 GPU 后端改称 O6，并在附录 B 明写「编号让位」，避免读者以为丢了一条机制 |
+| 3 | 「妙手」的第一版判据只看「走对了且领先次优」 | 发现会把 `must_block` 全部收进题库，`solve_rate` 立刻饱和；加「不是唯一应手」这一条，并把理由写进 §6.3.2 的引注 |
+| 4 | 题库若只有一张表，系数换代后门禁会无意义变红 | 拆 `proven` / `judged`，卡片带 `coeffs_sha`，门禁只用 `proven` |
+
+### 补记（2026-10-21 当天第二轮）：两句更正与一笔定价
+
+用户读完 v2.1 后指出两件事：① 头表那句「v1.0 的 A/B/C/D 四阶段已全部落地」是错的；② `:124` 现在是「带开关达标」而默认 0＝关，文档从没为「每个等待中的会话多一条引擎线程」定价，问要不要抬到 25 %／50 %。本轮因此只改文档，仍无生产代码改动。
+
+#### 更正一：43 条机制的真实分布是 32 / 8 / 3
+
+轮次139 早就逐条重落点过（32 条在跑、8 条异形、3 条判不落地），是 v2.0 的头表把它写成了「全部落地」。按阶段读，差别落在两处：
+
+| 阶段 | 真实状态 |
+| --- | --- |
+| A | 全部落地 |
+| B | 主体落地，但 `:427` 威胁延伸、`:426` LMR **判不落地**；`:424` 的 −30~50 % 与 `:423` 的 −20~35 % **都没读到**（−3.9 %、−1.23 %） |
+| C | Step 1/2 落地（`:415` 承诺 −60 %，读到 −63.6 %），但 **`:549` 的 1M nps 未达**（228,000），Step 3 未做 |
+| D | 落地（−71.5 %、+71 kB/worker） |
+
+v2.1 的头表改为「已实施但未全部落地：32/8/3」，并新增 §1.5 把这张表写进正文——**这条更正比它看起来重要**：整份 v2.1 里凡是引用 v1.0 验收数字的地方，都必须先分清那个数字属于「在跑」「异形」还是「判不落地」。
+
+#### 更正二：ponder 的成本形状——它是节点帽，不是墙钟
+
+用户担心的「每会话多一条引擎线程」，量出来比想象的小，但确实从没被定价过：
+
+| 项 | 值 | 性质 |
+| --- | --- | --- |
+| 预搜预算 | 下限 4,000、上限 **200,000 节点**（`game_manager.cpp:53-60`） | 实测（代码） |
+| 折算墙钟上限 | 200,000 ÷ 228,000 nps ≈ **0.88 s 单核** | 折算 |
+| 线程起 ＋ join | 28.92 µs | 实测（轮次141） |
+| 每会话内存 | +64..96 kB RSS | 实测（轮次141） |
+| 新增置换表 | **无**（`ponder_search` 是 `SearchEngine` 成员，用会话自己那张表） | 实测（代码） |
+
+所以那条「多出来的线程」**不是常驻线程，是每次等待最多 0.88 s 的一段突发**——人类思考 10–60 s 的其余时间里它是睡着的。
+
+#### 定价：三档的净账，25 % 是效率峰值
+
+用轮次141 的「空闲节点和」与「省下 ÷ 花掉」两列反推总节点是净省还是净亏（积为折算，分母按 19–20 臂 × 30 万节点估，只判符号）：
+
+| 预算 | 花掉 | 省下 | 省 ÷ 花 | 本手降幅中位 | 总节点净变化 |
+| --- | --- | --- | --- | --- | --- |
+| 0 % | 0 | — | — | 8.76 %（TT 自身复用） | 基准 |
+| **25 %** | 850,693 | 1,082,932 | **1.273** | 30.75 % | **≈ −4 %（折算）** |
+| 50 % | 1,387,226 | 1,566,178 | 1.129 | 45.80 % | ≈ −3 %（折算） |
+| 100 % | 1,820,303 | 1,787,538 | 0.982 | 53.06 % | ≈ +1 %（折算，转负） |
+
+**结论：ponder 在总节点上近乎免费（−3 ~ −4 %），「它吃 CPU」这句理由只在 100 % 档成立。** 25 %/50 % 真正付出的不是节点，是并发与热量。
+
+并发那笔账才是用户指出的缺口：单会话 ≤0.88 s×1 核／次；N 会话同时等待就是 N 倍突发；训练 quota > 0 时还会抢 §4.4 只留的那 2 个预留核。因此新增**机制 P-1（ponder 槽）**：全局默认 1 个槽，拿不到就不 arm（不排队不重试），训练期间置 0，槽在 `cancel_ponder()` 的 join 后释放（含 `make_move`/`undo`/`request_hint`/`halt_search` 四条异常路径）。验收仪器是「12 会话同时等待，`ponder_arms()` 并发峰值 ≤ 1，且 p99 与单会话差 ≤ 5 %」——没有这条仪器，槽就是摆设。
+
+#### 一句话：抬到 25 %，不抬到 50 %
+
+四条理由，前两条实测、后两条口径：
+
+1. 25 % 是效率峰值（省÷花 1.273，50 % 是 1.129，100 % 已跌破 1）；
+2. 25 % 是唯一总节点降幅最大的档（≈ −4 %），50 % 多买的 15 个点降幅是用几乎等量节点换的；
+3. **45.80 % 是自对弈口径**——那 24 臂里「对手」是同一个引擎，它预测的应手真会被走出来；人类经常走别的，命中率未测。按 45.80 % 给默认值定价＝按最好情况定价；
+4. `:124` 只要求 ≥ 25 %，25 % 预算读到 30.75 %，是「用最小代价达标」。
+
+并且这次抬默认值**按行为变更处理**：`--ponder 0` 保留为对照臂（语义＝与轮次141 之前逐字节相同）；验收要 24 臂的「本手降幅中位」＋「每手 p50/p99」两组数，着法与分值必须一个不变；**杀线是「人类对局的实测命中率让 省÷花 < 1 就回 0」**——这条读数今天不存在，所以默认值可以抬，但**不许宣称「更快」**。
+
+#### 整改单：B/C/D/E/F 落成 §7.1 的一张表
+
+用户列的 B（内核 4.4 倍，要授权）、C（`:555` 整树赛）、D（`:556` 的 225×2×42 位置项表）、E（口径）、F（选点基准搬进树内）已写成 §7.1 的五行表，每行标出「现状 / 卡在谁手上」：D 与 F 是纯工程、不需授权可立刻做；E 只要一句话；B 与 C 等授权与窗口。这也解释了 §7 为什么把 J 排在 F 之前——J 的段 A 不需要任何人拍板就能开工。
+
+### 判
+
+四个问题都有答案，且答案的形状与前两轮一致：**承认边界，而不是再加一层机制**。算力承认单线程 1M 拿不到（给口径 ＋ 三项刺探 ＋ 一项「没成本的」证明入库），并把用户的波前方案**判对一半**（跨根成立、单根不成立），而不是笼统否掉；棋力承认一边倒是「尺坏了」而不是「引擎坏了」（给题库这把不饱和的尺，并把「胜率」从强度读数里降级）；训练承认多进程是对的，并把「一键」定义成一个可中断、可复现、可解释的五相状态机；复盘承认「不需要新算法」，把成本压在第一段的零搜索上。**八件需要用户一句话的事写在 §9**，其中第 1 条（G5 口径）与第 8 条（J 先开工）不拍板，后续阶段就没有开工依据。
+
+### 门禁
+
+- `git diff --numstat 3266dfc` 的代码侧为空；仓库改动只有 `docs/ENGINE_REDESIGN_V2.md`（451 → 998 行）与本节（纯插入）
+- `node tests/readme_anchor_check.js` **120 citations / 0 problems**（文档定稿后复跑）
+- `node tests/web_frontend_check.js` **105/105 passed**（同上）
+- **ctest / memcheck / TSan 不跑**：没有任何 `src/`、`tests/` 改动，树与轮次141 门禁跑过 `8/8 / 486.37 s` 的那一棵逐字节相同，不当成通过，按「无可回归新代码」记
+- 环境自检（2026-10-21）：`nproc` = 12、无 `nvidia-smi`、无 `/dev/dri`；6 物理核口径沿用 `docs/2026-10-19-stress-report.md`。**这条读数的对象测错了，当天即更正，见下面的「更正：本机有 AMD 显卡」一节。**
+
+### 更正：本机有 AMD 显卡，此前「无 GPU」的结论作废
+
+用户当天追问「我电脑是 AMD 显卡，有 GPU，看起来没识别到」。查 Windows 侧：`Win32_VideoController` 报 **AMD Radeon RX 6600 XT**（Navi 23 / gfx1032，RDNA2），驱动 32.0.21045.5002 —— 硬件与 Windows 驱动都正常。
+
+| 事 | 真相 |
+| --- | --- |
+| 那条「`/dev/dri` 不存在」 | 是在 **Windows 侧 Git Bash（MINGW64）** 里跑出来的。该 shell 里不可能有 Linux 设备节点，所以这条探测**不构成任何证据** |
+| WSL 下 AMD 卡的正确形状 | 只有 `/dev/dxg`（半虚拟化 D3D12 / WSLg），**永远没有 `/dev/dri`**，没有 `amdgpu` 模块，`rocm-smi` / `clinfo` 查不到 |
+| WSL 下能不能跑 ROCm/HIP | **不能**，AMD 官方不支持 ROCm on WSL |
+| 原生 Linux 下 gfx1032 | 不在 ROCm 官方支持列表（列表覆盖 gfx1030 的 6800/6900 与 gfx1100 的 7900 系列），要走 `HSA_OVERRIDE_GFX_VERSION=10.3.0` 的未支持路径；**Vulkan compute（Mesa RADV）是完整支持的** |
+
+对设计的影响，已同步改 `docs/ENGINE_REDESIGN_V2.md`（§2.1 更正块、§2.4.3 杀线、§7 的 L 阶段、§8 风险、§9 第 6 件、附录 A）：O6 的后端从「CUDA 或 HIP」改成 **Vulkan compute 首选 ＋ HIP 仅原生 Linux ＋ CPU 兜底** 的三级探测；**单次思考不进 GPU 的结论不变**（延迟与批量的算术与厂商无关），但「本机没有 GPU」不再能当免测理由——真机刺探必须在原生 Linux ＋ Vulkan 上单独跑一轮，读数另标环境。
+
+## 轮次142 架构再审（三问）：`docs/ENGINE_REDESIGN_V2.md` 立项——单线程 1M nps 改口径、深度 6 「谁先手谁赢」判为信号问题而非棋力问题、自我训练走 broker + worker 进程模型 — architecture re-review round: ENGINE_REDESIGN v2.0 written against rounds 121-141, GPU ruled out of the single think on latency arithmetic, the depth-6 first-move sweep diagnosed as a training-signal problem, and self-training redesigned as supervisor + pinned workers with a single-source parameter registry and web preview
+
+用户这一轮要「拉取最新代码，基于 ENGINE_REDESIGN.md 和 REVIEW_LOG.md 重新评审架构，并对实现过程中遇到的三个问题给出方案」：算力（单线程 ≥ 1M nps 实测达不到，瓶颈在 `pattern_score` 与 `finish_direction`，能否再优化／能否 GPU 异步加速）、棋力（深度 6 以上胜率一边倒、谁先手谁赢）、自我训练（多线程改多进程／绑核／GPU，配后台进程管理，玩家在同一网页随时切换「管理自我训练」与「普通人机」，所有参数可随时改、有大白话说明与范围默认值、可预览效果）。
+
+本轮**无生产代码改动**：`src/`、`tests/`、`web/`、`tools/`、`CMakeLists.txt`、`README.md`、`data/` 与 `3266dfc` 逐字节相同，仓库新增 `docs/ENGINE_REDESIGN_V2.md`（451 行）、`docs/ENGINE_REDESIGN.md` 末尾追加 12 行状态声明（纯追加，`:434`／`:592` 两处被注释引用的绝对行号未移位），`REVIEW_LOG.md` 纯插入本节。
+
+### 拉代码的那一步：一次真冲突，和一个意外发现
+
+本地 `phase5-engine-redesign` 的 HEAD `f48b77e` 落后 `origin/master` 两个提交（`bed4425` 轮次140 验收、`3266dfc` 轮次141 ponder），工作区另有未提交 WIP（`SearchController::search_board_` 一手交接）。处置：stash → `merge --ff-only origin/master` → pop。`tests/test_search.cpp` 撞在一处（上游轮次140/141 与 WIP 同时在同一位置追加用例），冲突区 `8676-9206` 上游侧 530 行、WIP 侧为空——WIP 的两个用例已在冲突区之前干净合入，`main()` 的注册行也已在位，因此清除三个标记即可，`git stash drop`。
+
+**意外发现写进档**：那笔 WIP 在 master 上已经被提交为 `038812e`（`feat: a hand-off may carry one Board now`）。也就是说本地那点改动不是新工作，是上游已落地代码的一份未同步副本。合并后 `git status` 为空、HEAD = `3266dfc`。本轮因此从「最新的树」而不是「落后两轮的树」读全部基线数。
+
+### 总判一：三个问题各自的答案，以及答案的证据形状
+
+| 问题 | 答案 | 证据 |
+| --- | --- | --- |
+| 算力还能改吗／GPU 行不行 | CPU 侧三改（`finish_direction` 线段 LUT、已占子线字键缓存、排序／威胁分分离）合计约 1.5 倍，单线程可望 45–65 万 nps，**不是 100 万**；GPU 不进单次思考，只进训练批量 | §1.2、§2.1（下） |
+| 深度 6 一边倒 | **不是退化，是深搜把先手优势发现了**。修法是规则级交换 + 连续训练信号 + 深搜蒸馏，加深搜索只会让信号更二值 | §3 |
+| 自我训练多进程 + 网页管控 | 方向正确。broker + N worker、绑核 `物理核−2`、文件 spool + UDS（不新开 TCP）、`ParamRegistry` 单一真源、`config_preview` 用固定针臂 | §4 |
+
+### 读数 1：GPU 的物理账——把它算完，它就出局了
+
+| 量 | 值 | 出处 |
+| --- | --- | --- |
+| 一个节点 CPU 成本 | 4,385 ns（42,353.5 Ir ÷ 9.66 GIr/s） | 轮次135–140 |
+| GPU kernel 启动 + 往返 | 5–20 µs 量级 | 本机无 GPU，此项是量级估算，标为未实测 |
+| `Board` 副本 / `sizeof(Board)` | 0.118 µs / 4,664 B | 轮次141 |
+| 线程起 + join | 28.92 µs（≈ 6.6 个节点） | 轮次141 |
+| 每节点候选格评估次数 | 44.94 次（42,353.5 ÷ 942.4） | 轮次135–140 |
+
+三条理由：搜索是深度优先单链（下一层取决于上一层剪枝），GPU 拿到棋盘时 CPU 已无事可做；每节点只有 44.94 次候选评估，一次 d6 的可并行前沿撑不满一个 GPU；热点函数已是 L1/L2 小表读，搬 GPU 的成本先付在把 4,664 B 棋盘搬过去。**所以 GPU 在本版只落在「批量且独立」的位置**：训练侧局面定价与 §3.2 S2 的开局筛选，走 `BatchEvaluator` 运行时探测后端，本机 `nvidia-smi` 与 `/dev/dri` 都不存在 ⇒ 探测不到即等价不存在。
+
+### 读数 2：CPU 内核三改的可行性边界——两处必须写清的「不可能」
+
+1. **`finish_direction` 不是纯查表函数**：它 14.45 % 的成本里有一半花在「窗口给了形状，但形状能不能变成威胁只有棋盘知道」的黑棋特判（`pattern.cpp:383` `run_length ≥ 6`、`:417` `five_points`、`:446` `live`）。所以它**不可能**并进现有 2^18 窗口 LUT——这点必须写进 v2.0 §1.2，否则会重犯 README 记录过的那次被否决的「全盘增量评估」式乐观。
+2. **评估族清零也只有 3.23 倍**：评估族占节点成本 69.19 %（轮次136）。42,353.5 → 9,660 需要 4.4 倍，而 1/(1−0.6919) = 3.23。叠加节点侧已量到的 1.34／2.03 倍，单线程天花板约 45–65 万 nps。**据此建议把 G5 拆成 G5a（单线程 ≥ 45 万）与 G5b（整机 ≥ 100 万）**，这是本版唯一请用户拍的数字。
+
+### 读数 3：深度 6 一边倒——根因三连
+
+README `:213` 与轮次129 实测（d4 / 400 ms，同系数镜像对局，前 48 条 4 手开局 **45 条一方通吃**）+ 轮次128（`--fitness-games 2` 只有一对，适配度 0/0.25/0.5/0.75/1 五档，SPRT 最大 \|LLR\| 2.395 < 界 2.944）+ 轮次126（`--max-nodes` 把 d 分布 `{3,4}` → `{2,3}` 后同 seed 结论翻面 0.875 ↔ 0.375）。三条指向同一件事：**训练闭环在深度 6 上学不到东西**。搜索越深，越多开局被判成先手必胜，「颜色通吃」比例上升，验证分被钉在 0.5，门槛 0.56 形同虚设。v2.0 因此把 S1（`--opening-rule none/swap/soosyrv`，规则级补偿）排在第一位，S3（终局分差／成五手数／认输深度三个连续分量，全部从现有产物取）第二位，S4（`min_search_depth_` 提升 + `teacher_move` 蒸馏）第三位，S2（开局集按双方胜机筛选、GPU 唯一形状对的位置）第四位。每条都带杀线，且 S3 的第一条杀线就是「不许让同 seed 结论翻面」。
+
+### 读数 4：进程模型的四条理由，三条有实测
+
+崩溃隔离（memcheck 下 assert 会 abort，轮次124/141 两处 rc=134；线程模式一个 assert 带走整个 trainer）；`--threads` 语义已是糊涂账（轮次125：不带数据采集时惰性，user 56.50 vs wall 57.06、三份 RSS 只差 212 kB，因为这个 flag 只是「并行数据采集 worker」）；玩家思考必须与训练不共核（本机 6 物理核，asio 要留核）；TT 本来就每引擎一张（轮次127 共享表 20,448→21,496 kB 平坦，进程边界与共享表边界天然对齐）。
+
+IPC 选型有一条硬约束来自实测：一次并发压测曾把临时端口池打满、导致机器硬重启（`docs/PROMPT_STRESS_TEST.md`），故**新 IPC 不许再开 TCP 监听**——大流量走文件追加写（每行带 `run_id`/`seq`，broker 只 tail 不 seek，半行写识别后丢弃并重排任务），控制走 UDS。
+
+### 问题账（本轮真踩到的）
+
+| # | 事 | 处理 |
+| --- | --- | --- |
+| 1 | 长篇文档内容连续多次随工具调用丢失，`Write` 报 missing required parameter(s): content，产生了一个只有标题的空文件 | 改为分块 heredoc 追加；空文件被第 1 块覆盖，无残留半成品 |
+| 2 | `tests/test_search.cpp` 的 stash pop 冲突，一上手看像「上游覆盖了 WIP」 | 逐行读完冲突区才发现 WIP 的两个用例已在冲突区之前合入、注册行也已在位，清三个标记即可，没有丢任何一条用例 |
+| 3 | 一度准备把 v1.0 文档改写为新版 | 发现 `tests/test_training.cpp:3989` 按 `ENGINE_REDESIGN.md :434, :592` 绝对行号引用，改写会推弯全档引用；改为末尾纯追加 12 行状态声明，并实测 `:434`／`:592` 内容未移位 |
+| 4 | 准备在 README 加新文档指引 | 先跑 `readme_anchor_check` 与 `web_frontend_check` 确认不动 README 即无引用面影响，最终未改 README，两支检查原读数通过 |
+
+### 判
+
+三个问题都有答案，且答案的形状是「承认边界」而不是「再加一层机制」：算力承认单线程 1M 拿不到（给口径 + 三条树外刺探 + 杀线）；棋力承认一边倒是信号问题（给规则级交换 + 连续信号 + 蒸馏，每条带杀线）；自我训练承认多进程是对的（给进程模型 + 绑核 + 单一真源 + 预览，并给 Windows 回退的杀线）。**六件需要用户一句话的事写在 v2.0 §8**，其中第 1 条（G5 口径）不拍板，F 阶段的三项刺探就没有开工依据。
+
+### 门禁
+
+- `git diff --numstat 3266dfc` 的代码侧为空；本轮仓库改动只有三份文档：`docs/ENGINE_REDESIGN_V2.md`（新增 451 行）、`docs/ENGINE_REDESIGN.md`（+12，纯末尾追加）、`REVIEW_LOG.md`（本节纯插入）
+- `node tests/readme_anchor_check.js` **120 citations / 0 problems**；`node tests/web_frontend_check.js` **105/105 passed**（两支都在文档定稿后复跑）
+- **ctest / memcheck / TSan 不跑**：没有任何 `src/`、`tests/` 改动，树与轮次141 门禁跑过 `8/8 / 486.37 s` 的那一棵逐字节相同，不当成通过，按「无可回归新代码」记
+- 环境自检（2026-10-20）：`nproc` = 12、无 `nvidia-smi`、无 `/dev/dri`；本机 6 物理核口径沿用 `docs/2026-10-19-stress-report.md`
+
 ## 轮次141 引擎重构 N（方案A）：§2.4.3 ② 的 ponder 第一次进树——G3 那一格从 8.8 % 读到 45.8 %（25 % 预算 30.8 %），而 TSan 的变异表说承重的那件事不是「join」而是「副本」 — engine redesign stage N: design doc §2.4.3 ② (pre-search the reply the last think's own PV predicted) lands, G3's second cell reads 45.8 % median at a 50 % budget and 30.8 % at 25 %, and the mutation table shows the load-bearing guard is the Board copy, not the joins
 
 用户上一轮要「依次验收」，本轮要的是「先做A」——方案 A 就是轮次140 为 `docs/ENGINE_REDESIGN.md:124`（G3 第二格「节点数较冷启动下降 ≥ 25 %」，实测中位 8.8 %）开的那张整改单，出处是文档 `:299`：

@@ -28,6 +28,9 @@ struct SearchResult {
     int elapsed_ms = 0;
     std::string method;
     std::vector<Move> principal_variation;
+    // §6.3.1：根着法逐个分值，按分值降序、最多 kRootScoreReportLimit 行。只有
+    // AlphaBeta 的完整层会填它；快路径与战术层留空（它们的答案不是「比出来的」）。
+    std::vector<RootMoveScore> root_scores;
     bool resigned = false;
     // AlphaBeta's layered accounting, so a hand that ran out of budget is
     // distinguishable from a hand that had nothing to search: depth is the last
@@ -94,6 +97,12 @@ public:
     // nothing this returns is delivered to anybody.
     SearchResult ponder_search(const Board& board, int color, int max_depth,
                                int node_cap, std::atomic<bool>& stop_flag);
+
+    // §6.3.1 的补充：一个根着法的精确分值。根表里排在后面的着法带的是界，复盘
+    // 要判「差多少」时必须付这一次钱。走的是 ponder 那条窄路（无书、无战术层、
+    // 无时钟、只有节点帽），因为复盘要的是同一个深度的可比读数，不是一次完整思考。
+    int exact_root_score(const Board& board, int color, Move move, int max_depth,
+                         int node_cap, std::atomic<bool>& stop_flag);
 
     void set_progress_callback(ProgressCallback cb) { progress_callback_ = cb; }
 

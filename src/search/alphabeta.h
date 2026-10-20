@@ -21,6 +21,9 @@ struct SearchInfo {
     int score = 0;
     Move best_move;
     std::vector<Move> principal_variation;
+    // §6.3.1 的根着法表。SearchInfo 是 SearchStats 的镜像，所以这里也要有它，
+    // 否则 §6.10 的落点在 to_info 处断掉（第一次接线就是这么断的）。
+    std::vector<RootMoveScore> root_scores;
     int elapsed_ms = 0;
     // What a hand that ran out of budget looks like. One layer completing is the
     // normal case, and then partial_depth stays 0; when it did not, depth is the
@@ -115,6 +118,10 @@ private:
     // once when a layer commits, which is what keeps the line and the node count two
     // separate questions.
     PvTable pv_;
+    // 本层已经问过的根着法及其分值。层开始时清空，层完整提交时排序、截断、搬进
+    // stats_.root_scores；被切断的层不搬——那半张表里的数来自短路的子树，和 PV
+    // 是同一条纪律。
+    std::vector<RootMoveScore> layer_scores_;
     int node_limit_;
     // Only the layered accounting left in the object: the counters and the three
     // ways a think can end live in the context, so the stop test is one function

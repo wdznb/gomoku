@@ -59,6 +59,23 @@ struct RootScore {
     }
 };
 
+// 一根根着法的分值（设计文档 ENGINE_REDESIGN_V2.md §6.3.1）。段 B 要判「这一步
+// 排第几、差多少」，而一个 think 只报最好的那一手时，俗手与妙手都判不了：俗手是
+// 「走的那手比最好差了多少」，妙手是「走的那手领先第二名多少」，两句话都要整张表。
+// 只在根层收集，只在完整层提交，且不进 WebSocket 帧——帧只发判定结果，不发整张表。
+struct RootMoveScore {
+    Move move;
+    int score = 0;
+    // 这个分是不是精确值。根层给后续着法的窗口下界是「当前最好」，所以一次失败低
+    // 返回的是界（往往正好等于 alpha），不是那一手的真值。排序可以拿界用，判
+    // 「比最好差多少」不行——段 B 因此只对 needs-exact 的几手付复算的钱。
+    bool exact = false;
+};
+
+// 一张表报几行。§6.3.1 定的是 8：报告只需要前几名与「走的那手」的相对位置，
+// 再长就是给一次思考的载荷加字节。
+constexpr int kRootScoreReportLimit = 8;
+
 // How one think is allowed to spend its budget.
 struct SearchLimits {
     int max_depth = 8;
@@ -83,6 +100,7 @@ struct SearchStats {
     Move best_move;                 // the last completed layer's winner
     Move partial_best_move;         // the interrupted layer's, for display only
     std::vector<Move> pv;
+    std::vector<RootMoveScore> root_scores;  // 完整层的根着法分值，按分值降序
     uint64_t nodes = 0;
     uint64_t qnodes = 0;
     uint64_t tt_hits = 0;
