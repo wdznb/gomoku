@@ -261,7 +261,7 @@ git push origin master                # 然后核对 git log --oneline -1 origin
 
 ### 丙-2 O2：`BoardValueCache`（**文档原文写错了，按这里做**）
 
-**状态**：未做。**注意：`ENGINE_REDESIGN_V2.md` §2.2 O2 的前提是错的**——它说「`pattern_score` 对每颗已占子调用」，实际 `pattern_score` 是对**空候选格**调的（`evaluator.cpp:279/289`），已占子只进 `position_term` / `edge_penalty_term`（`:208-233`，那里不调 `pattern_score`）。所以「已占子键缓存」打不到那 20.85 %。
+**状态**：未做。**注意：`ENGINE_REDESIGN_V2.md` §2.2 O2 的前提是错的**——它说「`pattern_score` 对每颗已占子调用」，实际 `pattern_score` 是对**空候选格**调的（`evaluator.cpp:279/289`），已占子只进 `position_term` / `edge_penalty_term`（`:208-233`，那里不调 `pattern_score`）。所以「已占子键缓存」打不到那 20.85 %。**轮次153 实测：这一半已经在树里**——`CandidateCache::board_score`（§2.6 Step 2/3，轮次122-123）就是这份每格棋盘和价缓存，键是四条线字、失效判据是线字键比对，命中由 `test_search` 的 C2-4 钉着（quiet BLACK d6：8,755,599 probes／4,949,934 命中 = 56.5 %）；状态应为**已做**，本轮交的是点名而树里缺的两张验收（18,900 组逐格差分 ＋ cap 不进缓存）。
 
 **目标效果**：把 `evaluate_board` 里每个空候选格的**棋盘和价**（`board_pair_value`）缓存起来，键不变就复用，把 20.85 % 的 `pattern_score` 大部分省掉。
 
@@ -288,7 +288,7 @@ git push origin master                # 然后核对 git log --oneline -1 origin
 
 ### 丙-3 O3：排序分与威胁分分离
 
-**状态**：未做。排序路径现在算两色全量配对分（`CandidateCache::cell` 8.20 % ＋ `recognize_position_both` 8.18 %），而排序真正需要的只是「这一格是冲四 / 活三 / 挡点吗」。
+**状态**：轮次154 实测判**不落地**。前提先纠正：排序路径**不重识别**——`sort_moves` 的 ③/④ 段（`alphabeta.cpp:88-98`）读的是丙-2 那条缓存的记录（`cell()` 命中就是一次加法），识别与两色求值只发生在失算那一次，`CandidateCache::cell` 9.50 % ＋ `recognize_position_both` 8.66 % 是失算的成本、不是每节点排序的成本。机制按本单元原样量过（威胁等级键）：六臂每一次宽度截断的 kept 集合有 **99.45 %~100 %** 与今天不同（每份被截的 tier 只有 3.6~4.0 个等级，宽度却要留 8-16 个），杀线直接命中；成本侧「`cell()` 填两色价」整条路实测 ≈ 13.56 % Ir，够不到本单元 `≥ 30 %` 那一格（需要 354.5 `Ir/候选格`，整条路只有 160.2），而文档 `ENGINE_REDESIGN_V2.md:187` 自己的估值是 6-8 %。读数、口径与未测项见 REVIEW_LOG 轮次154。
 
 **目标效果**：排序路径改成 O(1) 线字判定，两色全量配对分只保留在叶子（`stand_pat` / `evaluate_board`）。
 
@@ -703,7 +703,7 @@ git push origin master && git log --oneline -1 origin/master
 | 丙-1 | 命中返回什么 | `±(100000 + dist)` | 认输判定（`search_engine.cpp:349`）与 TT 距离还原都依赖这个约定 | 不换 |
 | 丙-2 | 缓存挂哪 | `SearchState`（跟一次思考生死） | `Board` 要可复制、要能跨思考复用，挂上去会带来失效地狱 | 不换 |
 | 丙-2 | 键用什么 | 四 `uint64` 线字 | 「±2 邻域」会漏：实测 (7,7) 会因 (7,12) 落子而变（轮次122） | 不换。键成本 > 收益时是**作废**，不是换键 |
-| 丙-3 | 威胁等级从哪来 | 复用 `MoveGenerator` 已有的一次 `recognize` | 那里已经为分 Tier 扫过一遍，再算就是第三次 | 若它给不出所需布尔量，才新写线字判定 |
+| 丙-3 | 威胁等级从哪来 | 复用 `MoveGenerator` 已有的一次 `recognize` | 那里已经为分 Tier 扫过一遍，再算就是第三次 | 不换。轮次154 补：布尔量**给得出**（等级 = 行棋方四方向 `PatternType` 最大档），分辨率**给不够**（每份被截的 tier 只有 3.6-4.0 档，宽度却要留 8-16 个），所以不存在「再写细一点」的第二方案 |
 | 丙-3 | 着法变了怎么办 | **不换方法，直接作废** | 这一项改的是「哪些格子被保留」，着法变了说明 Tier 判定被改了，不是优化 | 不换 |
 | 丙-4 | 键宽 | 3^13（实现时用 3^12 压缩索引） | 中心格恒黑（`pattern.cpp:350`），只有 3^12 个不同键，省 6 倍内存 | 不换 |
 | 丙-4 | 建表方式 | **复用现有 `finish_direction` 的纯函数副本** | 重写会有第二份语义，两份迟早漂移 | 不换 |
