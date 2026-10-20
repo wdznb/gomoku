@@ -21,27 +21,25 @@
 
 | 项 | 值 |
 | --- | --- |
-| 构建/验证主机 | `ssh wdz@192.168.44.129`，代码在 `~/Desktop/workspace/gomoku` |
+| 主机 | **就是你现在所在的这台 Linux 主机**；代码在 `~/Desktop/workspace/gomoku` |
 | 主机 | Ubuntu，kernel 7.0.0-38，**6 vCPU**，VMware 虚拟机（只有 SVGA 虚拟卡，**AMD 卡未直通，GPU 路径不可验证**） |
 | 工具链 | cmake 4.2.3、g++ 15.2.0、node v22、无 ninja |
 | 构建 | `cmake --build build -j6 --target <目标>`；`build/` 已配好离线 JSON（`FETCHCONTENT_FULLY_DISCONNECTED=ON` ＋ `build/_deps/json-src`），**不要重新 configure 成联网模式** |
 | 测试 | `ctest --test-dir build`（8 个套件，**约 500 s**，`test_search` 占 470 s） |
 | 推送 | origin 是 SSH（`git@github.com:wdznb/gomoku.git`），主机 `~/.ssh/id_ed25519` 认到 `wdznb`。**HTTPS 无凭据，别用** |
-| Windows 侧 | 只是编辑副本，**没有 C++ 编译器**；所有构建/测试都在上面那台 Linux 主机 |
+| **实现者位置** | **你就在这台 Linux 主机上**：直接编辑 `~/Desktop/workspace/gomoku`，直接构建、直接 `git push`。**不需要 ssh，也不需要 tar 同步** |
 
-### 1.1 改代码的正确姿势（重要）
+### 1.1 改代码的正确姿势
 
-**不要**在远端用 python/sed 打补丁——工具层会吃掉 `\n` 转义，行级替换会命中同名子串，前几轮因此把 `analyze_main.cpp` 打坏过两次。
+**你就在这台主机上**，直接编辑 `~/Desktop/workspace/gomoku` 里的文件、直接 `cmake --build`、直接 `git push`。没有同步环节，所以不会出现「本地改了但远端没同步」这类问题。
 
-正确做法：
+仍然要守三条：
 
-```
-本地 Read/Edit/Write 改文件
-  → tar cf - <改动文件> | ssh wdz@192.168.44.129 'tar xf - -C ~/Desktop/workspace/gomoku'
-  → ssh ... 'cmake --build build -j6 --target <目标>'
-```
+1. **一次只改一个文件（或一对必须同时改的 .h/.cpp），改完立刻编译**。多文件一起改，编译错误会掩盖真正的失败点，定位成本翻倍。
+2. **不要用 `sed -i` 或脚本做多锚点替换**：含转义的锚点容易不匹配，行级替换会命中同名子串——本仓库曾因此把 `analyze_main.cpp` 打坏两次，只能 `git checkout` 回滚。用编辑器精确改，或改完立刻编译验证。
+3. **批量脚本一律用 `&&` 串联**：脚本中途失败时，后面的命令不能照跑（尤其是「改完就 commit」这类链）。
 
-**一次只改一个文件（或一对必须同时改的 .h/.cpp）**，编译通过再动下一个。所有串联用 `&&`，**绝不用换行分隔**——上一轮就是因为换行串联，python 断言失败后 `tar` 照跑，把半成品推了上去。
+> 如果你是从 Windows 侧编辑副本（另一种工作方式），才需要 `本地改 → tar cf - <文件> | ssh ... tar xf -` 这条链路。那种方式下**命令必须用 `&&`**，否则脚本断言失败后同步照跑，会把半成品推到远端。
 
 ---
 
@@ -49,8 +47,8 @@
 
 | # | 规矩 | 为什么 |
 | --- | --- | --- |
-| 1 | **一次一个文件，编译通过再下一个** | 多文件补丁坏在中间会把半成品推进树 |
-| 2 | **命令串联一律 `&&`** | 失败必须阻断后续同步 |
+| 1 | **一次一个文件，编译通过再下一个** | 多文件一起改，编译错误会掩盖真正的失败点 |
+| 2 | **命令串联一律 `&&`** | 脚本中途失败时，后面的命令不能照跑 |
 | 3 | 编译失败 → `git checkout -- <该文件>` 立即回滚 | 已验证这是最快恢复路径 |
 | 4 | 新增用例至少一条**变异臂**：改错一条断言 → 期望非零退出并报出行号，然后还原 | 纯 `assert` 的用例不验证一遍，等于没写（轮次144 起执行） |
 | 5 | 改 `src/` → 必须跑完整 `ctest`；只改 `tools/`、`web/`、`docs/` → 可以不跑，但必须在提交信息里写明理由 | `ctest` 里没有 `tools/` 目标 |
@@ -601,10 +599,10 @@ git push origin master                # 然后核对 git log --oneline -1 origin
 
 | # | 坑 | 现象 | 处置 |
 | --- | --- | --- | --- |
-| 1 | 远端 python/sed 打补丁 | heredoc 吃掉 `\n` 转义，含反斜杠的锚点全不匹配 | 本地 Edit ＋ `tar` 同步 |
+| 1 | 用 python/sed 打多锚点补丁 | 含转义的锚点会不匹配（heredoc 还会吃掉转义），改一半就退出 | 用编辑器精确改；脚本里每个锚点 `assert count == 1` |
 | 2 | 行级 find/replace | `cards written` 命中了同名子串，把 `analyze_main.cpp` 打坏 | 用唯一锚点，改完立刻编译 |
-| 3 | 换行串联命令 | python 失败后 `tar` 照跑，半成品进树 | 一律 `&&` |
-| 4 | Write 工具写 dotfile | `.patch.py` 在沙箱下不落盘 | 用普通文件名 |
+| 3 | 换行串联命令 | 前一条失败后，后一条照跑（曾把半成品推到远端） | 一律 `&&` |
+| 4 | 写 dotfile 存脚本 | 某些沙箱/工具下 dotfile 不落盘，脚本「成功」但文件不存在 | 用普通文件名（如 `patch_j.py`） |
 | 5 | `readme_anchor_check` | 给 README 插一行，后面所有 `README:NNN` 位移 | 只追加到末尾，或改完立刻重跑 |
 | 6 | `web_frontend_check` | 105 项是**行为断言**，`drawEvalGraph` 几何被逐点校验 | 加标记只追加绘制 |
 | 7 | `time_limit_ms = 0` | 会被兜到 100 ms，层切割点跟机器忙闲走 | 复盘/定深臂一律 `set_max_nodes` ＋ 不 binding 的时限 |
@@ -619,8 +617,7 @@ git push origin master                # 然后核对 git log --oneline -1 origin
 ## 6. 验收命令模板
 
 ```bash
-# 0) 开工前
-ssh wdz@192.168.44.129
+# 0) 开工前（你已经在主机上，直接进目录）
 cd ~/Desktop/workspace/gomoku && git pull && git log --oneline -1   # 期望 a9dfeb1 或其后代
 
 # 1) 改完一个文件
