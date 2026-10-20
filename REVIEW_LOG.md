@@ -1980,6 +1980,46 @@ additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cp
 no existing assertion was edited.
 
 
+## 轮次153 引擎重构 丙-2：`BoardValueCache` 这一半**已经在树里**——本轮补的是指导书点名的两张验收（18,900 组逐格差分 ＋ cap 不进缓存），并登记 §4 丙-2 的状态行过期 — engine redesign stage 丙-2: the per-square board-value cache the unit asks for is what §2.6 Step 2/3 shipped (rounds 122-123); this round adds the two acceptance artefacts the guide names — an 18,900-group per-cell differential over the census and a cap-is-not-cached pin — and registers that 丙-2's 状态 line is stale
+
+**先说结论与证据**：指导书 §4 丙-2 写「未做」，但它自己在 注意 里要求的四条形状，生产码里已经在跑：
+
+| 指导书要求 | 树内是哪一段 |
+| --- | --- |
+| 实现思路 1：每格一份记录，键是四条线字（`line_key`），黑白各 32 位拼一个字 | `src/search/search_state.h:339-345` ＋ `Entry{uint64_t key[4]; Cell; bool valid}` |
+| 实现思路 2：缓存的是 `board_pair_value` 的返回值，与排序用的 `candidate_pair_value` 是两个数 | `search_state.h:321`（求和读记录）／`evaluator.cpp:192`（排序价），两者不同函数、不同用途 |
+| 实现思路 3：读穿——键相同用旧值，不同就重算并更新 | `CandidateCache::cell()`（`:245-270`），命中/重算/问数三个账本 |
+| 实现思路 4：挂在 `SearchContext`/`SearchState` 上，跟着一次思考生死，不放进 `Board` | 缓存在 `MoveGenerator` 里，`MoveGenerator` 在 `AlphaBetaSearch` 里（`search_engine.cpp:252` 那个作用域），C2-5 钉着这条边界 |
+| 注意 1：cap 不在缓存里 | 夹子只在 `evaluate_board_from`（`evaluator.cpp:270-272`）落 |
+| 注意 2：失效判据是线字键，不是 ±2 邻域 | `cell()` 比的就是 4 个 `uint64`；轮次122 记过 (7,7) 会因 (7,12) 落子而变 |
+
+另外一条实测能一眼看清「这件事已经买过了」：`Evaluator::evaluate_board` 在 `src/` 里**没有任何生产调用方**（`grep -rn "evaluate_board(" src/` 只剩它自己的定义与注释），叶子的求和走的是 `alphabeta.cpp:159/346 → move_gen_.board_score() → CandidateCache::board_score()`。生产命中率也早有断言守着：C2-4 那行 `8,755,599 / 4,949,934 / 3,805,665`（问数／命中／重算，黑）＝**56.5 % 命中**，白是 `7,247,557 / 4,132,247 / 3,115,310`。
+
+**所以本轮不新建第二张缓存**——同一份「每格棋盘和价」被缓存两次才是这里真正的风险。本轮交的是丙-2 验收点名、而树里确实没有的两样东西。
+
+### 新增：`tests/test_search.cpp:9209` `test_the_board_sum_cache_answers_every_cell_of_the_census_and_keeps_the_cap_outside`
+
+- **验收①「18,900 组逐格相同」**：42 副普查盘（`c2_census_boards()`，指导书说的「复用乙-1 的棋盘集」——`tests/pinned_positions.h` 那份与它逐位相同，这里用套件内已有的那份，因为 `test_search.cpp` 顶部加一个 `#include` 会把它自己三条被按行号引用的断言（`:2591/:3973/:3986`）推走）× 225 格 × 2 色 = **18,900 组**，`assert(groups == 18900)` 把字面计数钉住（普查盘被换小就红）。拆分：**16,764 组**空格——记录的图案与现算的 `recognize_position_both` 逐字段相同、加数 `board_pair_value(记录) == board_pair_value(现算)`；**2,136 组**占子格——守卫直接拒绝（`cell()` 返回 null），并且断言这一格**不在 `active_empty()` 里**。
+- **验收②「cap 不被缓存」**：49 子的拥挤盘，逐格加数（未夹）之和实测 **−1,735,960**，求和之后是 **−99,999 == −(five − 1)**。断言写成双向：越过 `±(five-1)` 的和被拉回同号的界，而记录里躺着的始终是未夹的加数；同一盘面 `board_score` 与 `evaluate_board` 同数。
+- 验收②的另一半（**成本对比与针臂不变**）本轮实测**没有新路可买**：热路径一行未动（`git diff --numstat` 只有 `tests/test_search.cpp` 的 98 行），所以 `Ir/节点` 前后是同一棵树。杀线「`Ir/节点` 降幅 < 5 % 作废」由**已落地的 Step 2/3** 满足：轮次122 的记录是排序/候选识别 −88.5 %、总识别 −63.6 %、`ns_per_node` −7.9 %、`knps` +8.5 %，且 18 臂节点数一字不变（纯成本改动，答案不变）。本轮不假称量了一个新收益。
+
+### 问题账（本轮真踩的）
+
+| # | 事 | 处理 |
+| --- | --- | --- |
+| 1 | 我第一版把「占子的格」写成「现算也应得 0」→ `assert(fresh_addend == 0)` 红。`recognize_position_both` **不看占用**，它对占子格给的是非 0 的图案；两边同意的其实是「这一格谁都不问」（`evaluate_board` 只走 `active_empty()`） | 断言改成「守卫拒绝 ＋ 不在候选表里」，并在注释里写清这条差别，免得下一轮又把它当「加数为 0」 |
+| 2 | cap 那一条先写成单向 `uncapped > cap`，实测这块盘越的是**下界**（−1,735,960 → −99,999） | 改成双向：`|uncapped| > cap` 且 `capped == (uncapped>0? cap : -cap)`，读数原样打印 |
+
+### 门禁
+
+- 变异臂（纪律 4）：把逐格等式 `cached_addend == fresh_addend` 改成 `== fresh_addend + 1` → **`rc=134`**，报 `tests/test_search.cpp:9252: Assertion 'cached_addend == fresh_addend + 1' failed`；还原后 `cmp` 逐字节相同，重跑套件全绿。
+- `ctest` **9/9 / 735.27 s**（`test_search` 466.66、`test_pinned` 239.94）。`readme_anchor_check` 122 citations / 0 problems；`web_frontend_check` 111/111。
+- 本轮不动 `src/`（生产码与 `03de8a4` 逐字节相同）。
+
+### 判
+
+丙-2 交付为「**机制已在树内（§2.6 Step 2/3）＋ 本轮补它欠的两张验收**」。给指导书的一句：§4 丙-2 的状态行「未做」应改成「已做，形状是 `CandidateCache::board_score`；`Evaluator::evaluate_board` 只剩差分基准的角色」，§9.4 那一行的落点也从 `test_evaluator` 改成 `test_search`——那张缓存住在 `src/search/`，`test_evaluator` 的 TU 只链 board/pattern/evaluator，根本没有缓存可测。
+
 ## 轮次152 引擎重构 丙-1：`ProofTable` 建起来量了——命中 3.59 %（第一格过），节点降幅 **0.00 %**（第二格不过，杀线触发），而且 84 根里有一根的 `method` 从 alphabeta 变成 resign ⇒ 判不落地并回滚 — engine redesign stage 丙-1, the tactical proof table was built and measured: 3.59 % hit share clears the first kill line, a 0.00 % node drop trips the second, and one root's `method` flips alphabeta→resign, so the mechanism is judged 不落地 and reverted (生产码回到 `3f0e5a8` 逐字节)
 
 指导书 §4 丙-1（v2 §2.3 O5）。这条机制的依据是实测（轮次121 B5：`vcf.cpp`/`vct.cpp` 里没有任何一次 probe/store，同一份证明可能被买三次），指导书给了两条杀线：**命中 < 3 % 作废**、**命中达标但节点降幅 < 2 % 也作废**，外加一句硬规矩「任何一臂出现着法或分值变化 → 立即回滚」。三条里中了后两条。

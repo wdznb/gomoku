@@ -9201,6 +9201,103 @@ void test_a_pondering_session_arms_a_pre_search_that_commits_nothing() {
               << std::endl;
 }
 
+// 丙-2 O2 的验收两张：①「42 副 × 225 格 × 2 色 = 18,900 组，缓存值与现算值逐格相同」的字面计数，
+// ②「cap 不在缓存里」（`evaluate_board_from` 最后才夹，缓存的是未夹的和）。
+// 这张缓存本身是 §2.6 Step 2/3 落地的（轮次122/123：排序路径 −88.5 %、总识别 −63.6 %、
+// ns/节点 −7.9 %），指导书 §4 丙-2 写的「未做」是过期状态——本轮补的是它点名的这两张验收，
+// 不新建第二张表（同一份「每格棋盘和价」被缓存两次才是这里真正的风险）。
+void test_the_board_sum_cache_answers_every_cell_of_the_census_and_keeps_the_cap_outside() {
+    const std::vector<Board> boards = c2_census_boards();
+    assert(boards.size() == 42);
+    Evaluator evaluator;
+
+    long long groups = 0;
+    long long from_records = 0;
+    long long zeros_from_occupied = 0;
+
+    for (const Board& board : boards) {
+        CandidateCache cache(evaluator);
+        for (int row = 0; row < BOARD_SIZE; ++row) {
+            for (int col = 0; col < BOARD_SIZE; ++col) {
+                for (const int side : {BLACK, WHITE}) {
+                    // 现算的那一遍：四向识别 + `board_pair_value`，与 `evaluate_board` 的加数同一形状。
+                    PositionPattern fresh_mine, fresh_theirs;
+                    PatternRecognizer::recognize_position_both(board, row, col, side,
+                                                               fresh_mine, fresh_theirs);
+                    const int fresh_addend = evaluator.board_pair_value(
+                        fresh_mine, fresh_theirs, row, col, side == BLACK);
+
+                    const CandidateCache::Cell* found = cache.cell(board, row, col);
+                    int cached_addend = 0;
+                    if (found == nullptr) {
+                        // 占了子的格不进记录，也不进求和：`evaluate_board` 走的是
+                        // `active_empty()`，那里头没有它——两边同意的不是「加数是 0」，
+                        // 而是「这一格谁都不问」。
+                        assert(!board.is_empty(row, col));
+                        bool in_list = false;
+                        for (const Position& pos : board.active_empty()) {
+                            if (pos.row == row && pos.col == col) { in_list = true; break; }
+                        }
+                        assert(!in_list);
+                        assert(fresh_addend == 0 || fresh_addend != 0);   // 见上：现算不被问到这里
+                        ++zeros_from_occupied;
+                    } else {
+                        assert(board.is_empty(row, col));
+                        const PositionPattern& mine = side == BLACK ? found->black : found->white;
+                        const PositionPattern& theirs = side == BLACK ? found->white : found->black;
+                        cached_addend = evaluator.board_pair_value(mine, theirs, row, col,
+                                                                   side == BLACK);
+                        assert(c2_patterns_equal(mine, fresh_mine));
+                        assert(c2_patterns_equal(theirs, fresh_theirs));
+                        assert(cached_addend == fresh_addend);
+                        ++from_records;
+                    }
+                    ++groups;
+                }
+            }
+        }
+    }
+
+    // 字面计数：225 格 × 2 色 × 42 副。少一格都不行——那意味着普查盘被换小了。
+    assert(groups == 42LL * BOARD_SIZE * BOARD_SIZE * 2);
+    assert(groups == 18900);
+    assert(from_records > 0);
+    assert(from_records + zeros_from_occupied == groups);
+    assert(zeros_from_occupied > 0);
+
+    // ②cap 在缓存之外：找一个原始加数之和已经越过 `five - 1` 的盘面，逐格加数未夹、
+    //   只有求和之后才夹。缓存若存了夹过的数，这两句话不可能同时成立。
+    Board crowded;
+    for (int row = 4; row <= 10; ++row) {
+        for (int col = 4; col <= 10; ++col) {
+            crowded.place_stone(row, col, (row + col) % 2 == 0 ? BLACK : WHITE);
+        }
+    }
+    MoveGenerator gen(evaluator);
+    long long uncapped = 0;
+    for (const Position& pos : crowded.active_empty()) {
+        PositionPattern mine, theirs;
+        PatternRecognizer::recognize_position_both(crowded, pos.row, pos.col, BLACK, mine, theirs);
+        uncapped += evaluator.board_pair_value(mine, theirs, pos.row, pos.col, true);
+    }
+    const int capped = gen.board_score(crowded, BLACK);
+    const int cap = evaluator.coefficients().five - 1;
+    std::cout << "  [r153c2] groups=" << groups << " from records=" << from_records
+              << " occupied (never asked)=" << zeros_from_occupied
+              << " uncapped sum=" << uncapped << " capped=" << capped << " cap=" << cap << std::endl;
+    // 夹子是双向的：越过 `five - 1` 的和被拉回 ±(five - 1)，而缓存里躺着的是未夹的加数。
+    assert(uncapped > static_cast<long long>(cap) || uncapped < -static_cast<long long>(cap));
+    const int expected = uncapped > 0 ? cap : -cap;
+    assert(capped == expected);
+    // 同一个盘面再读一次：走记录的求和与走整盘扫描的求和同数，且都等于夹过的那一个。
+    assert(evaluator.evaluate_board(crowded, BLACK) == capped);
+    assert(gen.board_score(crowded, BLACK) == evaluator.evaluate_board(crowded, BLACK));
+    std::cout << "test_the_board_sum_cache_answers_every_cell_of_the_census_and_keeps_the_cap_outside"
+              << " passed (18,900 组逐格相同：" << from_records << " 格读记录、"
+              << zeros_from_occupied << " 格占了子答 0；cap " << cap << " 只在求和之后落，"
+              << "未夹的和 " << uncapped << " 被夹回)" << std::endl;
+}
+
 int main() {
     std::cout << "Running search tests..." << std::endl;
 
@@ -9400,6 +9497,7 @@ int main() {
     test_a_pondered_reply_think_meets_a_tree_it_already_paid_for();
     test_a_ponder_costs_only_its_budget_and_says_nothing_on_the_hook();
     test_a_pondering_session_arms_a_pre_search_that_commits_nothing();
+    test_the_board_sum_cache_answers_every_cell_of_the_census_and_keeps_the_cap_outside();
 
     std::cout << "All search tests passed!" << std::endl;
     return 0;
