@@ -1980,6 +1980,46 @@ additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cp
 no existing assertion was edited.
 
 
+## 轮次152 引擎重构 丙-1：`ProofTable` 建起来量了——命中 3.59 %（第一格过），节点降幅 **0.00 %**（第二格不过，杀线触发），而且 84 根里有一根的 `method` 从 alphabeta 变成 resign ⇒ 判不落地并回滚 — engine redesign stage 丙-1, the tactical proof table was built and measured: 3.59 % hit share clears the first kill line, a 0.00 % node drop trips the second, and one root's `method` flips alphabeta→resign, so the mechanism is judged 不落地 and reverted (生产码回到 `3f0e5a8` 逐字节)
+
+指导书 §4 丙-1（v2 §2.3 O5）。这条机制的依据是实测（轮次121 B5：`vcf.cpp`/`vct.cpp` 里没有任何一次 probe/store，同一份证明可能被买三次），指导书给了两条杀线：**命中 < 3 % 作废**、**命中达标但节点降幅 < 2 % 也作废**，外加一句硬规矩「任何一臂出现着法或分值变化 → 立即回滚」。三条里中了后两条。
+
+### 这一版建了什么（回滚前的工作形状，写给下一次别再踩）
+
+| 位置 | 是谁 |
+| --- | --- |
+| `src/search/proof_table.h`（新） | 2^16 格，槽里存**全宽 64 位键 ＋ 行棋方 ＋ verdict ＋ distance ＋ best_move ＋ 代龄**。只有两个存储态（`WIN_FOR_SIDE_TO_MOVE` / `LOSS_FOR_SIDE_TO_MOVE`），**UNKNOWN 不写**；键带行棋方是因为 `Board::zobrist_hash()` 只散列棋子，而摆棋可以摆出等数子、奇偶推不出行棋方 |
+| `src/search/vcf.cpp` | 写点：`vcf_attack` 四处「这一手就是杀」的返回各记一次入口局面，递归回来的 `100000+x` 折算成父节点的 `x+1`；`find_defense` 的 `PROVEN_LOSS` 记防守方视角的输。读点：`vcf_attack` 进节点先查，命中且 `distance <= depth` 才敢短路，分数用**本节点自己的预算**说 |
+| `src/search/alphabeta.cpp` | 读点③：`tt_.probe` 之后、终局判定与候选生成之前查一次，同样带 `distance <= depth` 的帽 |
+| `src/search/search_engine.{h,cpp}` | 引擎拥有一张表（每会话一张），四处构造点传下去；`proof_table()` 与 `advance_proof_generation()` 是给会话与仪器的出入口 |
+| `src/server/game_manager.cpp` | 两张表同一条时钟：两处 `advance_generation()` 之后各加一次 `advance_proof_generation()`（一手棋子一步龄，不按思考龄） |
+
+### 读数（`/tmp/v2/proof_measure.cpp`，两棵树各编一遍，42 副普查盘 × 两色 ＝ 84 根，定深 4、无节点帽、时限 600 s 不参与；每根之后推一次代龄＝会话形状）
+
+| 臂 | 总节点 | probes | hits | stores | 命中占节点 | `method` 分布 |
+| --- | --- | --- | --- | --- | --- | --- |
+| HEAD（没有这张表） | **1,611,150** | — | — | — | — | vcf 12／alphabeta 60／resign 3／other 9 |
+| 加表（本版） | **1,611,150** | 491,642 | 57,858 | 41,805 | **3.5911 %** | vcf 12／alphabeta **59**／resign **4**／other 9 |
+
+- 第一格（命中 ≥ 3 %）**过**：57,858 ÷ 1,611,150 = 3.59 %，两次跑读数逐字相同（确定性）。
+- 第二格（节点降幅 ≥ 2 %）**不过**：两臂总节点**一字不差**。命中的那些节点，本来就已经被置换表或 α/β 窗口剪掉了——「同一份证明买了三次」这件事在账上是真的（stores 41,805 次），在节点数上**一个都没省下来**。
+- 逐根 diff：84 根里 **83 根完全相同**，第 38 副白棋那一根（`ROOT 74`）`method` 从 `alphabeta` 变成 `resign`，而 `score`（-99999）、`best_move`（11,6）与 `nodes`（28,573）**全部一样**。也就是说：同一个答案，交付形态变了（打出来的一手 vs 认输）。指导书 §4 丙-1 的注意第 2 条正是为这一种情形写的——**出现新答案就是 bug，不是收益**，判回滚。
+
+### 顺带记一条我自己这一版的结构缺陷（不改变上面的判定）
+
+`ctest` 在这棵树上 **6/9 过、3 段 SEGFAULT**（`test_position`／`test_server`／`test_training`）。原因是我把 `ProofTable`（≈1.5 MB）做成了 `SearchEngine` 的**值成员**，而这三个套件里有在栈上直接构造 `SearchEngine` 的用例——1.5 MB 的栈对象把栈打穿。要修就得像 `owned_tt_` 那样改成堆持有（`std::unique_ptr`）。这条与「值不值得留这张表」无关：即便修好，第二格（0.00 % 降幅）与那根翻转的 `method` 已经各自足以作废。
+
+### 门禁
+
+- **本轮无代码留下**：`git diff --quiet HEAD -- src/ tests/ tools/ CMakeLists.txt web/ data/` 通过，生产码与 `3f0e5a8` **逐字节相同**；仓库改动只有本节。
+- 因此 `ctest` 与 valgrind **不跑**，理由与轮次136-140 同一句：这就是乙-2 门禁跑过 **9/9 / 744.28 s** 的那棵树（`proof_table.h` 已删，未跟踪文件为零，`git status` 除本节外干净）。
+
+### 判与给文档的一句话
+
+**不落地**，回滚。第 ③ 个读点按文档字面写出来是不成立的：库里的距离是 VCF 的**攻方回合数**，读它的 `alphabeta` 说的是**自己那一份 ply 预算**，两者之间缺一个换算，也缺一个权威问题——「一次思考里证到的输」有没有资格变成**整局认输**的判据？那根 `alphabeta → resign` 的翻转就是这个问题没被回答时的样子。要再来一次，先把这条口径写清（谁负责把证明升格为认输），再谈 1.5 MB。
+
+第 4 次「机制建起来、量完、按杀线回收」的先例（威胁延伸、LMR、futility、O5）。仪表留在 `/tmp/v2/`（`proof_measure.cpp`、`roots_old.txt`、`roots_new.txt`、`sum_*.txt`），复跑口径都在上面的表里。
+
 ## 轮次151 引擎重构 乙-2：选点基准第一次住进树里——`test_pinned` 六臂钉着着法、分值与节点数，其中两臂逐位复现轮次138 的出厂针 — engine redesign stage 乙-2: the choice-consistency arms become a resident suite; six arms pin move/score/nodes, and the two depth-8 ones reproduce 轮次138's factory pins (1,408,083 and 2,378,724 nodes) exactly
 
 指导书 §4 乙-2，对应 v2 §7 回归保障 1（v1.0 `:554`）。此前这些读数只存在于 `REVIEW_LOG` 的 `/tmp` 仪表里，树内没有常驻臂——任何人改引擎，要等到下一次专门跑仪表才知道选点变了。
