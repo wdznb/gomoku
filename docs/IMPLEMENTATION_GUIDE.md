@@ -1,0 +1,692 @@
+# 实现指导书：ENGINE_REDESIGN_V2 剩余单元
+
+> 读者：接手实现的 AI / 工程师。
+> 规格来源：`docs/ENGINE_REDESIGN_V2.md`（v2.1，1051 行）。本文件**不替代**它——设计意图看那份，动手细节看这份。
+> 基线提交：`origin/master` = **`a9dfeb1`**（轮次147）。开始前先 `git pull` 并确认 `git log --oneline -1` 是这个 hash 或它的后代。
+
+---
+
+## 0. 怎么用这份文档
+
+1. 先读 §1（环境）与 §2（纪律）。**§2 的六条不是建议，是这个仓库付过学费的规矩。**
+2. 按 §3 的单元顺序做，一个单元一次 commit + push。
+3. 每个单元都给了「状态 / 目标效果 / 实现思路 / 注意 / 验收」。**验收里带「杀线」的，做不到就回收该单元，不许落半截。**
+4. 任何数字必须标「实测」或「未测/预估」。这是本仓库的文档纪律，写报告时会被检查。
+5. 卡住时先看 §5「已知坑清单」，那里是前几轮真踩过的。
+
+---
+
+## 1. 环境
+
+| 项 | 值 |
+| --- | --- |
+| 构建/验证主机 | `ssh wdz@192.168.44.129`，代码在 `~/Desktop/workspace/gomoku` |
+| 主机 | Ubuntu，kernel 7.0.0-38，**6 vCPU**，VMware 虚拟机（只有 SVGA 虚拟卡，**AMD 卡未直通，GPU 路径不可验证**） |
+| 工具链 | cmake 4.2.3、g++ 15.2.0、node v22、无 ninja |
+| 构建 | `cmake --build build -j6 --target <目标>`；`build/` 已配好离线 JSON（`FETCHCONTENT_FULLY_DISCONNECTED=ON` ＋ `build/_deps/json-src`），**不要重新 configure 成联网模式** |
+| 测试 | `ctest --test-dir build`（8 个套件，**约 500 s**，`test_search` 占 470 s） |
+| 推送 | origin 是 SSH（`git@github.com:wdznb/gomoku.git`），主机 `~/.ssh/id_ed25519` 认到 `wdznb`。**HTTPS 无凭据，别用** |
+| Windows 侧 | 只是编辑副本，**没有 C++ 编译器**；所有构建/测试都在上面那台 Linux 主机 |
+
+### 1.1 改代码的正确姿势（重要）
+
+**不要**在远端用 python/sed 打补丁——工具层会吃掉 `\n` 转义，行级替换会命中同名子串，前几轮因此把 `analyze_main.cpp` 打坏过两次。
+
+正确做法：
+
+```
+本地 Read/Edit/Write 改文件
+  → tar cf - <改动文件> | ssh wdz@192.168.44.129 'tar xf - -C ~/Desktop/workspace/gomoku'
+  → ssh ... 'cmake --build build -j6 --target <目标>'
+```
+
+**一次只改一个文件（或一对必须同时改的 .h/.cpp）**，编译通过再动下一个。所有串联用 `&&`，**绝不用换行分隔**——上一轮就是因为换行串联，python 断言失败后 `tar` 照跑，把半成品推了上去。
+
+---
+
+## 2. 六条纪律
+
+| # | 规矩 | 为什么 |
+| --- | --- | --- |
+| 1 | **一次一个文件，编译通过再下一个** | 多文件补丁坏在中间会把半成品推进树 |
+| 2 | **命令串联一律 `&&`** | 失败必须阻断后续同步 |
+| 3 | 编译失败 → `git checkout -- <该文件>` 立即回滚 | 已验证这是最快恢复路径 |
+| 4 | 新增用例至少一条**变异臂**：改错一条断言 → 期望非零退出并报出行号，然后还原 | 纯 `assert` 的用例不验证一遍，等于没写（轮次144 起执行） |
+| 5 | 改 `src/` → 必须跑完整 `ctest`；只改 `tools/`、`web/`、`docs/` → 可以不跑，但必须在提交信息里写明理由 | `ctest` 里没有 `tools/` 目标 |
+| 6 | 每个新机制必须带**杀线**（什么读数出现就作废） | 先例：威胁延伸、LMR、futility 三轮都是这样回收的 |
+
+### 2.1 每次提交前的固定门禁
+
+```bash
+node tests/readme_anchor_check.js     # 期望：120 citations, 0 problems
+node tests/web_frontend_check.js      # 期望：105/105 passed
+ctest --test-dir build                # 期望：8/8 passed（改 src/ 时）
+git push origin master                # 然后核对 git log --oneline -1 origin/master
+```
+
+> `readme_anchor_check` 扫描 `src/`、`tests/`、`web/` 里所有 `README:NNN` 形式的绝对行号引用。**给 README 插入一行会让后面所有引用位移**，所以要么追加到文件末尾，要么改完立刻重跑这支检查并按报错修正。
+
+---
+
+## 3. 当前状态
+
+### 3.1 已完成（不要重做）
+
+| 交付 | 提交 | 内容 |
+| --- | --- | --- |
+| 复盘漏斗段 A | `37b0fbd` | `ReplayAnalyzer`：零搜索筛查（摆幅/方法迁移/必挡连跑/深度塌陷/将杀穿越），两条剔除（开局、无信息）＋ 第三条（`replay`/`book` 不是决策） |
+| 段 B / 段 C | `37b0fbd` | `ReplayReviewer`：定预算复核、精确复算（`SearchEngine::exact_root_score`）、六种判定、难度阶梯 |
+| 题卡 | `37b0fbd` | `TacticsCard`（§6.6 全部字段）、JSON 往返、系数指纹 |
+| CLI | `37b0fbd` / `59e3dca` | `gomoku_analyze --replay / --review / --cards / --cards-dir / --bench / --layer / --params` |
+| 题卡分表 | `59e3dca` | `proven/`（杀棋题，与系数无关）vs `judged/`（判断题）＋ `index.json` |
+| 样本 teacher | `a9dfeb1` | `TrainingSample::teacher_move` / `teacher_source`；`--export-samples` |
+| `root_scores` | `37b0fbd` | `RootMoveScore{move, score, exact}`，穿过 `SearchStats → SearchInfo → SearchResult` |
+
+已有数据：`data/tactics/proven/hard.jsonl`（2 张漏杀）、`data/tactics/judged/normal.jsonl`（2 张俗手）、`data/tactics/index.json`。
+
+### 3.2 待做（17 个单元）
+
+甲-3、甲-4、乙-1、乙-2、丙-1..4、丁-1..6、戊-1..3。见 §4。
+
+### 3.3 明确不做
+
+- **L 阶段全部**（`WavefrontBatch`、`BatchEvaluator`、GPU 后端）——构建主机是 VMware 虚拟机，没有真 GPU，**没有仪器就不开工**。
+- v1.0 已判不落地的三条（威胁延伸、LMR、futility）不复活。
+- 神经网络评估不在范围。
+
+---
+
+## 4. 单元说明
+
+### 甲-3 复盘面板（协议 ＋ 前端）
+
+**状态**：未开始。协议层没有任何 `analyze_*` 帧；前端只有回放（`replay` 帧）与胜率曲线，没有判定标记。
+
+**目标效果**：一局结束后（或手动点「复盘」），服务端对整局跑一遍段 A＋段 B，边跑边推「第几手 / 共几手」，跑完推每手的判定；前端在**已有的胜率曲线**上打标记（俗手红点 / 妙手绿星 / 唯一应手灰线 / 反例紫方块），点标记跳到那一手，并给出「摆棋测试」入口。**不新增页面、不新增端口。**
+
+**实现思路**
+
+1. **协议（服务端）**
+   - `src/server/server.h` 的 handler 声明区（约 `:184` 之后）加：
+     `void handle_analyze_request(std::shared_ptr<WebSocketSession> session, const json& msg);`
+   - `src/server/server.cpp` 的 `handle_message` 分发链（`:715-743`）加一个 `else if (type == "analyze_request")`。**它是会话级帧，所以不要动 `:705` 那个白名单**（白名单只管 `ping`/`check_position` 这类不需要会话的帧）。
+   - 新 handler 里：
+     - 用 `get_int_or(msg, "depth", 8)` / `get_int_or(msg, "budget", 20000)` 读参数（`server.cpp:25-40` 的两个 helper 已防 `{"row":"7"}` 这类异常）；
+     - 从 `GameManager::replay_snapshot()`（`game_manager.cpp:334-351`，`thinking_mutex_` 下拷贝）取整局；把 `MoveAnalysis` 逐字段转成 `GameRecord::moves`（`row/col/color/score/depth/nodes/method/...` 一一对应）；
+     - **起一个后台线程**跑 `ReplayAnalyzer` ＋ `ReplayReviewer`（都在 `src/training/replay_analyzer.h`），每完成一手 `send_message(session, analyze_progress)`，最后发一帧 `analyze_result`；
+     - 玩家正在思考（`ai_thinking()`）时**直接拒绝**，回一帧 `error` 说明「AI 正在思考，复盘会偷走它的时钟」，不排队。
+   - 线程安全：`WebSocketSession::send` 内部走 `net::post`（`server.cpp:352-370`），**后台线程可以直接调**；但 socket 关闭后不能再写，所以要么在 `clear_game_callbacks`（`:1660`）里 join/置停，要么用 `weak_ptr` ＋ `expired()` 检查。
+
+2. **协议（帧形状）**
+
+   | 方向 | 帧 | 字段 |
+   | --- | --- | --- |
+   | C→S | `analyze_request` | `depth`（可选，默认 8）、`budget`（可选，默认 20000）、`max_candidates`（可选，默认 12） |
+   | S→C | `analyze_progress` | `done`（已复核手数）、`total`（候选手数） |
+   | S→C | `analyze_result` | `moves[]`：每项 `{ply, kind, best:{row,col}, played:{row,col}, loss, gap, layer}`；`coeffs_sha`；`cards`（本次写出的卡数，若启用） |
+
+   `kind` 取值：`blunder` / `brilliant` / `forced` / `counterexample` / `missed_mate` / `unlisted` / `none`。
+
+3. **前端**
+   - `web/app.js` 的 `switch (msg.type)`（`:1693-1751`）加两个 `case`：`analyze_progress` → 更新状态行「复盘 12/34」；`analyze_result` → 把结果写进 `this.analysis[i].verdict`（`this.analysis` 与 `this.moveHistory` 下标对齐，见 `constructor:78`）。
+   - `drawEvalGraph`（`:905-961`）里**只追加标记绘制**：在 `forEach` 里把 `verdict` 挂到 `points` 上，在既有的红点绘制（`:953-960`）之后按类别换色/换形状。
+   - 点击：`canvas` 已有 click 处理（`:963`），按 x 反算下标后调 `showReplayMove(index)`（`:781-793`）。
+   - 面板 DOM：`web/index.html` 的 `#region-left`（`:23-35`）里加一个 `<section id="analyze-panel" hidden>`，内含「复盘」「摆棋测试」两个按钮与一个结果列表；`web/style.css` 末尾加 `.panel / .panel-title / .mark-*`，复用既有 `.field`、`.btn-tiny`。
+
+**注意（逐条都会让你返工）**
+
+1. **`drawEvalGraph` 的几何一位都不能动**：`limit = 2000`、`x = width * (i + 0.5) / n`、`y = height / 2 - (clamped / limit) * (height / 2 - 6)`、`|score| >= 99999` 才画点。`tests/web_frontend_check.js` 有两条用例逐点校验（约 `:1138-1195` 与 `:1679-1721`）。**加标记只能新增绘制**。
+2. 前端测试桩**没有 `clientWidth/clientHeight`**，走 `200×64` 回退分支；新画的任何东西都要能在回退尺寸下算出来。
+3. `resumeApplied` 为真时不会自动进回放视角（`app.js:739-742`），面板要「开局即复盘」就必须显式调 `showReplayMove(0)`。
+4. `web_frontend_check.js` 的 105 项**全是行为断言**（元素桩属性、实际发出的帧、canvas 调用坐标），不是源码字符串匹配。新用例**只许追加到文件末尾**，并且不要依赖用例之间的全局元素状态（元素桩是单例，需要先显式清空，参考 `:3733-3735` 的注释）。
+5. `tt_hits` 服务端已经下发（`server.cpp:1068`）但前端丢弃了，做面板时可以直接消费，**不需要改协议**。
+6. 不要为复盘新开端口。仓库有过一次压测把临时端口池打满导致机器硬重启的记录（`docs/PROMPT_STRESS_TEST.md`）。
+
+**验收**
+
+- `tests/test_server.cpp` 用既有 `Harness`（`:218-234`）＋ `drain_frames` 加两条：
+  - 发 `analyze_request` 后，**至少收到 1 帧 `analyze_progress` 与恰好 1 帧 `analyze_result`**，且 `analyze_result.moves` 长度 == 对局手数；
+  - AI 思考中发 `analyze_request` → 收到 `error`，且**没有** `analyze_*` 帧。
+- `tests/web_frontend_check.js` 末尾追加 ≥3 条：面板默认隐藏；收到 `analyze_result` 后标记数 == 带判定的手数；点击标记后 `replayIndex` 变成对应下标。
+- **杀线**：`drawEvalGraph` 的折线坐标或点阈值改一位 → 既有 105 项里必须变红。跑一次验证：故意把 `limit` 改成 2001，确认红，再改回。
+
+---
+
+### 甲-4 题库门禁接进流程
+
+**状态**：`tools/tactics_bench.sh` 已存在并能跑，但没接进任何流程，`--cards` 的注释也过时了。
+
+**目标效果**：`build.sh` 之后能一条命令跑三档 `solve_rate`，README 有一行指引，人和 AI 都知道这道门禁存在。
+
+**实现思路**
+
+1. `tools/tactics_bench.sh` 的注释里 `--cards data/tactics/judged/normal.jsonl` 改成 `--cards-dir data/tactics`（甲-1 已改 CLI，脚本注释没跟上）。
+2. `build.sh` 末尾加一段**注释**说明「构建完成后建议跑 `tools/tactics_bench.sh`」（不要真的塞进 `build.sh` 执行——构建脚本不该跑 8 秒的门禁）。
+3. `README.md` **追加到文件末尾**（不要插在中间）：一行说明题库门禁的命令与判据。
+
+**注意**
+
+- README 的行号被 `readme_anchor_check` 扫描，**插入行会让所有 `README:NNN` 引用位移**。所以只能追加到末尾，改完立刻跑 `node tests/readme_anchor_check.js`。
+- 门禁判据是「与上一 tag 的读数比，任何一档掉 > 2 个百分点即红」；0 %/100 % 的告警**不算红**（那是预算选错了，换一档再读）。
+
+**验收**
+
+- `tools/tactics_bench.sh data/tactics` 输出三档 `solve_rate`（当前基线：`@4000 0/4`、`@8000 0/4`、`@32000 0/4`，实测）。
+- `node tests/readme_anchor_check.js` → 0 problems。
+
+---
+
+### 乙-1 D：位置项差分表（225 × 2 × 42）
+
+**状态**：未做。这是 v1.0 `:556` 欠下的账：A5 位置项落地时没有交差分表。
+
+**目标效果**：证明「位置项 / 贴边项」的实现与「按定义逐子重算」在 42 副棋盘 × 225 格 × 2 色 = **18,900 组**上完全一致，产出 `data/diff/position_term.csv` 存档。
+
+**实现思路**
+
+1. 新 `tools/position_term_table.cpp`，CMake 加一个目标（照 `gomoku_analyze` 的写法，链 `GOMOKU_CORE_SOURCES`）。
+2. 棋盘集从 `tests/pinned_positions.h`（乙-2 建）取 42 副；没有就先在工具里内联 42 副（`data/position_*.json` 已有模板可参考）。
+3. 对每副棋盘、每一格、每一色输出一行：`board,row,col,color,position_term,edge_penalty_term,recomputed_position_term,recomputed_edge_penalty_term,match`。
+4. 「重算」= 直接遍历 `move_history()`，按 `position_weights_[r][c]` 与「外两行/列」的定义求和，**不复用增量路径**。
+
+**注意**
+
+- `position_term` / `edge_penalty_term` 是 `Evaluator` 的 **private** 成员函数（`evaluator.h:117-118`）。仓库既有先例是用 `#define private public` 在测试 TU 里打开（`tests/test_search.cpp` 就这么做），工具里也可以，但**只能在工具/测试里用**，不要污染 `src/`。
+- 这一项**不改任何生产代码**，它只是把已有的实现钉住。所以它不会让任何读数变好——它的价值是「以后改评估器时有一张表能比对」。
+- 输出文件放 `data/diff/`，不要让 `build` 每次生成（会污染工作区）；用命令行参数指定输出路径。
+
+**验收**
+
+- CSV 恰好 **18,900 行数据**（不含表头），`match` 列全为 1。
+- 变异臂：把 `edge_penalty_term` 的「外两行/列」改成「外三行/列」→ 表里必须出现 `match=0`。
+
+---
+
+### 乙-2 F：选点基准搬进树内
+
+**状态**：未做。选点一致性基准目前只存在于 `REVIEW_LOG` 的 `/tmp` 读数里，树内没有常驻臂。
+
+**目标效果**：把 pos24 与两副 d8 臂做成树内常驻用例，任何人改引擎都能立刻看出「着法/分值/节点数」有没有变。
+
+**实现思路**
+
+1. 新 `tests/pinned_positions.h`：42 副普查棋盘 ＋ pos24 ＋ 两副 d8 臂（用 `std::array<Position, N>` 或直接一串 `Move`）。
+2. **单独一个 test 目标 `test_pinned`**（不要塞进 `test_search`）：这些臂是定深搜索，d8 一副要数秒，塞进 `test_search` 会让本来 470 s 的套件更慢，而人一旦开始跳过 `ctest`，门禁就死了。
+3. 用例只断言三件事：`best_move` 的格号、`score`、`nodes`。**分值允许变化时必须写明理由**，着法变化必须能解释（v1.0 `:554`）。
+
+**注意**
+
+- 这些读数来自 `REVIEW_LOG` 轮次137–141，**搜索前必须 `set_max_nodes` ＋ 给一个不 binding 的时限**。`time_limit_ms = 0` 会被 `search_engine.cpp:256-260` 兜到 100 ms，层切割点跟着机器忙闲走，读数就不可比了（轮次121 B5 踩过）。
+- `test_pinned` 要加进 `CMakeLists.txt` 末尾那个 `foreach(... -UNDEBUG)` 列表，否则 Release 构建下 `assert` 会被编译掉。
+
+**验收**
+
+- `./build/test_pinned` 全绿，且打印每副棋盘的 `move/score/nodes`。
+- 变异臂：把某一副的期望 `nodes` 改 ±1 → 必须红。
+
+---
+
+### 丙-1 O5：战术证明入库（`ProofTable`）
+
+**状态**：未做。依据是一条实测：**`VCFSearch` / `VCTSearch` 完全不读写共享置换表**（轮次121 B5 为论证门控等价性顺带量到的，`vcf.cpp` / `vct.cpp` 里没有任何一次 probe/store）。后果是同一份「这里能杀」的证明被买了三次。
+
+**目标效果**：同一次思考里，VCF 证明过的杀，AlphaBeta 不再重爬；下一手同一会话里，已证明的局面直接命中。**答案一个字都不许变。**
+
+**实现思路**
+
+1. 新 `src/search/proof_table.h`：`2^16` 项 × 24 B ≈ 1.5 MB，条目 `{uint32 key16, uint8 verdict, uint8 distance, Move best_move}`，`verdict ∈ {WIN_FOR_side, LOSS_FOR_side}`，**没有 UNKNOWN 这个存储态**。
+2. 写点两处：
+   - `VCFSearch::search_impl` 返回 `VCFResult::WIN` 时写 `WIN`，距离 = `variation.size()`；
+   - `find_defense` 返回 `DefenseResult::PROVEN_LOSS` 时写 `LOSS`。
+   - **`UNKNOWN` 一律不写**——「没证明」不是信息。
+3. 读点两处：
+   - `VCFSearch::vcf_attack` 进节点先查，命中 `WIN` 直接返回 `100000 + dist`；
+   - `AlphaBetaSearch::alphabeta` 在 TT 探测之后、候选生成之前查一次，命中就整节点短路。
+4. 代龄按手推进（与 A3 给 TT 定的规则同口径），`new_search()` 不老化它。
+
+**注意**
+
+- **命中必须返回 `±(100000 + dist)`**，不能返回 `±100000`：`search_engine.cpp:349` 的认输判定与 `transposition.h:98` 的距离还原都依赖这个约定。
+- **任何一臂出现着法或分值变化 → 立即回滚**。证明表的语义是「同一个答案换一条路径」，出现新答案就是 bug，不是收益。
+- `ProofTable` 每会话一张，跟着 `SearchEngine` 走；训练侧每 worker 一张（与 TT 同生命周期）。
+- 这张表**不进 `SearchResult`、不进帧**。
+
+**验收**
+
+- 在同一批根上（轮次121 B5 的 275 根臂）跑加表前后：`nodes` 必须下降，`method` 分布与 `score`/`best_move` 必须逐根相同。
+- 报两个数：**命中占比**（`alphabeta` 命中 `ProofTable` 的节点数 ÷ 总节点数）与**节点降幅**。
+- **杀线**：命中 < 3 % → 作废（1.5 MB 换不到可测的节点数）；命中达标但节点降 < 2 % → 也作废（说明命中的节点本来就被 TT 或杀手剪掉了）。
+
+---
+
+### 丙-2 O2：`BoardValueCache`（**文档原文写错了，按这里做**）
+
+**状态**：未做。**注意：`ENGINE_REDESIGN_V2.md` §2.2 O2 的前提是错的**——它说「`pattern_score` 对每颗已占子调用」，实际 `pattern_score` 是对**空候选格**调的（`evaluator.cpp:279/289`），已占子只进 `position_term` / `edge_penalty_term`（`:208-233`，那里不调 `pattern_score`）。所以「已占子键缓存」打不到那 20.85 %。
+
+**目标效果**：把 `evaluate_board` 里每个空候选格的**棋盘和价**（`board_pair_value`）缓存起来，键不变就复用，把 20.85 % 的 `pattern_score` 大部分省掉。
+
+**实现思路**
+
+1. 照 `CandidateCache` 的形状（`src/search/search_state.h:226-350`）：每格一份记录，键是**四族线字**（`uint64_t key[4]`，黑白各 32 位拼成一个字，见 `line_key` `:339-345`）＋ `valid`。
+2. 缓存的是 `board_pair_value(my_pattern, opp_pattern, row, col, black_is_mine)` 的返回值——**注意它与 `candidate_pair_value` 是两个数**：前者不含中心权重、含禁手判定、会被 cap；后者是排序价。
+3. `evaluate_board`（`evaluator.cpp:276-293`）改成读穿缓存：键相同用旧值，键不同重算并更新。
+4. 缓存挂在 `SearchContext` / `SearchState` 上，**跟着一次思考生死**，不要放进 `Board`。
+
+**注意**
+
+- **cap 不在缓存里**：`evaluate_board_from` 最后才 cap（`:270-272`），缓存的是未 cap 的和。缓存 cap 后的值会在系数变化时静默出错。
+- 失效判据必须是**线字键**，不是「±2 邻域」：实测过 (7,7) 会因 (7,12) 落子而变（轮次122），邻域判据会漏。
+- 键比对成本是 4 × `uint64` × 候选数；若「命中省的钱不比键贵」，本项作废。
+
+**验收**
+
+- 42 副棋盘 × 225 格 × 2 色 = 18,900 组，缓存值与现算值**逐格相同**（复用乙-1 的棋盘集）。
+- 报 `Ir/节点` 与 `ns/节点` 前后对比；固定针臂的着法/分值/节点数**一个不许变**（这是纯成本改动）。
+- **杀线**：`Ir/节点` 降幅 < 5 % → 作废。
+
+---
+
+### 丙-3 O3：排序分与威胁分分离
+
+**状态**：未做。排序路径现在算两色全量配对分（`CandidateCache::cell` 8.20 % ＋ `recognize_position_both` 8.18 %），而排序真正需要的只是「这一格是冲四 / 活三 / 挡点吗」。
+
+**目标效果**：排序路径改成 O(1) 线字判定，两色全量配对分只保留在叶子（`stand_pat` / `evaluate_board`）。
+
+**实现思路**
+
+1. `MoveGenerator::generate`（`move_generator.cpp:145+`）已经为了分 Tier 跑过一次 `recognize_position_both`，**先看它能不能直接给出「行棋方四线的成五/成四/活三」布尔量**，而不是再算一次 `candidate_pair_value`。
+2. 排序键改成「Tier → 线字威胁等级 → 中心距离 → 格号」的四元全序，与 A6 的三元组保持同一个方向。
+3. `candidate_pair_value` 保留，但只被叶子调用。
+
+**注意**
+
+- **这不只是顺序改动**：`generate` 同时用配对分决定 Tier 归属与宽度截断。改它会影响**哪些格子被保留**，进而改着法。所以验收必须是「着法与分值不变」，而不是「节点数下降」。
+- 仓库有三次「机制建好后判不落地」的先例（威胁延伸、LMR、futility）。这一项若着法变了且解释不了，直接判不落地。
+- 以 `Ir/候选格` 单一读数决生死（轮次140 的口径）。
+
+**验收**
+
+- 固定针臂（乙-2 的 pos24 ＋ 两副 d8）着法/分值/深度**全同**；`Ir/候选格` 下降 ≥ 30 %。
+- **杀线**：任何一副针臂换答案 → 作废。
+
+---
+
+### 丙-4 O1：`finish_direction` 升格为线段局部 LUT
+
+**状态**：未做。该函数占 14.45 % Ir（轮次141 callgrind），是第二大热点，且**不是纯查表函数**——它读棋盘走线。
+
+**目标效果**：把「13 格三态 → 修正后的 `PatternType`」做成一张表，把走线变成一次表读。
+
+**实现思路**
+
+1. 键 = 以候选格为中心、沿 `dir` 的 **13 格三态**（EMPTY / BLACK / WHITE，出界按 blocked），`3^13 = 1,594,323` 项，`uint8`（基础类型 3 位 ｜ 黑棋修正类型 3 位）≈ 1.6 MB。**中心格恒为黑**（`pattern.cpp:350` 的 `own |= 1u << kCenterBit`），所以只有 `3^12` 个不同键。
+2. **建表复用现有 `finish_direction` 的纯函数副本**，跑满一次生成——不要重写判断逻辑，否则会有第二份语义。
+3. 查询：从 `board.line_bits(color, dir, line)`（`board.h:76-77`）＋ `LINE_MARGIN = 8`（`board.h:19`）取位 8..22，shift + mask 出 13 格，再一次表读。
+4. 建表成本单独记进启动开销（文档 O4），不许藏在吞吐数字里。
+
+**注意（三条前提，缺一条就做不成）**
+
+1. **必须把两处无界 `while` 与 `run_length` 在 ±6 截断**：`pattern.cpp:421-432`（`five_points` 的走线）、`:465-467`（`painted` 的扩张）、`:384`（`run_length() >= 6`）。截断必须证明不改答案——骨架：穿过探针的连续段 ≤ 4（否则窗型已是 FIVE/LONG_FIVE），凑成五只需看 `4 - f` 格，判定格 ≤ ±5；`painted` 只需知道「连续段超过 4」，±6 足够。
+2. **键必须是三态，不能把 EMPTY 和 WHITE 合并**：`five_points` 与活三段用的是 `== EMPTY`，而 `fill_run` / `painted` 把两者都当阻断——两种用法不同，合并会错。
+3. **基础 `PatternType` 不进键**：它由键中央 9 个 trit 唯一决定（`pattern_lut_`，`pattern.cpp:353`），进键只会让表大 6 倍。
+
+**验收**
+
+- **42 副棋盘 × 225 格 × 4 方向 × 2 色 = 75,600 组**，LUT 值与现函数值**逐组相同**，1 组不一致即弃。
+- 同一棋盘集上再逐格比 `recognize_position_both` 的聚合字段，确认误差没从另一条路径渗回来。
+- 报该函数的 Ir 降幅与整节点成本降幅（目标 11–13 %，**预估**）。
+- **杀线**：75,600 组有 1 组不一致 → 作废；取窗指令数超估值 2 倍（省下的只是函数调用开销）→ 作废。
+
+---
+
+### 丁-1 S3：训练信号从二值胜负换成连续量
+
+**状态**：未做。`--fitness-games 2` 时适配度只有 5 档（0 / 0.25 / 0.5 / 0.75 / 1，轮次128 实测），优化器看到的是一个平台。
+
+**目标效果**：给适配度加连续分量，让「赢得多漂亮」也进入信号，而不只是「赢没赢」。
+
+**实现思路**
+
+1. 改 `Trainer::measure_fitness`（`trainer.cpp:38-49`）：现在它返回 `play_match(...)` 的胜负对分数；改成「胜负对 × (1-w) ＋ 连续分量 × w」。
+2. 三个分量全部从**现有产物**取，不加新基础设施：
+   - 终局静态分差：终局局面 `Evaluator::evaluate_board` 的两色差，归一化到 [0,1]；
+   - 先成五一方用了多少手：`GameRecord::moves.size()` 归一化；
+   - 认输时的深度差：`MoveRecord.depth`。
+3. 权重是可训练参数（`TrainingConfig` 加字段），并且**必须可关**（`w = 0` 时与今天逐字节一致）。
+
+**注意**
+
+- **同 seed 结论不许翻面**。轮次126 有先例：`--max-nodes` 把每手搜浅之后，同 seed 的验证赛结论从 0.875 晋升翻成 0.375 不晋升。翻面 → 权重下调直到消失；下调到 0 仍翻 → 作废。
+- `measure_fitness` 里要把 `five` / `forbidden_penalty` 对齐到冠军（`trainer.cpp:44-46`），新分量不能破坏这一步。
+
+**验收**
+
+- `--fitness-games 2` 下适配度取值**档数从 5 涨成连续**（报直方图或唯一值个数）。
+- 同 seed 跑两轮，晋升结论一致。
+- **杀线**：同 seed 翻面且权重降到 0 仍翻 → 作废。
+
+---
+
+### 丁-2 S4：深搜蒸馏（`teacher_move` 进 `MoveRecord`）
+
+**状态**：未做。`TrainingSample::teacher_move` 已就位（轮次147），但**没有产地**——自对弈时没人算它。`data_collector` 的 `min_search_depth_` 默认 1，且 vcf/must_block 不回填 `depth`，所以战术层的 ply 全被丢掉（轮次125 实测 14/28/62 → 112/224/496）。
+
+**目标效果**：每手棋由「当时的引擎」和「一个更贵的老师」各给一个答案，两者分开记；样本因此第一次覆盖战术层 ply。
+
+**实现思路**
+
+1. `src/training/game_record.h` 的 `MoveRecord` 加 `Move teacher_move` / `int teacher_depth` / `int teacher_score`（只增字段，放在 `tt_hits` 之后），`game_record.cpp` 的 `to_json` / `from_json` 各加三个可选键（旧记录读回为空 = 没有老师）。
+2. `SelfPlayConfig` 加 `teacher_depth` / `teacher_max_nodes`（0 = 关）；`SelfPlay::run` 在 `engine.search`（`self_play.cpp:76`）之后、`place_stone`（`:115`）之前，用**独立引擎 ＋ 独立 TT** 再搜一次，写进 `entry.teacher_*`。
+3. `DataCollector::collect`（`data_collector.cpp:155-166`）把 `entry.teacher_move` 搬进 `sample.teacher_move`，`teacher_source = "distill"`。
+
+**注意**
+
+1. **教师必须用独立 TT**。worker 与 `shared_tt_` 共用一张表（`trainer.cpp:286`），教师若在同一张表上写 d6 条目，随后的 d4 搜索会直接切在 d6 条目上，`entry.depth` 与 `search_depth` 失真，样本口径被污染。
+2. **教师必须在落子前搜**，否则局面已变。
+3. **vcf/vct/must_block 不回填 `depth`**（`search_engine.cpp:179/225-250`），教师深度要显式记 `config.teacher_depth`，不要指望 `result.depth`。
+4. **顺手修一个 bug**：`RetryExplorer::reset()`（`self_play.cpp:163-168`）会清掉 `set_start_line` 设的开局（`trainer.cpp:296` 只设一次），所以重试那一局是从空盘开始的。改成保留 start line。
+
+**验收**
+
+- 样本里出现 `teacher_source == "distill"` 的记录；**样本覆盖 vcf / must_block 的 ply**（今天这些 ply 全丢）。
+- 报「teacher 与实际一致的比例」随轮次的变化。
+- **杀线**：教师搜索贵 k 倍，若每轮对局数塌到 1/4 以下 → 只对 `--fitness-games` 的对局做蒸馏。
+
+---
+
+### 丁-3 S6：黑白分离的系数（`CoefficientPair`）
+
+**状态**：未做。`Evaluator` 只持一份 `ThreatCoefficients`（`evaluator.h:105`），全部打分对双方共用这一份。
+
+**目标效果**：黑白各一套系数（14 个可调量 × 2），且**反对称性不许破**：`eval(W) == -eval(B)` 是 negamax、TT 单符号约定、根层比较三处的地基。
+
+**实现思路**
+
+1. `params.h` 加 `struct CoefficientPair { ThreatCoefficients black, white; }`，附 `static CoefficientPair shared(const ThreatCoefficients&)`；旧文件（单份系数）读进来时两侧同值。
+2. `Evaluator` 改持 `CoefficientPair`，并新增 `set_coefficients(const CoefficientPair&)`；旧签名保留为 `shared(c)` 的薄包装（**旧调用点一行不用改**）。
+3. 签名加 `color` 的三处：
+   - `pattern_score(const PositionPattern&, int row, int col, int color)`（私有）
+   - `get_position_weight(int row, int col, int color)`
+   - `board_pair_value(..., int my_color)`（把原来的 `bool black_is_mine` 换掉）
+4. `position_weights_` 变 `[2][BOARD_SIZE][BOARD_SIZE]`，`init_position_weights()` 跑两遍。
+5. `evaluate_board_from` 的帽改成 `min(pair.black.five, pair.white.five) - 1`——**帽必须与颜色无关**，否则反对称在帽处就破了。
+
+**注意（这是全项目最容易破不变量的一项）**
+
+1. **反对称的唯一支点是 `evaluator.cpp:245/248`**：两侧必须按「**子的颜色**」取系数（`my_color` / `opponent(my_color)`），不能按「我方/对方」取同一套。`eval(W) = S_W − S_B`、`eval(B) = S_B − S_W`，这样才恒等取负。
+2. **换系数集必须 `tt.clear()`**：TT 的 `static_eval` 只存 BLACK 符号（`transposition.h:44-52`），这个约定只在同一套系数内成立。
+3. **序列化要兼容旧文件**：`kParams` 是一基因一行（`params.cpp:42-63`）、`to_json_string` 是扁平结构（`:171-179`）、checkpoint 的 `versions[]` 就是那个扁平对象（`trainer.cpp:509-513`）。单份文件读成「两侧同值」，不要造新格式。
+4. **`sanitize` 与 `CrossRule` 必须逐色各跑一遍**（`params.cpp:128-159`、`:303-329`），否则一套合法、另一套越界的文件会被静默接受。
+5. **威胁阶梯两侧必须同阶（±20 %）**：否则「白方」就是另一个引擎，Elo 失去意义。允许两侧不同的是位置项 / 贴边 / 候选宽度 / 防守权重。
+6. 基因数从 14 变 28，`TUNABLE_COUNT` 与 `CoefficientVector::to_vector/from_vector` 都要跟着改；`measure_fitness`（`trainer.cpp:44-46`）与 `score_match`（`:111-112`）假定「候选 = 一套系数」，要重定义为「候选 = 一对」。
+
+**验收**
+
+- **等价臂先行**：`pair.black == pair.white` 时，整棵树的着法/分值/节点数与今天**逐字节相同**。
+- `eval(W) == -eval(B)` 在 42 副棋盘 × 225 格上成立（`tests/test_evaluator.cpp:549-554` 那条断言的加强版）。
+- 旧参数文件 / 旧 checkpoint 能读进来，读成两侧同值。
+- **注意：`tests/test_evaluator.cpp` 有多处硬数值**（`:233-242`、`:260-297`、`:315-335`、`:361-364`、`:388-397`、`:510-558`、`:575-608`），签名一改就会红；这些是**预期红灯**，要逐条改，不许删断言。
+
+---
+
+### 丁-4 S6 后半：平衡控制器
+
+**状态**：未做。依赖丁-3。
+
+**目标效果**：每轮训练后读一次**按色胜率**，只对落后那一侧走一步有界修正，让训练赛不一边倒。
+
+**实现思路**
+
+1. 新 `src/training/balance.h/.cpp`：`BalanceController`，输入 `{wr_black, wr_white, games}`，输出「改哪一项、改多少」或「不动」。
+2. 判据用 **Wilson 区间**与 0.5 比较，只有区间不含 0.5 才算「偏了」——8 局的噪声不该触发动作。
+3. 动作：只改**落后那一侧**的 `position_weight_scale` / `edge_penalty` / `cand_width_*` 中的一个，步长 ±10 %，**每轮最多一步**，累计 5 步封顶。
+4. 到 5 步仍偏 → 停手，把问题交给 S1（规则级补偿），并在报告里写明「系数补偿到头了」。
+5. `solve_rate` 掉 2 个点 → 回滚该步并冻结本机制。
+
+**注意**
+
+- **威胁阶梯两侧不动**（丁-3 的约束），这里只动位置/贴边/宽度/防守权重。
+- 按色胜率会**被这套机制本身改变**，所以强度读数只认题库 `solve_rate` 与整树赛 Elo，**不认按色胜率**。
+- 默认关（`train_balance_step = 0`）。
+
+**验收**
+
+- 三步内按色胜率差必须缩小；否则回对称系数并作废。
+- 每一步都要有一条 `train_status` 记录「改了哪一项、从多少到多少、读数变化」。
+
+---
+
+### 丁-5 S1：开局规则参数化（swap / soosyrv）
+
+**状态**：未做。**这一项改的是五子棋规则本身**，不是引擎内部。
+
+**目标效果**：`--opening-rule none|swap|soosyrv`，默认 `none`（与今天一致）。让先手优势有**规则级**补偿，而不是靠搜索补偿。
+
+**实现思路**
+
+1. `TrainingConfig` 与 `GameManager` 各加一个 `opening_rule` 字段，**两者读同一份定义**（否则网页上换了规则、训练器不认）。
+2. `swap`（swap2）：黑下第 1、3 手，白在第 2 手后决定是否交换颜色；`soosyrv`（Soosõrv-8 简化）：黑第 1 手天元、白第 2 手、黑第 3 手，白再决定是否交换。
+3. `game_manager` 要暴露「交换回合」给前端（一个新的 C→S 帧 `choose_swap`），训练器侧在 `score_match` 的开局阶段走同一套判定。
+
+**注意**
+
+- **老记录不可比**：换规则前后的对局不能放在一起算胜率。换规则前导出旧记录，读数另标规则名。
+- 训练侧的 `--match-opening-plies` 与这个规则是**两件事**（前者是重放固定开局，后者是交换颜色），不要混。
+- 默认必须 `none`，且 `none` 下整条链路与今天逐字节相同。
+
+**验收**
+
+- 同一套系数下跑 48 条开局，报两个数：**「一方通吃比例」**与**「颜色决定的对局占比」**，对照组是 `none` 规则的同 seed 结果。
+- **杀线**：`swap` 下仍 > 60 % 开局一方通吃 → 说明该强度下这些开局本身就是必胜局，换规则不解决问题 → 转 S2；若「适配度赛钉在 0.5 的比例」不降反升（轮次129 读到过 32.5 % → 38.8 %）→ 记为反向证据，权重下调而不是硬上。
+
+---
+
+### 丁-6 S2：开局集按双方胜机筛选（无 GPU 版）
+
+**状态**：未做。文档原本把这一项放在 GPU 批处理上，但 **L 阶段已取消**，所以退回顺序循环。
+
+**目标效果**：开场前对每条候选开局做「黑白各自下的胜机评估」，只保留双方都有胜机的开局进训练集；结果落盘复用，不在线筛。
+
+**实现思路**
+
+1. 新函数（放 `trainer.cpp` 或新 `src/training/opening_screen.h/.cpp`）：对每条候选开局，黑白各跑 K 次短局（低深度、定节点），读「成五手数」与「终局分差」。
+2. 判据：双方胜率都落在 `[0.25, 0.75]` 才算「都有胜机」；否则剔除。
+3. 结果写 `data/training/openings.json`（含 `coeffs_sha`，系数换代要重筛）。
+
+**注意**
+
+- **顺序循环就是全部并行度**：没有 GPU、没有 `WavefrontBatch`（L 阶段取消）。K 与候选数要小，否则筛选成本超过省下的训练局数。
+- 筛选判据选错时，**换判据而不是放宽阈值**。
+- 落盘文件要带 `coeffs_sha`：换系数后旧筛选结果失效。
+
+**验收**
+
+- 筛前 / 筛后各报一遍「一方通吃比例」，筛后应压到 **1/3 以下**。
+- **杀线**：筛选成本 > 省下的训练局数 → 降 K 并复用落盘；两者都救不回来 → 作废，退回「固定 8 条轮换」。
+
+---
+
+### 戊-1 H：进程模型（`gomoku_broker` ＋ `gomoku_train --worker`）
+
+**状态**：未做。现在是**进程内 `std::thread`**（`trainer.cpp:268-327`），没有 broker、没有 worker 模式、没有绑核。
+
+**目标效果**：supervisor 进程（broker）派活给 N 个 worker 进程，每个 worker 绑一个物理核；玩家下棋时 worker 让位；崩溃只死一个任务。
+
+**实现思路**
+
+1. 新 `tools/broker_main.cpp` → `gomoku_broker`：读配额、写任务文件、tail 各 worker 的 JSONL、汇总状态、看门（退出码非 0 重排）、在轮末跑 `BalanceController`。
+2. `main_trainer.cpp` 加 `--worker <root>` 模式：从任务文件读活、跑完写记录、退出。**复用现有 `Trainer`，不复制训练逻辑**。
+3. IPC：**文件 spool ＋ UDS，不新开 TCP 端口**。大流量（记录/样本/逐手统计）追加写文件，每行带 `run_id`/`seq`；控制（起停/心跳/参数版本）每 worker 一条 UDS。
+4. 绑核：`sched_setaffinity` 绑 `reserved_cores … n-1`；`reserved_cores` 默认 2（1 给 asio/GameManager，1 给玩家那手搜索）。
+5. 玩家一开始思考 → broker 把部分 worker 置 `PAUSED`（不是杀），玩家那手结束再 `RESUME`。
+
+**注意**
+
+1. **不许新开 TCP 监听**：仓库有过一次压测把临时端口池打满、导致机器硬重启（`docs/PROMPT_STRESS_TEST.md`；TIME_WAIT 峰值 5011 = 熔断线 8000 的 63 %）。
+2. **半行写要丢弃并重排任务，不许续行**——续一行被截断的 JSON 是数据污染，不是健壮性。
+3. `--threads` 的语义已经是糊涂账（不带数据采集时是惰性的：user 56.50 vs wall 57.06，三份 RSS 只差 212 kB，轮次125 实测）。进程模型要把资源契约写成显式的「N 个 worker 进程」。
+4. **Windows 回退**：`CreateProcess` ＋ Job Object ＋ `SetProcessAffinityMask`；两者都不可用 → 退回线程模式并**显式上报**「本机为线程模式」。**不允许「两边都有但一边没测」的状态进树**。
+5. TT 本来就是每引擎一张（轮次127 实测共享表平坦，+71 kB/worker），进程边界与共享表边界天然对齐。
+
+**验收**
+
+- 1 / 2 / 4 worker：报每秒节点数与每轮墙钟；**每 worker 的 nps ≥ 单进程的 90 %**（绑核生效、没有互相踩 cache）。
+- `SIGKILL` 一臂 ＋ 半行写一臂：broker 的任务账与文件账在 N 秒内对齐。
+- 三档（全训 / 半训 / 边下边训）：报一次人类 think 的 p50/p99；**边下边训档 p99 相对全停档劣化 ≤ 20 %**（超过说明绑核没生效，不是机器不够）。
+
+---
+
+### 戊-2 I：参数单一真源 ＋ 网页控制面 ＋ 预览
+
+**状态**：未做。参数现在散在三处：`src/training/params.h`（可训练系数）、`src/main.cpp`（启动旗标）、`web/app.js` 的 `set_config`（只下发 `timeout_ms` / `max_depth`，`app.js:646-651`）。
+
+**目标效果**：一份 `ParamSpec` 定义同时喂服务端、训练器、前端；前端零硬编码；面板能改、能预览、能解释。
+
+**实现思路**
+
+1. 新 `src/server/param_schema.h`：`ParamSpec{ key, group, type, min, max, default, step, unit, when_live, desc_plain, effect_note, suggest }`；`ParamRegistry` 是它的单例。
+2. 帧：
+   - C→S `config_schema`（拉清单）、`config_set`（改一个，带 `preview` 布尔）、`config_preview`（跑固定针臂，不回填）；
+   - S→C `config_schema`（清单）、`config_ack` / `config_reject`（改参结果，越界要点名）。
+3. 前端：拿到 schema 后**动态渲染**表单，`min`/`max`/`default`/`suggest` 全部来自服务端；每次开新对局、起训练、开复盘面板都先拉一次 schema，**不缓存默认值**。
+4. 三类 `when_live`：`live`（立即生效）/ `next_think`（下一手/下一轮）/ `restart`（要重启，面板禁用并写明）。
+5. 预览：跑固定针臂（quiet / scattered × 两色 ＋ pos24），回填「完成深度 / 节点数 / 墙钟 / nps / 着法 / 分值 / `solve_rate@8k`」；**预览不改任何状态**，玩家思考时直接拒绝。
+
+**注意**
+
+- **前端零硬编码**是一条纪律，要写一条用例守住：`web_frontend_check` 里加「`app.js` 不含默认参数硬编码」。
+- 参数清册见 `docs/ENGINE_REDESIGN_V2.md` §5（四组：人类对局 / 训练 / 复盘题库 / 系统资源），每条都要能查到同一行；**表格改而代码不改等于没有单一真源**。
+- 服务端对每个 `config_set` 做范围校验，越界 `config_reject`，**不截断、不静默改**（沿用轮次74/86 的哨兵风格）。
+
+**验收**
+
+- `test_server`：`config_schema` 形状（每条都有 8 个字段）、越界拒绝、三类 `when_live` 各一例。
+- `web_frontend_check` 追加：面板由 schema 渲染（改 schema 的 `max`，输入框 `max` 跟着变）、不含默认参数硬编码。
+- 预览两次读数一致；预览前后不改参数时，正式 think 的读数与预览同形（允许时间项抖动）。
+
+---
+
+### 戊-3 K：一键训练（五相状态机）
+
+**状态**：未做。CLI 现在只有「从头跑 N 轮」或「从 checkpoint 续 N 轮」（`main_trainer.cpp:420`），没有分相入口。
+
+**目标效果**：`train_autopilot` 把六个要人手串的动作串成一个**可中断、可恢复、可解释**的循环。
+
+**实现思路**
+
+| 相 | 做什么 | 出口 | 失败时 |
+| --- | --- | --- | --- |
+| `PREPARE` | 读 checkpoint、生成/复用开局集、起 worker、绑核 | 开局集就绪 ＋ 心跳齐 | 缺开局集 → 现场筛；筛失败 → 退回固定 8 条 |
+| `COLLECT` | 自对弈产 records/samples（含 teacher） | 局数或节点预算到 | 单 worker 死 → 重排该任务，不重跑整相 |
+| `OPTIMIZE` | 遗传/爬山在适配度上搜 | 代数/停滞代数到 | 适配度全等 → 记「饱和」并跳 `BALANCE` |
+| `VERIFY` | 候选 vs 冠军：SPRT ＋ 按色胜率 ＋ 题库解题率 | SPRT 出界或局数到顶 | 解题率掉 > 2 点 → 拒绝晋升（即使胜率好看） |
+| `BALANCE` | `BalanceController` 走一步或不动 | 一步走完 | 见丁-4 杀线 |
+
+**注意**
+
+- 状态机放 **broker**，不放前端：关掉浏览器不能停训练。
+- `train_pause` 在**相边界**生效（不打断一手棋）；`train_stop` 写 checkpoint 后退出，`train_start` 从 checkpoint 续。
+- 每相结束发一帧 `train_status`，带「这一相花了多久、产出了什么、下一步为什么是它」——这是一键不变成黑箱的唯一办法。
+- **一键的边界**：只自动做上面五相，不改代码、不换算法、不调机器。
+
+**验收**
+
+- **同 seed 跑两次，相序列、每相出口条件、最终 checkpoint 的系数逐字节相同**（除时间字段）。这条比任何胜率读数都硬。
+- 中途 `train_pause` 后再 `train_start`，能从断点续且结果与不中断一致。
+
+---
+
+## 5. 已知坑清单（前几轮真踩过的）
+
+| # | 坑 | 现象 | 处置 |
+| --- | --- | --- | --- |
+| 1 | 远端 python/sed 打补丁 | heredoc 吃掉 `\n` 转义，含反斜杠的锚点全不匹配 | 本地 Edit ＋ `tar` 同步 |
+| 2 | 行级 find/replace | `cards written` 命中了同名子串，把 `analyze_main.cpp` 打坏 | 用唯一锚点，改完立刻编译 |
+| 3 | 换行串联命令 | python 失败后 `tar` 照跑，半成品进树 | 一律 `&&` |
+| 4 | Write 工具写 dotfile | `.patch.py` 在沙箱下不落盘 | 用普通文件名 |
+| 5 | `readme_anchor_check` | 给 README 插一行，后面所有 `README:NNN` 位移 | 只追加到末尾，或改完立刻重跑 |
+| 6 | `web_frontend_check` | 105 项是**行为断言**，`drawEvalGraph` 几何被逐点校验 | 加标记只追加绘制 |
+| 7 | `time_limit_ms = 0` | 会被兜到 100 ms，层切割点跟机器忙闲走 | 复盘/定深臂一律 `set_max_nodes` ＋ 不 binding 的时限 |
+| 8 | `RetryExplorer` | 记录里 53 % 的 ply 是 `replay`（回退重放），不是决策 | 段 A 已剔除；做样本/统计时也要排除 |
+| 9 | `ponder_node_budget` | 是**节点帽**（4000–200000）不是墙钟 | 定价按节点算，不按时钟算 |
+| 10 | 根表尾部是**界**不是分 | 第一版段 B 拿表里的分数做差，12 手全 `loss 0` | 已加 `RootMoveScore::exact` ＋ `exact_root_score()`；新判据要记住这条 |
+| 11 | `ctest` 要 8.5 分钟 | 改 `src/` 必须跑，改 `tools/` 可以不跑 | 提交信息里写明跑没跑、为什么 |
+| 12 | 构建主机的「本机」口径 | 是 6 vCPU 的 VMware 虚拟机，不是 12 线程物理机 | 报告里别写「本机 12 逻辑核」 |
+
+---
+
+## 6. 验收命令模板
+
+```bash
+# 0) 开工前
+ssh wdz@192.168.44.129
+cd ~/Desktop/workspace/gomoku && git pull && git log --oneline -1   # 期望 a9dfeb1 或其后代
+
+# 1) 改完一个文件
+cmake --build build -j6 --target <受影响目标>          # 期望 rc=0，零新增 warning
+
+# 2) 跑该单元的专用验证（见 §4 每个单元的「验收」）
+
+# 3) 固定门禁
+ctest --test-dir build                                  # 期望 8/8（改 src/ 时）
+node tests/readme_anchor_check.js                       # 期望 120 citations, 0 problems
+node tests/web_frontend_check.js                        # 期望 105/105
+
+# 4) 变异臂（新增用例必做）
+#    改错一条断言 → 期望非零退出并报出 test_xxx.cpp:行号 → 还原 → 复跑全绿
+
+# 5) 提交并推送
+git add -A && git commit -F - <<'MSG'
+feat: <一句话> — 轮次NNN
+
+<规格章节 / 落点 / 读数 / 杀线 / 门禁>
+MSG
+git push origin master && git log --oneline -1 origin/master
+```
+
+---
+
+## 7. 交接检查清单
+
+开工前确认：
+
+- [ ] `git log --oneline -1` 是 `a9dfeb1` 或其后代，`git status` 干净
+- [ ] `cmake --build build -j6` 能过（不重新 configure）
+- [ ] `ctest --test-dir build` 8/8（基线）
+- [ ] `node tests/readme_anchor_check.js` 120/0、`node tests/web_frontend_check.js` 105/105
+- [ ] 读过 `docs/ENGINE_REDESIGN_V2.md` 的 §2.2（O1–O4）、§3.2（S1–S4）、§3.3/§3.4（S5/S6）、§4（进程模型）、§6（复盘漏斗）
+- [ ] 知道 **L 阶段不做**、GPU 不可用
+
+每个单元交付时确认：
+
+- [ ] 一个 commit，一条 `push`，`origin/master` hash 已核对
+- [ ] 提交信息里有「规格章节 / 落点 / 读数 / 杀线 / 门禁」
+- [ ] 新机制带杀线，读数标了「实测」或「未测」
+- [ ] 新增用例有变异臂证据（报出行号）
+- [ ] 若走杀线：写清读数与理由，回收代码，**继续下一个单元**
+
+---
+
+## 附：单元与设计文档的对应
+
+| 单元 | 设计文档章节 | v1.0 出处 |
+| --- | --- | --- |
+| 甲-3 复盘面板 | §6.9、§6.10 | — |
+| 甲-4 门禁接线 | §6.7 c | — |
+| 乙-1 位置项差分表 | §7 回归保障 3 | `:556` |
+| 乙-2 选点基准 | §7 回归保障 1 | `:554` |
+| 丙-1 O5 证明入库 | §2.3 | — |
+| 丙-2 O2 `BoardValueCache` | §2.2 O2（**前提已更正**） | — |
+| 丙-3 O3 排序/威胁分离 | §2.2 O3 | — |
+| 丙-4 O1 `finish_direction` LUT | §2.2 O1 | — |
+| 丁-1 S3 连续信号 | §3.2 S3 | `:435` |
+| 丁-2 S4 蒸馏 | §3.2 S4 | — |
+| 丁-3 S6 按色系数 | §3.4 | — |
+| 丁-4 平衡控制器 | §3.4.3 | — |
+| 丁-5 S1 交换规则 | §3.2 S1 | — |
+| 丁-6 S2 开局筛选 | §3.2 S2 | `:436` |
+| 戊-1 H 进程模型 | §4.1–§4.4 | `:433` |
+| 戊-2 I 控制面 | §4.5–§4.6、§5 | — |
+| 戊-3 K 一键训练 | §4.8 | — |
+
+> `docs/ENGINE_REDESIGN.md`（v1.0）**不要改**：`:434` / `:592` 被 `tests/test_training.cpp` 按绝对行号引用。
