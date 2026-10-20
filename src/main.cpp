@@ -11,6 +11,7 @@ int main(int argc, char* argv[]) {
     std::string sessions_dir = "data/sessions";
     std::string records_path = "data/training/records.jsonl";
     std::string params_path;
+    int ponder_percent = 0;
     bool no_sessions = false;
     // Which of the two persistence paths the caller actually wrote down, as
     // opposed to the defaults above - --no-sessions needs to tell them apart.
@@ -70,6 +71,19 @@ int main(int argc, char* argv[]) {
                     std::cerr << "Invalid --params (must not be empty)" << std::endl;
                     return 1;
                 }
+            } else if (arg == "--ponder" && i + 1 < argc) {
+                // Design doc 2.4.3 ②: the share of a finished think that a session may
+                // spend pre-searching the reply it predicted. Off unless asked for,
+                // because it is one more engine thread per waiting session.
+                const std::string text = argv[++i];
+                std::size_t used = 0;
+                const int parsed = std::stoi(text, &used);
+                if (used != text.size() || parsed < 0 || parsed > 100) {
+                    std::cerr << "Invalid --ponder " << text
+                              << " (must be a whole number 0-100)" << std::endl;
+                    return 1;
+                }
+                ponder_percent = parsed;
             } else {
                 std::cerr << "Unknown or valueless option: " << arg << std::endl;
                 return 1;
@@ -130,7 +144,7 @@ int main(int argc, char* argv[]) {
     try {
         gomoku::GameServer server(port, web_dir, book_path,
                                   params_path.empty() ? nullptr : &coefficients,
-                                  sessions_dir, records_path);
+                                  sessions_dir, records_path, ponder_percent);
         server.start();
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;

@@ -455,4 +455,39 @@ SearchResult SearchEngine::search(const Board& board, int color,
     return result;
 }
 
+SearchResult SearchEngine::ponder_search(const Board& board, int color, int max_depth,
+                                         int node_cap, std::atomic<bool>& stop_flag) {
+    SearchResult result;
+    if (node_cap <= 0 || max_depth <= 0 || stop_flag.load()) return result;
+
+    // No deadline is installed, so the only budget this think can run out of is the
+    // node cap; `SearchLimits::ponder` is left alone on purpose. The doc's ② put the
+    // flag on the search and let the root loop decide to pre-search, but the decision
+    // needs a PV that only exists once a think has finished, so the tree asks from the
+    // caller's side and the layered search stays what it is - a search. A flag no node
+    // behaves differently for would be a claim, not a mechanism.
+    AlphaBetaSearch ab(evaluator_, *tt_alphabeta_);
+    SearchLimits limits;
+    limits.max_depth = max_depth;
+    limits.hard_time_ms = 0;
+    limits.soft_time_ms = 0;
+    limits.max_nodes = node_cap;
+
+    const Move ponder_move = ab.search(board, color, limits, stop_flag);
+    const SearchInfo info = ab.last_search_info();
+    result.best_move = ponder_move;
+    result.score = info.score;
+    result.depth = info.depth;
+    result.nodes_searched = info.nodes_searched;
+    result.partial_depth = info.partial_depth;
+    result.root_moves_done = info.root_moves_done;
+    result.root_moves_total = info.root_moves_total;
+    result.seldepth = info.seldepth;
+    result.tt_hits = info.tt_hits;
+    result.stopped = stop_reason_name(info.stopped);
+    result.principal_variation = info.principal_variation;
+    result.method = "alphabeta";
+    return result;
+}
+
 }

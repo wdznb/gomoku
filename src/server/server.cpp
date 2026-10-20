@@ -545,11 +545,16 @@ GameServer::GameServer(int port, const std::string& web_dir,
                        const std::string& book_path,
                        const ThreatCoefficients* coefficients,
                        const std::string& sessions_dir,
-                       const std::string& records_path)
+                       const std::string& records_path,
+                       int ponder_percent)
     : ioc_(), acceptor_(net::make_strand(ioc_)),
       signals_(ioc_, SIGINT, SIGTERM), web_dir_(web_dir),
       sessions_dir_(sessions_dir), records_path_(records_path), flush_timer_(ioc_),
       accept_retry_timer_(ioc_) {
+    // Assigned in the body rather than the init list: the member is declared ahead of
+    // the two timers, and an init list that runs out of declaration order is a warning
+    // the next reader would have to reason about for no benefit.
+    ponder_percent_ = ponder_percent < 0 ? 0 : (ponder_percent > 100 ? 100 : ponder_percent);
     if (coefficients) {
         coefficients_ = *coefficients;
         use_loaded_coefficients_ = true;
@@ -1223,6 +1228,7 @@ std::shared_ptr<GameServer::TrackedGame> GameServer::open_session(const SessionS
     auto game = std::make_shared<GameManager>();
     if (use_loaded_coefficients_) game->set_coefficients(coefficients_);
     game->set_opening_book(&book_);
+    game->set_ponder(ponder_percent_);
 
     bool unreadable_record = false;
     if (from) {

@@ -8988,6 +8988,219 @@ void test_the_session_records_the_table_reads_it_kept() {
               << " table reads)" << std::endl;
 }
 
+// ---------------------------------------------------------------------------
+// 轮次141 A（design doc 2.4.3 ②「把上一手的 PV 第二着作为预置」）: the one cross-hand
+// reuse that can actually cut. A record written two plies into a think is stored two
+// plies shallower than the next root asks for, so an ordinary session hit only
+// reorders the new tree (REVIEW_LOG 轮次140 读数 2: 23/24 命中, 中位 −8.8 %). Searching
+// the predicted reply ahead writes that position's children at the depth the next
+// think will request. No clock anywhere: every think below is ended by its depth, so
+// `nodes` is a count, not a load figure.
+// ---------------------------------------------------------------------------
+
+void test_a_pondered_reply_think_meets_a_tree_it_already_paid_for() {
+    struct Arm { const char* name; Board board; int color; };
+    const std::vector<Arm> arms = {
+        {"quiet BLACK", b1_quiet(), BLACK},
+        {"quiet WHITE", b1_quiet(), WHITE},
+        {"scattered BLACK", b1_scattered(), BLACK},
+        {"scattered WHITE", b1_scattered(), WHITE},
+    };
+    const int depth = 4;
+    // A wall far above what these poses cost, so the node budget a 0 ms timeout would
+    // derive (100 ms -> 20,000 nodes) never becomes the thing under test.
+    const int wall_ms = 600000;
+    std::atomic<bool> stop(false);
+
+    long long cold_total = 0;
+    long long warm_total = 0;
+    for (const Arm& arm : arms) {
+        SearchEngine session;
+        SearchEngine fresh;
+
+        const SearchResult first = session.search(arm.board, arm.color, depth, wall_ms, stop);
+        const SearchResult first_control =
+            fresh.search(arm.board, arm.color, depth, wall_ms, stop);
+        // The two engines have to start from the same conclusion, or what is being
+        // compared below is two trees rather than one tree paid for twice.
+        assert(first.method == "alphabeta" && first_control.method == "alphabeta");
+        assert(first.best_move == first_control.best_move);
+        assert(first.score == first_control.score);
+        assert(first.principal_variation.size() >= 2);
+
+        Board reply_position = arm.board;
+        assert(reply_position.place_stone(first.best_move.pos, arm.color));
+        const Move predicted = first.principal_variation[1];
+        assert(predicted.color == opponent(arm.color));
+        assert(reply_position.place_stone(predicted.pos, predicted.color));
+
+        // What the session would spend on it: the share the product setting uses.
+        const int budget = first.nodes_searched / 2;
+        const SearchResult pondered =
+            session.ponder_search(reply_position, arm.color, depth, budget, stop);
+        assert(pondered.method == "alphabeta");
+        assert(pondered.nodes_searched > 0);
+
+        const SearchResult cold = fresh.search(reply_position, arm.color, depth, wall_ms, stop);
+        const SearchResult warm =
+            session.search(reply_position, arm.color, depth, wall_ms, stop);
+        assert(cold.depth == depth && warm.depth == depth);
+        // 着法与分值不许动 - 这是 :554 那句「变化必须能解释」在这一格上的形状：这里没有
+        // 需要解释的变化。
+        assert(warm.best_move == cold.best_move);
+        assert(warm.score == cold.score);
+        assert(warm.nodes_searched < cold.nodes_searched);
+        cold_total += cold.nodes_searched;
+        warm_total += warm.nodes_searched;
+        std::cout << "  [" << arm.name << "] first " << first.nodes_searched
+                  << " / budget " << budget << " spent " << pondered.nodes_searched
+                  << " -> second think cold " << cold.nodes_searched << " vs warm "
+                  << warm.nodes_searched << std::endl;
+    }
+    // The row is 「节点数较冷启动下降 ≥ 25 %」, read over the four arms together: one
+    // pose's ratio is a property of that pose, while the row is about the mechanism.
+    assert(warm_total * 4 <= cold_total * 3);
+    std::cout << "test_a_pondered_reply_think_meets_a_tree_it_already_paid_for passed ("
+              << arms.size() << " arms at depth " << depth << ": cold " << cold_total
+              << " -> pondered " << warm_total << " nodes, "
+              << 100.0 * (1.0 - static_cast<double>(warm_total) / static_cast<double>(cold_total))
+              << "% cheaper, every arm the same move at the same score)" << std::endl;
+}
+
+// The same mechanism's two silences, which are what make it safe to run inside a live
+// session: a ponder spends its own node budget and never a wall clock - so whoever
+// ends it joins a thread that stops at the next node check, not one that runs out a
+// deadline nobody is reading - and it emits no progress frame and no elapsed time,
+// because the client already holds its move and a frame after the stone would read as
+// a second think.
+void test_a_ponder_costs_only_its_budget_and_says_nothing_on_the_hook() {
+    const Board board = b1_quiet();
+    std::atomic<bool> stop(false);
+    SearchEngine engine;
+    int frames = 0;
+    engine.set_progress_callback([&frames](const SearchStats&) { ++frames; });
+
+    const SearchResult first = engine.search(board, BLACK, 4, 600000, stop);
+    assert(first.method == "alphabeta");
+    const int frames_after_a_think = frames;
+    // The hook is wired, so the equality below says something.
+    assert(frames_after_a_think > 0);
+
+    Board reply_position = board;
+    assert(reply_position.place_stone(first.best_move.pos, BLACK));
+    const Move predicted = first.principal_variation[1];
+    assert(reply_position.place_stone(predicted.pos, predicted.color));
+
+    const int budget = 3000;
+    const SearchResult pondered =
+        engine.ponder_search(reply_position, BLACK, 6, budget, stop);
+    assert(pondered.method == "alphabeta");
+    assert(pondered.nodes_searched <= budget);
+    assert(pondered.stopped == "nodes");
+    assert(pondered.elapsed_ms == 0);
+    assert(frames == frames_after_a_think);
+
+    // A pre-search that was given no budget searches nothing at all.
+    const SearchResult unfunded = engine.ponder_search(reply_position, BLACK, 6, 0, stop);
+    assert(unfunded.nodes_searched == 0 && unfunded.method.empty());
+
+    // And one met by a 终止 already standing never reaches its first node.
+    stop.store(true);
+    const SearchResult stopped = engine.ponder_search(reply_position, BLACK, 6, budget, stop);
+    assert(stopped.nodes_searched == 0);
+    stop.store(false);
+
+    std::cout << "test_a_ponder_costs_only_its_budget_and_says_nothing_on_the_hook passed ("
+              << pondered.nodes_searched << " of " << budget << " nodes, stopped "
+              << pondered.stopped << ", " << frames << " frames - the same "
+              << frames_after_a_think << " the think itself made)" << std::endl;
+}
+
+// 轮次141 A（design doc 2.4.3 ②）在会话那一层的形状。预搜是**空闲时间**里的活：它既不能
+// 落子、也不能进复盘、更不能冒充「上一手耗时」，而谁要动棋盘就得先把它收回来。上一条量的
+// 是节点收益，这一条量的是这四件事 - 一个跑在会话里的线程做错任何一件都会被客户的帧或者
+// 悔棋看见。
+void test_a_pondering_session_arms_a_pre_search_that_commits_nothing() {
+    GameManager game;
+    game.set_player_color(BLACK);
+    game.set_config(3000, 4);
+    game.set_ponder(50);
+
+    std::atomic<int> ai_moves{0};
+    std::atomic<int> last_elapsed_ms{0};
+    game.set_move_callback([&](const Move&, int, int elapsed_ms) {
+        last_elapsed_ms.store(elapsed_ms);
+        ai_moves.fetch_add(1);
+    });
+
+    assert(game.make_move(7, 7));
+    for (int i = 0; i < 600 && ai_moves.load() < 1; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    assert(ai_moves.load() == 1);
+    // The worker arms the pre-search as its last act, while ai_thinking_ is still up,
+    // so a session that has answered cannot yet be holding a half-told story.
+    for (int i = 0; i < 200 && game.is_ai_thinking(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    assert(!game.is_ai_thinking());
+    assert(game.ponder_arms() == 1);
+
+    const auto generation_before = game.transposition_table().generation();
+    const size_t rows_before = game.replay_snapshot().moves.size();
+    for (int i = 0; i < 200 && game.ponder_last_nodes() == 0; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    const int pondered_nodes = game.ponder_last_nodes();
+    assert(pondered_nodes > 0);
+    // None of that left a mark on anything the client or a 复盘 reads.
+    assert(game.transposition_table().generation() == generation_before);
+    assert(game.replay_snapshot().moves.size() == rows_before);
+    assert(game.prev_think_elapsed_ms() == last_elapsed_ms.load());
+
+    // Turning the switch off takes back the one that is running, rather than leaving it
+    // to write into the table the next stone is about to age.
+    game.set_ponder(0);
+    assert(!game.ponder_active());
+
+    // A human stone is the other way out, and it has to be the synchronous kind: the
+    // board it places and the generation it advances are the two things the ponder
+    // thread must not be touching at the same time.
+    assert(game.make_move(8, 8));
+    assert(!game.ponder_active());
+    for (int i = 0; i < 600 && ai_moves.load() < 2; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    assert(ai_moves.load() == 2);
+    for (int i = 0; i < 200 && game.is_ai_thinking(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    // With the share at 0 the second think arms nothing, so the game plays on exactly
+    // as it did before this mechanism existed.
+    assert(game.ponder_arms() == 1);
+
+    GameManager silent;
+    silent.set_player_color(BLACK);
+    silent.set_config(3000, 4);
+    std::atomic<int> silent_moves{0};
+    silent.set_move_callback([&](const Move&, int, int) { silent_moves.fetch_add(1); });
+    assert(silent.make_move(7, 7));
+    for (int i = 0; i < 600 && silent_moves.load() < 1; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    assert(silent_moves.load() == 1);
+    for (int i = 0; i < 200 && silent.is_ai_thinking(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    assert(silent.ponder_arms() == 0);
+    assert(silent.ponder_last_nodes() == 0);
+
+    std::cout << "test_a_pondering_session_arms_a_pre_search_that_commits_nothing passed ("
+              << "one arm, " << pondered_nodes << " nodes spent in the idle time, "
+              << "generation / replay / 上一手耗时 all untouched, switch off joins it)"
+              << std::endl;
+}
+
 int main() {
     std::cout << "Running search tests..." << std::endl;
 
@@ -9180,6 +9393,13 @@ int main() {
     // G, in the contract's order: the field leaving the search, then the session keeping it.
     test_the_table_reads_a_think_took_are_reported_out_of_the_search();
     test_the_session_records_the_table_reads_it_kept();
+
+    // A（轮次141, design doc 2.4.3 ②）: what a pre-searched reply buys, then what it is
+    // not allowed to do - its own budget, and silence on the hook and the clock - and
+    // last what the session looks like while one is running.
+    test_a_pondered_reply_think_meets_a_tree_it_already_paid_for();
+    test_a_ponder_costs_only_its_budget_and_says_nothing_on_the_hook();
+    test_a_pondering_session_arms_a_pre_search_that_commits_nothing();
 
     std::cout << "All search tests passed!" << std::endl;
     return 0;

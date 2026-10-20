@@ -167,6 +167,24 @@ public:
     // move came back when it did.
     int prev_think_elapsed_ms() const { return prev_think_elapsed_ms_.load(); }
 
+    // Design doc 2.4.3 ②「预置复用」, the session's side of it. After the AI commits a
+    // stone, the idle time before the human's next stone is spent searching the reply
+    // the finished think's own PV predicted, on this session's table, so the next think
+    // meets records at the depth it will ask for instead of re-proving them (a normal
+    // cross-move hit is two plies shallower than the new root needs - see REVIEW_LOG
+    // 轮次140 读数 2). `percent` is that pre-search's budget as a share of the think
+    // that predicted the reply; 0 - the default - never arms one, because the cost is a
+    // second engine thread per waiting session and the doc prices no such thing.
+    // The ponder delivers nothing: no frame, no analysis row, no 上一手耗时, and the
+    // table's generation only steps for stones that were actually played.
+    void set_ponder(int percent);
+    int ponder_percent() const { return ponder_percent_; }
+    bool ponder_active() const { return ponder_active_.load(); }
+    // The two witnesses, read-only: how many pre-searches this session armed since it
+    // was opened, and what the last one that ended cost.
+    int ponder_arms() const { return ponder_arms_.load(); }
+    int ponder_last_nodes() const { return ponder_last_nodes_.load(); }
+
     void set_opening_book(const OpeningBook* book);
     
 private:
@@ -188,6 +206,17 @@ private:
     std::atomic<bool> ai_thinking_;
     std::atomic<bool> stop_flag_;
     std::atomic<bool> hint_active_;
+    // The idle pre-search's own stop flag and busy flag: 终止 stops it with the think,
+    // while `ai_thinking_` keeps saying only what it said before - that a move is being
+    // looked for. `make_move` / `undo` refuse while a think runs but not while a ponder
+    // runs, so those two end the ponder by joining it instead.
+    std::atomic<bool> ponder_active_;
+    std::atomic<bool> ponder_stop_;
+    // Witnesses, because 「一个预搜不落子、不进复盘、也不算成上一手耗时」 is a claim
+    // about a thread nobody can see: how many pre-searches this session armed, and what
+    // the last one that ended cost. A session with --ponder 0 keeps both at 0.
+    std::atomic<int> ponder_arms_{0};
+    std::atomic<int> ponder_last_nodes_{0};
     // Hard abort: reset / resign / destructor paths flip this before joining
     // the worker. The worker must discard its in-flight best move. Plain
     // stop_thinking leaves it false so the aborted worker still commits the
@@ -196,6 +225,7 @@ private:
     std::atomic<bool> discard_pending_;
     std::unique_ptr<std::thread> search_thread_;
     std::unique_ptr<std::thread> hint_thread_;
+    std::unique_ptr<std::thread> ponder_thread_;
     std::mutex thinking_mutex_;
     
     int timeout_ms_;
@@ -206,6 +236,9 @@ private:
     // remaining time derives.
     int soft_time_ms_ = 0;
     int max_nodes_ = 0;
+    // 0 arms nothing (see set_ponder); otherwise it is the share of the predicting
+    // think's node count that the pre-search is allowed to spend.
+    int ponder_percent_ = 0;
     // The searching thread writes this after a think hands back its move; the thread
     // that spawns the next one reads it into the Budget it passes by value, which is
     // why it is atomic rather than a plain int like the two above.
@@ -260,6 +293,9 @@ private:
     // worker: the engine's hint is written by the searching thread and read by no
     // other, so the worker never touches the session's own members for it.
     void ai_thinking_worker(int timeout_ms, int max_depth, Reuse reuse, Budget budget);
+    // Stop and join the idle pre-search, leaving `ponder_stop_` ready for the next one.
+    // Same rule as halt_search: never with thinking_mutex_ held.
+    void cancel_ponder();
     // Sets game-over state without joining the search threads, so it is safe to
     // call from ai_thinking_worker itself.
     void resign_now(int color);

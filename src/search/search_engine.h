@@ -84,6 +84,17 @@ public:
                         int max_depth, int time_limit_ms,
                         std::atomic<bool>& stop_flag);
 
+    // Design doc 2.4.3 ②「预搜对手应手」: the position a finished think's own PV
+    // predicts, searched ahead on the session's table while nobody is waiting for it,
+    // so the next think meets records deep enough to cut on. Deliberately narrower
+    // than search(), because a ponder is not a move: no book, no VCF/VCT, no resign
+    // probe, no progress frames, no hint, and no wall clock at all - only a node
+    // budget, so whoever ends the ponder joins a thread that stops within the
+    // 1024-node check instead of a deadline. `elapsed_ms` stays 0 for the same reason;
+    // nothing this returns is delivered to anybody.
+    SearchResult ponder_search(const Board& board, int color, int max_depth,
+                               int node_cap, std::atomic<bool>& stop_flag);
+
     void set_progress_callback(ProgressCallback cb) { progress_callback_ = cb; }
 
     void set_vcf_enabled(bool v) { vcf_enabled_ = v; }

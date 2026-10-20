@@ -43,12 +43,27 @@ int clamp_soft_time_ms(int soft_time_ms, int hard_time_ms) {
 int clamp_max_nodes(int max_nodes) {
     return max_nodes > 0 ? max_nodes : 0;
 }
+
+// The idle pre-search's share of the think that predicted the reply. Both bounds are
+// about what a *ponder* is for: with no floor, a think of a few thousand nodes leaves
+// the pre-search nothing to prove and the next think re-proves the whole tree; with no
+// ceiling, a session that was allowed two minutes for a move would spend another
+// minute of idle CPU on a guess the opponent may not even play. Neither bound is a
+// wall clock, so the join that ends a ponder still lands at the next node check.
+int ponder_node_budget(int think_nodes, int percent) {
+    if (think_nodes <= 0 || percent <= 0) return 0;
+    long long budget = static_cast<long long>(think_nodes) * percent / 100;
+    if (budget < 4000) budget = 4000;
+    if (budget > 200000) budget = 200000;
+    return static_cast<int>(budget);
+}
 }
 
 GameManager::GameManager() 
     : player_color_(BLACK), ai_color_(WHITE),
       status_(GameStatus::WAITING), winner_(EMPTY),
       ai_thinking_(false), stop_flag_(false), hint_active_(false),
+      ponder_active_(false), ponder_stop_(false),
       discard_pending_(false),
       timeout_ms_(5000), max_depth_(8) {
     // The engine only fires its own progress hook; forward it to whichever
@@ -79,6 +94,33 @@ void GameManager::halt_search() {
     }
     search_thread_.reset();
     hint_thread_.reset();
+    // The join above can leave a fresh ponder behind: the AI worker arms one as its
+    // last act, so a halt that arrived while it was still running has to take it off
+    // too before anything reads the board or the table this session owns.
+    cancel_ponder();
+}
+
+// Stop and join the idle pre-search. Never called with thinking_mutex_ held: the
+// caller is about to touch engine_ or board_, and the ponder thread is the only other
+// thing that touches either of them while it runs.
+void GameManager::cancel_ponder() {
+    ponder_stop_.store(true);
+    if (ponder_thread_ && ponder_thread_->joinable()) {
+        ponder_thread_->join();
+    }
+    ponder_thread_.reset();
+    ponder_active_.store(false);
+    // Ready for the next arm: the flag a ponder reads is this one, and a stale true
+    // would make the next pre-search stop on its very first node.
+    ponder_stop_.store(false);
+}
+
+void GameManager::set_ponder(int percent) {
+    // Outside that range the number means nothing the arm can use: a zero or negative
+    // share arms nothing, and a share over 100 % is a pre-search that costs more than
+    // the think that predicted it - at which point the honest setting is 100.
+    ponder_percent_ = percent < 0 ? 0 : (percent > 100 ? 100 : percent);
+    if (ponder_percent_ == 0) cancel_ponder();
 }
 
 void GameManager::reset() {
@@ -171,7 +213,12 @@ int GameManager::current_turn() const {
 bool GameManager::make_move(int row, int col) {
     if (status_ == GameStatus::GAME_OVER) return false;
     if (ai_thinking_.load()) return false;
-    
+
+    // The idle pre-search is a guess about what this stone will be, and the stone has
+    // now arrived: end it before this thread touches board_ or advances the table's
+    // generation, because the two would otherwise be written from both sides.
+    cancel_ponder();
+
     int turn = current_turn();
     // While a hand-set position is still pending, no side has been claimed yet,
     // so this stone is the claim (README lets 落子 start the game instead of
@@ -225,6 +272,9 @@ bool GameManager::undo(int& out_move_count, GameStatus& out_status) {
     if (ai_thinking_.load()) return false;
     if (position_pending_) return false;
     if (board_.move_count() == 0) return false;
+    // Taking a stone back rewrites the board the pre-search is reading a copy of and
+    // the table it is writing; end it first, same rule as make_move.
+    cancel_ponder();
     // Base stones are not a history: 摆棋 put them there and only another 摆棋
     // takes them off. With no analysed move to give back there is nothing to
     // undo, so a board of nothing but pre-placed stones refuses.
@@ -332,6 +382,9 @@ bool GameManager::request_hint(int timeout_ms, int max_depth) {
     if (hint_thread_ && hint_thread_->joinable()) {
         hint_thread_->join();
     }
+    // One engine, one thread inside it: the idle pre-search has to be off the table
+    // before a 求招 think starts.
+    cancel_ponder();
 
     hint_active_.store(true);
     stop_flag_.store(false);
@@ -416,6 +469,10 @@ void GameManager::start_ai_thinking(int timeout_ms, int max_depth) {
     if (hint_thread_ && hint_thread_->joinable()) {
         hint_thread_->join();
     }
+    // Last, not first: the AI worker is the thread that arms a ponder, so its own join
+    // is what makes "no thread is inside engine_" true. After this line nothing but the
+    // thread armed below touches the engine.
+    cancel_ponder();
     // Both workers are joined above, so any hint one of them wrote is visible here.
     Reuse reuse;
     
@@ -452,6 +509,10 @@ void GameManager::start_ai_thinking() {
 
 void GameManager::stop_thinking() {
     stop_flag_.store(true);
+    // 终止 means "stop working on this position", and the idle pre-search is work on a
+    // position too - one the player has not even agreed to. The join that follows at
+    // the next arm point is what actually ends it.
+    ponder_stop_.store(true);
 }
 
 void GameManager::ai_thinking_worker(int timeout_ms, int max_depth, Reuse reuse,
@@ -486,6 +547,15 @@ void GameManager::ai_thinking_worker(int timeout_ms, int max_depth, Reuse reuse,
         return;
     }
 
+    // What the idle pre-search would work on: decided under the lock below and armed
+    // after it is released (design doc 2.4.3 ②). The board is a *prediction* - this
+    // think's own variation played one reply further - which is the whole point: a
+    // record written at ply 2 of the previous think is two plies shallower than the
+    // next root asks for, while a pre-search of that very position writes them at the
+    // depth the next think can actually cut on.
+    Board ponder_root;
+    int ponder_nodes = 0;
+
     if (move_callback_ && result.best_move.pos.is_valid()) {
         std::lock_guard<std::mutex> lock(thinking_mutex_);
         // A user stop_thinking sets stop_flag_ but leaves discard_pending_
@@ -500,7 +570,8 @@ void GameManager::ai_thinking_worker(int timeout_ms, int max_depth, Reuse reuse,
             // The table's clock steps once per committed stone, not once per think:
             // the records this think wrote stay in the table for the moves that
             // follow, which is what lets a later think meet the same position by a
-            // different move order and read them.
+            // different move order and read them. A ponder is not a stone, so it
+            // advances nothing here.
             engine_.transposition_table().advance_generation();
             analyses_.push_back(MoveAnalysis{result.best_move, result.score, result.depth,
                                              result.nodes_searched, result.elapsed_ms,
@@ -519,9 +590,44 @@ void GameManager::ai_thinking_worker(int timeout_ms, int max_depth, Reuse reuse,
             move_callback_(result.best_move, result.score, result.elapsed_ms);
 
             check_game_over();
+
+            // Armed only for the shape this is about: a layered think, a game still
+            // alive, a reply left in its own variation, and a human now holding the
+            // move. A fast-path answer predicts nothing, and 终止 / 认输 / a finished
+            // game leave nothing idle to fill.
+            if (ponder_percent_ > 0 && result.method == "alphabeta" &&
+                !result.resigned && result.principal_variation.size() >= 2 &&
+                status_ == GameStatus::PLAYING && current_turn() == player_color_) {
+                const Move reply = result.principal_variation[1];
+                Board root = board_;
+                if (reply.color == current_turn() &&
+                    root.place_stone(reply.pos, reply.color)) {
+                    ponder_root = root;
+                    ponder_nodes = ponder_node_budget(result.nodes_searched, ponder_percent_);
+                }
+            }
         }
     }
-    
+
+    if (ponder_nodes > 0) {
+        // Nothing should still be running at this point - every path that arms one
+        // joins the previous one first - but replacing a joinable std::thread calls
+        // std::terminate, and an idle pre-search is not worth that class of bug.
+        cancel_ponder();
+        ponder_active_.store(true);
+        // Counted before the thread exists, so a test that waits for this worker to
+        // finish can read the arm without racing the ponder itself.
+        ponder_arms_.fetch_add(1);
+        const int ponder_color = ai_color_;
+        ponder_thread_ = std::make_unique<std::thread>(
+            [this, ponder_root, ponder_color, ponder_nodes, max_depth]() {
+                const SearchResult pondered = engine_.ponder_search(
+                    ponder_root, ponder_color, max_depth, ponder_nodes, ponder_stop_);
+                ponder_last_nodes_.store(pondered.nodes_searched);
+                ponder_active_.store(false);
+            });
+    }
+
     ai_thinking_.store(false);
 }
 

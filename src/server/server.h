@@ -86,7 +86,12 @@ public:
                const std::string& book_path = "data/opening_book.json",
                const ThreatCoefficients* coefficients = nullptr,
                const std::string& sessions_dir = "data/sessions",
-               const std::string& records_path = "data/training/records.jsonl");
+               const std::string& records_path = "data/training/records.jsonl",
+               // Design doc 2.4.3 ②, server-wide policy: the share of a finished think
+               // that its session may spend pre-searching the reply it predicted while
+               // the human is thinking. 0 (the default) never arms one - this is a
+               // second engine thread per waiting session, which no document prices.
+               int ponder_percent = 0);
 
     void start();
     void stop();
@@ -128,6 +133,8 @@ private:
     // GameManager owns its own engine; the file is read once here, never again.
     ThreatCoefficients coefficients_;
     bool use_loaded_coefficients_ = false;
+    // --ponder, handed to every session the server opens (see the constructor).
+    int ponder_percent_ = 0;
     std::map<WebSocketSession*, std::shared_ptr<GameManager>> games_;
     std::map<std::string, std::shared_ptr<TrackedGame>> sessions_;
     std::map<WebSocketSession*, std::string> socket_tokens_;

@@ -233,6 +233,29 @@ struct Harness {
     }
 };
 
+// 轮次141 方案A 的接线：`--ponder <percent>` 只有走进每一局的会话才算数，而它是
+// open_session 里的一行，所以这一条钉的是「会话拿到的是服务器那一份」，不是默认值。
+void test_the_ponder_share_reaches_the_sessions_it_opens() {
+    const auto dir = scratch("r141_ponder_sessions");
+    {
+        // 服务器没被要求预搜：每一局都是 0，也就是这棵树在没有 --ponder 时的老形状。
+        GameServer off(0, std::string(), std::string(), nullptr, dir.string(), std::string());
+        auto entry = off.open_session(nullptr);
+        assert(entry->game->ponder_percent() == 0);
+        assert(!entry->game->ponder_active());
+    }
+    {
+        // 要求 50 %：新建的会话一出生就带着它，不需要客户端再说什么。
+        GameServer on(0, std::string(), std::string(), nullptr, dir.string(), std::string(), 50);
+        auto entry = on.open_session(nullptr);
+        assert(entry->game->ponder_percent() == 50);
+        // 越界的百分比在构造函数那一格就被折回 0..100，会话里读到的是折回后的数。
+        GameServer wide(0, std::string(), std::string(), nullptr, dir.string(), std::string(), 180);
+        assert(wide.open_session(nullptr)->game->ponder_percent() == 100);
+    }
+    std::cout << "test_the_ponder_share_reaches_the_sessions_it_opens passed" << std::endl;
+}
+
 // Round 72, handle_undo: an undo gives the token back to the undecided game, so
 // the finished game that was already exported must be exportable again once the
 // position finishes a second time.
@@ -2847,6 +2870,8 @@ int main() {
     PatternRecognizer::init();
 
     test_undo_reopens_export();
+
+    test_the_ponder_share_reaches_the_sessions_it_opens();
     test_set_position_reopens_export();
     test_emptied_board_deletes_residue();
     test_failed_flush_retries_and_keeps_dedup();

@@ -1980,6 +1980,116 @@ additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cp
 no existing assertion was edited.
 
 
+## 轮次141 引擎重构 N（方案A）：§2.4.3 ② 的 ponder 第一次进树——G3 那一格从 8.8 % 读到 45.8 %（25 % 预算 30.8 %），而 TSan 的变异表说承重的那件事不是「join」而是「副本」 — engine redesign stage N: design doc §2.4.3 ② (pre-search the reply the last think's own PV predicted) lands, G3's second cell reads 45.8 % median at a 50 % budget and 30.8 % at 25 %, and the mutation table shows the load-bearing guard is the Board copy, not the joins
+
+用户上一轮要「依次验收」，本轮要的是「先做A」——方案 A 就是轮次140 为 `docs/ENGINE_REDESIGN.md:124`（G3 第二格「节点数较冷启动下降 ≥ 25 %」，实测中位 8.8 %）开的那张整改单，出处是文档 `:299`：
+
+> ② 把上一手的 PV 第二着作为 ponder 预置（对手真走了这一手 → 整棵子树已在本手前被搜索过，TT 直接命中）
+
+本轮动了 9 个文件、`+466 / −6` 行（`git diff --numstat` 见门禁），默认关。
+
+### 落点：一条搜索入口、一处会话所有权、一个开关
+
+| 位置 | 是谁 |
+| --- | --- |
+| `src/search/search_engine.h:95`＋`src/search/search_engine.cpp:458` | `SearchEngine::ponder_search(board, color, max_depth, node_cap, stop_flag)`：只有 AlphaBeta 一层，没有开局库、没有 VCF/VCT、没有 resign 探针、没有进度帧、**没有墙钟**，`elapsed_ms` 留 0 |
+| `src/server/game_manager.cpp:53` | `ponder_node_budget(think_nodes, percent)`：上一次思考节点数的百分比，地板 4000、天花板 200000 |
+| `src/server/game_manager.cpp:598` | arm 判据（五件事同时成立才点）：`percent > 0` ＋ `method == "alphabeta"` ＋ 没认输 ＋ PV 第二着存在 ＋ 棋还活着且轮到人手；落点是提交块之内、`thinking_mutex_` 之下 |
+| `src/server/game_manager.cpp:616-630` | 起线程：`Board root = board_` 再摆上预测的应手，副本由线程所有；`ponder_arms_` 先加，再发布 `std::thread` |
+| `src/server/game_manager.cpp:106` | `cancel_ponder()`＝置停→join→复位 `ponder_stop_`；被 `make_move`（`:220`）、`undo`（`:277`）、`request_hint`（`:387`）、`start_ai_thinking`（`:475`）、`halt_search`（`:100`）调用 |
+| `src/server/server.cpp:1231`＋`:557` | `open_session()` 把服务器那一份百分比发给每一局；构造时折回 0..100 |
+| `src/main.cpp:74` | `--ponder <percent>`，越界与非数一律 `rc=1` |
+
+停的那一侧有代码保证：`hard_stopped()`（`src/search/search_state.h:416-428`）每次调用都读 `stop_flag_`，只有钟走的是 `(++check_counter_ & 0x3FF)` 那一格——所以一把只带节点预算的预搜，join 落在下一个节点检查，不等 1024。
+
+### 读数 1：G3 那一格第一次过，代价是同一笔 CPU 换个时间花
+
+仪器 `/tmp/r141/g3_prod.cpp`＝轮次140 那支 `/tmp/g3/g3_ponder.cpp` 的两处改动：预搜走产品入口 `ponder_search`，预算走产品那条 `ponder_node_budget`（逐字照搬）。三副局面（quiet 四子、scattered 四孤子、pos24 二十四子）× 两色 × 会话内连想四轮 ＝ **24 臂**，`max_depth = 6`、无钟无帽，与轮次140 读数 2 同一把尺；口径也沿用：**两臂都完成 depth 6 的才算可比臂**。
+
+| 预搜预算 | 可比臂 | 根命中 | 降幅中位 | 最差臂 | ≥ 25 % 的臂 | 着法／分值 | 空闲节点和 | 省下 ÷ 花掉 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| **0 %（＝轮次140 那一格）** | 20 | 23/24 | **8.76 %** | −4.5 % | 1/20 | 20/20 同 | 0 | — |
+| 25 % | 20 | 23/24 | **30.75 %** | −0.9 % | 13/20 | 20/20 同 | 850,693 | 1.273 |
+| 50 % | 19 | 23/24 | **45.80 %** | −3.4 % | 15/19 | 19/19 同 | 1,387,226 | 1.129 |
+| 100 % | 18 | 23/24 | 53.06 % | −3.4 % | 12/18 | 18/18 同 | 1,820,303 | 0.982 |
+| 50 % 且去掉地板 | 19 | 23/24 | 41.00 % | −4.5 % | 14/19 | 19/19 同 | 1,384,702 | 1.131 |
+
+- **对照臂逐字段相同**：`prod_0.out` 与轮次140 的 `g3b.out` 24 行、每行的 warm/cold 节点、命中、深度、着法、分值全部一致（`diff` 空），也就是说 `--ponder` 不在时这棵树**一步没变**。
+- **文档那一格过了**：`:124` 要「≥ 25 %」，25 % 预算读到 30.75 %、50 % 读到 45.80 %，中位口径；且 24 臂里被ponder影响的答案**一个都没变**（`same_best`、`same_score` 全 1）。
+- **地板不是装饰**：同一份 50 %，带地板 45.80 %、不带 41.00 %。差的那几臂正是上一手只花了几千节点的小思考——没有地板时预搜只有几百节点，下一手什么也没买到。
+- 可比臂随预算变少（20→19→18）不是漏臂：预搜把子树铺满以后，那几臂在将杀短路处 depth 1 就返回，被「两臂都要跑完 depth 6」这条口径排除在外。
+- **代价要说全**：省下与花掉几乎 1:1（50 % 那一臂 1.129）。这不是「更快」，是「把同一笔 CPU 从人等的那一刻挪到等人落子的那一刻」——文档 `:299` 那半句「整棵子树已在本手前被搜索过」就是这个意思。100 % 那臂已经跌破 1，所以默认值不该往上走。
+
+产品 API 那一侧的三条用例各钉一件事（`tests/test_search.cpp`）：
+- `:9001` `test_a_pondered_reply_think_meets_a_tree_it_already_paid_for`：四臂定深 4，冷 64,927 → 预搜后 44,351 节点＝**31.691 %**，四臂 `:9062` 收在 `warm_total * 4 <= cold_total * 3`（就是文档那一格的 25 %），着法与分值逐臂相同；
+- `:9076` `test_a_ponder_costs_only_its_budget_and_says_nothing_on_the_hook`：预算 3000 就花 3000（`stopped == "nodes"`），钩子上 5 帧 `thinking_progress`，与不预搜时那 5 帧逐字相同；
+- `:9123` `test_a_pondering_session_arms_a_pre_search_that_commits_nothing`：一把 arm 花掉 4000 节点（地板），表的代龄、`replay_snapshot` 行数、`上一手耗时` 三项纹丝不动，`set_ponder(0)` 把它 join 回来。
+
+### 读数 2：并发——干净树 0 条 race，五臂变异里只有一臂响，而那一臂响的是「副本」
+
+`/tmp/r141/ponder_tsan.cpp`（产品 API，八个相遇场景 S1-S8：落子、悔棋、halt、求招、关开关、连续四手都开 ponder、AI 一手把棋下死、思考进行中析构）＋ `/tmp/r141/build.sh … tsan`（`-fsanitize=thread -g -O1 -fno-omit-frame-pointer`，与 `build-tsan` 同形）。本机不需要 `vm.mmap_rand_bits`，`setarch -R` 没用上；也没有 `thread leak` 报警（析构那一臂 S8 专门盯它）。
+
+**干净树**：`rc=0`，8 场景 0 失败，`data race` **0 条**，`thread leak` 0 条（`/tmp/r141/tsan_clean3.{out,err}`）。
+
+| 臂 | 改哪一句 | 结果 | 为什么（不）响 |
+| --- | --- | --- | --- |
+| M1 | 删 `make_move` 的 `cancel_ponder()` | `rc=0`，race 0，断言 0 失败 | 人的一子写在 `board_` 上，而预搜读的是**副本**；它写的表是 `tt_alphabeta_`，`advance_generation()` 走的是另一张（VCF）表——两边根本没有同一个对象 |
+| M2 | 再删 `undo` 与 `start_ai_thinking` 的 join | `rc=1`，race **0**，1 条断言红（S2） | 两次思考真的重叠了也不报：表是分片带锁的（`transposition.h:216` 每片一把 `std::mutex`），并发写不是 race 而是**契约**问题 |
+| M3 | 只删 `undo` 的 join | `rc=1`，race 0，1 条断言红 | 同 M1；这一处 join 由 `ponder_active()` 那条断言杀掉，不靠 TSan |
+| M5 | `halt_search` 里把 cancel 挪到 join **之前** | `rc=0`，race 0，断言 0 失败 | 杀不掉不是仪表失灵：`discard_pending_` 在 halt 第一行就置真，而 arm 嵌在提交块里——**halt 之后 worker 永远不会再点一把 ponder**。那句「Last, not first」因此是防而非治，本轮如实登记 |
+| M4 | 预搜改读**活动棋盘** ＋ 删 `make_move` 的 join | `rc=66`，race **8**，断言 0 失败 | 两条栈正好是这件事的两端：T 在 `alphabeta.cpp:602` 的 `Board::Board(const Board&)`（`board.h:45`）**读**，主线程 `Board::place_stone`（`board.cpp:65/71`、`set_stone_bits`、`update_active_empty`、`activate`）**写** |
+
+结论写成人话：这一轮真正承重的不是那五处 `cancel_ponder()`，而是 arm 里那句 `Board root = board_;`。副本在，join 是纪律；副本不在，join 是唯一的防线——M4 一撤就响 8 条。M1／M2／M3／M5 四臂的「不响」同样有用了：它们把「哪些守卫是内存安全、哪些是逻辑契约」分开了，而 M3 那一臂的断言红证明仪表通着电。
+
+`ponder_search` 因此对入参有一条硬要求：**必须交给它一份调用方私有的棋盘**。这一点写在 `search_engine.h:87-94` 那段注释里，M4 是它的仪器。
+
+### 读数 3：CPU 与内存——多一把线程的价格，和一把预搜的热点
+
+`perf` 在这台机器上仍然取不到（`kernel.perf_event_paranoid = 4`，且「不得修改系统配置」是硬约束），仪器换成 callgrind（指令计数）与 `/usr/bin/time -v`（峰值 RSS）。
+
+- **热点**（`/tmp/r141/cg_ponder.out`：一把定深 4、预算 8000 的预搜，实跑 7,881 节点，`I refs: 571,718,793`）：`Evaluator::pattern_score` 20.85 %、`PatternRecognizer::finish_direction` 14.45 %、`CandidateCache::cell` 8.20 %、`recognize_position_both` 8.18 %、`match_pattern` 7.58 %、一次性 `fill_pattern_lut` 5.64 %。前五项与轮次125 的整机表（20.92 / 16.39 / 9.45 %）同一形状——**预搜没有带来任何新的热点函数**，它就是同一台内核多跑一遍。
+  别拿这把数去比轮次135 那格 42,353.5 Ir/节点：那台尺量的是定深 6 的完整 think，这里只有 7,881 个节点、还含着 32.2 M Ir 的一次性 LUT 构建（扣掉是 68,456 Ir/节点）。本轮没有把两把尺对齐的预算，所以只登记形状一致，不登记倍数。
+- **多一把线程的价格**（`/tmp/r141/thread_cost.cpp`，`-O2`，`taskset -c 3`，各 2000 次）：`std::thread` 起＋join **28.92 µs**，`detach` 那种 55.54 µs；`Board` 副本 **0.118 µs**、`sizeof(Board) = 4,664` 字节；`sizeof(SearchResult) = 152` 字节。相对地板那一把 4000 节点的预搜（≈ 2.7 亿 Ir），起停线程这笔是万分之一量级。
+- **内存**（同一支 `/tmp/r141/one_ponder`，`/usr/bin/time -v`）：不预搜峰值 RSS 11,592 KB，4000 节点那把 11,656 KB（**+64 KB**），定深 4 跑满 7,881 节点 11,688 KB（+96 KB）。也就是说每一条在等的会话多出来的驻留是几十 KB 加一份 4.7 KB 的棋盘，线程栈是虚拟的、按触到的页算。
+- **valgrind memcheck**（`build-vg`，Debug＋`-UNDEBUG`）：`test_board` / `test_pattern` / `test_evaluator` / `test_session` 全 clean（29 / 6 / 2 / 4 s，报告 0 条），`test_server` clean（42 s；新用例拼入后单独复跑 41 s 仍 0 条）；`test_position` **ABORTED rc=134／reports 0／795 s**——轮次里已经记过这条仪表脆弱（`REVIEW_LOG:6533`：读的是进程峰值 RSS，memcheck 的影子内存记在它头上），本轮读数 437 MB 对当时记的 425 MB，红点仍在 `tests/test_position.cpp:1127` 那条 `assert(after.ru_maxrss < 250LL * 1024)`，**abort 点没前移、报告零新增**（裸跑 `build-vg/test_position` 的用例次序确认：`blank_cell`（第 20 行）就在 r98cc1 那条 16 MB 用例之前，与 valgrind 那遍最后两行一致）。
+- 仓库外的预搜探针在 memcheck 下同样 0 报告、0 definite leak（`/tmp/r141/vg_probe.{out,err}`）。
+
+### 异形登记（照文档做，但形状不一样）
+
+1. 文档 `:300` 把这一条写成搜索内部的一个开关：`if (limits_.ponder && limits_.hint_move…) { /* 预搜对手应手 */ }`。本树的决定权在**会话的所有者**（`game_manager.cpp:598`），`SearchLimits::ponder`（`src/search/search_limits.h:68`）这个字段仍然没有任何读者，也没有人写它。理由与轮次139 那条同源：一个没有任何节点行为差异的旗标是一句主张，不是一个机制——树里预搜与正搜的差异全在调用方（有没有钟、有没有帧、有没有快路径、提交不提交）。
+2. 文档没写预搜该花多少。本树定成「上一次思考节点数的百分比 ＋ 地板 4000 ＋ 天花板 200000」，其中地板是读数 1 那条 41.00 % → 45.80 % 的读数买来的；天花板是给「客户端可以要到 depth 20／两分钟」那一格兜底。
+3. **默认 0（关）**，靠 `--ponder` 打开，与 `--shared-tt`、D-4 同一先例：文档没有为「每个等待中的会话多一条引擎线程」定价 CPU，而这台机器上一轮刚因为连接风暴卡过。因此 `:124` 那一格现在是**带开关达标**：`--ponder 50` 读 45.80 %，不带就是轮次140 记的 8.76 %。要不要把默认值抬到 25 % 或 50 %，是用户的一句话，不是本轮可以自代的（读数 1 的 100 % 臂已经给出「别往上」的方向）。
+
+### 问题账（本轮真实踩到的）
+
+| # | 事 | 处理 |
+| --- | --- | --- |
+| 1 | 探针自己读板：一句调试打印在 worker 提交的同时读 `current_turn()` → 报出 1 条真 race（`board.cpp:69` 写 vs `board.h:61` 读） | 删掉那句打印；这不是产品缺陷，是仪表的，记在这里免得下一轮把它当产品账 |
+| 2 | `note()` 一失败就 `exit(1)`，M2 那臂因此跑不到「连续四手都开 ponder」的重叠窗口，读到 0 race 像是仪表失灵 | 探针改成计数继续、退出码带失败数（`failures=`），M2 重跑仍是 0 race，而这条 0 有了理由（分片锁） |
+| 3 | 脚本给的第二手撞在 AI 刚落的应子上，`make_move` 直接拒 → 场景卡死 20 s | 加 `next_free()`，人的一子从空位里取；落点不再依赖 AI 走了哪 |
+| 4 | S4 那句「hint 不会落子」写成了 `wait_for_ai_move(before)`，同义反复、永远真 | 换成「求招之后 `ai_moves` 计数不变」的断言 |
+| 5 | memcheck 下 S3 的 `ponder_active()` 观察不到：影子内存慢下来的过程中，地板那 4000 节点已经跑完 | 不改成断言（那是时序断言），登记为仪表脆弱；同一件事在 TSan 那一臂是观察到的 |
+| 6 | `set_ponder()` 与 worker 的 arm 之间有一个窗口：arm 是 worker 的最后一件事，而 `set_ponder` 不像 `make_move` 那样先看 `ai_thinking_` | 产品路径只在 `open_session()`（此刻一条线程都没有）调它，探针也一律先等 `is_ai_thinking()` 落下再动开关；这是**契约**，写进 S5 的注释里 |
+| 7 | 第一轮把 `--ponder abc` 说成会打印专门那句 | 实测走的是通用 `Invalid command-line argument: stoi`（与 `--port abc` 同一格），只有 −5／101／50x 这类「数字但越界」才打专门那句；两条路径都 `rc=1`，本轮按实测登记，代码不改 |
+
+### 门禁
+
+- `node tests/readme_anchor_check.js` **120 citations / 0 problems**；`node tests/web_frontend_check.js`
+  **105/105 passed**——两支都跑了**两遍**：`src/`＋`tests/` 定稿之后一遍（那一遍 `test_server.cpp` 刚长出
+  25 行，正是要看 README 的针有没有被推移），本节拼入之后又一遍，读数一致。
+- `cmake --build build -j4` 无新警告，`ctest` **8/8 / 486.37 s**（`test_search` 458.30、`test_server` 9.26、`test_position` 7.78、`test_training` 10.85）。
+- TSan 见读数 2；memcheck 见读数 3；两者不与任何负载跑重叠（`docs/STRESS_TEST_RULES.md` §5）。
+- `git diff --numstat` 本轮代码：9 个文件 **466 / 6**。
+- 本节拼在轮次140 表头之前（原 1983 行处），纯插入：`git diff --numstat` ＝ **110 / 0**，
+  `wc -l REVIEW_LOG.md` 从 8527 到 **8637**；被推下去的档内绝对针（`REVIEW_LOG:2289` → 轮次125 的
+  1.99 s 那一行，拼入前在 **4152** 行）拼入后在 **4262** 行，差 **1973** 行。
+
+### 判
+
+方案 A **落地**。`:124` 第二格第一次有达标读数（`--ponder 50`：中位 45.80 %、15/19 臂 ≥ 25 %、24 臂答案一个没变），代价写全了：它把同一笔 CPU 从人等的那一刻挪到等人落子的那一刻（省下 ÷ 花掉 1.129），并且**默认关着**——默认值要不要抬，交用户一句话。
+
+没动的账：`:549` 第一格（内核 4.4 倍，方案 B 要授权）、`:555` 整树赛（方案 C）、`:556` 位置项那张 225×2×42 的表（方案 D）、`:548` B 行口径的措辞（方案 E）、`:554` 基线宽度（方案 F）。
+
 ## 轮次140 验收：`docs/ENGINE_REDESIGN.md` 的六条目标、§4 四行与四条回归保障逐条对账——G1／G2／G4／G6 与 A／D 行有达标读数，G3 第二格第一次量到（中位 8.8 %，那一格要 25 %），C 行仍差那个 4.4 倍因子，`:555` 与 `:556` 各欠一样东西 — acceptance round: every goal, §4 row and regression guarantee in the design doc read against the tree, with two fresh measurements (the B-row's 64 arms split by `method`, and a session's second think priced against a cold start)
 
 用户这一轮要的是「按文档依次验收；文档内的目标如果没有实现，必须给出真实数据和整改方案，确认方案可以按照文档实现」。
