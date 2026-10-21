@@ -1980,6 +1980,137 @@ additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cp
 no existing assertion was edited.
 
 
+## 轮次157 引擎重构 丁-2：S4 深搜蒸馏落地——每一手在学生落子之前由独立引擎、独立置换表的老师再想一次，战术层的 ply 第一次进得了样本（456 → 672 条，+47 %），关着的时候逐字节是 S4 之前的形状 — engine redesign stage 丁-2: a deeper teacher thinks before each data-game ply with its own transposition table; samples cover the tactical plies for the first time (456 → 672) and the default-off path writes byte-identical records
+
+指导书 §4 丁-2 要「每手棋由当时的引擎和一个更贵的老师各给一个答案，两者分开记」，四条实现要点
+（独立 TT、落子前搜、深度显式记、顺手修 `RetryExplorer::reset()`）与三条验收（出现
+`teacher_source == "distill"`、样本覆盖 vcf/must_block 的 ply、报师生一致率随轮次的变化），
+杀线是「老师贵 k 倍若每轮对局数塌到 1/4 以下就只对适配度赛做蒸馏」。四条要点全部照做，
+杀线没有触发。缺省 **关**（`--teacher-depth 0`），与丁-1 的权重、D-4 的开局轮换、轮次141 的
+ponder 同一先例。
+
+### 记什么、谁来记
+
+- `MoveRecord` 尾部三个字段（`src/training/game_record.h:42-50`）：`teacher_move` /
+  `teacher_depth` / `teacher_score`。JSON 是**四个可选键**（`game_record.cpp:76-84` 写、
+  `:178-187` 读）——老师的颜色恒等于这一手的行棋方，所以不必重复存，读回来时继承
+  `move.color`。没有老师时这四个键一个都不写，**蒸馏关着的每一行 JSONL 逐字节是 S4 之前的形状**
+  （轮次147 给 `TrainingSample` 钉的是同一条纪律，本轮在 `GameRecord` 上照做）。
+- 生产者是 `SelfPlay`（`self_play.cpp:124-142`）：在 `engine.search` 之后、`board.place_stone`
+  之前用 `teacher_` 搜同一局面，写进 `entry.teacher_*`。`teacher_` 由 `set_teacher` 交进来
+  （`self_play.h:64`、`RetryExplorer` 转发在 `:100`）。训练口径由 `SelfPlay` 声明而不是让
+  引擎自己猜，与它给学生的那两句同一条理由（`self_play.cpp:44`）。
+- 老师的深度记的是**请求值**（注意 3）：`vcf` / `vct` / `must_block` 的 `result.depth` 是 0，
+  那是结构性的，不是「老师只看了 0 层」。
+- `trainer.cpp:392-401` 每个 worker 一个老师（`SearchEngine` 不是线程安全的），
+  系数与这一批的学生相同、`set_resign_detection(false)`（认输回来不带 `best_move`，
+  那一手就没有答案可记）、`set_book_enabled(false)`（与 `prepare` 给学生同一个理由）。
+  表是 `teacher_tt_`（`trainer.cpp:352-359`、成员在 `trainer.h:244-249`）而不是 `shared_tt_`。
+  **共享只发生在老师之间**：几个 worker 的老师读的是同一份系数、同一个深度口径下的条目，
+  所以共享它省的是 7.3 MB × (--threads)，与注意 1 要防的「学生的表被老师写深了」是两件事。
+- `DataCollector`（`data_collector.cpp:128-136`、`:175-183`）：门槛从「`entry.depth ≥
+  min_search_depth_`」放宽成「**或这一手有老师的答案**」，样本带上 `teacher_move`（跟着
+  增广的每个朝向一起转）与 `teacher_source = "distill"`。
+  `sample.search_depth` 仍然记学生自己的 0——拿老师的深度去补它同样是污染，只是换个方向，
+  指导书 §9.4 那一格「`search_depth` 不被污染」要的就是这个。
+
+### 读数
+
+样本与代价（`--method hill --rounds 2 --hill-iterations 3 --data-games 8 --threads 2
+--depth 2 --max-nodes 1500 --max-moves 24 --seed 20261011`，两遍除了老师别无差别）：
+
+| | 记录行数 | 样本条数 | 带老师的样本 | 师生一致 | 墙钟 |
+|---|---|---|---|---|---|
+| 关（缺省） | 16 | **456** | 0（0 %） | — | 134 s |
+| 开（老师 depth 5 / 20,000 节点） | 16 | **672** | 672（100 %） | 456／672 = **67.9 %** | 147 s（+9.7 %） |
+
+- 每轮对局数没有塌（16 行记录两边相同）⇒ 杀线不触发，不需要退回「只对适配度赛做蒸馏」。
+  学生 depth 2 / 1,500 节点、老师 depth 5 / 12,000 节点，这一档的实测代价是整轮 +9.7 %。
+- 一致率随轮次下降：**round 1 = 280/376 = 74.5 %，round 2 = 176/296 = 59.5 %**
+  （读数仪 `/tmp/d2/agree`，用生产码的 `TrainingSample::from_json` 解析，不是自己写的 JSON 读取）。
+  第二轮冠军被换过一次，浅层学生与深层老师开始更频繁地分道——这正是 S3/S4 想要的信号来源。
+- 样本里 `grep -c teacher` 在关的那一份是 **0**，开的那一份 672 条全带 `teacher_source`。
+
+### 四口用例与五支变异臂
+
+`tests/test_training.cpp`：`:5915` 往返与「关着不写键」、`:5963` SelfPlay 蒸馏且学生一字不动、
+`:6051` 被教的战术手进得了样本（含增广跟着转）、`:6120` `reset()` 回到起始线而不是空盘。
+`:5963` 那一口把注意 1、2、3 各钉成可核的形式：老师的深度必须是请求的 4；把记录重放一遍，
+老师答的那一格**在那一手之前**必须是空的（落子之后就永远说不出这一格）；
+两边学生的 `move`/`depth`/`nodes`/`score` 逐手相等。
+
+变异臂（§2.4，各 `rc=134` 并报出 `file:line`，逐支用编辑器改、`cp` 还原）：
+
+| 支 | 拧什么 | 断在哪 |
+|---|---|---|
+| M1 | 钉值 `teacher_depth == 6` → `== 7` | `tests/test_training.cpp:5949` |
+| M2 | `teacher_depth = config.teacher_depth` → `= result.depth`（注意 3 的口径） | `:6010` |
+| M3 | 老师改用**学生的引擎与表**搜（注意 1 的实质） | `:6036`——且报错行先打出一手真实污染：`ply 1 student moved: (6,7) d2 n76 vs (6,6) d2 n10` |
+| M4 | 把 `DataCollector` 的门槛退回只看 `entry.depth` | `:6089`（样本数 9 → 8） |
+| M5 | `reset()` 退回清掉起始线 | `:6142`（当前线 3 → 0） |
+
+M3 那一支值得多说一句：它不是「断言失败」而是**复现了指导书担心的那个失效**——学生的第二手
+从 (6,7) 变成 (6,6)、节点从 76 掉到 10，因为老师的 d4 条目就在学生自己的表里。
+这条与轮次156 那句「差分证明不了生产差分的语义」是同一类：本轮用一支代码变异把测试的判别力量出来了。
+
+### 门禁
+
+- `ctest` **9/9 passed / 765.13 s**（`test_search` 465.54、`test_pinned` 239.37、
+  `test_training` 40.55——四口新用例里那两场真棋值这 20 s，套件仍在 300 s 水位的一半以下）。
+- TSan（`/tmp/d2/teacher_tsan.cpp`，`-fsanitize=thread -O1 -g`，走产品入口
+  `Trainer::run_round`：3 个数据采集 worker 共享 `teacher_tt_`）：**0 条 data race**，
+  14 局、288 条样本。轮次141 的教训（只有把活 `Board` 交给 worker 那一支才报）在这里不适用：
+  老师拿到的 `board` 是学生那份的只读引用，且搜索在 `place_stone` 之前完成。
+- valgrind memcheck（`tools/valgrind_check.sh memcheck test_training`）：**clean，reports=0**
+  （invalid_read / invalid_write / uninitialised / definite_leak 全 0，**752 s**；上一轮同一套件是 544 s，
+  多的正是四口用例里那两场真棋）。
+- `readme_anchor_check` **122 citations / 0 problems**，`web_frontend_check` **111/111 passed**
+  （README 只在末尾追加一节，676 → 690 行）。
+
+### 改了哪几处
+
+| 位置 | 改动 |
+|---|---|
+| `src/training/game_record.h:42-50` | `MoveRecord` 尾部三个老师字段 |
+| `src/training/game_record.cpp:76-84`、`:178-187` | 四个可选键的写与读（没有老师时一个都不写） |
+| `src/training/self_play.h:22-28`、`:60-64`、`:98-109` | 老师的两个预算旋钮、`set_teacher`、`RetryExplorer` 的转发与 `start_line_` |
+| `src/training/self_play.cpp:44`、`:124-142`、`:156-158`、`:192-198` | 声明训练口径、落子前搜老师、写进 entry、`reset()` 回起始线 |
+| `src/training/data_collector.cpp:128-136`、`:175-183` | 门槛放宽与 `teacher_source = "distill"`（跟着对称变换走） |
+| `src/training/trainer.h:105-112`、`:244-249` | `TrainingConfig::teacher_depth` / `teacher_max_nodes`（缺省 0 = 关）与 `teacher_tt_` |
+| `src/training/trainer.cpp:352-359`、`:384-401` | 老师表的建与清、每 worker 一个老师并交给 explorer |
+| `src/training/main_trainer.cpp:49-53`、`:262-268`、`:333-344` | 两个 flag 的 usage 与解析；负值与「不大于 --depth」都拒 |
+| `tests/test_training.cpp:5915-6147` | 四口新用例 |
+| `README.md:677-690`（末尾追加，不动已被引用的行号） | 「深搜蒸馏（丁-2）」一节：三条不变量、代价读数 |
+
+上一轮（轮次156）那张「`trainer.cpp` 指针位移表」里的三个数又被本轮挪动，**以这张为准**：
+worker 的 `SearchEngine engine(current_champion, shared_tt_.get())` 在 `trainer.cpp:376`、
+`explorer.set_start_line(...)` 在 `:402`、checkpoint 的 `root["versions"]` 写在 `:619`；
+`candidate_engine`（`:192`）与 `shared_tt_` 的建用（`:337-339`）没动。
+
+### 顺手修掉的那个 bug 的账
+
+`RetryExplorer::reset()` 以前把 `prefix_` 一起清空。worker 每轮只调一次
+`set_start_line`（`trainer.cpp:402`），所以**从第二轮的第一次重试起，每一局都是空盘开局**：
+`--match-opening-plies` 打开时那 8 条固定开局只作用于每轮的第一局，D-4 那套筛查所担心的
+「同一位置被反复问」在这里其实没被解决。改成回到起始线后，树照样丢（它属于上一条线）。
+既有用例 `test_retry_explorer_forced_line` 全绿，说明这一条以前没有任何断言守着。
+
+### 申报
+
+- 老师与学生的**棋力差**没有被量过：本轮只证明信号在（一致率随轮次下降）与代价在（+9.7 %）。
+  「蒸馏出来的 `teacher_move` 是不是更好的那一手」要的是 §6 那条题卡流水线或一场赛，
+  不在丁-2 的单子里。
+- 一致率 67.9 % 是**增广后**的样本口径（每一手最多 8 个朝向），不是手数口径；两个口径在这里
+  成正比，但没有换算过。
+- `--fitness-games` 与验证赛**不蒸馏**（`play_game` 那条路径不接 `set_teacher`，
+  `settings.teacher_depth` 也没有从 `score_match` 传下去）。杀线说的是「若代价塌了才只给适配度赛做」，
+  所以这是**方向相反**的选择：蒸馏只给数据采集做。这一条写在 `trainer.h:105-112` 的注释里。
+- 老师的深度门限（必须 > `--depth`）是 CLI 的校验，不是 `Trainer` 的：直接构造 `TrainingConfig`
+  的调用方（含测试）能把一个更浅的「老师」塞进去，本轮没有把这条路堵上。
+- memcheck 只跑了 `test_training`（本轮唯一新增行为的套件）；`test_server` 会经过
+  `GameRecord::to_json` 那条会话导出路径，它没有老师、写的键与之前一致，由
+  `ctest` 的 27 s 全绿覆盖，没有单独跑 valgrind。
+
 ## 轮次156 引擎重构 丁-1：S3 的适配度第一次有了连续分量——`w = 0` 逐字回到那 5 档，`w = 0.35` 下同一颗 seed 读出 0.879687 与 0.556875，两轮同 seed 的晋升结论一字不动 — engine redesign stage 丁-1: fitness gains a per-game continuous margin (terminal score gap, ply count, resign depth) behind a switchable weight; with w = 0 the match score is still the win/loss lattice, with w = 0.35 the same seed produces off-lattice values and identical promotions
 
 指导书 §4 丁-1 要「给适配度加连续分量，让『赢得多漂亮』也进入信号」，形状是

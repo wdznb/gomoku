@@ -39,6 +39,9 @@ GameRecord SelfPlay::run(const std::vector<Move>& prefix,
                          std::atomic<bool>* stop_flag) {
     std::atomic<bool> unused_stop(false);
     std::atomic<bool>& flag = stop_flag ? *stop_flag : unused_stop;
+    // 丁-2：训练口径由这一处声明，不靠引擎自己猜（与上面给学生的那两句同一条理由）——
+    // 老师的 think 也发生在训练对局里，它不该被软窗口塑形，只认自己的节点帽与硬时限。
+    if (teacher_ != nullptr && config_.teacher_depth > 0) teacher_->set_training(true);
 
     Board board;
     GameRecord record;
@@ -112,6 +115,27 @@ GameRecord SelfPlay::run(const std::vector<Move>& prefix,
             out_choices->push_back(choices);
         }
 
+        // 丁-2：老师在**落子之前**搜同一个局面（§4 丁-2 注意 2——落子后局面就变了），
+        // 用调用方交来的独立引擎与独立置换表（注意 1）。它的答案只多记三个字段，
+        // 不参与这一局下哪一手，也不进学生的节点/深度账。
+        Move teacher_answer;
+        int teacher_depth = 0;
+        int teacher_score = 0;
+        if (teacher_ != nullptr && config_.teacher_depth > 0) {
+            teacher_->set_max_nodes(config_.teacher_max_nodes);
+            // 同一只 stop flag：整轮被叫停时老师不能自己再跑完一次深搜。
+            const SearchResult taught = teacher_->search(board, color, config_.teacher_depth,
+                                                        config_.timeout_ms, flag);
+            // 老师不做认输判定：认输会不带 best_move 回来，那样这一手就没有答案可记。
+            if (!taught.resigned && taught.best_move.pos.is_valid()) {
+                teacher_answer = taught.best_move;
+                // 注意 3：记的是请求的深度。vcf / vct / must_block 的 `result.depth`
+                // 是 0，那是结构性的，不是「老师只看了 0 层」。
+                teacher_depth = config_.teacher_depth;
+                teacher_score = taught.score;
+            }
+        }
+
         board.place_stone(chosen.pos, color);
         // Per committed ply, not per think: the records this ply's search wrote stay
         // in the table for the rest of the game, so a transposition later in the same
@@ -131,6 +155,9 @@ GameRecord SelfPlay::run(const std::vector<Move>& prefix,
         entry.seldepth = result.seldepth;
         entry.stopped = result.stopped;
         entry.tt_hits = result.tt_hits;
+        entry.teacher_move = teacher_answer;
+        entry.teacher_depth = teacher_depth;
+        entry.teacher_score = teacher_score;
         record.moves.push_back(entry);
 
         record.total_nodes += result.nodes_searched;
@@ -161,13 +188,17 @@ RetryExplorer::RetryExplorer(SearchEngine& black_engine, SearchEngine& white_eng
     : self_play_(black_engine, white_engine, config) {}
 
 void RetryExplorer::reset() {
-    prefix_.clear();
+    // 丁-2 注意 4：以前这里把 prefix_ 一起清空，于是 worker 只在每轮第一次设过的开局
+    // 只作用于第一局——重试的那几局是从空盘开始的，「悔棋再战」退到的其实是另一棵树。
+    // 现在 reset 回到起始线，树照样丢（它属于上一条线）。
+    prefix_ = start_line_;
     choices_.clear();
     tried_.clear();
     exhausted_ = false;
 }
 
 void RetryExplorer::set_start_line(const std::vector<Move>& line) {
+    start_line_ = line;
     prefix_ = line;
     choices_.clear();
     tried_.clear();

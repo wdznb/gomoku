@@ -369,7 +369,7 @@ git push origin master                # 然后核对 git log --oneline -1 origin
 
 ### 丁-2 S4：深搜蒸馏（`teacher_move` 进 `MoveRecord`）
 
-**状态**：未做。`TrainingSample::teacher_move` 已就位（轮次147），但**没有产地**——自对弈时没人算它。`data_collector` 的 `min_search_depth_` 默认 1，且 vcf/must_block 不回填 `depth`，所以战术层的 ply 全被丢掉（轮次125 实测 14/28/62 → 112/224/496）。
+**状态**：轮次157 **已落地**，缺省 `--teacher-depth 0` = 关（关着时记录与样本逐字节是 S4 之前的形状，四个老师键是可选键）。四条注意全部照做并有断言守着：老师用 `teacher_tt_`（不是 `shared_tt_`，`trainer.cpp:352-359`）、在 `board.place_stone` 之前搜（重放记录可核：它答的那一格当时必须为空）、`teacher_depth` 记请求值而不是 `result.depth`、`RetryExplorer::reset()` 改成回到起始线。读数：`--data-games 8 --threads 2 --depth 2 --max-nodes 1500 --seed 20261011` 下样本 **456 → 672**（战术层 ply 第一次进来，+47 %），整轮墙钟 134 → 147 s（+9.7 %），每轮对局数不变 ⇒ 杀线不触发；师生一致率 67.9 %，随轮次下降（74.5 % → 59.5 %）。五支变异臂各断在钉值上，其中「老师改用学生的表」那一支复现了真实污染（`ply 1 student moved: (6,7) d2 n76 vs (6,6) d2 n10`）。ctest 9/9（765.13 s）、memcheck test_training clean（reports=0，752 s）、TSan 3 worker 共享老师表 0 条 race。师生**棋力**差没有量过（不在本单元单子里）。落地位置与读数详见 REVIEW_LOG 轮次157。
 
 **目标效果**：每手棋由「当时的引擎」和「一个更贵的老师」各给一个答案，两者分开记；样本因此第一次覆盖战术层 ply。
 

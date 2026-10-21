@@ -101,6 +101,16 @@ struct TrainingConfig {
     // buys hit rate on a machine with the memory for it.
     int shared_tt_entries = 1 << 18;
 
+    // 丁-2（v2 §3.4 S4）：深搜蒸馏。每一手在学生think完之后、落子之前，让一个更贵的
+    // 老师也think一次，两者的答案分开记（`MoveRecord::teacher_*`）。
+    // **teacher_depth = 0 是缺省，也就是关**：一局都不多搜一次，样本、记录、每轮对局数
+    // 逐字节是 S4 之前的形状。开的时候它只进数据采集那几局——适配度与验证赛的对局不蒸馏，
+    // 因为那两处的分数是判据，不是数据。
+    // 老师的预算是节点数（与 D-1 同一口径：让一手在空机与满载机上花一样的钱），
+    // 不是毫秒。深度差 k 倍就应当看到每轮对局数掉 k 倍上下——那是杀线要量的读数。
+    int teacher_depth = 0;
+    int teacher_max_nodes = 0;
+
     uint64_t seed = 20261011;
 
     std::string records_path;
@@ -232,6 +242,11 @@ private:
     // Built once for the whole Trainer when --shared-tt names a size, so the flag that
     // decides whether a probe takes a shard lock is set before any worker exists.
     std::unique_ptr<TranspositionTable> shared_tt_;
+    // 丁-2：老师专用的一张表，与上面那张**不是同一张**（指导书 §4 丁-2 注意 1）。
+    // 每个 worker 自己的学生引擎共享 shared_tt_，它们的老师共享这一张——
+    // 同一份系数、同一个深度口径，所以共享它不改变任何一手的读数，
+    // 而 d6 的条目永远不会被随后的 d4 搜索切走。
+    std::unique_ptr<TranspositionTable> teacher_tt_;
     int games_played_ = 0;
     size_t samples_collected_ = 0;
     int rounds_completed_ = 0;

@@ -19,6 +19,13 @@ struct SelfPlayConfig {
     // A training game usually ends long before the board fills; without a cap a
     // mirrored, never-progressing pair could run for 225 plies per sample.
     int max_moves = 80;
+    // 丁-2（v2 §3.4 S4）：老师的深度与节点预算，0 = 关（关着的时候一局棋一次额外搜索
+    // 都不做，逐字节还是改之前的形状）。深度记在 `MoveRecord::teacher_depth` 上的是
+    // **这个请求值**，不是 `SearchResult::depth`——战术层报 0 是结构性的（指导书 §4 丁-2 注意 3）。
+    // 老师是谁、用哪张置换表，由 `SelfPlay::set_teacher` 交进来：它必须与学生的表
+    // 不是同一张（注意 1），否则 d6 的条目会被随后的 d4 搜索直接切走。
+    int teacher_depth = 0;
+    int teacher_max_nodes = 0;
 };
 
 // Every move `color` may legally play in `board`: empty cells near the live
@@ -51,10 +58,16 @@ public:
 
     const SelfPlayConfig& config() const { return config_; }
 
+    // 丁-2：把老师交给这一局。指针为空或 `config.teacher_depth == 0` 都不搜第二次。
+    // 引擎与其置换表由调用方持有并且必须活过这一局；每个 worker 用自己的老师
+    //（`SearchEngine` 不是线程安全的），但老师绝不能与学生共用表——见 §4 丁-2 注意 1。
+    void set_teacher(SearchEngine* teacher) { teacher_ = teacher; }
+
 private:
     SearchEngine& black_engine_;
     SearchEngine& white_engine_;
     SelfPlayConfig config_;
+    SearchEngine* teacher_ = nullptr;
 };
 
 // 悔棋再战. Repeatedly plays games that differ as late as possible: after each
@@ -79,14 +92,21 @@ public:
     // branch tree belongs to the previous line, so it is dropped with it.
     void set_start_line(const std::vector<Move>& line);
 
-    // Forgets the tree, so the next explore() starts a fresh game.
+    // Forgets the tree, so the next explore() starts a fresh game. The opening set by
+    // `set_start_line` survives: the worker sets it once per round (§4 丁-2 注意 4).
     void reset();
+
+    // 丁-2：老师往下传到真正下棋的那一个。
+    void set_teacher(SearchEngine* teacher) { self_play_.set_teacher(teacher); }
 
 private:
     bool rewind_to_next_branch(const std::vector<Move>& played);
 
     SelfPlay self_play_;
     std::vector<Move> prefix_;
+    // The line `set_start_line` was given. `reset()` returns to this rather than to
+    // the empty board, which is what the worker's one-per-round call expects.
+    std::vector<Move> start_line_;
     std::vector<PlyChoices> choices_;
     std::vector<std::set<int>> tried_;
     bool exhausted_ = false;

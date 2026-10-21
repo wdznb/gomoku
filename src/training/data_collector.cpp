@@ -127,7 +127,13 @@ std::vector<TrainingSample> DataCollector::collect(const GameRecord& record, int
 
         const bool engine_chose = entry.method != "replay" && entry.method != "forced" &&
                                   entry.method != "default" && entry.move.pos.is_valid();
-        if (engine_chose && entry.depth >= min_search_depth_) {
+        // 丁-2：这一手有老师的答案也算「引擎自己决定的」。战术层（vcf / vct / must_block）
+        // 不回填 `depth`，所以它们过去被 `min_search_depth_` 整段丢掉（轮次125 实测
+        // 14/28/62 → 112/224/496 条样本，差的就是这几类 ply）。`search_depth` 仍然记学生
+        // 自己的深度（0 就是 0）——指导书 §9.4 那一格要的是「独立 TT 不把 `search_depth` 污染」，
+        // 拿老师的深度去补它同样是污染，只是换个方向。
+        const bool taught = entry.teacher_depth > 0 && entry.teacher_move.pos.is_valid();
+        if (engine_chose && (entry.depth >= min_search_depth_ || taught)) {
             const float value = record.outcome_for(side);
             if (value != 0.0f || keep_undecided_) {
                 // 0-24 are the same under every square symmetry: compute them once
@@ -163,6 +169,16 @@ std::vector<TrainingSample> DataCollector::collect(const GameRecord& record, int
                     sample.weight = 1.0f;
                     sample.game_id = game_id;
                     sample.move_index = static_cast<int>(i);
+                    // 丁-2：`teacher_move` 从此有了产地（轮次147 只有字段没有生产者）。
+                    // 没有老师时两个字段都留空，写出来的样本逐字节还是改之前的形状。
+                    // 增广的每一个对称都要跟着转——老师的答案与这一手处在同一个局面上，
+                    // 用同一个 `variant`、同一个 `side` 变换，否则样本会带着一个
+                    // 属于别的朝向的老师。
+                    if (taught) {
+                        sample.teacher_move = Move(transform_position(entry.teacher_move.pos,
+                                                                     variant), side);
+                        sample.teacher_source = "distill";
+                    }
                     samples.push_back(sample);
                 }
             }

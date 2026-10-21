@@ -46,6 +46,11 @@ void print_usage(const char* program) {
         "  --fitness-margin-weight W   Blend W of a per-game continuous margin (final score\n"
         "                              gap, move count, resign depth) into the fitness\n"
         "                              score; 0 keeps the plain win/loss tiers (0)\n"
+        "  --teacher-depth N         丁-2 distillation: a teacher thinks N plies after the\n"
+        "                              student on every data-game ply, recorded separately;\n"
+        "                              0 turns it off and must exceed --depth otherwise (0)\n"
+        "  --teacher-max-nodes N      The teacher's per-move node ceiling, same yardstick as\n"
+        "                              --max-nodes; 0 lets the ms budget set it (0)\n"
         "  --verification-games N      Ceiling on the games a candidate must beat the\n"
         "                              champion over before promotion (8)\n"
         "  --accept-score X            Promotion threshold, >0.5 and <=1.0 (0.56)\n"
@@ -258,6 +263,12 @@ int main(int argc, char** argv) {
                 // 丁-1：适配度里连续分量的权重。默认 0 = 今天；它只改优化器看到的那个数，
                 // 验证赛的 SPRT 序列不动。
                 config.fitness_margin_weight = require_double("--fitness-margin-weight", i, argc, argv);
+            } else if (flag == "--teacher-depth") {
+                // 丁-2：深搜蒸馏的老师深度，0 = 关（缺省）。只进数据采集的对局。
+                config.teacher_depth = require_int("--teacher-depth", i, argc, argv, 0);
+            } else if (flag == "--teacher-max-nodes") {
+                // 老师的节点预算；0 让它用这一次 think 由剩余时间推出来的上限。
+                config.teacher_max_nodes = require_int("--teacher-max-nodes", i, argc, argv, 0);
             } else if (flag == "--sprt-elo") {
                 // Zero is this knob's own answer - "no sequential test, play every
                 // pair" - so it parses where the game counts would not, and only
@@ -317,6 +328,18 @@ int main(int argc, char** argv) {
     // that merely survived.
     if (config.fitness_margin_weight < 0.0 || config.fitness_margin_weight >= 1.0) {
         std::cerr << "Error: --fitness-margin-weight must be in [0,1)" << std::endl;
+        return 1;
+    }
+    if (config.teacher_depth < 0 || config.teacher_max_nodes < 0) {
+        std::cerr << "Error: --teacher-depth and --teacher-max-nodes cannot be negative"
+                  << std::endl;
+        return 1;
+    }
+    // 丁-2 记的是「一个更贵的老师」。深度不大于学生的老师不是老师，它只会把每一手
+    // 变贵而不带来任何新信息，所以这里直接拒，而不是让它在样本里悄悄产出一个更浅的「答案」。
+    if (config.teacher_depth > 0 && config.teacher_depth <= config.search_depth) {
+        std::cerr << "Error: --teacher-depth must exceed --depth (" << config.search_depth
+                  << "); 0 turns distillation off" << std::endl;
         return 1;
     }
     if (config.accept_score <= 0.5 || config.accept_score > 1.0) {

@@ -38,6 +38,16 @@ struct MoveRecord {
     // the session's bridge (server.cpp:189/:205) copies it field by field, and design doc
     // 2.9 :443's table-read count has to survive a save/restore to be worth reporting.
     int tt_hits = 0;
+    // 丁-2（v2 §3.4 S4）：同一局面「一个更贵的老师」给的答案，与上面那一手分开记。
+    // 老师在落子前搜、用自己的置换表，所以它既不改变这一手是谁下的，也不改变
+    // `depth`/`nodes` 那条口径（那是学生这一次思考的账）。
+    // `teacher_depth` 记的是**请求的深度**而不是 `SearchResult::depth`：
+    // vcf / vct / must_block 报 0 是结构性的（指导书 §4 丁-2 注意 3）。
+    // 三个字段合起来要么完整要么全空——`teacher_move` 无效就是「这局没有老师」，
+    // 写文件时这三个键整个省掉，所以没有老师的记录逐字节不变。
+    Move teacher_move;
+    int teacher_depth = 0;
+    int teacher_score = 0;
 };
 
 struct GameRecord {

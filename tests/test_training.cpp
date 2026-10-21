@@ -5909,6 +5909,243 @@ void test_a_margin_weight_blends_the_real_match_score_off_the_lattice() {
               << std::endl;
 }
 
+// 丁-2（v2 §3.4 S4）第一口：`MoveRecord::teacher_*` 的往返，以及「没有老师时逐字节不变」。
+// 这四个键是**可选**的：缺省时一条都不写，所以蒸馏关着的每一行 JSONL 与 S4 之前同形；
+// 写的时候老师的颜色跟着这一手走（老师与学生在同一个局面上下同一色），不必重复存。
+void test_teacher_fields_round_trip_and_stay_absent_when_off() {
+    GameRecord record;
+    record.winner = BLACK;
+    record.reason = GameEndReason::FIVE;
+
+    MoveRecord ply;
+    ply.move = Move(7, 7, BLACK);
+    ply.score = 1234;
+    ply.depth = 2;
+    ply.method = "alphabeta";
+    record.moves.push_back(ply);
+
+    // 1) 没有老师：整行里不该出现 "teacher" 这个子串（轮次147 给样本钉的是同一条纪律）。
+    const std::string untaught = record.to_json();
+    assert(untaught.find("teacher") == std::string::npos);
+    GameRecord untaught_back;
+    std::string error;
+    assert(GameRecord::from_json(untaught, untaught_back, error));
+    assert(!untaught_back.moves[0].teacher_move.pos.is_valid());
+    assert(untaught_back.moves[0].teacher_depth == 0);
+    assert(untaught_back.moves[0].teacher_score == 0);
+
+    // 2) 有老师：四个键写出来，读回来格号与分值都在，颜色继承这一手的颜色。
+    record.moves[0].teacher_move = Move(8, 8, WHITE);   // 故意给错颜色，读回来必须仍是 BLACK
+    record.moves[0].teacher_depth = 6;
+    record.moves[0].teacher_score = -4200;
+    const std::string taught = record.to_json();
+    assert(taught.find("\"teacher_depth\":6") != std::string::npos);
+    assert(taught.find("\"teacher_score\":-4200") != std::string::npos);
+    GameRecord taught_back;
+    assert(GameRecord::from_json(taught, taught_back, error));
+    assert(taught_back.moves[0].teacher_move.pos.row == 8 &&
+           taught_back.moves[0].teacher_move.pos.col == 8);
+    assert(taught_back.moves[0].teacher_move.color == BLACK);
+    assert(taught_back.moves[0].teacher_depth == 6);
+    assert(taught_back.moves[0].teacher_score == -4200);
+    // 学生的账一字不动：老师是**多记的一列**，不是被改写的读数。
+    assert(taught_back.moves[0].depth == 2 && taught_back.moves[0].score == 1234);
+
+    std::cout << "test_teacher_fields_round_trip_and_stay_absent_when_off passed" << std::endl;
+}
+
+// 第二口：SelfPlay 真的在落子之前问了老师，而且**没有改变学生下的那一手**。
+// 后半句是 §4 丁-2 注意 1 的实质：老师的条目若写进学生的表，随后的学生搜索会直接切在
+// 更深的条目上，`depth`/`nodes` 就不是「当时那一手搜了多深」。这里同一所（同一份系数、
+// 同一对引擎形状）下两遍——一遍关老师、一遍开老师（老师用的是另一张表）——
+// 逐手比对学生的着法、深度、节点与分值。两边都把时限放到远在水位之上、只认节点帽，
+// 所以「一字不动」这条断言不由机器快慢决定（§9.2：定深臂用节点帽当超时）。
+void test_self_play_records_a_teacher_answer_without_touching_the_student() {
+    PatternRecognizer::init();
+    const ThreatCoefficients coeffs = ThreatCoefficients();
+
+    SelfPlayConfig plain_settings;
+    plain_settings.max_depth = 2;
+    plain_settings.timeout_ms = 20000;
+    plain_settings.max_nodes = 2500;
+    plain_settings.max_moves = 10;
+
+    SelfPlayConfig taught_settings = plain_settings;
+    taught_settings.teacher_depth = 4;
+    taught_settings.teacher_max_nodes = 20000;
+
+    GameRecord plain;
+    {
+        SearchEngine student(coeffs);
+        student.set_book_enabled(false);
+        SelfPlay play(student, student, plain_settings);
+        plain = play.run({}, nullptr, nullptr);
+    }
+
+    GameRecord taught;
+    {
+        SearchEngine student(coeffs);
+        student.set_book_enabled(false);
+        TranspositionTable teacher_table(1 << 18, true);
+        SearchEngine teacher_engine(coeffs, &teacher_table);
+        teacher_engine.set_book_enabled(false);
+        teacher_engine.set_resign_detection(false);
+        assert(&student.transposition_table() != &teacher_engine.transposition_table());
+
+        SelfPlay play(student, student, taught_settings);
+        play.set_teacher(&teacher_engine);
+        taught = play.run({}, nullptr, nullptr);
+    }
+
+    assert(plain.reason != GameEndReason::INVALID);
+    assert(taught.reason != GameEndReason::INVALID);
+    assert(!plain.moves.empty() && !taught.moves.empty());
+
+    // 1) 每一个引擎手都带回了老师的答案，深度记的是请求的那一档（注意 3）。
+    //    「在落子之前搜」钉成可核的形式：把记录重放一遍，老师答的那一格在**那一手之前**
+    //    必须是空的（注意 2）——落子之后再搜就永远不可能说出这一格。
+    Board replay;
+    int same_as_student = 0;
+    for (const MoveRecord& entry : taught.moves) {
+        assert(entry.teacher_depth == 4);
+        assert(entry.teacher_move.pos.is_valid());
+        assert(replay.is_empty(entry.teacher_move.pos));
+        if (entry.teacher_move.pos == entry.move.pos) ++same_as_student;
+        replay.place_stone(entry.move.pos, entry.move.color);
+    }
+    assert(same_as_student > 0);   // 师生一致的那几手就是「先搜后落」的物证
+    // 2) 关着的时候一个老师字段都不写。
+    for (const MoveRecord& entry : plain.moves) {
+        assert(entry.teacher_depth == 0);
+        assert(!entry.teacher_move.pos.is_valid());
+    }
+    // 3) 学生的读数一字不动。
+    assert(plain.moves.size() == taught.moves.size());
+    for (size_t i = 0; i < plain.moves.size(); ++i) {
+        if (!(plain.moves[i].move == taught.moves[i].move) ||
+            plain.moves[i].depth != taught.moves[i].depth ||
+            plain.moves[i].nodes != taught.moves[i].nodes ||
+            plain.moves[i].score != taught.moves[i].score) {
+            std::cout << "  ply " << i << " student moved: (" << plain.moves[i].move.pos.row
+                      << "," << plain.moves[i].move.pos.col << ") d" << plain.moves[i].depth
+                      << " n" << plain.moves[i].nodes << " vs ("
+                      << taught.moves[i].move.pos.row << "," << taught.moves[i].move.pos.col
+                      << ") d" << taught.moves[i].depth << " n" << taught.moves[i].nodes
+                      << std::endl;
+        }
+        assert(plain.moves[i].move == taught.moves[i].move);
+        assert(plain.moves[i].depth == taught.moves[i].depth);
+        assert(plain.moves[i].nodes == taught.moves[i].nodes);
+        assert(plain.moves[i].score == taught.moves[i].score);
+    }
+
+    std::cout << "test_self_play_records_a_teacher_answer_without_touching_the_student passed ("
+              << taught.moves.size() << " plies distilled)" << std::endl;
+}
+
+// 第三口：蒸馏让战术层的 ply 第一次进得了样本。
+// `DataCollector` 的门槛是 `entry.depth >= min_search_depth_`（缺省 1），而 vcf / vct /
+// must_block 报的 depth 是 0——轮次125 那句「14/28/62 → 112/224/496 条样本，差的就是这几类 ply」
+// 就是这个门槛造成的。现在「这一手有老师的答案」也算数，但 `search_depth` 仍然记学生自己的
+// 0（拿老师的深度去补它同样是污染，只是换个方向）。
+void test_a_taught_tactical_ply_becomes_a_sample() {
+    GameRecord record;
+    record.winner = BLACK;
+    record.reason = GameEndReason::FIVE;
+    const int black_cols[5] = {6, 7, 8, 9, 5};
+    const int white_cells[4][2] = {{8, 6}, {8, 7}, {8, 8}, {6, 6}};
+    for (int i = 0; i < 4; ++i) {
+        MoveRecord black;
+        black.move = Move(7, black_cols[i], BLACK);
+        black.score = 500;
+        black.depth = 2;
+        black.method = "alphabeta";
+        record.moves.push_back(black);
+        MoveRecord white;
+        white.move = Move(white_cells[i][0], white_cells[i][1], WHITE);
+        white.score = 480;
+        white.depth = 2;
+        white.method = "alphabeta";
+        record.moves.push_back(white);
+    }
+    MoveRecord finish;
+    finish.move = Move(7, black_cols[4], BLACK);   // (7,5)：补上 7 行 5..9 的整五
+    finish.score = 100000;
+    finish.depth = 0;                                // 战术层不回填深度
+    finish.method = "vcf";
+    record.moves.push_back(finish);
+    assert(record.moves.size() == 9u);
+
+    DataCollector collector;
+    const std::vector<TrainingSample> before = collector.collect(record, 1, false);
+    // 九手里只有最后那一手是 depth 0 ⇒ 被门槛挡掉，前面八手各出一条。
+    assert(static_cast<int>(before.size()) == 8);
+    for (const TrainingSample& sample : before) assert(sample.teacher_source.empty());
+
+    record.moves.back().teacher_move = Move(7, 4, BLACK);
+    record.moves.back().teacher_depth = 5;
+    record.moves.back().teacher_score = 100000;
+    const std::vector<TrainingSample> after = collector.collect(record, 1, false);
+    assert(static_cast<int>(after.size()) == 9);
+
+    const TrainingSample& taught = after.back();
+    assert(taught.move_index == 8);
+    assert(taught.teacher_source == "distill");
+    assert(taught.teacher_move.pos.row == 7 && taught.teacher_move.pos.col == 4);
+    assert(taught.teacher_move.color == BLACK);
+    assert(taught.move.pos.row == 7 && taught.move.pos.col == 5);
+    assert(taught.search_depth == 0);   // 学生的深度不被老师的深度改写
+    assert(taught.value == 1.0f);
+
+    // 增广的每一个朝向都要跟着转：老师与学生在同一个局面上，样本换了镜像而老师不换，
+    // 等于给同一个位置配了另一个位置的答案。
+    const std::vector<TrainingSample> wide = collector.collect(record, 2, true);
+    int taught_variants = 0;
+    for (const TrainingSample& sample : wide) {
+        if (sample.move_index != 8) continue;
+        ++taught_variants;
+        assert(sample.teacher_source == "distill");
+        assert(sample.teacher_move.pos.is_valid());
+        assert(!(sample.teacher_move.pos == sample.move.pos));
+    }
+    assert(taught_variants > 1);
+
+    std::cout << "test_a_taught_tactical_ply_becomes_a_sample passed (" << taught_variants
+              << " oriented samples for the taught ply)" << std::endl;
+}
+
+// 第四口（§4 丁-2 注意 4 的那个顺手 bug）：`reset()` 以前连起始线一起清掉，
+// worker 每轮只设一次开局，于是重试的那几局都从空盘开始——「悔棋再战」退到的是另一棵树。
+// 钉两件事：reset 之后当前线仍然是那条开局；树被丢掉（下一局从这条线重新分叉）。
+void test_reset_returns_to_the_start_line_not_the_empty_board() {
+    PatternRecognizer::init();
+    const ThreatCoefficients coeffs = ThreatCoefficients();
+    SearchEngine engine(coeffs);
+    engine.set_book_enabled(false);
+
+    SelfPlayConfig settings = quick_play_config();
+    settings.max_nodes = 2000;
+    settings.timeout_ms = 20000;
+
+    RetryExplorer explorer(engine, engine, settings);
+    const std::vector<Move> line = {Move(7, 7, BLACK), Move(7, 8, WHITE), Move(6, 6, BLACK)};
+    explorer.set_start_line(line);
+    assert(explorer.current_line().size() == 3u);
+
+    GameRecord record;
+    std::atomic<bool> never(false);
+    assert(explorer.explore(record, &never));
+    // 退到分叉点之后当前线可能变短，但它永远不该掉回空盘。
+    assert(explorer.current_line().size() >= 1u);
+
+    explorer.reset();
+    assert(explorer.current_line().size() == 3u);
+    assert(explorer.current_line()[0].pos.row == 7 && explorer.current_line()[0].pos.col == 7);
+    assert(explorer.current_line()[2].pos.row == 6 && explorer.current_line()[2].pos.col == 6);
+
+    std::cout << "test_reset_returns_to_the_start_line_not_the_empty_board passed" << std::endl;
+}
+
 int main() {
     std::cout << "Running training tests..." << std::endl;
 
@@ -6031,6 +6268,10 @@ int main() {
     test_game_margin_answers_its_three_readings_by_value();
     test_the_margin_blend_is_identity_at_zero_weight();
     test_a_margin_weight_blends_the_real_match_score_off_the_lattice();
+    test_teacher_fields_round_trip_and_stay_absent_when_off();
+    test_self_play_records_a_teacher_answer_without_touching_the_student();
+    test_a_taught_tactical_ply_becomes_a_sample();
+    test_reset_returns_to_the_start_line_not_the_empty_board();
 
     std::cout << "All training tests passed" << std::endl;
     return 0;

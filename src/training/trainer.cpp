@@ -346,6 +346,15 @@ int Trainer::generate_data_games(int games, int threads) {
     // 7.3MB.
     if (shared_tt_) shared_tt_->clear();
 
+    // 丁-2：老师的那张表。同样是「开在任何 worker 之前、每轮批首清空」，
+    // 也同样是 `shared = true`——几个 worker 的老师读的是同一份系数下的条目，
+    // 共享它省的是 7.3 MB × (--threads)，与注意 1 要防的「学生的表被老师写深了」是两件事。
+    if (config_.teacher_depth > 0 && config_.shared_tt_entries > 0 && !teacher_tt_) {
+        teacher_tt_ = std::make_unique<TranspositionTable>(
+            static_cast<size_t>(config_.shared_tt_entries), true);
+    }
+    if (teacher_tt_) teacher_tt_->clear();
+
     for (int t = 0; t < worker_count; ++t) {
         // t is captured by value: the loop advances while the workers are already
         // running, so a reference capture would hand several workers the same
@@ -372,8 +381,24 @@ int Trainer::generate_data_games(int games, int threads) {
             settings.timeout_ms = config_.timeout_ms;
             settings.max_nodes = config_.max_nodes;
             settings.max_moves = config_.max_moves;
+            settings.teacher_depth = config_.teacher_depth;
+            settings.teacher_max_nodes = config_.teacher_max_nodes;
+
+            // 丁-2：每一个 worker 一个老师（`SearchEngine` 不是线程安全的），
+            // 系数与这一批的学生相同，表是 `teacher_tt_` 而不是 `shared_tt_`。
+            // 认输判定关掉：认输回来是不带 best_move 的，那样这一手就没有答案可记。
+            // 开局库同样关掉，与 `prepare` 给学生的理由一样——蒸馏要的是这套系数
+            // 在这个局面下搜出来的答案，不是背下来的那一步。
+            std::unique_ptr<SearchEngine> teacher;
+            if (config_.teacher_depth > 0) {
+                teacher = std::make_unique<SearchEngine>(current_champion, teacher_tt_.get());
+                teacher->set_book_enabled(false);
+                teacher->set_resign_detection(false);
+                teacher->set_training(true);
+            }
 
             RetryExplorer explorer(engine, engine, settings);
+            if (teacher) explorer.set_teacher(teacher.get());
             explorer.set_start_line(random_opening_line(config_.data_opening_plies, seed));
 
             const int count = per_worker + (t < remainder ? 1 : 0);

@@ -56,7 +56,7 @@ std::string GameRecord::to_json() const {
 
     json move_array = json::array();
     for (const auto& record : moves) {
-        move_array.push_back({
+        json entry = {
             {"row", record.move.pos.row},
             {"col", record.move.pos.col},
             {"color", color_name(record.move.color)},
@@ -71,7 +71,17 @@ std::string GameRecord::to_json() const {
             {"seldepth", record.seldepth},
             {"stopped", record.stopped},
             {"tt_hits", record.tt_hits},
-        });
+        };
+        // 丁-2：老师的答案是**可选键**。没有老师时这三个键整个不写，所以蒸馏关掉
+        //（缺省）的每一条记录逐字节还是改之前的形状；有老师时只多这三个数，
+        // 因为老师的颜色恒等于这一手的行棋方，不必再记一遍。
+        if (record.teacher_move.pos.is_valid()) {
+            entry["teacher_row"] = record.teacher_move.pos.row;
+            entry["teacher_col"] = record.teacher_move.pos.col;
+            entry["teacher_depth"] = record.teacher_depth;
+            entry["teacher_score"] = record.teacher_score;
+        }
+        move_array.push_back(std::move(entry));
     }
     root["moves"] = move_array;
     return root.dump();
@@ -165,6 +175,15 @@ bool GameRecord::from_json(const std::string& text, GameRecord& out, std::string
         move_record.stopped = entry.contains("stopped") && entry["stopped"].is_string()
                                   ? entry["stopped"].get<std::string>() : "none";
         move_record.tt_hits = read_int("tt_hits", 0);
+        // 丁-2 的可选键：旧文件里这三个数缺席，读回来就是「没有老师」
+        //（`teacher_move` 保持无效，`teacher_depth` 为 0），不是坏记录。
+        const int teacher_row = read_int("teacher_row", -1);
+        const int teacher_col = read_int("teacher_col", -1);
+        if (teacher_row >= 0 && teacher_col >= 0) {
+            move_record.teacher_move = Move(teacher_row, teacher_col, move_record.move.color);
+        }
+        move_record.teacher_depth = read_int("teacher_depth", 0);
+        move_record.teacher_score = read_int("teacher_score", 0);
         record.moves.push_back(move_record);
     }
 
