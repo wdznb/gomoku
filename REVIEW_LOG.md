@@ -1980,6 +1980,106 @@ additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cp
 no existing assertion was edited.
 
 
+## 轮次155 引擎重构 丙-4：O1 把 `finish_direction` 的走线折成 ±6 线窗表——等价性四条全过（75,600 组、18,900 格、531,441 键 × 8 变体全部 0 例外），但取窗实测 **100 条指令**对文档估的「约 10 条」，整节点 Ir **+5.86 %**（六臂 +7.20 %）⇒ 按杀线判不落地，代码全部撤回 — engine redesign stage 丙-4: the line table is provably equivalent (75,600 groups, 18,900 aggregate squares, 531,441 keys × 8 outer variants, zero exceptions) but the 13-trit key costs 100 Ir/call against the doc's ~10-instruction estimate, and whole-node Ir rises 5.86 % (7.20 % on six arms), so the unit's own kill line rejects it and the tree is reverted
+
+指导书 §4 丙-4 的四条验收与两条杀线，本轮全部量到了读数。结论是：**这张表做对了，但它不该做**——
+旧函数不是「一条被反复调用的贵函数」，而是「一条被极大量调用的便宜函数」。
+
+### 表按指导书原样建起来了（四条验收全过）
+
+实现落在 `src/core/pattern.{h,cpp}`：`line_lut_` = 531,441 项 × 1 字节（`3^12`，中心格恒为行棋方的
+虚拟子所以不进键），静态存储（不是任何对象的成员——轮次152 记过 1.5 MB 值成员会把三个在栈上造引擎的
+套件直接 segfault）；键取探针 ±6 格共 13 格的**三态**（EMPTY／行棋方／被阻断，出界算被阻断，
+每 (格,方向) 预生成 13 位 `wall`）；查询 = 两条 `line_bits` 移位取 13 位 + **四组三格各查一张 64 项表**
+把 12 个三态折成下标 + 一次表读。白棋不进表（`finish_direction` 对白棋只剩 `LONG_FIVE → FIVE`，
+读窗型不读线）。建表**复用旧函数本身**：DFS 物化 (7,7) 那条线的 12 格三色，叶子用同一个 `line_key_at()`
+算键、用 `walk_direction()`（= 窗型 + `finish_direction`）给值——没有第二份判断逻辑；建完扫 0xFF 哨兵，
+无残留同时证明键是双射。
+
+- **75,600 组逐组相同**：42 副普查棋盘 × 225 格 × 4 方向 × 2 色，表路径 vs 走线路径 = **0 组不一致**
+  （`test_line_table_matches_the_walk_on_the_census`）。
+- **聚合字段**：同集逐格比 `recognize_position_both` 的本侧 11 个字段 + 对手侧 4 个 = **18,900 格、0 处不一致**。
+- **±6 截断被穷举关掉**：全部 **531,441 个窗键 × 窗外两格 (7,0)/(7,14) 的 8 个非规范变体 = 4,251,528 次评估，
+  0 次答案变化、0 次键变化**——指导书「注意 1」那句「截断必须证明不改答案」在这里不是抽样。
+  骨架同轮次154 那三条：穿过探针的连续段 ≤ 4（否则窗型已是 FIVE/LONG_FIVE，三段修正根本不会跑），
+  `five_points` 的补点因此 ≤ ±5、`fill_run` 判「== 5」最远看到 ±6，`painted` 只需知道连续段 > 4。
+  出界之所以能并进「被阻断」：每条走线在出界处停下来的方式与遇到对手子相同，而 `painted` 那支的
+  `break`/`continue` 差别不可观测（越界之后整段都是出界）。
+- **选点不变**：`git archive 4d23999` 的树与工作树各跑六臂，`method`/`depth`/`score`/`best`/`nodes`
+  逐字节相同（221,774／156,428／300,347／175,088／1,408,083／2,378,724）。
+
+### 杀线在这一格触发：取窗是 100 条指令，不是 10 条
+
+`docs/ENGINE_REDESIGN_V2.md:171` 的查询估算是「shift + mask 取出 13 格（**约 10 条指令**）＋ 一次表读」，
+杀线是「取窗指令数超估值 2 倍 → 本项作废，不落树」。实测（`-O2`、`m_old`/`m_new` 同一份乙-2 读数仪）：
+
+| 读数 | 旧树 `4d23999` | 新树（表） |
+|---|---|---|
+| 四臂 d6 PROGRAM TOTALS | 79,147,997,595 Ir | **83,786,118,514 Ir（+5.86 %）** |
+| 六臂 PROGRAM TOTALS | 252,898,861,120 Ir | **271,116,928,736 Ir（+7.20 %）** |
+| 被替代的那条路 | `finish_direction` self 15.91 %（12,588,823,566 Ir）／249,004,808 次调用 = **50.6 Ir/次** | `line_key_at` self 14.65 %（六臂 39,731,242,100 Ir）／397,312,421 次调用 = **100.0 Ir/次** |
+| `direction_from_bits` self | 8.68 %（recognize_position_both  absorbs 它，内联形状不同） | 7.88 % |
+
+**为什么旧函数这么便宜**：它 777,032,656 次调用（六臂）平均只有 50.1 条指令——绝大多数调用的窗型是
+NONE／眠二／活二，函数在 `color == WHITE` 与 `if (color == BLACK)` 两道门前就返回了，三段走线根本不跑。
+指导书把「占 14.45 % Ir」读成「这 14.45 % 是可替换的稳态成本」，实测它是 1,550 万次 × 50 条指令的**累积**；
+而 13 格 → 三进制下标这件事必须对每一次调用无条件做完（两组移位掩码 + 四次 64 项表读 + 三次加），
+再便宜也是 100 条。于是**表比走线贵一倍，整节点贵 5.86 %**。
+`-O0` 的墙钟也同向：`test_search` 470.28 → 518.69 s（+10.3 %）、`test_pinned` 240.19 → 263.06 s（+9.5 %），
+而两者节点数一字未动。
+
+还有一格必须写明白，否则下一次会误读这张差分表：**等价测试只能证明「±6 截断不改答案」，
+证明不了走线语义本身**——表是启动时由 `walk_direction()` 自己跑满生成的，拧走线等于同时拧表和答案，
+两边一起动，差分照旧为绿。这一点由三支代码变异臂间接证实：拧组位（把中心格含进键）、
+拧窗宽（`0x3FFF → 0x1FF`）、拧出界（不当阻断）三支都死在**更早的既有用例**（`test_pattern.cpp:56`、
+`:536`）上，而不是死在本轮新增的 75,600 组里——旧用例读同一张表，它们先红。
+
+### 门禁与变异臂
+
+- `ctest` **9/9 passed / 842.42 s**（表在树里时）：`test_search` 518.69、`test_pinned` 263.06、
+  `test_pattern` 7.13、`test_server` 27.49、`test_training` 16.54、其余四套共 10.2 s。
+- 变异臂六支，各 `rc=134` 并报出 `file:line`：M1 普查规模 `42 → 41` 断在 `tests/test_pattern.cpp:881`；
+  M2 形状期望 `LIVE_FOUR → RUSH_FOUR` 断在 `:993`（伴随 `SHAPE asymmetric four table=6 walk=6 expected=5`）；
+  M3 组位 `{0,3,7,10} → {0,3,6,10}` 断在 `:56`；M4 窗宽 `0x3FFF → 0x1FF` 断在 `:56`；
+  M5 ±6 枚举规模 `×8 → ×7` 断在 `:953`；M6 出界不当阻断断在 `:536`。还原后 `restored-clean`、绿跑 `rc=0`。
+- 建表成本单独记（v2 §2.2 O4）：**80.5 ms（-O2）／708.3 ms（-O0）**，进程启动一次，每个测试套件各付一次。
+- valgrind memcheck 与 `readme_anchor_check`／`web_frontend_check`：本轮**撤回后不跑** valgrind——
+  留下的树就是 `4d23999`（轮次153/154 各跑过 9/9 与 memcheck 的那棵）；
+  两个 node 门禁照跑；还原后的树重编并复跑 `test_pattern`，读数见「处置」。
+
+### 处置：代码全部撤回，`src/`、`tests/`、`CMakeLists.txt` 回到 `4d23999` 逐字节
+
+按指导书 §4 丙-4 的杀线（取窗超估值 2 倍）与 §707 那条通则（读数不过就换判据，不换机制的形状），
+本轮不落树。还原后 `git status --short` 为空，`cmp` 与 `git show 4d23999:` 逐字节一致，
+重编后 `test_pattern` 复跑绿：**0.079 s**（表在树里时同一套件的读数是 7.13 s——四口新用例里 ±6 全枚举那支要跑 4,251,528 次评估，建表本身在 -O0 下 708 ms）。备份与仪器留在 `/tmp/c4/`：`old`／`new`／`best` 三棵树、`cg_old.txt`／`cg_new.txt`／
+`d6_*.txt` 五份 callgrind dump、`shapes`（七形状取钉值）、`init_o2`／`init_dbg`（建表成本）、
+`mutate.sh`（六支变异臂）、`test_pattern.cpp.orig`／`pattern.cpp.orig`（还原比对基准）。
+
+如果 O1 还要再启，**别再把它做成「替代路径」**：本轮数据指向的形状是**条件表**——
+`matched ∈ {FIVE, LIVE_FOUR, RUSH_FOUR, LIVE_THREE}` 才查表（四类之外直接返回窗型，与今天的早退一致），
+其余调用一分钱不付。要重启它先得量一个新读数：**四类窗型在黑棋方向评估里各占多少次**
+（本轮没量，`/tmp/c4/shapes` 那支的普查直方图是合成窗的，不是真盘的）。
+
+### 一条给下一次的结构提醒（本轮实测得到形状的只有一条）
+
+`-O0` 的墙钟倒退（+10.3 %／+9.5 %）与 `-O2` 的指令倒退同向，但**尺子仍是 Ir**：
+测试套件的形状不带 `-O2`（CMake 只在 `gomoku_server`／`gomoku_train`／`gomoku_analyze`／
+`position_term_table` 上显式加），所以墙钟在这里既不是生产形状也不是指令数。
+本轮把它记成旁证而不是判据。
+
+### 申报
+
+- `best` 形（黑棋连 18 位窗型表都不查、直接一次线表读）也量了：四臂 d6 **83,275,699,492 Ir**，
+  对基线 79,147,997,595 是 **+5.21 %**——比替代形状（+5.86 %）只找回 0.65 个百分点。
+  也就是说这条路的**最省形式仍然是倒退**，判定不依赖任何未完成的读数。
+- 归属用的是 dump 里的 `calls=` 计数与 self Ir，`--separate-callers` 没开；
+  所以 50.6／100.0 Ir/次是「该函数 self 成本 ÷ 该函数被调用次数」，不含其 callee。
+- 两臂 d8 只在六臂那一组读数里参与（252.90 G → 271.12 G），四臂 d6 那一组是为了与轮次154 的
+  79.28 G 口径可比；轮次154 那个数是带计数器的树量的，本轮无计数器基线是 79.15 G，
+  差 0.17 % ——即计数器本身的代价，两条都对得上。
+- ±6 的全枚举只在**对称位置**（探针 (7,7)、dir 0）做：那里窗外只剩两格，是「窗外有子」可能性最大的形状；
+  偏心探针的窗外有三格，那一类由 75,600 组普查差分覆盖（42 副真盘）。
+
 ## 轮次154 引擎重构 丙-3：O3「排序分与威胁分分离」按指导书原样量了三遍——换键 ⇒ 六臂每一次宽度截断几乎都换集合（杀线命中），而 `≥ 30 %` 那一格比**配对分这条路的全部成本还大一倍** ⇒ 判不落地，`src/` 一字未动 — engine redesign stage 丙-3: the sort-key swap was measured, not assumed; the threat-level key changes the kept set on 99.45-100 % of width truncations (kill line), and the guide's ≥30 % Ir/候选格 bar is 2.2× the *entire* price path (13.56 % of Ir), so no arm of this mechanism can pass — production code untouched
 
 指导书 §4 丙-3 要「排序路径改成 O(1) 线字判定，两色全量配对分只留在叶子」，验收写的是
