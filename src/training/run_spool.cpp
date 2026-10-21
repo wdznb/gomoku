@@ -116,9 +116,16 @@ bool write_task_file(const std::string& path, const RunTask& task, std::string& 
     root["max_nodes"] = task.max_nodes;
     root["max_moves"] = task.max_moves;
     root["pin_cpu"] = task.pin_cpu;
+    root["timeout_ms"] = task.timeout_ms;
+    root["teacher_depth"] = task.teacher_depth;
+    root["teacher_max_nodes"] = task.teacher_max_nodes;
+    root["data_opening_plies"] = task.data_opening_plies;
     root["params_path"] = task.params_path;
     root["spool_path"] = task.spool_path;
     root["done_path"] = task.done_path;
+    // 与 params_path 一样是「有才写」：任务文件的契约里那 16 个必填项一个都不动，
+    // 心跳只是派活的一方主动加的通道。
+    if (!task.control_socket.empty()) root["control_socket"] = task.control_socket;
     return atomic_write_text(path, root.dump(2), error);
 }
 
@@ -154,10 +161,17 @@ bool read_task_file(const std::string& path, RunTask& out, std::string& error) {
     if (!read_required_int(root, "max_nodes", task.max_nodes, error)) return false;
     if (!read_required_int(root, "max_moves", task.max_moves, error)) return false;
     if (!read_required_int(root, "pin_cpu", task.pin_cpu, error)) return false;
+    if (!read_required_int(root, "timeout_ms", task.timeout_ms, error)) return false;
+    if (!read_required_int(root, "teacher_depth", task.teacher_depth, error)) return false;
+    if (!read_required_int(root, "teacher_max_nodes", task.teacher_max_nodes, error)) return false;
+    if (!read_required_int(root, "data_opening_plies", task.data_opening_plies, error)) return false;
     if (!read_required_string(root, "spool_path", task.spool_path, error)) return false;
     if (!read_required_string(root, "done_path", task.done_path, error)) return false;
     if (root.contains("params_path") && root["params_path"].is_string()) {
         task.params_path = root["params_path"].get<std::string>();
+    }
+    if (root.contains("control_socket") && root["control_socket"].is_string()) {
+        task.control_socket = root["control_socket"].get<std::string>();
     }
     if (task.run_id.empty() || task.seq < 0 || task.attempt < 1 || task.games <= 0 ||
         task.depth <= 0) {
@@ -245,6 +259,9 @@ bool SpoolWriter::finish(std::string& error) {
     root["seq"] = seq_;
     root["attempt"] = attempt_;
     root["lines"] = written_;
+    // 完成标记里带上 spool 路径，收账的一方不需要按命名规则猜文件在哪：标记说了才算，
+    // 路径也由标记说。这样「有标记但 spool 不见」是一笔能对上的坏账，而不是一条靠约定掩盖的坏账。
+    root["spool_path"] = spool_path_;
     std::ostringstream text;
     text << root.dump();
     return atomic_write_text(done_path_, text.str(), error);

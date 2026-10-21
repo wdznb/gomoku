@@ -57,7 +57,7 @@ set(GOMOKU_TRAINING_SOURCES
     src/training/genetic.cpp
     src/training/hill_climbing.cpp
     src/training/trainer.cpp
-    src/training/run_spool.cpp
+    src/training/run_spool.cpp src/training/worker_mode.cpp
 )
 set(GOMOKU_SOURCES
     src/main.cpp
@@ -385,4 +385,40 @@ if(MSVC)
     target_compile_options(worker_nps_probe PRIVATE /W4)
 else()
     target_compile_options(worker_nps_probe PRIVATE -Wall -Wextra -O2 -Wno-template-body -Wno-template-id-cdtor)
+endif()
+
+# 进程模型的 supervisor（v2 §4.1 / 指导书 §4 戊-1 思路 1）。它只要 run_spool 那一层契约
+# （任务文件 + spool 信封 + tail 判决），训练本身在 worker 进程里，所以这里不链训练器。
+# 继续追加在文件末尾：上面那些目标行被 REVIEW_LOG 按行号指认（`:166-180`、`:313-327`、
+# `:331/336`、`:337`、`:339`、`:352-369`、`:375-388`）。
+add_executable(gomoku_broker
+    tools/broker_main.cpp
+    src/training/run_spool.cpp
+)
+target_include_directories(gomoku_broker PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/tests)
+target_link_libraries(gomoku_broker PRIVATE Threads::Threads nlohmann_json::nlohmann_json)
+if(UNIX)
+    target_link_libraries(gomoku_broker PRIVATE pthread)
+endif()
+if(MSVC)
+    target_compile_options(gomoku_broker PRIVATE /W4)
+else()
+    target_compile_options(gomoku_broker PRIVATE -Wall -Wextra -O2 -Wno-template-body -Wno-template-id-cdtor)
+endif()
+
+# 一次人类 think 的墙钟分布仪器（v2 §4.4 的验收档 / 指导书 §4 戊-1 验收第 3 条）。
+# 继续追加在文件末尾：上面那些目标行被 REVIEW_LOG 按行号指认。
+add_executable(think_latency_probe
+    tools/think_latency_probe.cpp
+    ${GOMOKU_CORE_SOURCES}
+)
+target_include_directories(think_latency_probe PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/tests)
+target_link_libraries(think_latency_probe PRIVATE Threads::Threads nlohmann_json::nlohmann_json)
+if(UNIX)
+    target_link_libraries(think_latency_probe PRIVATE pthread)
+endif()
+if(MSVC)
+    target_compile_options(think_latency_probe PRIVATE /W4)
+else()
+    target_compile_options(think_latency_probe PRIVATE -Wall -Wextra -O2 -Wno-template-body -Wno-template-id-cdtor)
 endif()

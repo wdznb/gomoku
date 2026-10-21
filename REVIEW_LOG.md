@@ -1980,6 +1980,84 @@ additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cp
 no existing assertion was edited.
 
 
+## 轮次164 引擎重构 戊-1 第二段：进程模型的两半都接上了——`gomoku_train --worker <task>` 跑的是与线程模式**同一条**数据采集路（同一批局、除去墙钟逐字相同），`gomoku_broker` 负责派活／收账／看门／让位，五条进程级臂把 §4.3 与 §4.4 的三条验收钉住：`SIGKILL` 之后任务账与文件账在 N 秒内重新对齐、一行没写完的 spool 让**整批**作废（绝不把半行补完再读）、`pause` 之后一个新任务都不派；三档 think 的 p99 相对全停档实测 **100.1 %**（饱和档）与 **101.1 %**（把时间帽抬到 20 s 让分布不饱和再测一遍），判据「劣化 ≤ 20 %」两档都成立 ⇒ 绑核生效 — engine redesign stage 戊-1 part 2: both halves of the process model are wired together — the worker runs the *same* collection path as the threaded build (identical games, byte-equal once the wall clock is stripped), a broker does dispatch / accounting / watchdog / yielding, and five process-level arms pin the three acceptance lines of §4.3–§4.4; the human-think p99 comes in at 100.1 % of the stopped baseline in the saturated regime and 101.1 % when the time cap is lifted so the distribution is no longer pinned at the cap
+
+**交的东西**（一行训练逻辑都没复制，这是指导书思路 2 的执行处）：
+
+- `src/training/worker_mode.h/.cpp`：`run_worker_mode(task_path, error, out)` = 读任务 → `sched_setaffinity` 自绑（`worker_mode.cpp:136-152`，Windows 那侧对绑核与心跳两条都**显式拒绝**而不是写一份没仪器覆盖的回退：`:150` 与 `:207`）→ 可选载入学生系数 → 用 `TrainingConfig` 走 `Trainer::collect_data_games`（`worker_mode.cpp:211`；原始产物先落 `spool_path + ".records/.samples"`，与线程模式同一处落盘）→ 每行**原样**装进 spool 信封 → 完成标记 → 删中间文件。失败路径一律在标记之前返回（缺标记 = 重排，与被杀的形状一致）。
+- 心跳（v2 §4.3「每 worker 一条 UDS 连接，消息是单行 JSON」）：`worker_beat_line(seq, attempt)`（`worker_mode.cpp:28`）把那一行的字节形状钉成一个纯函数，`BeatChannel` 一条连接用到底，第一拍在动手**之前**同步发出（`:192`），之后每 200 ms 一拍（看门缺省 5 s，留 25 倍余量）；连不上就当场拒活，不写标记。`control_socket` 与 `params_path` 一样是任务文件里**有才写**的可选项，那 16 个必填键一个没动。
+- `tools/broker_main.cpp` → `gomoku_broker`：配额 `max(1, 在线 CPU − reserved_cores)`（缺省 `reserved_cores=3`，轮次163 的实测，不是抄文档的 2）；`posix_spawn` + `POSIX_SPAWN_SETSID` 派活；绑核只用 `reserved_cores … n-1`，0/1 永远留给 asio 与玩家那手；判账在收尸之后（`broker_main.cpp:431` 放进 `pending_`，`:628` 判）；非阻塞监听在 `:202`，心跳那道闸在 `:472`；控制面 `<root>/broker.sock` 一行一条 JSON（`pause`/`resume`/`stop`/`quota`/`status`/`beat`），认下的回 ack、认不出的点名 reject，`beat` 不回话（一秒五拍 ×N 的应答只是噪音）；`--send '<一行>'`（`send_control`，`:801`）是同一通道上的一次性客户端，面板之外的一根探针和面板读的是同一份状态。**没有新开任何 TCP 监听。** `main_trainer.cpp:312` 是 `--worker` 那个分支。
+- `tools/think_latency_probe.cpp` → `think_latency_probe`：四档（全停／全训／半训／边下边训）各测一次人类 think 的 p50/p99 墙钟，并把训练侧的每秒节点数从 broker 的 `status` 里读回来。
+- 状态里新增 `merged_nodes` / `merged_search_ms` / `nodes_per_search_second` 与 `workers[]`（每个在飞任务的 pid、心跳年龄、在飞时长）：验收要的「每秒节点数」不再另开一条 IPC，而是从本来就要并账的记录行里加出来——分母写清是**搜索时间**之和而不是墙钟（本机墙钟不可复现，见轮次163 的吞吐表）。
+
+**两个缺陷是臂抓出来的，不是看出来的**：
+
+1. **判账的时机**。早先的收账是「按目录扫完成标记 → 谁的标记在就读谁」，于是 worker 还在写的时候就被读了一次：正在写的那半条被当成截断 ⇒ 把一个**还在飞**的 attempt 判脏 ⇒ 删它的标记、重排 ⇒ 同一 seq 双跑。冒烟里读到的形状是 `requeued=2`、`spawned=3`、还多出一份 `task-1-3.json`，而 `merged_records` 只有 2（B2 那臂把它逼成了断言）。改成**收尸之后才判**：`reap_children` 把跑完的 attempt 放进 `pending_`，`tail_all` 从这份名单里取，判一次；顺带把「完成标记自己声明的条数 == 数到的完整行数」加成一条正面账（标记说 66 行而文件里只有 65 行就是断号，与半行同罪）。
+2. **`accept4(…, SOCK_NONBLOCK)` 的 flag 只作用于返回的那个新 socket**，监听 socket 自身还阻塞的话第一次 `accept4` 就把主循环卡在「等第一个连接」上。第一次冒烟的症状是 broker 活着、一个任务文件都没写出去，`/proc/<pid>/wchan` 读出来是 `__skb_wait_for_more_packets`。改成 `socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0)`。
+3. 另一处踩坑是**仪器自己**：`--send` 的第一版在没有回话的命令上阻塞 `recv`，于是「发一条 `pause`」这一行读数读起来跟服务端死掉一模一样（其实是探针在等）。现在服务端对每条被认下的命令都回 ack，探针那一侧再加 2 s 的 `SO_RCVTIMEO` 兜底。
+
+**等价性读数**（这条是「换到进程模式不改变数据」的凭据，`test_h1_a_worker_task_yields_the_same_bytes_the_threaded_path_does`）：同一个 `TrainingConfig` 分别走线程模式与 worker 任务，records 2 条 / samples 72 条 / `games_played` 502 三处相同；把 `elapsed_ms` 从行里剥掉之后**全部逐字相同**（含墙钟那一条比较是 0/2 —— 本机墙钟不可复现，所以这条只能这样钉，见 [[quoted-measurements-must-be-re-derivable]]）。
+
+**三档 think 的读数**（`--pin 1 --depth 6 --poses 24`，think 钉在 reserved 之前、worker 只拿 3/4/5；两档时间帽）：
+
+| 档 | 时间帽 | p50 | p99 | p99 / 全停 | 训练 nps（搜索秒） |
+| --- | --- | --- | --- | --- | --- |
+| 全停 | 1200 ms | 1121.6 | 1204.0 | 1.000 | — |
+| 全训（3 worker） | 1200 ms | 1063.0 | 1203.7 | 99.98 % | 42,847 |
+| 半训（1 worker） | 1200 ms | 1023.8 | 1206.7 | 100.2 % | 38,733 |
+| 边下边训（pause/resume） | 1200 ms | 1117.1 | 1205.4 | **100.1 %** | 38,910 |
+| 全停 | 20 s（不饱和） | 2323.9 | 10963.8 | 1.000 | — |
+| 全训 | 20 s | 2381.6 | 11689.7 | 106.6 % | 40,963 |
+| 半训 | 20 s | 2403.7 | 11292.1 | 103.0 % | 42,880 |
+| 边下边训 | 20 s | 2379.0 | 11089.3 | **101.1 %** | 39,984 |
+
+第一遍的 p99 全部贴着时间帽（think 被 1200 ms 截停），比值天然是 1.0，那一档只能证明「没有超出预算」；所以又跑了一遍把帽抬到 20 s，让分布不饱和——判据在两边都成立，而不饱和那一遍才是有信息的那一遍。四档全程 `requeued=0 failed=0`，`spawned` 最多到 188（全训档 90 s 内派了 188 个任务）。
+
+**五条进程级臂**（`tests/test_training.cpp`，全部在 `#ifndef _WIN32` 下）：B1 `SIGKILL` 采局中的 worker ⇒ 无标记 ⇒ 作废 + `attempt=2` 重排 ⇒ 三条记录补齐、`spawned=2`、`requeued=1`、`done/w1-1.json` 不在而 `w1-2.json` 在、样本号全部 > 3（**被杀那一 attempt 用掉的号不回收**，所以「同一个号两批不同的局」在结构上不成立）；B2 往 spool 里自己写一条截断的行（带 `[[TORN-MARKER]]` 记号）⇒ 判脏 ⇒ 整批作废 ⇒ 并入的只有重排那一遍的 2 条、残骸随作废一起清掉、退出码 0；B3 `SIGSTOP` 冻住 worker ⇒ 先证明真收到过心跳（`status` 里 `beats ≥ 1`），再看门在 1 s 档内报 `heartbeat stale` 并且**那一行点名的 pid 就是被冻的 worker**，broker 之后还能回话；B4 `pause` 收到 ack，随后**在让位期间**取一次账：队列里还压着活（`--tasks 24` 而配额 3）、`spawned` 与 `merged_records` 都不许超过 pause 那一刻已经在飞的个数、等 2.5 s 之后还是这个数（这才是「一个新任务都不派」的可观察形状），然后 `resume` 必须继续供活，`bogus` 命令被点名 `reject`；B5 心跳那一行逐字钉住 + 真发出去（测试自己 bind+listen，靠 backlog 不需要并发）+ 连不上就拒活且不留信封 + 没给控制面的任务照跑（`beats=0`）。
+
+**变异矩阵**（每条都要让钉它的那一臂变红）：
+
+| 臂 | 改坏的是哪一句 | 变红的臂 | 死掉的断言（在最终形状的树上重新取行号） | rc |
+| --- | --- | --- | --- | --- |
+| M1 | 判脏那道闸拆掉：`if (report.needs_requeue() \|\| count_mismatch)` → `if (false)` | B2 | `wait_until(… "is dirty" …)` | `test_training.cpp:7593` | 134 |
+| M2 | 作废时不截断：`std::ofstream truncate(… std::ios::trunc)` → `std::ios::app` | B2 | `run.wait_for_exit(90000) == 0`（三次重排全部用完 ⇒ `failed=1` ⇒ 退出码 1） | `:7599` | 134 |
+| M3 | 监听 socket 回到阻塞那一版：`socket(AF_UNIX, SOCK_STREAM \| SOCK_NONBLOCK, 0)` → 去掉 flag | B1 | `wait_until(… "spawned seq=1" …)`（一个任务都派不出去，主循环卡在第一次 accept） | `:7523` | 134 |
+| M4 | 重排不改 attempt：`job.attempt++` → `job.attempt += 0` | B1 | `wait_until(… "requeue seq=1 as attempt=2" …)` | `:7532` | 134 |
+| M5 | 看门整条拆掉：`if (!flight.beating)` → `if (true)`（每个在飞任务都被跳过） | B3 | `wait_until(… "heartbeat stale" …)` | `:7629` | 134 |
+| M6 | `pause` 不再拦派活：`spawn_ready` 的循环条件去掉 `!paused_` | B4 | `during["queued"].get<int>() >= 1`（让位期间队列被自己派空） | `:7682` | 134 |
+| M7 | 控制命令不回话：`if (cmd != "beat" && cmd != "status")` → `if (false)` | B4 | `ack.find("\\"applied\\":\\"pause\\"")` | `:7665` | 134 |
+| M8 | worker 吞掉连接失败：`if (!channel.open(…)) return false;` → 不判返回值 | B5 | `error.find("connect")` | `:7792` | 134 |
+
+八条都在**最终形状的树**上重跑过一遍：上表的行号出自那一遍，`rc` 全是 134；收尾是一次 `cmake --build build -j4 -- -B` 的强制重建（145 个 TU），保证门禁读的不是变异留下的旧对象。M8 那一行取的是**再一遍**的行号——它下面的 B5 后来因为 memcheck 那一遍改了两句（见第四条坑），行号从 7788 移到 7792，其余七条的断言都在改动点之前，未受影响。
+
+几条臂不是一遍过的，四个坑都记下来：
+
+- **M6 第一版点不着**。B4 原来用 `--tasks 1`，队列里本来就压在 3 个在飞任务上、没有排队的活，于是「pause 不拦派活」这一改**没有东西可拦**，变异树全绿（`rc=0`）。改成 `--tasks 24` 并且把观察窗放进让位期间（读 `queued`/`spawned`/`merged_records` 三件，而不是等排空之后再比一次 `spawned`：poll 循环只有 20 ms，排空后的两次读数在变异树下反而相等），这条才变红。改完之后 B4 在 pristine 树上重跑一遍（绿），M6 重跑一遍（红），两行都是最终形状上的读数。
+- **M8 第一遍是假绿**。第一次只重建了 `gomoku_broker` 与 `gomoku_train`，而 `test_training` 自己 static 链接着一份 `worker_mode.cpp.o` —— 于是那一臂跑的是**没被变异**的那份代码，读出来 `rc=0`。这是轮次127 那个「测了未变异树」的老坑换了个地方：变异文件被谁链接，就得把谁一起重建。补跑之后 `rc=134`（`:7779`），并且收尾做了一次 `cmake --build build -j4 -- -B`（273 个 TU 重编）保证门禁读的是干净的最终形状。
+- **TSan 那一遍的 `rc=134` 不是竞争，是路径**。`tools/valgrind_check.sh tsan test_training` 连着两遍在 B1 里断言失败（`races=0 deadlocks=0`，177 s 与 247 s），而脚本在非 0 rc 时只 tail 两行 stdout 并把自己的 stderr `rm -f` 掉（脚本既有的形状，轮次124 就登记过），断言文本当场拿不到。随后**同一条 tsan 二进制在 `build-tsan/` 里直接复跑**却是 `rc=0`、stderr 全空。差异只有一个：门禁脚本从**仓库根**执行 `"$bindir/$t"`，而这些进程级臂按既有的套件惯例写的是 `./gomoku_broker` / `./gomoku_train`（ctest 把 WORKING_DIRECTORY 配成 build 目录，所以平时成立）。仓库根没有这两个文件，broker 派不出活，B1 的界自然到点。修法是把路径从**可执行文件自己**推（`/proc/self/exe` 的目录），于是两条路读的是同一份代码：改完之后 `bash tools/valgrind_check.sh tsan test_training` → `test_training clean races=0 deadlocks=0 rc=0 184s`，native 侧从 build 目录与从仓库根各跑一遍套件都绿。
+- **顺带看见的一处真缺口（本轮只登记，不修）**：臂按设计 `abort` 时 fixture 的析构不会跑，于是被 `posix_spawn` 出去的 broker 与它的 worker 留在后台继续训练——一轮变异下来本机积了十几个这种孤儿（`ps` 里 8 千秒还在）。测试侧的解法是给自己这一组进程加一道 `kill(-pid)` 的收尾；产品侧的对应问题更严重：**服务端重启后孤儿 worker 会一直吃核**，而 §4.4 的整条承诺就是「玩家的核优先」。正确的做法是 `PR_SET_PDEATHSIG`（broker 与 worker 两侧各一行），但它要求派活的一方是**直接父进程**——本轮的 broker 是经 `/bin/sh` 起的，PDEATHSIG 落在 sh 上，测不到效果。所以这条留给戊-2/戊-3：broker 接进服务端那一轮才有真正的父进程可以验证。登记在此，不当成已完成。
+- **插桩那一遍的时间界仍然按倍数走**：`proc_budget()` 把进程级臂的界在 `RUNNING_UNDER_VALGRIND`（valgrind 注入并被 fork/exec 继承）下乘 20、TSan 下乘 8、ASan 下乘 12。这不是给上面那个 bug 打掩护（那一条已经按路径修好了），而是因为「还能往前走」的界本质上是仪器速度的一部分；缺省路径下它是 1，什么都没放松。
+- **B5 的第一条心跳不能整串比**。memcheck 那一遍在 1023 s 处断言失败（`reports=0 invalid_read=0 invalid_write=0 uninitialised=0 definite_leak=0`，也就是**没有任何内存报告**，红的是断言本身）：那一句写的是「`recv` 收到的整串 == 那一行心跳」，而 Debug -O0 下一次采局要跑好几秒，心跳线程按 200 ms 一拍就发十几拍，一次 `recv` 带回的是**好几行粘在一起**。改成只比第一条（`compare(0, want.size(), want)`），并在注释里把这一条的形状钉住。TSan 那一遍没红是运气：-O1 下任务短到只发得出第一拍。同一类教训在轮次163 记过一次（时间敏感的判据不能钉绝对值）。
+
+
+**为什么不新建 `test_broker` 套件**：这些臂要的活体是一个 `Trainer` 与它的 temp helper（`read_lines` / `temp_path` / 既有的 `GameRecord::from_json` 读者），另开套件只会把训练代码复制一遍——那正好违反思路 2。臂因此并进 `test_training`，进程级的部分在 `#ifndef _WIN32` 下。**这一条与指导书 §9.4 那行原来写的「新 `test_broker` 仍未交」是有意的偏离，已在同一行改成实际形状。**
+
+**仍未交 / 缺口**：Windows 那半（`CreateProcess` + Job Object + `SetProcessAffinityMask`）按 §4.2 的杀线取「POSIX-only ＋ Windows 保持线程模式」，worker 侧两条 POSIX 特性都显式拒绝，所以树里不存在「两边都有但一边没测」的状态；思路 1 那句「轮末跑 `BalanceController`」仍然落空（丁-4 判不落地，树里没有这个类），broker 因此不做轮末平衡步骤；§4.4 的「面板上一个训练并发」滑杆是戊-2 的帧族，本轮只交它背后的 `quota` 命令；进程模型接进 `gomoku_server` 的实盘路径（开局即降档）不在本轮，因为面板还没接 `train_*` 帧；**孤儿 worker 那一条见上面的缺口登记**（`PR_SET_PDEATHSIG` 要等 broker 由服务端直接起的那一轮才有可验证的父进程）。
+另有一条**取不到的证据**要写明：TSan 那 0 race 我试着按轮次127 的做法补一臂「仪器会说话」的反证（把「先发停表信号、再 join」那句删掉，让主线程的读数与心跳线程并发），结果那一改把 `join()` 变成了等一个永远不会停的线程——**卡死而不是竞争**，所以本机的反证没点着，只能作废。可用的替代证据是这台仪器在本仓库的历史读数（轮次127 同一脚本 + 一个已知竞争 → 59 条 race 点名 `store()/probe()`），本轮的 0 因此是「同一台会说话的仪器这一遍没听见」，不是「没人听过它说话」。
+
+**行的指针表**（本轮在 `src/training/main_trainer.cpp` 插了 `--worker` 分支与一条前置声明，被按行号指认的那几处整体下移）：`343 → 349`（`if (config.rounds <= 0)`，REVIEW_LOG:9648 指的那处）、`402-407 → 408-413`、`420 → 426`（指导书 :571 指的 CLI 入口，已就地改数字，指导书仍 849 行）；`:11` 之后新增的前置声明占掉了原来那行空行，所以 286 之前与 300 处一字未动。
+
+**门禁**（全部在最终形状的树上跑）：
+
+- `ctest` → **9/9 passed，831.76 s**（`test_search` 474、`test_pinned` 241.5、`test_training` 94.23——这一格从轮次163 的 ~64 s 涨到 94 s，涨的就是五条要真起进程的臂）。这一遍是在 `src/training/*`、`tools/*` 与 `tests/test_training.cpp` 都改过的形状上跑的，符合 §2「改了 src/ 就全套件」；在此之前的一遍（测试侧重构前）是 9/9、831.22 s。
+- `node tests/readme_anchor_check.js` → **122 citations, 0 problems**；`wc -l README.md` 仍是 **765**（两处都是行内改：`--data-games / --threads / --shared-tt` 那一行加了 `--worker`，「产物目录」那一段加了 broker 的账本形状与两台仪器）。
+- `node tests/web_frontend_check.js` → **111/111**（前端一字未动，本轮不碰协议帧）。
+- TSan（`tools/valgrind_check.sh tsan test_training`）→ **`test_training clean races=0 deadlocks=0 rc=0 184s`**；这一遍之前那两遍红的原因见上（路径，不是竞争）。这条 0 的仪器可信度沿用轮次127 在同一脚本下的反证，本轮自己的反证没点着，也写在上面。
+- 全量强制重建（`cmake --build build -j4 -- -B`，145 个 TU）的 warning 数是 **4**，逐条查过都是既有的：`data_collector.cpp:95` 的 `unused parameter 'side_to_move'` ×2（轮次160 就登记过）、`test_training.cpp:3647` 的 `range-loop-construct`、`server.cpp:181` 的 `unused function`——**本轮没有新增 warning**。
+- `test_training` 从 `build/` 与从仓库根各跑一遍都绿（这一条就是上面那个路径缺陷的回归凭据）。
+- memcheck（`tools/valgrind_check.sh memcheck test_training`）→ **`test_training clean reports=0 invalid_read=0 invalid_write=0 uninitialised=0 definite_leak=0 1022s`**，`rc=0`。第一遍（1023 s）是在 B5 那一句整串比较上断言失败的，`reports` 全是 0——内存一侧从来没有红过，红的从来是断言的形状；改完重跑即上面这一行。
+
+
 ## 轮次163 引擎重构 戊-1 第一段：进程模型先量成本再建——同一批普查棋盘上 2 份绑核 = 100.5/97.9 %、3 份 = 96.2/94.6/95.9 %、4 份 = 87.9/87.0/88.6 %，而**不绑核的控制臂是 89.0/88.8/89.2 %**（差 −0.7 %～−2.0 %），把置换表从 2^18 条缩到 512 条（RSS 12.2 MB → 5.2 MB）仍是 88.2 % ⇒ 掉的那 11 % 不是绑核没生效也不是 cache，是这台 6 核虚机的共享物理核；缺省配额因此按实测取 **3**（用户裁决），一起交的还有 §4.3 的 IPC 核心（任务文件 + spool 行 + 只往前读的 tail，五条用例、九条变异臂），worker 模式与 broker 与让位三档的 p50/p99 **本轮不交** — engine redesign stage 戊-1 part 1: price the process model before building it — 2/3/4 pinned copies hold 100/96/88 % of the single-process nps while the unpinned control sits at the same 89 %, and a 512-entry table changes nothing, so the loss is the VM's shared physical cores rather than affinity; the default quota is 3 by measurement, and what ships with it is the §4.3 IPC core (task file + spool line + forward-only tail, five cases, nine arms); worker mode, the broker and the three-regime think latency are explicitly deferred
 
 **这一段交什么、不交什么**。交：`tools/worker_nps_probe.cpp`（新目标 `worker_nps_probe`，追加在

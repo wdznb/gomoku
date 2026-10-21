@@ -508,7 +508,7 @@ git push origin master                # 然后核对 git log --oneline -1 origin
 
 ### 戊-1 H：进程模型（`gomoku_broker` ＋ `gomoku_train --worker`）
 
-**状态**：**轮次163 交的是第一段：成本仪器 + 吞吐实测 + IPC 核心**。新仪器 `tools/worker_nps_probe.cpp`（目标 `worker_nps_probe`，追加在 CMake 末尾）与 `src/training/run_spool.h/.cpp`（任务文件 + spool 行 + 只往前读的 tail，五条 `test_h1_*` 用例 + 九条变异臂）。**实测（同一批 42 副普查棋盘、同一个 depth 4 与节点帽 20000，每一行的 `nodes`/`checksum` 都逐字相同）**：单进程基线 16,395-21,914 nps（绝对值随桌面负载走，所以只比同一遍内的比值），**2 份绑核 = 100.5 / 97.9 %，3 份 = 96.2 / 94.6 / 95.9 %，4 份 = 87.9 / 87.0 / 88.6 %**；4 份**不绑核**的控制臂 = 89.0 / 88.8 / 89.2 %（与绑核那一臂同形，差 −0.7～−2.0 %），把表从 2^18 条（RSS 12.2 MB）缩到 512 条（5.2 MB）仍是 88.2 %。⇒ 绑核确实生效（15 份 pinned 拷贝各自报 `affinity=2/3/4/5`），但**掉的那 11 % 不是绑核没生效、也不是 cache 容量**，而是这台 6 核 VMware 虚机的共享物理核；**本单元验收第 1 条（每 worker ≥ 单进程 90 %）在本机于 4 worker 达不到、于 ≤3 worker 达到**。由此定下：**缺省配额按实测取 3**（`reserved_cores` 缺省从文档的 2 改成 3，公式 `workers = max(1, 物理核 − reserved_cores)` 不动）——§4.4 写的那句「超过说明绑核没生效，不是机器不够」被控制臂证伪，已在本行登记。**第二段（worker 模式 + broker + 让位三档的 think p50/p99）尚未落地**，所以第 2、3 条验收本轮交不出；§4.2 那四条理由（崩溃隔离、`--threads` 惰性、核要让给玩家、TT 每引擎一张）在轮次124/125/127/141 已有实测，不受吞吐这一格影响。**另一处文档要改**：思路 1 说 broker「每轮末跑一次 `BalanceController`」，而丁-4 已判不落地、树里没有这个类——派活的一方不能调度一个不存在的组件，这一条要等丁-4 的复测条件成熟再挂回去。现在是**进程内 `std::thread`**（`trainer.cpp:268-327`），没有 broker、没有 worker 模式、没有绑核。
+**状态**：**两段都落地了**——第一段（轮次163）= 成本仪器 + 吞吐实测 + IPC 核心（`tools/worker_nps_probe.cpp`、`src/training/run_spool.h/.cpp`）；第二段（轮次164）= `src/training/worker_mode.h/.cpp`（`gomoku_train --worker <task>`：自绑核 → 走**同一条**数据采集路 → 每行原样装进 spool 信封 → 落完成标记；带 `control_socket` 时每 200 ms 往那条 UDS 发一行心跳，连不上就当场拒活）、`tools/broker_main.cpp` → `gomoku_broker`（配额 `workers = max(1, 在线 CPU − reserved_cores)`，缺省 `reserved_cores` 按实测取 **3**；`posix_spawn` + `SETSID` 派活；一个 attempt **收尸之后**才判账——标记在、整份读干净、且行数与标记自己声明的条数逐条对上，才算入账，否则整批作废重排；看门：退出码非 0 / 没有标记 / 心跳超 5 s；控制面只有那条 UDS，`pause`/`resume`/`stop`/`quota`/`status`/`beat`，认下的回 ack、认不出的点名 reject；不新开 TCP）、`tools/think_latency_probe.cpp`（四档 think 墙钟）。**吞吐（42 副普查棋盘、depth 4、节点帽 20000，各行 `nodes`/`checksum` 逐字相同）**：单进程 16,395–21,914 nps，**2 份绑核 100.5/97.9 %、3 份 96.2/94.6/95.9 %、4 份 87.9/87.0/88.6 %**，4 份不绑核 89.0/88.8/89.2 %、缩表到 512 条仍 88.2 % ⇒ 掉的那 11 % 是这台 6 核虚机的共享物理核，不是绑核没生效也不是 cache；验收第 1 条于 ≤3 worker 达到、于 4 worker 达不到，故缺省配额取 3，§4.4 那句「超过说明绑核没生效」被控制臂证伪。**三档 think（验收第 3 条，`--pin 1` 把 think 钉在 reserved 之前、worker 只拿 3/4/5）**：饱和档（depth 6 / 1200 ms）全停 p50 1121.6 / p99 1204.0 ms，全训 1063.0/1203.7，半训 1023.8/1206.7，边下边训 1117.1/1205.4 ⇒ **p99 比 100.1 %**；把时间帽抬到 20 s 让分布不饱和再测一遍：全停 2323.9/10963.8，全训 2381.6/11689.7（106.6 %），半训 2403.7/11292.1（103.0 %），边下边训 2379.0/11089.3 ⇒ **101.1 %**，判据（≤ 120 %）两档都成立，绑核生效。**两个缺陷在本轮登记并已修**：(a) 判账时机——早先按目录扫完成标记，会在 worker 还活着时把它正在写的 spool 读成「截断」，于是把一个还在飞的 attempt 判脏、删标记、重排，同一个 seq 双跑（B2 臂抓到，表现为 `requeued=2` 与一次多余的 attempt）；现在只有收尸之后才判，且新增「标记声明的条数 == 数到的行数」这条正面账。(b) `accept4(…, SOCK_NONBLOCK)` 的 flag 只作用于返回的**新** socket，监听 socket 自身还阻塞的话第一次 accept 就把主循环卡在「等第一个连接」上（第一次冒烟一个任务文件都没写出去，进程睡在 socket 等待里）。**验收第 2 条 = 七条进程臂**（worker 与线程模式逐字等价、失败不留标记、`SIGKILL` 后账对齐、半行判脏整批作废、心跳超时被看门杀、让位是任务粒度且 `pause` 不是退出、心跳字节形状与连不上就拒活）。**仍未交**：Windows 那半（`CreateProcess` + Job Object + `SetProcessAffinityMask`）按 §4.2 的杀线取「POSIX-only ＋ Windows 保持线程模式」，worker 侧对绑核与心跳两条都**显式拒绝**而不是写一份没有仪器覆盖的回退；思路 1 那句「轮末跑 `BalanceController`」仍然落空（丁-4 判不落地，树里没有这个类），broker 因此不做轮末平衡步骤；线程模式仍然在原处（`trainer.cpp:268-327`）作为没有 broker 时的缺省路径。
 
 **目标效果**：supervisor 进程（broker）派活给 N 个 worker 进程，每个 worker 绑一个物理核；玩家下棋时 worker 让位；崩溃只死一个任务。
 
@@ -568,7 +568,7 @@ git push origin master                # 然后核对 git log --oneline -1 origin
 
 ### 戊-3 K：一键训练（五相状态机）
 
-**状态**：未做。CLI 现在只有「从头跑 N 轮」或「从 checkpoint 续 N 轮」（`main_trainer.cpp:420`），没有分相入口。
+**状态**：未做。CLI 现在只有「从头跑 N 轮」或「从 checkpoint 续 N 轮」（`main_trainer.cpp:426`，轮次164 因为插入 `--worker` 分支整体下移 6 行），没有分相入口。
 
 **目标效果**：`train_autopilot` 把六个要人手串的动作串成一个**可中断、可恢复、可解释**的循环。
 
@@ -816,7 +816,7 @@ set_tests_properties(test_training  PROPERTIES TIMEOUT 300)   # 实测 13 s，me
 | 丁-4 平衡控制器 | **未交用例**（轮次159 判不落地，机制未写） | 原判据（Wilson、一步一项、5 步封顶、回滚）改为读数记在轮次159：每色 4 局只有 4-0 才点火、误点火 12.5 % | — |
 | 丁-5 S1 交换规则 | **未交用例**（轮次160 判不落地）；仪器在 `tools/opening_rule_screen.cpp` | 原判据（`none` 逐字节、交换回合、非法规则被拒）改为读数记在轮次160：`swap` 臂与对照臂逐字相同（47/48 = 97.9 %、两局判决不同 = 0） | 仪器约 25 min / 288 局 |
 | 丁-6 S2 开局筛选 | `test_training`（轮次162 四条 `test_d6_*`：判据逐分支、键与落盘、关着逐字不变、真实一对的成本） | 判据边界、落盘复用（同 sha 不重记）；**事后退役口径**：每对两局皆分胜负且同一座位赢下才算证据、含未分胜负的对不算、账本只挂这次 run 的起点系数（冠军换代不清空）、未退役集合轮转 + 不足 8 条退回固定 8 条 | 300 s |
-| 戊-1 H 进程模型 | 轮次163 交的是 IPC 核心：`test_training` 里五条 `test_h1_*`（任务文件契约、payload 逐字、半行与断号丢弃并重排、attempt 各自成序列且尾读只往前、真的 `fork`+`SIGKILL` 两型）；**新 `test_broker` 仍未交** | 半行写丢弃并重排、`SIGKILL` 后账对齐、绑核生效 | 脚本 `timeout 300` |
+| 戊-1 H 进程模型 | 轮次163 五条 `test_h1_*`（任务文件契约、payload 逐字、半行与断号丢弃并重排、attempt 各自成序列且尾读只往前、真的 `fork`+`SIGKILL` 两型）＋轮次164 七条（worker 与线程模式逐字等价、失败不留标记、`SIGKILL` 后账对齐、半行判脏整批作废、心跳超时被看门杀、让位是任务粒度、心跳字节形状与连不上就拒活）。**臂落在 `test_training` 里而不是新套件 `test_broker`**：这些臂要的活体是一个 `Trainer` 与它的 temp helper，另开套件只会把训练代码复制一遍 | 半行写丢弃并重排、`SIGKILL` 后任务账与文件账对齐（重排那一遍补齐且号不回收）、让位期间一个新任务都不派、心跳那一行逐字钉住 | `test_training` TIMEOUT 300（实测 93 s） |
 | 戊-2 I 控制面 | `test_server` ＋ `web_frontend_check.js` | schema 形状、越界拒绝、三类 `when_live`、前端零硬编码 | 180 s |
 | 戊-3 K 一键训练 | `test_training` | 同 seed 两次相序列与 checkpoint 逐字节相同 | 300 s |
 

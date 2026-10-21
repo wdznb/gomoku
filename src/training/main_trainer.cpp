@@ -8,7 +8,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
-
+namespace gomoku { struct WorkerOutcome; bool run_worker_mode(const std::string&, std::string&, WorkerOutcome*); }  // 戊-1：定义在 worker_mode.cpp；这里只用三参形式，免得加一行 include 把被按行号指认的那几处推走
 namespace {
 
 using namespace gomoku;
@@ -107,7 +107,7 @@ void print_usage(const char* program) {
         "                              is given too, the two must name one file\n"
         "                              (not together with --params)\n"
         "  --quiet                     Only print the final result\n"
-        "  --help                      Show this text\n";
+        "  --worker TASK.json          戊-1: run one data task from that file and exit\n" "  --help                      Show this text\n";
 }
 
 std::string require_value(const char* flag, int& index, int argc, char** argv) {
@@ -309,6 +309,12 @@ int main(int argc, char** argv) {
                 // Zero is a real answer here - "no shared table" - so only negatives are
                 // refused, and the size ceiling is checked with the other guards below.
                 config.shared_tt_entries = require_int("--shared-tt", i, argc, argv, 0);
+            } else if (flag == "--worker") {
+                // 戊-1（v2 §4.1）：一个进程跑一个任务；活全部来自任务文件，命令行再给别的旗标不参与。
+                std::string worker_error;
+                const bool ok = gomoku::run_worker_mode(require_value("--worker", i, argc, argv), worker_error, nullptr);
+                if (!ok) std::cerr << "Error: worker: " << worker_error << "\n";
+                return ok ? 0 : 1;
             } else if (flag == "--no-data") {
                 config.collect_data = false;
             } else if (flag == "--no-resign") {

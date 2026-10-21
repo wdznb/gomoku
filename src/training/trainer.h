@@ -209,12 +209,12 @@ public:
     // symmetries). A small set is chosen so a long run comes back to positions it
     // has already measured instead of never measuring one twice.
     static constexpr int kMatchOpeningSet = 8;
-
+    // 戊-1（进程模型）：worker 进程跑的就是 `run_round` 里那一步数据采集（同一个 `RetryExplorer`、同一个 collector、同一处落盘），只是活从任务文件来；`id_base` 是样本 id 的起点，由派活的一方给，所以要先设再生成。
+    int collect_data_games(int games, int threads, int id_base) { games_played_ = id_base; return generate_data_games(games, threads); }
     // The opening one match pair is played from, fixed by its index in that set:
     // legal by construction (it is generated move by move out of the same
     // legal_moves() the replay validates against) and identical for every run.
     static std::vector<Move> match_opening_line(int index, int plies);
-
     bool save_checkpoint(const std::string& path, std::string& error) const;
     bool load_checkpoint(const std::string& path, std::string& error);
 

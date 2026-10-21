@@ -7163,6 +7163,661 @@ void test_h1_a_sigkilled_writer_leaves_at_most_one_partial_line() {
     std::cout << "test_h1_a_sigkilled_writer_leaves_at_most_one_partial_line passed" << std::endl;
 }
 
+// 在这里 include 而不是在文件顶部：`tests/test_training.cpp` 顶部加一行会把 REVIEW_LOG 按行号
+// 指认的那几十处（`test_training.cpp:6239`…`:7033`）一起推走，而这两条用例用不到更早的位置。
+#include "training/worker_mode.h"
+#include <nlohmann/json.hpp>
+
+// 归一化掉墙钟再比对：`elapsed_ms` 在记录级与每一手上都有，它在任何两次运行之间都会不同
+// （「时间类读数不可复现」在本仓库已经量过多次），所以进程模式的等价性只能对**决策本身**成立
+// ——着法序列、分值、深度、节点数、胜负，一项都不能差；墙钟一项不比。
+std::string strip_wall_clock(const std::string& json_text) {
+    nlohmann::json node = nlohmann::json::parse(json_text);
+    if (node.is_object()) {
+        node.erase("elapsed_ms");
+        if (node.contains("moves") && node["moves"].is_array()) {
+            for (auto& move : node["moves"]) {
+                if (move.is_object()) move.erase("elapsed_ms");
+            }
+        }
+    }
+    return node.dump();
+}
+
+// 两个小读数助手，只给下面这两条用（放在这里而不是文件顶部：`tests/test_training.cpp` 有
+// 几十处被 REVIEW_LOG 按行号指认的断言，顶部加行会把它们一起推走）。
+std::vector<std::string> read_lines(const std::string& path) {
+    std::vector<std::string> out;
+    std::ifstream file(path);
+    std::string line;
+    while (std::getline(file, line)) {
+        if (!line.empty()) out.push_back(line);
+    }
+    return out;
+}
+
+std::vector<std::string> spool_payloads(const std::string& path, const std::string& kind) {
+    std::vector<std::string> payloads;
+    std::string error;
+    for (const std::string& line : read_lines(path)) {
+        SpoolLine parsed;
+        if (!parse_spool_line(line, parsed, error)) continue;
+        if (parsed.kind == kind) payloads.push_back(parsed.payload);
+    }
+    return payloads;
+}
+
+// 戊-1 第六条（进程模型的「等价」那一句）：同一个任务交给自己绑核的 worker 进程跑，与把同样的
+// 配置交给 `Trainer` 的线程那条路，产出的 records 必须**逐字节相同**。「复用现有 Trainer，不复制
+// 训练逻辑」（指导书 §4 思路 2）不是自我声明，它在这里被比对。
+void test_h1_a_worker_task_yields_the_same_bytes_the_threaded_path_does() {
+    const std::string task_path = temp_path("h1_worker_task.json").string();
+    RunTask task;
+    task.run_id = "run-w1";
+    task.seq = 11;
+    task.attempt = 1;
+    task.games = 2;
+    task.first_game_id = 500;
+    task.depth = 2;
+    task.max_nodes = 200;      // 判定用节点帽，时限只防死循环（§9.2）
+    task.max_moves = 10;
+    task.timeout_ms = 60000;
+    task.teacher_depth = 0;
+    task.teacher_max_nodes = 0;
+    task.data_opening_plies = 2;
+    task.pin_cpu = -1;         // 等价比对不需要绑核；绑核那一半在下一条里单独量
+    task.spool_path = temp_path("h1_worker_spool.jsonl").string();
+    task.done_path = temp_path("h1_worker_done.json").string();
+    std::string error;
+    assert(write_task_file(task_path, task, error));
+
+    WorkerOutcome out;
+    assert(run_worker_mode(task_path, error, &out));
+    std::cout << "  [戊-1] worker outcome: records " << out.records << " samples " << out.samples
+              << " games " << out.games_played << std::endl;
+    // `games_played` 在数据采集这条路上同时充当 id 的高水位（`id_base` + 这一批真正留下的局数），
+    // 所以它的期望是 500 + 2，不是 2——这正是不重号的机制本身。
+    assert(out.games_played == 502);
+    assert(out.records == 2);
+    assert(out.samples > 0);
+    assert(std::filesystem::exists(task.done_path));
+    std::cout << "  [戊-1] worker task: records " << out.records << " samples " << out.samples
+              << " games " << out.games_played << std::endl;
+
+    // 同一套配置走线程那条路：seed 由任务推出来，所以两边必须给出同一批局。
+    TrainingConfig config;
+    config.search_depth = task.depth;
+    config.max_nodes = task.max_nodes;
+    config.max_moves = task.max_moves;
+    config.timeout_ms = task.timeout_ms;
+    config.data_opening_plies = task.data_opening_plies;
+    config.seed = worker_seed_for(task);
+    config.shared_tt_entries = 0;
+    config.records_path = temp_path("h1_thread_records.jsonl").string();
+    config.samples_path = temp_path("h1_thread_samples.jsonl").string();
+    Trainer threaded(ThreatCoefficients(), config);
+    assert(threaded.collect_data_games(task.games, 1, static_cast<int>(task.first_game_id)) >= 0);
+    assert(threaded.games_played() == 502);   // 同上：id 高水位，不是本批局数
+
+    const std::vector<std::string> worker_lines = spool_payloads(task.spool_path, "game");
+    const std::vector<std::string> thread_lines = read_lines(config.records_path);
+    assert(worker_lines.size() == thread_lines.size());
+    int byte_identical = 0;
+    for (size_t i = 0; i < worker_lines.size(); ++i) {
+        // 除了墙钟，逐字：连字符顺序、浮点写法都不许多改一次。
+        assert(strip_wall_clock(worker_lines[i]) == strip_wall_clock(thread_lines[i]));
+        if (worker_lines[i] == thread_lines[i]) ++byte_identical;
+    }
+    std::cout << "  [戊-1] records 逐字相同（含墙钟）" << byte_identical << "/"
+              << worker_lines.size() << " 条；除去墙钟后全部相同" << std::endl;
+    const std::vector<std::string> worker_samples = spool_payloads(task.spool_path, "sample");
+    const std::vector<std::string> thread_samples = read_lines(config.samples_path);
+    assert(worker_samples.size() == thread_samples.size());
+    assert(!worker_samples.empty());
+    for (size_t i = 0; i < worker_samples.size(); ++i) {
+        assert(strip_wall_clock(worker_samples[i]) == strip_wall_clock(thread_samples[i]));
+    }
+    // 样本 id 的起点来自任务（不是各进程自己数），否则两个 worker 会发同一号：`first_game_id`
+    // 是「上一个任务用到的最后一个号」，所以第一批从它 +1 起。
+    TrainingSample first_sample;
+    assert(TrainingSample::from_json(worker_samples[0], first_sample, error));
+    assert(first_sample.game_id == static_cast<int>(task.first_game_id) + 1);
+
+    std::filesystem::remove(task_path);
+    std::filesystem::remove(task.spool_path);
+    std::filesystem::remove(task.done_path);
+    std::filesystem::remove(config.records_path);
+    std::filesystem::remove(config.samples_path);
+    std::cout << "test_h1_a_worker_task_yields_the_same_bytes_the_threaded_path_does passed"
+              << std::endl;
+}
+
+// 戊-1 第七条：worker 的失败形状。任务读不进来、绑核绑到一个不存在的核上，都必须**不写完成标记**
+// 就返回失败——「缺标记 = 这一 attempt 作废，重排」是尾读与账唯一的凭据。
+void test_h1_a_failing_worker_leaves_no_done_marker() {
+    std::string error;
+    assert(!run_worker_mode(temp_path("h1_absent_task.json").string(), error, nullptr));
+    assert(error.find("cannot open") != std::string::npos);
+
+    RunTask task;
+    task.run_id = "run-w2";
+    task.seq = 12;
+    task.attempt = 1;
+    task.games = 1;
+    task.first_game_id = 1;
+    task.depth = 2;
+    task.max_nodes = 100;
+    task.max_moves = 6;
+    task.data_opening_plies = 2;
+    task.pin_cpu = 99999;   // 不存在的那个核
+    task.spool_path = temp_path("h1_bad_pin_spool.jsonl").string();
+    task.done_path = temp_path("h1_bad_pin_done.json").string();
+    const std::string task_path = temp_path("h1_bad_pin_task.json").string();
+    assert(write_task_file(task_path, task, error));
+    assert(!run_worker_mode(task_path, error, nullptr));
+    assert(error.find("sched_setaffinity") != std::string::npos);
+    assert(!std::filesystem::exists(task.done_path));
+    assert(!std::filesystem::exists(task.spool_path));   // 连信封都还没打开就退了
+
+    // 参数文件读不进来同样是「失败且不留标记」：worker 不许拿缺省系数假装这一批跑完了。
+    RunTask bad_params = task;
+    bad_params.pin_cpu = -1;
+    bad_params.params_path = temp_path("h1_no_such_params.json").string();
+    bad_params.spool_path = temp_path("h1_bad_params_spool.jsonl").string();
+    bad_params.done_path = temp_path("h1_bad_params_done.json").string();
+    const std::string bad_params_path = temp_path("h1_bad_params_task.json").string();
+    assert(write_task_file(bad_params_path, bad_params, error));
+    assert(!run_worker_mode(bad_params_path, error, nullptr));
+    assert(!std::filesystem::exists(bad_params.done_path));
+
+    // 同一个任务重跑一次给出逐字相同的产出（重排之后 attempt 变了，种子也变了，所以两次的
+    // 信封能区分，而同一 attempt 重放不会给出两批不同的局）。
+    RunTask ok_task = task;
+    ok_task.pin_cpu = -1;
+    ok_task.spool_path = temp_path("h1_det_a.jsonl").string();
+    ok_task.done_path = temp_path("h1_det_a.done").string();
+    const std::string ok_path = temp_path("h1_det_task.json").string();
+    assert(write_task_file(ok_path, ok_task, error));
+    assert(run_worker_mode(ok_path, error, nullptr));
+    const std::vector<std::string> first = read_lines(ok_task.spool_path);
+    assert(!first.empty());
+    assert(run_worker_mode(ok_path, error, nullptr));   // 同一个任务第二次：追加的是同一批
+    const std::vector<std::string> twice = read_lines(ok_task.spool_path);
+    assert(twice.size() == first.size() * 2u);
+    for (size_t i = 0; i < first.size(); ++i) {
+        SpoolLine a;
+        SpoolLine b;
+        assert(parse_spool_line(first[i], a, error));
+        assert(parse_spool_line(twice[first.size() + i], b, error));
+        assert(strip_wall_clock(a.payload) == strip_wall_clock(b.payload));   // 同一 attempt 重放：除墙钟外同一批局
+        assert(a.index == b.index && a.attempt == b.attempt && a.seq == b.seq);  // 序号从头再起，不接在上一份后面
+    }
+
+    std::filesystem::remove(task_path);
+    std::filesystem::remove(bad_params_path);
+    std::filesystem::remove(ok_path);
+    std::filesystem::remove(ok_task.spool_path);
+    std::filesystem::remove(ok_task.done_path);
+    std::filesystem::remove(bad_params.spool_path);
+    std::filesystem::remove(bad_params.done_path);
+    std::cout << "test_h1_a_failing_worker_leaves_no_done_marker passed" << std::endl;
+}
+
+#ifndef _WIN32
+#include <csignal>
+#include <cstring>
+#include <spawn.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
+
+extern char** environ;
+
+// —— 戊-1 第二段的进程级臂。它们钉的是「broker 与 worker 之间」那几条口径（v2 §4.3 的
+// 「SIGKILL 后任务账与文件账要重新对齐」「半行写要丢弃并重排而不是续行」、§4.4 的「让位是任务
+// 粒度」、以及心跳这条通知路径），而不是 broker 内部哪个函数被调到了。读账只读两处外部形状：
+// broker 自己写的日志，和它控制面上那条 `status` 回话——也就是面板将来要读的那一份。
+namespace {
+
+std::string read_whole_file(const std::string& path) {
+    std::ifstream file(path);
+    std::ostringstream buffer;
+    buffer << file.rdbuf();
+    return buffer.str();
+}
+
+// 进程级臂要自己拉起 broker 与 worker。既有的套件按「cwd 就是 build 目录」写（ctest 那样配），
+// 可 `tools/valgrind_check.sh` 是从仓库根直接跑二进制的，那里没有 `./gomoku_broker`——
+// 于是同一份代码在两条路下一边绿一边红（TSan 那一遍的 `rc=134` 就是这么来的，不是竞争）。
+// 所以路径从**可执行文件自己**推，而不是从 cwd 猜。
+std::string exe_dir() {
+    char buffer[4096];
+    const ssize_t n = ::readlink("/proc/self/exe", buffer, sizeof(buffer) - 1);
+    if (n <= 0) return ".";
+    return std::filesystem::path(std::string(buffer, static_cast<size_t>(n))).parent_path().string();
+}
+
+// 往 broker 的控制面发一行；`out` 为空就把回话丢掉。
+int control_send(const std::string& root, const std::string& line, const std::string& out) {
+    const std::string command = "'" + exe_dir() + "/gomoku_broker' --root '" + root +
+                                "' --send '" + line + "' " +
+                                (out.empty() ? "> /dev/null 2>&1" : "> '" + out + "' 2>&1");
+    const int status = std::system(command.c_str());
+    return status == -1 ? 1 : WEXITSTATUS(status);
+}
+
+pid_t spawn_shell(const std::string& command) {
+    pid_t pid = -1;
+    posix_spawnattr_t attr;
+    posix_spawnattr_init(&attr);
+    posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSID);   // 新会话：收尾时整组能一起收掉
+    std::vector<char*> argv = {const_cast<char*>("/bin/sh"), const_cast<char*>("-c"),
+                               const_cast<char*>(command.c_str()), nullptr};
+    const int rc = posix_spawnp(&pid, "/bin/sh", nullptr, &attr, argv.data(), environ);
+    posix_spawnattr_destroy(&attr);
+    return rc == 0 ? pid : -1;
+}
+
+// 这些臂界的是「进程还能往前走」，不是被测性质本身；而插桩的那一遍里一次进程启动就慢一个量级
+// （valgrind 会把 `RUNNING_UNDER_VALGRIND` 注进环境，TSan/ASan 是编译期就能看见的）。
+// 所以界按这个倍数走——把一个_startup_ 界钉成绝对毫秒数，读到的就是仪器而不是代码。
+int proc_budget() {
+    if (std::getenv("RUNNING_UNDER_VALGRIND")) return 20;
+#if defined(__SANITIZE_THREAD__)
+    return 8;
+#elif defined(__SANITIZE_ADDRESS__)
+    return 12;
+#else
+    return 1;
+#endif
+}
+
+bool wait_until(const std::function<bool()>& predicate, int timeout_ms) {
+    const int scaled = timeout_ms * proc_budget();
+    for (int waited = 0; waited < scaled; waited += 50) {
+        if (predicate()) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    return predicate();
+}
+
+int parse_int_after(const std::string& text, const std::string& needle) {
+    const size_t found = text.find(needle);
+    if (found == std::string::npos) return -1;
+    size_t i = found + needle.size();
+    while (i < text.size() && !std::isdigit(static_cast<unsigned char>(text[i])) && text[i] != '-') {
+        ++i;
+    }
+    return std::atoi(text.c_str() + i);
+}
+
+// 面板读的那一份账：一次 `--send '{"cmd":"status"}'`，把回话解出来。
+nlohmann::json broker_status(const std::string& root) {
+    const std::string out = temp_path("h1_status_out.txt").string();
+    if (control_send(root, "{\"cmd\":\"status\"}", out) != 0) return nlohmann::json();
+    try {
+        return nlohmann::json::parse(read_whole_file(out));
+    } catch (const nlohmann::json::exception&) {
+        return nlohmann::json();
+    }
+}
+
+struct BrokerFixture {
+    std::string root;
+    std::string log;
+    pid_t pid = -1;
+    bool reaped = false;
+    explicit BrokerFixture(const std::string& name, const std::string& flags)
+        : root((std::filesystem::temp_directory_path() / ("gomoku_training_" + name)).string()),
+          log(root + "/log.txt") {
+        std::error_code ec;
+        std::filesystem::remove_all(root, ec);
+        std::filesystem::create_directories(root, ec);
+        // 路径从可执行文件所在目录推（见 `exe_dir` 那段），所以 ctest 与门禁脚本两条路都读得通。
+        pid = spawn_shell("'" + exe_dir() + "/gomoku_broker' --root '" + root + "' --worker '" +
+                          exe_dir() + "/gomoku_train' " + flags + " > '" + log + "' 2>&1");
+    }
+    // 一次性那一档（不给 `--seconds`）：任务排空后 broker 自己退出，而它落在盘上的那份状态
+    // 就是这一 run 的最终账——退出码则是「账平不平」的结论。
+    // 这里不用 `--send status`：持续供活那一档下 `spawned` 一直在涨，读数没有可钉的值。
+    int wait_for_exit(int timeout_ms) {
+        int status = 0;
+        if (!wait_until([&] { return ::waitpid(pid, &status, WNOHANG) == pid; }, timeout_ms)) {
+            ::kill(-pid, SIGKILL);
+            ::waitpid(pid, &status, 0);
+            reaped = true;
+            return -1;
+        }
+        reaped = true;
+        return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    }
+    nlohmann::json file_status() const {
+        try {
+            return nlohmann::json::parse(read_whole_file(root + "/broker_status.json"));
+        } catch (const nlohmann::json::exception&) {
+            return nlohmann::json();
+        }
+    }
+
+    ~BrokerFixture() {
+        if (pid <= 0 || reaped) return;
+        // 先叫停（等在飞的收尾），等不到就整组 SIGKILL：测试不许留孤儿 worker。
+        control_send(root, "{\"cmd\":\"stop\"}", "");
+        int status = 0;
+        if (!wait_until([&] { return ::waitpid(pid, &status, WNOHANG) == pid; }, 8000)) {
+            ::kill(-pid, SIGKILL);
+            ::waitpid(pid, &status, 0);
+        }
+    }
+};
+
+}  // namespace
+
+// B1：worker 在跑任务的中途被 SIGKILL。要看的是「任务账与文件账在 N 秒内重新对齐」——
+// 没有完成标记 ⇒ 这一 attempt 作废（残行丢弃）、以 attempt+1 重排、重排那一遍把这一批的记录
+// 补齐，而且补齐的每一行都还是记录本来的形状。
+void test_h1_a_sigkilled_worker_is_requeued_and_the_ledger_realigns() {
+    BrokerFixture run("h1_broker_kill",
+                      "--tasks 1 --games-per-task 3 --depth 3 --max-nodes 400");
+    assert(run.pid > 0);
+    assert(wait_until(
+        [&] { return read_whole_file(run.log).find("spawned seq=1") != std::string::npos; },
+        10000));
+    const pid_t worker = parse_int_after(read_whole_file(run.log), "spawned seq=1 attempt=1 pid=");
+    assert(worker > 0);
+
+    // 杀在采局中间：这一 attempt 一个字都还没往信封里写（worker 跑完整批才 republish），
+    // 所以 broker 看到的形状一定是「进程没了，标记也没有」。
+    assert(::kill(worker, SIGKILL) == 0);
+    assert(wait_until([&] {
+        return read_whole_file(run.log).find("requeue seq=1 as attempt=2") != std::string::npos;
+    }, 20000));
+    assert(wait_until(
+        [&] { return read_whole_file(run.log).find("done seq=1 attempt=2") != std::string::npos; },
+        90000));
+    assert(run.wait_for_exit(30000) == 0);   // 账平了才许退出
+
+    const nlohmann::json status = run.file_status();
+    assert(status.is_object());
+    assert(status["requeued"].get<int>() == 1);
+    assert(status["failed"].get<int>() == 0);
+    assert(status["spawned"].get<int>() == 2);
+    assert(status["merged_records"].get<int>() == 3);   // 整批重跑：三条，一条不多一条不少
+    // 标记的账：作废那一 attempt 的标记被删掉了，留下的只有真正完成的那一份。
+    assert(!std::filesystem::exists(run.root + "/done/w1-1.json"));
+    assert(std::filesystem::exists(run.root + "/done/w1-2.json"));
+
+    const std::vector<std::string> records = read_lines(run.root + "/merged/records.jsonl");
+    assert(records.size() == 3u);
+    std::string error;
+    for (const std::string& line : records) {
+        GameRecord record;
+        // 交回**既有的**记录读者：payload 是那一段字节本身，进程模式没有改它的形状。
+        assert(GameRecord::from_json(line, record, error));
+        assert(!record.moves.empty());
+    }
+    // 号是派活的一方发的（记录行里本来没有号，样本行才有）：被杀那一 attempt 用掉的 1..3 不回收，
+    // 重排那一遍从 4 起，于是「同一个号出现在两批不同的局里」这件事在结构上就不成立。
+    std::set<int> ids;
+    for (const std::string& line : read_lines(run.root + "/merged/samples.jsonl")) {
+        const int game_id = nlohmann::json::parse(line).value("game_id", -1);
+        assert(game_id > 3);
+        ids.insert(game_id);
+    }
+    assert(ids.size() == 3u);
+    std::cout << "test_h1_a_sigkilled_worker_is_requeued_and_the_ledger_realigns passed"
+              << std::endl;
+}
+
+// B2：spool 里出现半行。文档的口径是「丢弃并重排任务，不许续行」，所以这里的判据不是
+// 「broker 能读出那半行后面的东西」，而是「这一 attempt 整批作废」——包括它那些**完整的**行。
+void test_h1_a_half_written_spool_voids_the_whole_attempt_not_the_line() {
+    BrokerFixture run("h1_broker_half",
+                      "--tasks 1 --games-per-task 2 --depth 3 --max-nodes 400");
+    assert(run.pid > 0);
+    // 等任务真的派出去（worker 正在采局，短时间内不会碰 spool），然后由测试自己写下那半行。
+    assert(wait_until(
+        [&] { return read_whole_file(run.log).find("spawned seq=1") != std::string::npos; },
+        10000));
+    const std::string spool = run.root + "/spool/w1.jsonl";
+    {
+        std::ofstream file(spool, std::ios::app);
+        // 一个截在半行中间的 spool 行，带一个独特的记号；「payl」这种子串不能用——每一条合法的
+        // spool 行里都有 `payload` 这个键名，它自己就含那四个字母。
+        file << "{\"run_id\":\"h1_broker_half\",\"seq\":1,\"attempt\":1,\"index\":1,"
+                "\"kind\":\"game\",\"payload\":\"[[TORN-MARKER]]";
+    }
+
+    // worker 那一份是**追加**在同一份文件后面的，所以它照样跑完、照样落标记；
+    // broker 读的时候先撞上这半行 ⇒ 整份判脏 ⇒ 删标记、弃这批、重排。
+    assert(wait_until([&] {
+        const std::string text = read_whole_file(run.log);
+        return text.find("is dirty") != std::string::npos &&
+               text.find("requeue seq=1 as attempt=2") != std::string::npos;
+    }, 60000));
+    // 「done」那行是收尸时打的，比并账早一拍，所以读账要等进程真的退出（退出前写完最终状态）。
+    assert(run.wait_for_exit(90000) == 0);
+
+    const std::vector<std::string> records = read_lines(run.root + "/merged/records.jsonl");
+    assert(records.size() == 2u);   // 只有重排那一遍的 2 条：判脏那一批 0 条入账
+    for (const std::string& line : records) {
+        assert(line.find("TORN-MARKER") == std::string::npos);   // 半行没有被「补完」再读进来
+    }
+    assert(read_whole_file(spool).find("TORN-MARKER") == std::string::npos);   // 残骸也随作废一起清了
+    const nlohmann::json status = run.file_status();
+    assert(status["requeued"].get<int>() == 1);
+    assert(status["merged_records"].get<int>() == 2);
+    std::cout << "test_h1_a_half_written_spool_voids_the_whole_attempt_not_the_line passed"
+              << std::endl;
+}
+
+// B3：心跳超时。worker 被 SIGSTOP 冻住（不再发心跳，进程还活着）⇒ 看门必须在超时内发现，
+// 被杀的必须是 worker 而不是 broker，且这一任务要重排。
+void test_h1_a_stale_heartbeat_is_caught_by_the_watchdog() {
+    BrokerFixture run("h1_broker_hb",
+                      "--tasks 1 --games-per-task 2 --depth 3 --max-nodes 400 --hb-timeout 1");
+    assert(run.pid > 0);
+    assert(wait_until(
+        [&] { return read_whole_file(run.log).find("spawned seq=1") != std::string::npos; },
+        10000));
+    const pid_t worker = parse_int_after(read_whole_file(run.log), "spawned seq=1 attempt=1 pid=");
+    assert(worker > 0);
+    // 先证明确实收到过心跳：否则这一臂量到的是「从来没活过」，不是「卡住了」。
+    assert(wait_until([&] { return broker_status(run.root)["beats"].get<int>() >= 1; }, 10000));
+
+    assert(::kill(worker, SIGSTOP) == 0);
+    assert(wait_until([&] {
+        const std::string text = read_whole_file(run.log);
+        return text.find("heartbeat stale") != std::string::npos &&
+               text.find("requeue seq=1 as attempt=2") != std::string::npos;
+    }, 20000));
+    // SIGKILL 对一个停住的进程是立刻生效的，而且它的父进程是 broker（测试 waitpid 不到孙进程），
+    // 所以这里不自己收尸，改为核对「那一行点名的 pid 就是被冻住的 worker」——
+    // 被杀的是 worker 而不是 broker，凭据是 broker 之后还能回话。
+    assert(read_whole_file(run.log).find("killing pid=" + std::to_string(worker)) !=
+           std::string::npos);
+    assert(broker_status(run.root)["paused"].get<bool>() == false);
+    assert(run.wait_for_exit(90000) == 0);
+    const nlohmann::json reading = run.file_status();
+    assert(reading["requeued"].get<int>() == 1);
+    assert(reading["failed"].get<int>() == 0);
+    assert(reading["merged_records"].get<int>() == 2);
+    std::cout << "test_h1_a_stale_heartbeat_is_caught_by_the_watchdog passed" << std::endl;
+}
+
+// B4：让位是任务粒度，不是杀进程（§4.4）。pause 之后：在飞的自己跑完、一个新任务都不派、
+// 循环继续转（还要收账、还要听控制面）；resume 之后接着派。
+void test_h1_pause_yields_by_task_and_resume_picks_the_line_back_up() {
+    // 队列里必须**留着**没派出去的活，`pause` 那道闸才有东西去拦：配额 3、任务 24，
+    // 于是让位期间队列不可能自己排空（早先用 `--tasks 1` 时队列本来就是空的，这一臂点不着变异）。
+    BrokerFixture run("h1_broker_pause",
+                      "--tasks 24 --games-per-task 1 --depth 3 --max-nodes 400 --seconds 60");
+    assert(run.pid > 0);
+    assert(wait_until(
+        [&] { return read_whole_file(run.log).find("spawned seq=1") != std::string::npos; },
+        10000));
+    const pid_t worker = parse_int_after(read_whole_file(run.log), "spawned seq=1 attempt=1 pid=");
+    assert(worker > 0);
+
+    const std::string ack_path = temp_path("h1_pause_ack.txt").string();
+    assert(control_send(run.root, "{\"cmd\":\"pause\"}", ack_path) == 0);
+    const std::string ack = read_whole_file(ack_path);
+    assert(ack.find("\"applied\":\"pause\"") != std::string::npos);   // 命令被认下并且回了话
+    assert(ack.find("\"paused\":true") != std::string::npos);
+
+    // 在飞的那个 worker 没被杀：它把这一批跑完，产出照常入账。
+    assert(wait_until(
+        [&] { return read_whole_file(run.log).find("done seq=1 attempt=1") != std::string::npos; },
+        60000));
+    // 在飞的那几个都不被杀：它们把各自这一批跑完、产出照常入账（让位是任务粒度，不是中断）。
+    // 观察窗必须落在**让位期间**：poll 循环只有 20 ms，只看「drain 之后 spawned 不再涨」是抓不到
+    // 漏掉 pause 闸的变异的——那一批队列早就被它派空了，两次读数反而相等。所以这里读的是
+    // 「让位期间队列里始终压着活，而入的账不超过 pause 之前在飞的那几个」。
+    const int spawned_at_pause = broker_status(run.root)["spawned"].get<int>();
+    assert(wait_until(
+        [&] { return broker_status(run.root)["in_flight"].get<int>() == 0; }, 60000));
+    std::this_thread::sleep_for(std::chrono::milliseconds(2500));
+    const nlohmann::json during = broker_status(run.root);
+    assert(during["paused"].get<bool>());
+    assert(during["queued"].get<int>() >= 1);
+    assert(during["spawned"].get<int>() == spawned_at_pause);
+    assert(during["merged_records"].get<int>() <= spawned_at_pause);
+    assert(during["failed"].get<int>() == 0);
+    assert(::kill(worker, 0) == 0 || errno == ESRCH);   // 它是自己跑完的，不是被冻或被杀
+
+    // resume 之后必须接着供活（§4.4 那档「边下边训」的凭据）。
+    assert(control_send(run.root, "{\"cmd\":\"resume\"}", "") == 0);
+    assert(wait_until(
+        [&] { return broker_status(run.root)["spawned"].get<int>() > spawned_at_pause; },
+        20000));
+
+    // 认不出的命令必须被点名拒绝，而不是沉默：沉默会让下发的一方以为它生效了。
+    const std::string reject_path = temp_path("h1_reject.txt").string();
+    assert(control_send(run.root, "{\"cmd\":\"bogus\"}", reject_path) == 0);
+    assert(read_whole_file(reject_path).find("\"cmd\":\"reject\"") != std::string::npos);
+    std::cout << "test_h1_pause_yields_by_task_and_resume_picks_the_line_back_up passed"
+              << std::endl;
+}
+
+// 一个只用来收心跳的监听者：先 bind+listen，worker 那条 connect 会排在 backlog 里，
+// 等 worker 跑完（它第一拍是同步发的）再 accept，于是不需要并发就能读到那一行。
+class BeatListener {
+public:
+    explicit BeatListener(const std::string& path) : path_(path) {
+        fd_ = ::socket(AF_UNIX, SOCK_STREAM, 0);
+        if (fd_ < 0) return;
+        sockaddr_un addr{};
+        addr.sun_family = AF_UNIX;
+        if (path_.size() + 1 >= sizeof(addr.sun_path)) return;
+        std::strncpy(addr.sun_path, path_.c_str(), sizeof(addr.sun_path) - 1);
+        std::error_code ec;
+        std::filesystem::remove(path_, ec);
+        if (::bind(fd_, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) != 0) return;
+        ok = ::listen(fd_, 4) == 0;
+    }
+    ~BeatListener() {
+        if (fd_ >= 0) ::close(fd_);
+        std::error_code ec;
+        std::filesystem::remove(path_, ec);
+    }
+    std::string accept_line() {
+        if (!ok) return "";
+        const int client = ::accept(fd_, nullptr, nullptr);
+        if (client < 0) return "";
+        char buffer[256];
+        const ssize_t n = ::recv(client, buffer, sizeof(buffer) - 1, 0);
+        ::close(client);
+        if (n <= 0) return "";
+        buffer[n] = '\0';
+        return std::string(buffer, static_cast<size_t>(n));
+    }
+    bool ok = false;
+
+private:
+    std::string path_;
+    int fd_ = -1;
+};
+
+// B5：心跳那一行的字节形状，以及 worker 真的把它发出去（连不上就当场拒活）。
+void test_h1_a_worker_beats_on_the_control_socket_and_refuses_a_broken_one() {
+    // 协议的字节形状先单独钉住：面板与看门都按这一行读。
+    assert(worker_beat_line(7, 3) == "{\"cmd\":\"beat\",\"seq\":7,\"attempt\":3}\n");
+
+    std::string error;
+    RunTask task;
+    task.run_id = "run-beat";
+    task.seq = 7;
+    task.attempt = 3;
+    task.games = 1;
+    task.depth = 2;
+    task.max_nodes = 100;
+    task.max_moves = 6;
+    task.data_opening_plies = 2;
+    task.pin_cpu = -1;
+    task.spool_path = temp_path("h1_beat_spool.jsonl").string();
+    task.done_path = temp_path("h1_beat_done.json").string();
+    const std::string socket_path = temp_path("h1_beat.sock").string();
+    task.control_socket = socket_path;
+    const std::string task_path = temp_path("h1_beat_task.json").string();
+    assert(write_task_file(task_path, task, error));
+    // 这一项和 params_path 一样是**可选**的：契约那 16 个必填键一个都不动。
+    RunTask round_trip;
+    assert(read_task_file(task_path, round_trip, error));
+    assert(round_trip.control_socket == socket_path);
+
+    BeatListener listener(socket_path);
+    assert(listener.ok);
+    WorkerOutcome outcome;
+    assert(run_worker_mode(task_path, error, &outcome));
+    // 只比**第一条**心跳：插桩那一遍里一次任务能跑十几拍，`recv` 一次就带回好几行，
+    // 整串相等这条在 memcheck 下必红（本轮实测：memcheck 1023 s 断在这一句）。
+    const std::string want = worker_beat_line(7, 3);
+    const std::string got = listener.accept_line();
+    assert(got.size() >= want.size() && got.compare(0, want.size(), want) == 0);
+    assert(outcome.beats >= 1);
+    assert(std::filesystem::exists(task.done_path));
+
+    // 控制面连不上（这里根本没有监听者）⇒ worker 当场拒活，且不留标记：
+    // 一条没有通知路径的活只会被看门当僵尸杀掉重排，早退比晚退省一整批局。
+    std::filesystem::remove(task.done_path);
+    std::filesystem::remove(task.spool_path);
+    RunTask broken = task;
+    broken.seq = 8;
+    broken.spool_path = temp_path("h1_beat_broken_spool.jsonl").string();
+    broken.done_path = temp_path("h1_beat_broken_done.json").string();
+    broken.control_socket = temp_path("h1_nobody_listening.sock").string();
+    const std::string broken_path = temp_path("h1_beat_broken_task.json").string();
+    assert(write_task_file(broken_path, broken, error));
+    assert(!run_worker_mode(broken_path, error, nullptr));
+    assert(error.find("connect") != std::string::npos);
+    assert(!std::filesystem::exists(broken.done_path));
+    assert(!std::filesystem::exists(broken.spool_path));
+
+    // 没给控制面的任务照跑，且不要求心跳（单跑 worker 那条路不能因为这一条断掉）。
+    RunTask quiet = task;
+    quiet.control_socket.clear();
+    quiet.seq = 9;
+    quiet.spool_path = temp_path("h1_beat_quiet_spool.jsonl").string();
+    quiet.done_path = temp_path("h1_beat_quiet_done.json").string();
+    const std::string quiet_path = temp_path("h1_beat_quiet_task.json").string();
+    assert(write_task_file(quiet_path, quiet, error));
+    WorkerOutcome quiet_outcome;
+    assert(run_worker_mode(quiet_path, error, &quiet_outcome));
+    assert(quiet_outcome.beats == 0);
+    // 「有才写」：这一项不在的时候，任务文件里连键都不该出现。
+    assert(read_whole_file(quiet_path).find("control_socket") == std::string::npos);
+    assert(read_whole_file(task_path).find("control_socket") != std::string::npos);
+
+    std::filesystem::remove(task_path);
+    std::filesystem::remove(broken_path);
+    std::filesystem::remove(quiet_path);
+    std::filesystem::remove(quiet.done_path);
+    std::filesystem::remove(quiet.spool_path);
+    std::cout << "test_h1_a_worker_beats_on_the_control_socket_and_refuses_a_broken_one passed"
+              << std::endl;
+}
+#endif  // !_WIN32
+
 int main() {
     std::cout << "Running training tests..." << std::endl;
 
@@ -7302,6 +7957,15 @@ int main() {
     test_h1_a_half_line_and_a_gap_are_dropped_and_requeued_never_repaired();
     test_h1_a_requeued_attempt_keeps_its_own_sequence_and_the_tail_only_moves_forward();
     test_h1_a_sigkilled_writer_leaves_at_most_one_partial_line();
+    test_h1_a_worker_task_yields_the_same_bytes_the_threaded_path_does();
+    test_h1_a_failing_worker_leaves_no_done_marker();
+#ifndef _WIN32
+    test_h1_a_sigkilled_worker_is_requeued_and_the_ledger_realigns();
+    test_h1_a_half_written_spool_voids_the_whole_attempt_not_the_line();
+    test_h1_a_stale_heartbeat_is_caught_by_the_watchdog();
+    test_h1_pause_yields_by_task_and_resume_picks_the_line_back_up();
+    test_h1_a_worker_beats_on_the_control_socket_and_refuses_a_broken_one();
+#endif
 
     std::cout << "All training tests passed" << std::endl;
     return 0;

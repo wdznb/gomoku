@@ -29,14 +29,24 @@ struct RunTask {
     int seq = 0;                 // 任务号，一个 run 内单调
     int attempt = 1;             // 第几次尝试；重排由派活的一方递增
     int games = 0;               // 这一个任务跑几局数据采集
-    uint64_t first_game_id = 1;  // 记录里 game_id 的起点，由派活的一方给（worker 不自己数）
+    uint64_t first_game_id = 0;  // 上一个任务用到的最后一个 game_id：这一批从它 +1 起，由派活的一方给
     int depth = 4;
     int max_nodes = 0;           // 0 = 由剩余时间推上限（与训练缺省同口径）
     int max_moves = 60;
     int pin_cpu = -1;            // -1 = 不绑，由调度器决定
+    // 下面四项是**数据采集那一步真正吃到的档位**。它们进契约是因为不等价就没有意义：
+    // worker 与线程模式必须跑同一套深度、同一套时间/节点预算、同一套开局长度与同一个老师，
+    // 否则「换到进程模式不改变数据」这句话只能对一半成立（丁-2 的蒸馏就是这样被漏掉的）。
+    int timeout_ms = 400;        // `max_nodes = 0` 时它才是预算，与训练缺省同口径
+    int teacher_depth = 0;       // 丁-2：0 = 关
+    int teacher_max_nodes = 0;
+    int data_opening_plies = 4;  // 每局数据采集的开局手数（`Trainer::random_opening_line`）
     std::string params_path;     // 学生系数所在文件；空 = 用缺省那一套
     std::string spool_path;      // 结果落点（这个 worker 自己的文件）
     std::string done_path;       // 完成标记落点
+    // 心跳走 UDS（v2 §4.3：控制面每 worker 一条连接，一行一条 JSON）。空 = 这条契约里没有人收心跳，
+    // 于是派活的一方也不能因为「没收到心跳」杀它——只有 broker 起了监听才填。
+    std::string control_socket;
 };
 
 bool write_task_file(const std::string& path, const RunTask& task, std::string& error);
