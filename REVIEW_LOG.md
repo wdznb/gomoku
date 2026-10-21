@@ -1980,7 +1980,72 @@ additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cp
 no existing assertion was edited.
 
 
-## 轮次159 引擎重构 丁-4：平衡控制器在写第一行代码之前判**不落地**——它要动的四个旋钮把白侧中心权重抹到 0 或抬到 20（±100 %／+150 %，是 5 步封顶的 10~30 倍）、把候选宽度砍到 2，按色读数一字不动（0/16 → 0/16），而能翻转这读数的只有威胁阶梯（白侧 `rush_four` 1000 → 300 把 16 局全白胜变成 16 局全黑胜），那正是丁-3 与丁-4 两处都不许动的 — engine redesign stage 丁-4: the balance controller is judged 不落地 before any code was written, because every knob it is allowed to move leaves the per-colour reading bit-identical even at 10-30x its own step size, while the only lever that flips it is the threat ladder, which 丁-3 and 丁-4 both forbid
+## 轮次160 引擎重构 丁-5：开局规则的验收仪器进了树（`tools/opening_rule_screen.cpp`），跑完四个臂之后这一单元的杀线自己命中——`swap` 下座位通吃仍是 **47/48 = 97.9 %**（阈值 60 %），而且与不动交换的对照臂**逐字相同**；原因是结构性的：交换判决只是局面的函数，而训练赛的换色对本来就把同一局面在两色各下一遍 ⇒ 机制一行未写，转 S2（丁-6） — engine redesign stage 丁-5: the S1 acceptance instrument is committed as a tool target and, once run, the unit's own kill line fires — under `swap` the seat-sweep rate is 47/48 = 97.9 % against the 60 % bar and bit-identical to the no-swap control, because the swap decision is a pure function of the position while the training pair already plays that position in both colours; no mechanism was written and the gap was handed to S2
+
+两条歧义先由用户裁决（本轮因此只交仪器与读数，不交机制）：`swap` 按时序按**标准 swap2**
+读（黑 1、白 2、黑 3，之后由非开场方决定换不换；`soosyrv` 与之只差「黑第 1 手固定天元」），
+决策依据文档没写，所以本轮不改树、只在仪器里实现一个可复现的策略。
+
+**仪器**（`tools/opening_rule_screen.cpp`，`CMakeLists.txt:352-369` 追加在文件末尾，不去动
+那些被按行号指认的目标行）：四个臂、同一批三面开局、每批两局只是**谁开场**互换，档位与
+轮次159 一致（depth 4、节点帽 1500/手、60 s 只防死循环、max_moves 60、认输开）。
+两个口径必须先分开，否则一个读数能被读成两种意思：
+
+- **座位通吃** = 同一座位赢下整对两局 → 候选局分恰为 **0.5**，谁强都看不出来（文档那条
+  「适配度赛钉在 0.5 的比例」就是这个数）；
+- **玩家通吃** = 同一玩家赢下两局 → 局分 1.0 / 0.0，**这才是判别力**。
+
+交换策略（只活在仪器里）：三面之后由**非开场方**用它自己那套系数评三面盘，
+`evaluate_board(prefix, BLACK) > 0` 就换到黑位。
+
+**读数**（`./build/opening_rule_screen --openings 48 --weak-openings 24`，288 局，全部实测）
+
+| 臂 | 对 | 座位通吃 | 玩家通吃 | 要求交换的对 | 两局判决不同 | 平均手数 |
+| --- | --- | --- | --- | --- | --- | --- |
+| A `none` / 同系数 | 48 | **47 (97.9 %)** | 0 (0.0 %) | — | — | 22.4 |
+| B `swap` / 同系数 | 48 | **47 (97.9 %)** | 0 (0.0 %) | 48 (100 %) | **0** | 22.4 |
+| C `none` / 弱一侧 | 24 | 18 (75.0 %) | 6 (25.0 %) | — | — | 20.2 |
+| D `swap` / 弱一侧 | 24 | 18 (75.0 %) | 6 (25.0 %) | 24 (100 %) | **0** | 20.2 |
+
+A 与 B、C 与 D 的四个关键数**一字不差**。这不是巧合，是这一单元的结论：
+
+1. **交换判决是局面的函数**（表里那一列「两局判决不同 = 0」就是这件事的读数）——同一局面
+   在两局里给出同一个决定；
+2. **训练赛的换色对本来就把同一局面在两色各下一遍**，所以「谁拿那个更好的座位」换了，
+   整对的局分分布不变；
+3. 于是要么两局都是白座位赢（A→B 仍是 47/48 座位通吃），要么两个玩家各自赢下自己更好的
+   那一局（C→D 仍是 18/24 座位通吃 + 6/24 玩家通吃），**交换规则动不了分子也动不了分母**。
+
+**判据**：这一单元自己的杀线是「`swap` 下仍 > 60 % 开局一方通吃 → 该强度下这些开局本身就是
+必胜局，换规则不解决问题 → 转 S2」。B 臂 97.9 %、D 臂 75.0 %，**两个都越过 60 %**，杀线命中；
+文档指定的对照组（A 臂同 seed）与 B 臂读数相同，连「不降反升」那种反向证据都不必引用——
+根本没有升降。⇒ **丁-5 按自己的杀线判不落地，机制一行未写**：不加 `TrainingConfig::opening_rule`、
+不加 `--opening-rule`、不动 `GameManager` 的交换回合、不发 `choose_swap` 帧。交的是仪器、四个臂的
+读数，以及「这条仪器量不到自己要证明的东西」这一句。
+
+**仪器的一处口径收益**：`Trainer::random_opening_line` 的第 1 手本来就被钉在天元
+（`trainer.cpp:263`：`const Move opening(BOARD_SIZE / 2, BOARD_SIZE / 2, BLACK);`，注释写明
+「空盘没有活动候选，所以第一手是固定的」），所以本仪器的三面开局**已经满足 Soosõrv-8 的
+「黑第 1 手天元」**——`soosyrv` 与 `swap` 在这一档是同一支，不需要单独量，也不需要为它再加一臂。
+
+**与轮次159 的接力**：丁-4 说「按色差是规则级的，交给 S1」；本轮 S1 的仪器说「在这一档，座位差
+连规则级补偿都吃不下——它是**开局本身**的形状问题（三面就定了胜局的开局占 75 %~98 %）」。
+两读数合起来的落点是文档里的 S2（丁-6）：**筛掉**这类一面倒的开局，而不是给它们换座位。
+丁-6 的验收句「筛后把一方通吃比例压到 1/3 以下」因此有了一条实测的起跑线：**97.9 %（三面、
+同系数）／75.0 %（三面、异强度）**。
+
+**门禁**：`src/` 与 `tests/` 一字未动（`git status` 只有 `tools/opening_rule_screen.cpp` 新增 +
+`CMakeLists.txt`/两份文档），按 §2 那条「只改工具与文档可以跳过全量 ctest」；交的是
+`ctest -E "test_search|test_pinned"` 七套件全绿（快档，证明新增目标没有碰坏任何套件）、
+`node tests/readme_anchor_check.js` 122 条引用 0 问题、`node tests/web_frontend_check.js` 111/111。
+新目标编译无新增 warning（`data_collector.cpp:95` 那条 `unused parameter ‘side_to_move’` 是既有的，
+`gomoku_train` 同样打印，本轮实测确认）。
+
+**复现**：`cmake -S . -B build && cmake --build build --target opening_rule_screen -j4`，再
+`./build/opening_rule_screen --openings 48 --weak-openings 24`（约 25 分钟 / 288 局；
+`--only A|B|C|D` 可单独补一臂）。
+
+
 
 指导书 §4 丁-4 的验收自己写了出口：「三步内按色胜率差必须缩小；**否则回对称系数并作废**」。
 本轮量的就是「缩小」这件事有没有杠杆，量完发现没有——于是代码一行没写，`src/` 与 `tests/`
@@ -2037,8 +2102,13 @@ no existing assertion was edited.
 **顺序上的建议**（不改指导书的编号，只在这里记）：丁-5 把座位差换成规则级（swap / soosyrv）
 之后再回看这一单元；如果那时按色差变成系数形状的，本节的 1500 节点档六臂就是现成的对照基线。
 
-**工具与出处**（都在 `/tmp/d4/`，不进树）：`wilson.cpp` 判据穷举；`null_match.cpp` 基线座位读数；
-`lever.cpp` 旋钮臂（`--pairs/--plies/--nodes/--ms/--depth/--resign/--knob/--value/--side`）。
+**工具与出处**（都在 `/tmp/d4/`，**不进树**——`wilson.cpp` 判据穷举、`null_match.cpp` 基线座位读数、
+`lever.cpp` 旋钮臂，参数是 `--pairs/--plies/--nodes/--ms/--depth/--resign/--knob/--value/--side`）。
+**这条出处在轮次160 被查明已经失效**：`/tmp` 在这台机器上会被清，本轮要按上面的参数把三个工具
+重写一遍才能复现读数。判据那一半不受影响——Wilson 的算式与那张表就是完整规格，谁都能独立重算；
+受影响的只有对局臂那几排数（基线 0/32、六臂不变、`rush_four` 翻转）。**教训记进以后：凡是本轮
+交付物是「读数」而不是「机制」的，仪器必须落进 `tools/`**——丁-5 的仪器就是这么办的
+（`tools/opening_rule_screen.cpp`，轮次160）。
 门禁：本轮 `src/` 与 `tests/` 一字未动，按 §2 那条「只改文档与工具可以跳过全量 ctest」——
 交的是 anchor 与 web 两道 + `git status` 干净证明（HEAD 仍是丁-3 的 `f6084ef`）。
 

@@ -348,3 +348,22 @@ foreach(gomoku_test_target test_board test_pattern test_evaluator test_search
         target_compile_options(${gomoku_test_target} PRIVATE -UNDEBUG)
     endif()
 endforeach()
+
+# 开局规则的验收仪器（v2 §3.2 S1 / 指导书 §4 丁-5）。它不是测试，是一台量「一方通吃比例」
+# 的仪器：四个臂跑同一批三面开局，报座位通吃与玩家通吃两个数。放在文件末尾是为了不去动
+# 上面那些被 REVIEW_LOG 按行号指认的目标行（`:166-180`、`:313-327`、`:331/336`、`:337`、`:339`）。
+add_executable(opening_rule_screen
+    tools/opening_rule_screen.cpp
+    ${GOMOKU_CORE_SOURCES}
+    ${GOMOKU_TRAINING_SOURCES}
+)
+target_include_directories(opening_rule_screen PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/tests)
+target_link_libraries(opening_rule_screen PRIVATE Threads::Threads nlohmann_json::nlohmann_json)
+if(UNIX)
+    target_link_libraries(opening_rule_screen PRIVATE pthread)
+endif()
+if(MSVC)
+    target_compile_options(opening_rule_screen PRIVATE /W4)
+else()
+    target_compile_options(opening_rule_screen PRIVATE -Wall -Wextra -O2 -Wno-template-body -Wno-template-id-cdtor)
+endif()
