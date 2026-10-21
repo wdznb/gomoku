@@ -64,6 +64,19 @@ constexpr ParamSpec kParams[] = {
 
 constexpr int kParamCount = static_cast<int>(sizeof(kParams) / sizeof(kParams[0]));
 
+// The genes whose two sides must stay the same shape of engine (指导书 §4 丁-3 注意 5):
+// the threat values. The positional genes - centre preference, stone distance,
+// edge discount and the two candidate widths - are what 丁-4's balance controller
+// is allowed to move on one side alone, so they carry no cross-side band.
+constexpr TunableParam kThreatGenes[] = {
+    TunableParam::LIVE_FOUR, TunableParam::RUSH_FOUR, TunableParam::LIVE_THREE,
+    TunableParam::SLEEPY_THREE, TunableParam::LIVE_TWO, TunableParam::SLEEPY_TWO,
+    TunableParam::DOUBLE_FOUR, TunableParam::DOUBLE_THREE, TunableParam::FOUR_THREE,
+};
+
+constexpr int kThreatGeneCount =
+    static_cast<int>(sizeof(kThreatGenes) / sizeof(kThreatGenes[0]));
+
 // Index loops rather than range-for: these run during constant evaluation, and
 // an older toolchain's constexpr support stops short of the relaxation that
 // allows range-for there.
@@ -103,6 +116,45 @@ int& field_of(ThreatCoefficients& coeffs, TunableParam param) {
 
 const char* name_of(TunableParam param) {
     return spec_for(param).name;
+}
+
+// The nearest value to `reference` that is within LADDER_MATCH_PERCENT of it.
+// Returns `value` untouched when it already sits in the band, which is what makes
+// this double as the reader's check: a file whose white ladder is out of band is
+// one where `pull_into_band` moves a value the file stated outright.
+int pull_into_band(int value, int reference) {
+    if (reference <= 0) return value;
+    const long long high = static_cast<long long>(reference) * (100 + LADDER_MATCH_PERCENT) / 100;
+    const long long low = static_cast<long long>(reference) * (100 - LADDER_MATCH_PERCENT) / 100;
+    if (value > high) return static_cast<int>(high);
+    if (value < low) return static_cast<int>(low);
+    return value;
+}
+
+// Pull every white threat gene into band with the black one, moving only the
+// white side (black is the reference the pair is measured against).
+void pull_white_into_band(CoefficientPair& pair) {
+    for (int i = 0; i < kThreatGeneCount; ++i) {
+        const TunableParam gene = kThreatGenes[i];
+        int& value = field_of(pair.white, gene);
+        value = pull_into_band(value, field_of(pair.black, gene));
+    }
+}
+
+// Pull the white threat ladder into band with the black one, re-establish white's
+// own hierarchy, and pull again. The two repairs feed each other: the band lowers
+// a white combo below white's live four, and the hierarchy raises it back out of
+// band. The loop runs to a fixed point and always ends on the band, so a pair that
+// cannot converge leaves a legal-but-tightened white side rather than a silent
+// band violation; the pass cap is there so that case stops instead of spinning.
+void enforce_ladder_match(CoefficientPair& pair) {
+    for (int pass = 0; pass < 8; ++pass) {
+        std::vector<int> before = CoefficientVector::to_vector(pair.white);
+        pull_white_into_band(pair);
+        CoefficientVector::sanitize(pair.white);
+        pull_white_into_band(pair);
+        if (CoefficientVector::to_vector(pair.white) == before) return;
+    }
 }
 
 }
@@ -159,9 +211,66 @@ void CoefficientVector::sanitize(ThreatCoefficients& coeffs) {
 }
 
 void CoefficientVector::sanitize_vector(std::vector<int>& values) {
+    // A genome wider than one set is a pair, and the optimizers hand the same
+    // helper both shapes: routing by length keeps a 28-gene candidate from being
+    // sanitized as if its white half were black's.
+    if (static_cast<int>(values.size()) > TUNABLE_COUNT) {
+        sanitize_pair_vector(values);
+        return;
+    }
     // Route through the struct so the vector and struct views can never drift
     // apart on what a legal parameter set means.
     values = to_vector(from_vector(values));
+}
+
+std::vector<int> CoefficientVector::to_vector(const CoefficientPair& pair) {
+    std::vector<int> values;
+    values.reserve(PAIR_GENE_COUNT);
+    for (int side = 0; side < 2; ++side) {
+        const std::vector<int> one_side =
+            to_vector(pair.for_color(side == 0 ? BLACK : WHITE));
+        values.insert(values.end(), one_side.begin(), one_side.end());
+    }
+    return values;
+}
+
+CoefficientPair CoefficientVector::pair_from_vector(const std::vector<int>& values) {
+    // A flat genome is a shared pair: the shape every old checkpoint, every
+    // hand-written parameter set and every test that names 14 genes already uses.
+    if (static_cast<int>(values.size()) <= TUNABLE_COUNT) {
+        return CoefficientPair::shared(from_vector(values));
+    }
+    // A short first half fills the rest from the defaults, exactly as
+    // from_vector does; a short second half does the same for the white side.
+    const int white_end = std::min(static_cast<int>(values.size()), PAIR_GENE_COUNT);
+    const std::vector<int> black_genes(values.begin(), values.begin() + TUNABLE_COUNT);
+    const std::vector<int> white_genes(values.begin() + TUNABLE_COUNT,
+                                       values.begin() + white_end);
+    CoefficientPair pair;
+    pair.black = from_vector(black_genes);
+    pair.white = from_vector(white_genes);
+    enforce_ladder_match(pair);
+    return pair;
+}
+
+void CoefficientVector::sanitize(CoefficientPair& pair) {
+    sanitize(pair.black);
+    sanitize(pair.white);
+    enforce_ladder_match(pair);
+}
+
+void CoefficientVector::sanitize_pair_vector(std::vector<int>& values) {
+    // The width a caller handed in is the width it gets back: a flat genome stays
+    // flat (its two sides are the same set), so a 14-gene caller never finds its
+    // vector grown past the genes it named.
+    const bool wide = static_cast<int>(values.size()) > TUNABLE_COUNT;
+    const CoefficientPair pair = pair_from_vector(values);
+    values = wide ? to_vector(pair) : to_vector(pair.black);
+}
+
+ParamBound CoefficientVector::bound_for_gene(int gene) {
+    if (gene < 0 || gene >= PAIR_GENE_COUNT) return ParamBound{0, 0};
+    return default_bound_for(static_cast<TunableParam>(gene % TUNABLE_COUNT));
 }
 
 ParamBound CoefficientVector::bound_for(TunableParam param) {
@@ -176,6 +285,105 @@ std::string CoefficientVector::to_json_string(const ThreatCoefficients& coeffs) 
     json root;
     root["coefficients"] = std::move(body);
     return root.dump();
+}
+
+std::string CoefficientVector::to_json_string(const CoefficientPair& pair) {
+    json body;
+    for (const ParamSpec& spec : kParams) {
+        body[spec.name] = pair.black.*(spec.field);
+    }
+    // The shared pair writes today's bytes: the second sub-object appears only
+    // when there is a second, different set to state.
+    if (!pair.identical()) {
+        json white_body;
+        for (const ParamSpec& spec : kParams) {
+            white_body[spec.name] = pair.white.*(spec.field);
+        }
+        body["white"] = std::move(white_body);
+    }
+    json root;
+    root["coefficients"] = std::move(body);
+    return root.dump();
+}
+
+bool CoefficientVector::pair_from_json_string(const std::string& text, CoefficientPair& out,
+                                              std::string& error) {
+    json root;
+    try {
+        root = json::parse(text);
+    } catch (const json::exception& e) {
+        error = std::string("coefficient JSON is not valid: ") + e.what();
+        return false;
+    }
+    if (!root.is_object()) {
+        error = "coefficient JSON must be an object";
+        return false;
+    }
+    const json* body = &root;
+    if (root.contains("coefficients")) {
+        if (!root["coefficients"].is_object()) {
+            error = "coefficients must be an object";
+            return false;
+        }
+        body = &root["coefficients"];
+    }
+    if (!body->contains("white")) {
+        ThreatCoefficients shared_coeffs;
+        if (!from_json_string(text, shared_coeffs, error)) return false;
+        out = CoefficientPair::shared(shared_coeffs);
+        return true;
+    }
+    if (!(*body)["white"].is_object()) {
+        error = "white must be an object";
+        return false;
+    }
+
+    // Each half goes through the single-set reader unchanged, so every range,
+    // every cross-key relation and every unknown-key refusal is checked once per
+    // colour rather than re-implemented here (指导书 §4 丁-3 注意 4).
+    json black_body = *body;
+    black_body.erase("white");
+    ThreatCoefficients black_coeffs, white_coeffs;
+    if (!from_json_string(black_body.dump(), black_coeffs, error)) {
+        error = "black side: " + error;
+        return false;
+    }
+    if (!from_json_string((*body)["white"].dump(), white_coeffs, error)) {
+        error = "white side: " + error;
+        return false;
+    }
+
+    // Rule constants are not genes, and a per-colour rule is not a strength
+    // difference: `five` is the threshold AlphaBeta compares raw scores against and
+    // the evaluation cap is taken from it, so two colours holding two different
+    // values would put two mate thresholds inside one search.
+    if (black_coeffs.five != white_coeffs.five) {
+        error = "five must be the same for both colours";
+        return false;
+    }
+    if (black_coeffs.forbidden_penalty != white_coeffs.forbidden_penalty) {
+        error = "forbidden_penalty must be the same for both colours";
+        return false;
+    }
+
+    CoefficientPair pair;
+    pair.black = black_coeffs;
+    pair.white = white_coeffs;
+    // A file is an instruction, so the cross-side band is a refusal here and a
+    // repair only in sanitize(), which the optimizers use.
+    for (int i = 0; i < kThreatGeneCount; ++i) {
+        const TunableParam gene = kThreatGenes[i];
+        const int value = field_of(pair.white, gene);
+        const int pulled = pull_into_band(value, field_of(pair.black, gene));
+        if (pulled == value) continue;
+        error = std::string("white ") + name_of(gene) + " " + std::to_string(value) +
+                " is more than " + std::to_string(LADDER_MATCH_PERCENT) +
+                "% away from black " + std::to_string(pulled) +
+                "（两侧必须是同一个引擎）";
+        return false;
+    }
+    out = pair;
+    return true;
 }
 
 bool CoefficientVector::from_json_string(const std::string& text, ThreatCoefficients& out,
@@ -206,6 +414,13 @@ bool CoefficientVector::from_json_string(const std::string& text, ThreatCoeffici
 
     ThreatCoefficients coeffs;
     int matched = 0;
+    // A per-colour file is not a single-set file with a spare key in it. Reading
+    // the black half and applying it to both colours would throw away the second
+    // side's coefficients and report success, so name the condition instead.
+    if (body->contains("white")) {
+        error = "this file carries a second colour's coefficients; load it as a pair";
+        return false;
+    }
     // The keys the file states itself; the cross-key checks below refuse to
     // rewrite a value the file wrote, never a default (present[] follows kParams).
     bool present[kParamCount] = {};
@@ -344,7 +559,25 @@ bool CoefficientVector::load(const std::string& path, ThreatCoefficients& out, s
     return from_json_string(buffer.str(), out, error);
 }
 
+bool CoefficientVector::load(const std::string& path, CoefficientPair& out, std::string& error) {
+    std::ifstream file(path);
+    if (!file.is_open()) {
+        error = "cannot open " + path;
+        return false;
+    }
+    std::ostringstream buffer;
+    buffer << file.rdbuf();
+    return pair_from_json_string(buffer.str(), out, error);
+}
+
 bool CoefficientVector::save(const std::string& path, const ThreatCoefficients& coeffs,
+                             std::string& error) {
+    // One set is the pair whose sides match, and the paired writer emits the flat
+    // object in exactly that case - so this is the same file, byte for byte.
+    return save(path, CoefficientPair::shared(coeffs), error);
+}
+
+bool CoefficientVector::save(const std::string& path, const CoefficientPair& pair,
                              std::string& error) {
     // Write-then-rename, mirroring save_session: the trained parameters are
     // only replaced once the whole new file is on disk, so an interrupted
@@ -356,7 +589,7 @@ bool CoefficientVector::save(const std::string& path, const ThreatCoefficients& 
             error = "cannot write " + tmp;
             return false;
         }
-        file << json::parse(to_json_string(coeffs)).dump(2);
+        file << json::parse(to_json_string(pair)).dump(2);
         // The rename may only replace a good file once these bytes left the
         // stream buffer: an error that surfaces at close would be reported as a
         // successful save of a truncated parameter file.

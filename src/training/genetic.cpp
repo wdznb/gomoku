@@ -24,7 +24,7 @@ GeneticOptimizer::GeneticOptimizer(CoefficientFitness fitness, const GeneticConf
     config_.mutation_sigma = clamp_double(config_.mutation_sigma, 0.01, 1.0);
 }
 
-void GeneticOptimizer::seed_population(const ThreatCoefficients& base) {
+void GeneticOptimizer::seed_population(const CoefficientPair& base) {
     const std::vector<int> base_genes = CoefficientVector::to_vector(base);
 
     population_.clear();
@@ -40,7 +40,7 @@ void GeneticOptimizer::seed_population(const ThreatCoefficients& base) {
     for (int i = 1; i < config_.population_size; ++i) {
         std::vector<int> genes = base_genes;
         for (int g = 0; g < static_cast<int>(genes.size()); ++g) {
-            const ParamBound bound = CoefficientVector::bound_for(static_cast<TunableParam>(g));
+            const ParamBound bound = CoefficientVector::bound_for_gene(g);
             const double span = static_cast<double>(bound.max_value - bound.min_value);
             // Half the members keep the human shape and get one randomly placed
             // nudge per gene, the rest are redrawn across the whole box.
@@ -54,7 +54,7 @@ void GeneticOptimizer::seed_population(const ThreatCoefficients& base) {
         CoefficientVector::sanitize_vector(genes);
         Individual member;
         member.genes = genes;
-        member.coefficients = CoefficientVector::from_vector(genes);
+        member.coefficients = CoefficientVector::pair_from_vector(genes);
         population_.push_back(member);
     }
 }
@@ -117,9 +117,9 @@ std::vector<int> GeneticOptimizer::mutate(const std::vector<int>& genes) const {
     return result;
 }
 
-ThreatCoefficients GeneticOptimizer::run(const ThreatCoefficients& base,
-                                         int& generations_run,
-                                         double& best_fitness) {
+CoefficientPair GeneticOptimizer::run(const CoefficientPair& base,
+                                      int& generations_run,
+                                      double& best_fitness) {
     generations_run = 0;
     best_fitness = 0.0;
     converged_ = false;
@@ -137,7 +137,7 @@ ThreatCoefficients GeneticOptimizer::run(const ThreatCoefficients& base,
                                           return lhs.fitness < rhs.fitness;
                                       });
     best_fitness_ = strongest->fitness;
-    ThreatCoefficients best_coefficients = strongest->coefficients;
+    CoefficientPair best_coefficients = strongest->coefficients;
     best_history_.push_back(best_fitness_);
     best_fitness = best_fitness_;
 
@@ -168,7 +168,7 @@ ThreatCoefficients GeneticOptimizer::run(const ThreatCoefficients& base,
 
             Individual member;
             member.genes = child;
-            member.coefficients = CoefficientVector::from_vector(child);
+            member.coefficients = CoefficientVector::pair_from_vector(child);
             next.push_back(member);
         }
 

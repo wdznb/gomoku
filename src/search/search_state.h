@@ -318,7 +318,9 @@ public:
             // way `generate()` does.
             const PositionPattern& mine = black_is_mine ? found->black : found->white;
             const PositionPattern& theirs = black_is_mine ? found->white : found->black;
-            total += evaluator_.board_pair_value(mine, theirs, pos.row, pos.col, black_is_mine);
+            // 丁-3：这里传的是**颜色**而不是「我方是不是黑」。`board_pair_value` 要按
+            // 子的颜色取两侧系数，布尔值带不过去那个信息。
+            total += evaluator_.board_pair_value(mine, theirs, pos.row, pos.col, my_color);
         }
         return evaluator_.evaluate_board_from(total, board, my_color);
     }

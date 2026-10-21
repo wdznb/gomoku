@@ -9,9 +9,12 @@
 
 namespace gomoku {
 
-// Score of a coefficient set. Higher is stronger; the trainer fills this in with
-// self-play results, and tests fill it in with arithmetic.
-using CoefficientFitness = std::function<double(const ThreatCoefficients&)>;
+// Score of a candidate. Higher is stronger; the trainer fills this in with
+// self-play results, and tests fill it in with arithmetic. 丁-3: a candidate is a
+// *pair* of coefficient sets, because that is what an engine is built from once
+// the two colours may hold different numbers - scoring half a pair would score a
+// set no player ever sits down with.
+using CoefficientFitness = std::function<double(const CoefficientPair&)>;
 
 struct GeneticConfig {
     int population_size = 8;
@@ -29,8 +32,10 @@ struct GeneticConfig {
 class GeneticOptimizer {
 public:
     struct Individual {
+        // Side-major: genes 0..13 are the black set and 14..27 the white one
+        // (CoefficientVector::PAIR_GENE_COUNT).
         std::vector<int> genes;
-        ThreatCoefficients coefficients;
+        CoefficientPair coefficients;
         double fitness = 0.0;
     };
 
@@ -39,9 +44,9 @@ public:
     // Evolves until the best result stops improving or max_generations is
     // reached. `generations_run` and `best_fitness` report what actually
     // happened; the caller owns the decision to keep training.
-    ThreatCoefficients run(const ThreatCoefficients& base,
-                           int& generations_run,
-                           double& best_fitness);
+    CoefficientPair run(const CoefficientPair& base,
+                        int& generations_run,
+                        double& best_fitness);
 
     bool converged() const { return converged_; }
     const std::vector<Individual>& population() const { return population_; }
@@ -59,7 +64,7 @@ public:
     std::vector<int> mutate(const std::vector<int>& genes) const;
 
 private:
-    void seed_population(const ThreatCoefficients& base);
+    void seed_population(const CoefficientPair& base);
     void evaluate(std::vector<Individual>& generation);
 
     CoefficientFitness fitness_;

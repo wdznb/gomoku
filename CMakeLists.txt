@@ -328,12 +328,12 @@ add_test(NAME test_pinned COMMAND test_pinned)
 
 set_tests_properties(test_board     PROPERTIES TIMEOUT 120)
 set_tests_properties(test_pattern   PROPERTIES TIMEOUT 120)
-set_tests_properties(test_evaluator PROPERTIES TIMEOUT 120)
+set_tests_properties(test_evaluator PROPERTIES TIMEOUT 120)   # 丁-3 后实测 5 s（两条 18,900 组普查臂）
 set_tests_properties(test_search    PROPERTIES TIMEOUT 900)   # 实测 470 s
 set_tests_properties(test_position  PROPERTIES TIMEOUT 120)
 set_tests_properties(test_session   PROPERTIES TIMEOUT 60)
 set_tests_properties(test_server    PROPERTIES TIMEOUT 180)
-set_tests_properties(test_training  PROPERTIES TIMEOUT 300)   # 实测 13 s，memcheck 下 166 s
+set_tests_properties(test_training  PROPERTIES TIMEOUT 300)   # 丁-3 后实测 41 s（三条普查臂在 test_evaluator，不在这里）
 set_tests_properties(test_pinned    PROPERTIES TIMEOUT 900)   # 六臂定深，d8 那两臂最慢
 
 # Every suite relies on plain assert(); a Release/RelWithDebInfo -DNDEBUG

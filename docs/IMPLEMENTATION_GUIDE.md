@@ -357,7 +357,7 @@ git push origin master                # 然后核对 git log --oneline -1 origin
 **注意**
 
 - **同 seed 结论不许翻面**。轮次126 有先例：`--max-nodes` 把每手搜浅之后，同 seed 的验证赛结论从 0.875 晋升翻成 0.375 不晋升。翻面 → 权重下调直到消失；下调到 0 仍翻 → 作废。
-- `measure_fitness` 里要把 `five` / `forbidden_penalty` 对齐到冠军（`trainer.cpp:44-46`），新分量不能破坏这一步。
+- `measure_fitness` 里要把 `five` / `forbidden_penalty` 对齐到冠军（`trainer.cpp:50-53`），新分量不能破坏这一步。
 
 **验收**
 
@@ -396,7 +396,7 @@ git push origin master                # 然后核对 git log --oneline -1 origin
 
 ### 丁-3 S6：黑白分离的系数（`CoefficientPair`）
 
-**状态**：未做。`Evaluator` 只持一份 `ThreatCoefficients`（`evaluator.h:105`），全部打分对双方共用这一份。
+**状态**：已落地（轮次158）。`Evaluator` 改持 `CoefficientPair`（`evaluator.h:157`），每一处系数按摆子的那一色取；两侧同值时整棵树与改之前逐字节相同（`test_pinned` 六臂一字未动，实测 246.49 s）。基因 14 → 28（`params.h:45 PAIR_GENE_COUNT`，索引 `side * 14 + gene`），旧文件读成两侧同值、只有分开才多写一个 `"white"` 子对象，换系数集清 TT 已进 `SearchEngine::set_coefficients`。**没给出来的那一项见下面注意 5 的括注：`kParams` 里没有「防守权重」这个基因。**
 
 **目标效果**：黑白各一套系数（14 个可调量 × 2），且**反对称性不许破**：`eval(W) == -eval(B)` 是 negamax、TT 单符号约定、根层比较三处的地基。
 
@@ -413,19 +413,19 @@ git push origin master                # 然后核对 git log --oneline -1 origin
 
 **注意（这是全项目最容易破不变量的一项）**
 
-1. **反对称的唯一支点是 `evaluator.cpp:245/248`**：两侧必须按「**子的颜色**」取系数（`my_color` / `opponent(my_color)`），不能按「我方/对方」取同一套。`eval(W) = S_W − S_B`、`eval(B) = S_B − S_W`，这样才恒等取负。
+1. **反对称的唯一支点是 `evaluator.cpp:267/270`**：两侧必须按「**子的颜色**」取系数（`my_color` / `opponent(my_color)`），不能按「我方/对方」取同一套。`eval(W) = S_W − S_B`、`eval(B) = S_B − S_W`，这样才恒等取负。
 2. **换系数集必须 `tt.clear()`**：TT 的 `static_eval` 只存 BLACK 符号（`transposition.h:44-52`），这个约定只在同一套系数内成立。
-3. **序列化要兼容旧文件**：`kParams` 是一基因一行（`params.cpp:42-63`）、`to_json_string` 是扁平结构（`:171-179`）、checkpoint 的 `versions[]` 就是那个扁平对象（`trainer.cpp:509-513`）。单份文件读成「两侧同值」，不要造新格式。
-4. **`sanitize` 与 `CrossRule` 必须逐色各跑一遍**（`params.cpp:128-159`、`:303-329`），否则一套合法、另一套越界的文件会被静默接受。
-5. **威胁阶梯两侧必须同阶（±20 %）**：否则「白方」就是另一个引擎，Elo 失去意义。允许两侧不同的是位置项 / 贴边 / 候选宽度 / 防守权重。
-6. 基因数从 14 变 28，`TUNABLE_COUNT` 与 `CoefficientVector::to_vector/from_vector` 都要跟着改；`measure_fitness`（`trainer.cpp:44-46`）与 `score_match`（`:111-112`）假定「候选 = 一套系数」，要重定义为「候选 = 一对」。
+3. **序列化要兼容旧文件**：`kParams` 是一基因一行（`params.cpp:42-63`，落地后仍是 14 行，按色只在向量与 JSON 这两层边界展开）、`to_json_string` 是扁平结构（`:280-288`）、checkpoint 的 `versions[]` 就是那个扁平对象（`trainer.cpp:626-629`）。单份文件读成「两侧同值」，不要造新格式。
+4. **`sanitize` 与 `CrossRule` 必须逐色各跑一遍**（`params.cpp:180-211`、`:518-544`），否则一套合法、另一套越界的文件会被静默接受。
+5. **威胁阶梯两侧必须同阶（±20 %）**：否则「白方」就是另一个引擎，Elo 失去意义。允许两侧不同的是位置项 / 贴边 / 候选宽度 / 防守权重——**注意：`kParams` 里没有「防守权重」这一基因**（14 个可调量是 9 个威胁 + `position_weight_scale` / `distance_to_stones` / `edge_penalty` / `cand_width_root` / `cand_width_deep`），所以这一项在这一版是**给不出来的**，丁-4 只能在四项里挑。
+6. 基因数从 14 变 28，`TUNABLE_COUNT` 与 `CoefficientVector::to_vector/from_vector` 都要跟着改；`measure_fitness`（`trainer.cpp:41-57`）与 `score_match`（`:180-257`）假定「候选 = 一套系数」，要重定义为「候选 = 一对」。
 
 **验收**
 
 - **等价臂先行**：`pair.black == pair.white` 时，整棵树的着法/分值/节点数与今天**逐字节相同**。
 - `eval(W) == -eval(B)` 在 42 副棋盘 × 225 格上成立（`tests/test_evaluator.cpp:549-554` 那条断言的加强版）。
 - 旧参数文件 / 旧 checkpoint 能读进来，读成两侧同值。
-- **注意：`tests/test_evaluator.cpp` 有多处硬数值**（`:233-242`、`:260-297`、`:315-335`、`:361-364`、`:388-397`、`:510-558`、`:575-608`），签名一改就会红；这些是**预期红灯**，要逐条改，不许删断言。
+- **预期红灯（落地时已逐条改，未删一条断言）**：变红的是 `tests/test_evaluator.cpp` 的三个辅助函数与两处用例——`naive_board_total` 与 `black_forbidden_candidates` 改成按色调 `pattern_score` / `get_position_weight`，`clamp_board_diff` 的帽取两侧 `five` 的较小者，`test_evaluate_board_never_judges_white` 与 `test_edge_penalty_below_rush_four` 里共五处补上颜色实参。（旧版这里列的是改之前那份文件里的行号区间，行号随新用例漂移，改为按**函数名**指认。）
 
 ---
 

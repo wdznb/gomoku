@@ -1980,7 +1980,97 @@ additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cp
 no existing assertion was edited.
 
 
-## 轮次157 引擎重构 丁-2：S4 深搜蒸馏落地——每一手在学生落子之前由独立引擎、独立置换表的老师再想一次，战术层的 ply 第一次进得了样本（456 → 672 条，+47 %），关着的时候逐字节是 S4 之前的形状 — engine redesign stage 丁-2: a deeper teacher thinks before each data-game ply with its own transposition table; samples cover the tactical plies for the first time (456 → 672) and the default-off path writes byte-identical records
+## 轮次158 引擎重构 丁-3：S6 的系数第一次有两个主人——`Evaluator` 改持 `CoefficientPair`、按摆子的那一色取系数；两侧同值时整棵树逐字节是改之前的形状（`test_pinned` 六臂的 221,774 / 156,428 / 300,347 / 175,088 / 1,408,083 / 2,378,724 一字未动），两侧分开时 `eval(W) == -eval(B)` 在 9,450 组探盘上逐组成立 — engine redesign stage 丁-3: the evaluator holds a per-colour CoefficientPair and prices every shape by the colour that plays it; with equal sides the whole tree is byte-identical (all six pinned node counts unchanged), with split sides antisymmetry still holds on every one of the 9,450 census probes
+
+指导书 §4 丁-3 的验收写的是三条（等价臂逐字节、`eval(W) == -eval(B)` 在 42 副 × 225 格、旧文件
+读成两侧同值），注意写的是六条，实现思路五条。全部照做，只有两处按现场事实改口径，都记在下面。
+
+**做了什么**
+
+1. `CoefficientPair{ ThreatCoefficients black, white; }` 落在 `src/core/evaluator.h`（**偏离**指导书
+   思路 1 说的 `params.h`：`params.h` 已经包含 `evaluator.h`，放过去就是循环包含，而「一套还是两套」
+   是评估器的事实不是训练器的事实）。`shared(c)` 是唯一造「一份当两套」的入口，`for_color(color)`
+   是唯一被允许的按色读法。
+2. `Evaluator` 改持 `pair_` 与 `position_weights_[3][15][15]`（思路 4 写的是 `[2]`，但 `BLACK = 1` /
+   `WHITE = 2` 在 `types.h:12`，用颜色当索引必须开三份——第一版按 `[2]` 写，`test_server` 当场
+   SEGFAULT，三份之后七个快套件 65.52 s 全绿）。思路 3 的三处签名（`pattern_score` /
+   `get_position_weight` / `board_pair_value`）各加了 `color`，`board_pair_value` 的那个
+   `bool black_is_mine` 被换成颜色。思路 5：帽改成两侧 `five` 的较小者减一，与颜色无关。
+3. 按色取系数之后仍然成立的恒等式：`eval(W) = S_W − S_B`、`eval(B) = S_B − S_W`。支点就两行
+   （`evaluator.cpp:267/270`），注释里写明了「换成按我方取会怎样」，那两行也是 M1 的靶子。
+4. 基因：`kParams` 仍是 14 行（一基因一行没动），按色只在**向量与 JSON 这两层边界**展开成
+   `PAIR_GENE_COUNT = 28`，索引 `side * 14 + gene`。`sanitize(pair)` 逐色各跑一遍再叠一条
+   「白侧威胁阶梯拉进黑侧 ±20 % 带内」（黑侧是基准；`sanitize` 是修，读文件是**拒绝**）；
+   `sanitize_vector` 按宽度决定它洗的是一套还是一对，所以优化器不需要知道自己在洗什么。
+   规则常量 `five` / `forbidden_penalty` 两侧必须同值——一枚将杀阈值不许变成两枚。
+5. 候选 = 一对：`CoefficientFitness`、`GeneticOptimizer::run`、`HillClimbingOptimizer::run`、
+   `Trainer::versions_/champion()/measure_fitness()/score_match()/play_match()` 全部改成
+   `CoefficientPair`；两个优化器的基因组 14 → 28。`SearchEngine` / `GreedySearch` /
+   `GameManager` / `GameServer` / `main.cpp` 各加一对的入口（旧签名留作 `shared()` 的薄包装，
+   思路 2 那句「旧调用点一行不用改」成立）。注意 2 的 `tt.clear()` 落进
+   `SearchEngine::set_coefficients`：借来的表也清，判据是「换过系数」而不是「值不同」。
+
+**读数**（全部实测；`-O2` 生产形状与 `-O0` 测试形状分开跑的那条纪律在这里不涉及，改的是等价性）
+
+- 等价臂：`test_pinned` 六臂着法/分值/节点数与钉值一字未动（ctest 实测 246.49 s），`test_search`
+  全套绿（485.59 s，含本轮新增的 TT 清空那条）。评估器自己那一口：42 副 × 225 格 × 2 色
+  = 18,900 组 `evaluate_board` 逐组相等，黑侧合计 **−96,649,575**。
+- 反对称：两侧拧开（白 `position_weight_scale` 3 / `distance_to_stones` 2 / `edge_penalty` 40）后
+  9,450 组探盘逐组 `black == -white`，其中非零 9,447、黑侧为正 4,311、最大绝对值 **99,999**
+  ——正好触到帽，所以「帽与颜色无关」这句不是空转。
+- 按色定价：同一列活三、同一颗候选格，白读 **996**、黑读 **596**，差 400 = 900 − 500；
+  再只动白侧中心权重，黑侧那个读数一个字不变。
+- 序列化：两侧同值写出的文件 **330 B**，与改之前逐字节相同；分开后 **651 B** 多一个 `"white"`
+  子对象。单套读法遇到按色的文件报
+  `this file carries a second colour's coefficients; load it as a pair`。
+- 带：白侧活四拧到 40,000（黑 10,000）→ `sanitize` 读回 **12,000**（带顶 1.2 倍），白侧冲四
+  随之被白侧自己的阶梯压到 **1,200**；同一份文件走读取路径报
+  `white live_four 40000 is more than 20 % away from black 12000`。位置项（`edge_penalty` 140）
+  不在带里，一个字没动。
+
+**变异臂八条**（每条都是非零退出 + 报出 `文件:行号`，改回后复跑全绿）
+
+| # | 改错的那一处 | 红的用例与位置 |
+| --- | --- | --- |
+| M1 | `board_pair_value` 的对方加数改成按我方取系数（注意 1 的反面） | `tests/test_evaluator.cpp:699` |
+| M2 | `CoefficientPair::for_color` 无视颜色返回黑侧 | `tests/test_evaluator.cpp:685` |
+| M3 | 单套读法对 `"white"` 的拒绝撤掉 | `tests/test_training.cpp:6239` |
+| M4 | `sanitize_pair_vector` 的宽度守恒撤掉（14 进来 28 出去） | `tests/test_training.cpp:6271` |
+| M5 | `sanitize(pair)` 里的带撤掉 | `tests/test_training.cpp:6309` |
+| M6 | 两侧规则常量必须同值的守卫撤掉 | `tests/test_training.cpp:6342` |
+| M7 | 读取那侧的带（拒绝）撤掉 | `tests/test_training.cpp:6331` |
+| M8 | `SearchEngine::set_coefficients` 里的 `tt.clear()` 撤掉 | `tests/test_search.cpp:9324` |
+
+M2 有一条顺带的读数值得记：它把 `for_color` 变成颜色-blind 之后，**等价臂那条用例照样绿**
+（两侧同值时「按色取」与「按黑取」是同一件事）。这正是等价臂与反对称那两条要分开钉的理由——
+一条钉「没变」，一条钉「变了以后仍然对称」，合成一条就两条都量不到。
+
+**没做到的 / 留下的口子**
+
+- 指导书注意 5 说两侧可以差「位置项 / 贴边 / 候选宽度 / **防守权重**」，但 `kParams` 的 14 个基因里
+  **没有「防守权重」这一项**（9 个威胁 + `position_weight_scale` / `distance_to_stones` /
+  `edge_penalty` / `cand_width_root` / `cand_width_deep`）。丁-4 只能在四项里挑，已在指导书里注明。
+- 复盘与筛题那条路（`AnalysisRequest.coeffs` → `ReplayReviewer` → `coefficients_fingerprint`）仍按
+  **一套**系数定价，取的是黑侧那一半；`coeffs_sha` 报的就是这个数，所以缓存键与算它的那套数字
+  始终一致，但按色的白侧数字进不了复盘。指导书把按色的评估只交给「下棋」这一侧，这一条记为
+  未做，不是已做。
+- **训练轨迹不再是轮次157 那条**：基因组从 14 变 28 之后，优化器每代消耗的随机数变了，所以同
+  seed 的 GA / 爬山过程与改之前不同（两侧的树仍然逐字节相同，因为两侧同值的评估器一字未变）。
+  套件里钉的是关系式判据（`best > initial`、同 seed 两次一致、评估次数公式），没有钉过一次具体的
+  训练产物，因此没有断言被「解释掉」；但拿旧 checkpoint 续训的人应当知道参数会分叉。
+- `position_weights_` 开三份而不是两份（见上第 2 条），是现场事实压过指导书字面的一处。
+
+**门禁**（最后一遍跑的是带 `enforce_ladder_match` 收尾改动的那棵树）：`ctest --timeout 900` 九套件全绿
+（总 792.88 s；test_search 483.25、test_pinned 242.94、test_training 40.38、test_evaluator 5.11、
+test_position 7.98、test_server 13.07、test_session 0.03、test_pattern 0.08、test_board 0.03——这一遍与
+下面的 memcheck 并行，墙钟只当「跑完了」用，判定看的是套件绿与 `test_pinned` 的钉值）；
+`node tests/readme_anchor_check.js` 122 条引用 0 问题；`node tests/web_frontend_check.js` 111/111；
+valgrind memcheck 直跑 `test_evaluator`（63,756 allocs 全回收）与 `test_training`（改完之后再跑一遍，
+1,119,391 allocs 全回收），三份都是 `in use at exit: 0 bytes`、`ERROR SUMMARY: 0 errors`、退出码 0。
+`CMakeLists.txt:331/336` 那两行的实测注释按新读数改了（test_evaluator 5 s、test_training 41 s，原来的
+「13 s / 166 s」是丁-3 之前）。
+
+
 
 指导书 §4 丁-2 要「每手棋由当时的引擎和一个更贵的老师各给一个答案，两者分开记」，四条实现要点
 （独立 TT、落子前搜、深度显式记、顺手修 `RetryExplorer::reset()`）与三条验收（出现

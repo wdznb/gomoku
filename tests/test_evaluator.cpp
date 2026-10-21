@@ -1,5 +1,7 @@
 #include "core/board.h"
 #include "core/pattern.h"
+// 丁-3 的两条普查臂跑的是乙-1 那 42 副棋盘 × 225 格，夹具与差分表同一份。
+#include "pinned_positions.h"
 // pattern_score is private; the forbidden-guard tests below re-derive what the
 // pre-round-81 aggregate summed, so the class body has to be readable.
 #define private public
@@ -15,22 +17,27 @@ using namespace gomoku;
 // forbidden guard), then the two positional terms taken as a difference between
 // the colours. The forbidden-guard cases below subtract exactly the black term
 // they claim to drop, so this has to carry everything else the function does.
+//
+// 丁-3：每一处都按**子的颜色**取系数与中心权重表——这条 re-derive 是评估器的独立对照，
+// 它若跟着评估器一起犯同一个错（比如两侧都取我方的系数），反对称就没人守了。
 static long long naive_board_total(const Board& board, int my_color, const Evaluator& evaluator) {
     long long total = 0;
     for (const Position& pos : board.active_empty()) {
         PositionPattern mine, theirs;
         PatternRecognizer::recognize_position_both(board, pos.row, pos.col, my_color, mine, theirs);
-        total += evaluator.pattern_score(mine, pos.row, pos.col) -
-                 evaluator.pattern_score(theirs, pos.row, pos.col);
+        total += evaluator.pattern_score(mine, pos.row, pos.col, my_color) -
+                 evaluator.pattern_score(theirs, pos.row, pos.col, opponent(my_color));
     }
     for (const Move& move : board.move_history()) {
-        const int centre = evaluator.get_position_weight(move.pos.row, move.pos.col) *
-                           evaluator.coeffs_.distance_to_stones;
+        const ThreatCoefficients& own = evaluator.pair_.for_color(move.color);
+        const int centre =
+            evaluator.get_position_weight(move.pos.row, move.pos.col, move.color) *
+            own.distance_to_stones;
         const int closed =
             ((move.pos.row <= 1 || move.pos.row >= BOARD_SIZE - 2) ? 1 : 0) +
             ((move.pos.col <= 1 || move.pos.col >= BOARD_SIZE - 2) ? 1 : 0);
         const long long term =
-            static_cast<long long>(centre) - static_cast<long long>(closed) * evaluator.coeffs_.edge_penalty;
+            static_cast<long long>(centre) - static_cast<long long>(closed) * own.edge_penalty;
         total += (move.color == my_color) ? term : -term;
     }
     return total;
@@ -39,8 +46,11 @@ static long long naive_board_total(const Board& board, int my_color, const Evalu
 // evaluate_board caps the aggregate at five-1 so a busy board cannot pass itself
 // off as a mate score. The cap predates the round-81 guard and is untouched by
 // it, so a "nothing changed" comparison has to apply it to the raw sum too.
+// 丁-3：帽与颜色无关，取两侧较小的那个 `five`——两侧同值时就是原来那个数。
 static long long clamp_board_diff(long long diff, const Evaluator& evaluator) {
-    const long long cap = static_cast<long long>(evaluator.coeffs_.five) - 1;
+    const long long black_five = evaluator.pair_.black.five;
+    const long long white_five = evaluator.pair_.white.five;
+    const long long cap = (black_five < white_five ? black_five : white_five) - 1;
     if (diff > cap) return cap;
     if (diff < -cap) return -cap;
     return diff;
@@ -56,8 +66,10 @@ static int black_forbidden_candidates(const Board& board, const Evaluator& evalu
         PatternRecognizer::recognize_position_both(board, pos.row, pos.col, BLACK, mine, theirs);
         if (!PatternRecognizer::is_forbidden_from_pattern(mine)) continue;
         if (count == 0) {
-            if (first_black_ps) *first_black_ps = evaluator.pattern_score(mine, pos.row, pos.col);
-            if (first_white_ps) *first_white_ps = evaluator.pattern_score(theirs, pos.row, pos.col);
+            if (first_black_ps)
+                *first_black_ps = evaluator.pattern_score(mine, pos.row, pos.col, BLACK);
+            if (first_white_ps)
+                *first_white_ps = evaluator.pattern_score(theirs, pos.row, pos.col, WHITE);
             if (first_pos) *first_pos = pos;
         }
         ++count;
@@ -355,7 +367,7 @@ void test_evaluate_board_never_judges_white() {
         PatternRecognizer::recognize_position_both(board, 7, 7, BLACK, mine, theirs);
         // From BLACK's seat the white shape is the opponent term; it must be
         // worth its full double_three.
-        white_ps = evaluator.pattern_score(theirs, 7, 7);
+        white_ps = evaluator.pattern_score(theirs, 7, 7, WHITE);
     }
     assert(white_ps == 31000);
     assert(evaluator.evaluate_board(board, WHITE) == 38700);
@@ -572,9 +584,9 @@ void test_edge_penalty_below_rush_four() {
     three_wall.place_stone(7, 3, BLACK);
     PositionPattern three, unused;
     PatternRecognizer::recognize_position_both(three_wall, 7, 1, BLACK, three, unused);
-    assert(evaluator.pattern_score(three, 7, 1) == c.live_three - c.edge_penalty);
+    assert(evaluator.pattern_score(three, 7, 1, BLACK) == c.live_three - c.edge_penalty);
     // The very same shape read at the middle of an open row keeps its full price.
-    assert(evaluator.pattern_score(three, 7, 7) == c.live_three);
+    assert(evaluator.pattern_score(three, 7, 7, BLACK) == c.live_three);
 
     // 活四 against the same wall loses the same one end.
     Board four_wall;
@@ -583,7 +595,7 @@ void test_edge_penalty_below_rush_four() {
     four_wall.place_stone(7, 4, BLACK);
     PositionPattern four, unused2;
     PatternRecognizer::recognize_position_both(four_wall, 7, 1, BLACK, four, unused2);
-    assert(evaluator.pattern_score(four, 7, 1) == c.live_four - c.edge_penalty);
+    assert(evaluator.pattern_score(four, 7, 1, BLACK) == c.live_four - c.edge_penalty);
 
     // A live two deep in an open row is not discounted at all, so the correction
     // is the wall's doing and not a blanket tax on small shapes.
@@ -591,7 +603,7 @@ void test_edge_penalty_below_rush_four() {
     open.place_stone(7, 8, BLACK);
     PositionPattern two, unused3;
     PatternRecognizer::recognize_position_both(open, 7, 7, BLACK, two, unused3);
-    assert(evaluator.pattern_score(two, 7, 7) == c.live_two);
+    assert(evaluator.pattern_score(two, 7, 7, BLACK) == c.live_two);
 
     // The bound that keeps the discount a discount: every candidate has four
     // directions and each direction has two ends, so the most one square can lose
@@ -610,6 +622,140 @@ void test_edge_penalty_below_rush_four() {
     std::cout << "test_edge_penalty_below_rush_four passed (discount per end "
               << c.edge_penalty << ", worst per candidate " << 8 * c.edge_penalty
               << ", rush_four " << c.rush_four << ")" << std::endl;
+}
+
+// 丁-3（v2 §3.4 S6）验收 1 —— 等价臂。`pair.black == pair.white` 时评估器必须给出
+// 与「一套系数」时代逐字相同的读数：42 副普查棋盘 × 225 格 × 2 色 = 18,900 次
+// evaluate_board，两侧同值的那一对与旧构造一次不差，并把总和钉成一个数（钉值，不钉存在）。
+// 整棵树那一口（着法/分值/节点数）由 test_pinned 钉着；这一口钉的是评估器自己。
+void test_d3_shared_pair_reads_exactly_like_the_single_set() {
+    const std::vector<Board> boards = pinned_census_boards();
+    assert(boards.size() == 42);
+
+    const ThreatCoefficients set;  // 编译期缺省那套
+    const Evaluator single(set);
+    const Evaluator paired(CoefficientPair::shared(set));
+
+    long long checks = 0;
+    long long black_total = 0;
+    for (const Board& board : boards) {
+        for (int row = 0; row < BOARD_SIZE; ++row) {
+            for (int col = 0; col < BOARD_SIZE; ++col) {
+                // 每一格真的放一颗子（与乙-1 差分表同一口径）：18,900 次比较跑在
+                // 18,900 个不同盘面上，而不是同一副盘读 225 遍。
+                Board probe = board;
+                probe.place_stone(row, col, (row + col) % 2 == 0 ? BLACK : WHITE);
+                for (const int color : {BLACK, WHITE}) {
+                    const int old_read = single.evaluate_board(probe, color);
+                    const int pair_read = paired.evaluate_board(probe, color);
+                    assert(old_read == pair_read);
+                    ++checks;
+                    // 只累加黑侧：两侧相加按反对称恒等于 0，钉它等于什么都没钉。
+                    if (color == BLACK) black_total += old_read;
+                }
+            }
+        }
+    }
+    const long long want_checks = 42LL * BOARD_SIZE * BOARD_SIZE * 2;
+    assert(checks == want_checks);
+    std::cout << "  [丁-3] shared pair: checks " << checks << " black aggregate "
+              << black_total << std::endl;
+    assert(black_total == -96649575LL);
+
+    std::cout << "test_d3_shared_pair_reads_exactly_like_the_single_set passed" << std::endl;
+}
+
+// 丁-3 验收 2 —— 反对称性。两侧的系数**不同**时也必须恒等取负：`eval(W) == -eval(B)`
+// 是 negamax、TT 单符号约定与根层比较三处的地基（指导书 §4 丁-3 注意 1）。支点是「按子的
+// 颜色取系数」，所以这里把每色的位置权重、贴边折扣与候选宽度都拧开，再跑同一批 18,900 格。
+// 帽那一侧同样钉住：帽取两侧 `five` 的较小者，与颜色无关。
+void test_d3_split_pair_stays_antisymmetric() {
+    const std::vector<Board> boards = pinned_census_boards();
+    assert(boards.size() == 42);
+
+    CoefficientPair pair;
+    pair.white.position_weight_scale = 3;      // 黑 8 / 白 3
+    pair.white.distance_to_stones = 2;         // 黑 1 / 白 2
+    pair.white.edge_penalty = 40;              // 黑 100 / 白 40
+    pair.white.cand_width_root = 30;           // 位置项的宽度，不参与打分
+    const Evaluator evaluator(pair);
+    assert(!pair.identical());
+    // 取系数只有一条被允许的读法：按子的颜色。
+    assert(evaluator.coeffs_for(BLACK).position_weight_scale == 8);
+    assert(evaluator.coeffs_for(WHITE).position_weight_scale == 3);
+    assert(evaluator.get_position_weight(7, 7, BLACK) != evaluator.get_position_weight(7, 7, WHITE));
+
+    long long checks = 0;
+    long long mirrored = 0;
+    long long nonzero = 0;
+    int worst_abs = 0;
+    for (const Board& board : boards) {
+        for (int row = 0; row < BOARD_SIZE; ++row) {
+            for (int col = 0; col < BOARD_SIZE; ++col) {
+                Board probe = board;
+                probe.place_stone(row, col, (row + col) % 2 == 0 ? BLACK : WHITE);
+                const int black = evaluator.evaluate_board(probe, BLACK);
+                const int white = evaluator.evaluate_board(probe, WHITE);
+                assert(black == -white);
+                ++checks;
+                // 反对称不是「两边都是 0」：非零读数与镜像读数各自要数得出来。
+                if (black != 0) ++nonzero;
+                if (black > white) ++mirrored;
+                const int magnitude = black < 0 ? -black : black;
+                if (magnitude > worst_abs) worst_abs = magnitude;
+            }
+        }
+    }
+    const long long want_checks = 42LL * BOARD_SIZE * BOARD_SIZE;
+    assert(checks == want_checks);
+    // 帽 = min(两侧 five) - 1 = 99999，与颜色无关。
+    assert(worst_abs <= 99999);
+    std::cout << "  [丁-3] split pair: checks " << checks << " nonzero " << nonzero
+              << " positive-for-black " << mirrored << " max |eval| " << worst_abs << std::endl;
+    assert(nonzero == 9447);
+    assert(mirrored == 4311);
+    assert(worst_abs == 99999);
+
+    std::cout << "test_d3_split_pair_stays_antisymmetric passed" << std::endl;
+}
+
+// 丁-3 验收 3 —— 「按子的颜色取系数」这一句在打分上的落点：同一个形状，白方摆出来
+// 值多少由白侧那套说了算，黑方摆出来由黑侧说了算。这里只改 `live_three`（黑 500 / 白 900，
+// 还在 ±20 % 之外，但 sanitize 不参与——评估器拿到什么就用什么），钉的是同一颗候选格
+// 在两侧各自的报价，以及「改白侧不动黑侧」这一条反向断言。
+void test_d3_a_shape_is_priced_by_the_colour_that_plays_it() {
+    CoefficientPair pair;                       // 缺省两侧同一套
+    pair.white.live_three = 900;                // 黑 500 / 白 900
+    const Evaluator evaluator(pair);
+
+    // 两颗子 + 探针格 = 一列活三（两端都空）。用三颗子会把这一手顶成活四，
+    // 而活四两侧同值——那一口就量不出按色取系数这件事了。
+    Board white_board;
+    assert(white_board.place_stone(6, 7, WHITE));
+    assert(white_board.place_stone(7, 7, WHITE));
+    Board black_board;
+    assert(black_board.place_stone(6, 7, BLACK));
+    assert(black_board.place_stone(7, 7, BLACK));
+
+    const int white_read = evaluator.evaluate_position(white_board, 5, 7, WHITE);
+    const int black_read = evaluator.evaluate_position(black_board, 5, 7, BLACK);
+    std::cout << "  [丁-3] live three priced 白 " << white_read << " / 黑 " << black_read
+              << std::endl;
+    // 同一个形状、同一颗候选格，两个读数只差在活三那一档：900 - 500。
+    assert(white_read - black_read == 400);
+    // 钉绝对值，不只是差值：中心权重那一半是两侧共用的，它不许跟着颜色漂。
+    assert(black_read == 500 + evaluator.get_position_weight(5, 7, BLACK));
+    assert(white_read == 900 + evaluator.get_position_weight(5, 7, WHITE));
+
+    // 反向：只动白侧的位置权重，黑方那一侧的报价一个字不许变——系数是按色取的，
+    // 不是一套全局数字被读了两遍。
+    CoefficientPair nudged = pair;
+    nudged.white.position_weight_scale = 1;
+    const Evaluator second(nudged);
+    assert(second.evaluate_position(black_board, 5, 7, BLACK) == black_read);
+    assert(second.evaluate_position(white_board, 5, 7, WHITE) != white_read);
+
+    std::cout << "test_d3_a_shape_is_priced_by_the_colour_that_plays_it passed" << std::endl;
 }
 
 int main() {
@@ -635,6 +781,9 @@ int main() {
     test_evaluate_board_prefers_centre_stones();
     test_evaluate_board_antisymmetric_with_terms();
     test_edge_penalty_below_rush_four();
+    test_d3_shared_pair_reads_exactly_like_the_single_set();
+    test_d3_split_pair_stays_antisymmetric();
+    test_d3_a_shape_is_priced_by_the_colour_that_plays_it();
     
     std::cout << "All evaluator tests passed!" << std::endl;
     return 0;

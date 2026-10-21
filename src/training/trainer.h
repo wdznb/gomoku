@@ -122,8 +122,10 @@ struct TrainingConfig {
 
 struct TrainerRound {
     int round = 0;
-    ThreatCoefficients champion;
-    ThreatCoefficients candidate;
+    // 丁-3：一轮的双方各是一对系数（`CoefficientPair`），不是一套。两侧同值时
+    // 这就是改之前的那个形状。
+    CoefficientPair champion;
+    CoefficientPair candidate;
     double champion_fitness = 0.0;
     double candidate_fitness = 0.0;
     double verification_score = 0.0;
@@ -160,6 +162,8 @@ public:
     using LogFn = std::function<void(const std::string& line)>;
 
     Trainer(const ThreatCoefficients& base, const TrainingConfig& config);
+    // 丁-3：候选是一对系数。两侧同值的那一对与改之前的一套是同一个形状。
+    Trainer(const CoefficientPair& base, const TrainingConfig& config);
 
     // Score coefficient sets without playing: used by the test suite and by any
     // tool that optimises a different objective. When set, verification becomes
@@ -170,8 +174,8 @@ public:
     TrainerRound run_round();
     std::vector<TrainerRound> run(int rounds);
 
-    const ThreatCoefficients& champion() const { return versions_[best_version_]; }
-    const std::vector<ThreatCoefficients>& versions() const { return versions_; }
+    const CoefficientPair& champion() const { return versions_[best_version_]; }
+    const std::vector<CoefficientPair>& versions() const { return versions_; }
     const EloSystem& ratings() const { return elo_; }
     size_t samples_collected() const { return samples_collected_; }
     int games_played() const { return games_played_; }
@@ -208,13 +212,13 @@ public:
     bool load_checkpoint(const std::string& path, std::string& error);
 
 private:
-    double measure_fitness(const ThreatCoefficients& coefficients);
+    double measure_fitness(const CoefficientPair& coefficients);
     // `margin_weight` 是丁-1 的连续分量权重：> 0 时每一手胜负被换成
     // 「胜负 × (1-w) + 连续分量 × w」，= 0（默认，也是验证赛那一侧）逐字节回到今天。
-    MatchOutcome score_match(const ThreatCoefficients& candidate,
-                             const ThreatCoefficients& reference, int games,
+    MatchOutcome score_match(const CoefficientPair& candidate,
+                             const CoefficientPair& reference, int games,
                              double margin_weight = 0.0);
-    double play_match(const ThreatCoefficients& candidate, const ThreatCoefficients& reference,
+    double play_match(const CoefficientPair& candidate, const CoefficientPair& reference,
                       int games, double margin_weight = 0.0);
     // 一局棋「赢得多漂亮」：三个读数都从已有产物取——终局的分差（赢方最后一手与输方
     // 最后一手各自报出的搜索分）、用了多少手、认输时两侧的搜索深度差。赢方视角，折进 [0,1]；
@@ -234,7 +238,7 @@ private:
     int generate_data_games(int games, int threads);
 
     TrainingConfig config_;
-    std::vector<ThreatCoefficients> versions_;
+    std::vector<CoefficientPair> versions_;
     size_t best_version_ = 0;
     EloSystem elo_;
     CoefficientFitness fitness_override_;

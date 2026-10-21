@@ -22,26 +22,28 @@ std::vector<int> HillClimbingOptimizer::neighbor(const std::vector<int>& genes, 
     const double scaled = candidate[index] * multiplier;
     const double rounded = std::llround(scaled);
     // Never collapse a positive coefficient to zero or let it wrap past its own
-    // bound by rounding; sanitize_vector finishes the job.
+    // bound by rounding; sanitize_vector finishes the job. It reads the width to
+    // decide what it is sanitizing - 14 genes is one set, 28 is a pair - so a
+    // probe into the white half cannot be repaired with black's rules alone.
     candidate[index] = rounded <= 0 ? 1 : static_cast<int>(rounded);
     CoefficientVector::sanitize_vector(candidate);
     return candidate;
 }
 
-ThreatCoefficients HillClimbingOptimizer::run(const ThreatCoefficients& base,
-                                              int& iterations_run,
-                                              double& best_fitness) {
+CoefficientPair HillClimbingOptimizer::run(const CoefficientPair& base,
+                                            int& iterations_run,
+                                            double& best_fitness) {
     iterations_run = 0;
     converged_ = false;
     stagnation_ = 0;
     best_history_.clear();
 
     std::vector<int> current = CoefficientVector::to_vector(base);
-    ThreatCoefficients current_coefficients = CoefficientVector::from_vector(current);
+    CoefficientPair current_coefficients = CoefficientVector::pair_from_vector(current);
     double current_fitness = fitness_(current_coefficients);
     evaluations_++;
 
-    ThreatCoefficients best_coefficients = current_coefficients;
+    CoefficientPair best_coefficients = current_coefficients;
     best_fitness = current_fitness;
     best_history_.push_back(best_fitness);
 
@@ -60,7 +62,8 @@ ThreatCoefficients HillClimbingOptimizer::run(const ThreatCoefficients& base,
         // walk before it has tried a single different point.
         if (candidate == current) continue;
         ++steps;
-        const ThreatCoefficients candidate_coefficients = CoefficientVector::from_vector(candidate);
+        const CoefficientPair candidate_coefficients =
+            CoefficientVector::pair_from_vector(candidate);
         const double candidate_fitness = fitness_(candidate_coefficients);
         evaluations_++;
 

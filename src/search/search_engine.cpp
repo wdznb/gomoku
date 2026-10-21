@@ -37,7 +37,25 @@ SearchEngine::SearchEngine(const ThreatCoefficients& coeffs, TranspositionTable*
       vcf_max_depth_(20), vct_max_depth_(12), alphabeta_max_depth_(8),
       resign_detection_(true), resign_node_limit_(400000) {}
 
+SearchEngine::SearchEngine(const CoefficientPair& coeffs, TranspositionTable* table)
+    : evaluator_(coeffs), greedy_(coeffs),
+      owned_tt_(table ? nullptr : std::make_unique<TranspositionTable>()),
+      tt_alphabeta_(table ? table : owned_tt_.get()),
+      book_enabled_(true),
+      vcf_enabled_(true), vct_enabled_(true), alphabeta_enabled_(true),
+      vcf_max_depth_(20), vct_max_depth_(12), alphabeta_max_depth_(8),
+      resign_detection_(true), resign_node_limit_(400000) {}
+
 void SearchEngine::set_coefficients(const ThreatCoefficients& coeffs) {
+    set_coefficients(CoefficientPair::shared(coeffs));
+}
+
+void SearchEngine::set_coefficients(const CoefficientPair& coeffs) {
+    // The table goes first: everything below rebuilds what the next think prices
+    // with, and an entry left from the old set would be read by that think. A
+    // borrowed table is cleared too - it is the caller's table, but the stale
+    // scores in it are this engine's problem.
+    transposition_table().clear();
     evaluator_.set_coefficients(coeffs);
     greedy_.set_coefficients(coeffs);
 }

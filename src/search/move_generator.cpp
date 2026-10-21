@@ -145,7 +145,9 @@ ThreatProbe threat_probe(const Board& board, int color) {
 void MoveGenerator::generate(const Board& board, int color, int ply, bool in_quiescence,
                              CandidateSet* out) const {
     *out = CandidateSet{};
-    const ThreatCoefficients& coeffs = evaluator_.coefficients();
+    // 丁-3：候选宽度是按色的旋钮（指导书 §4 丁-3 注意 5 允许两侧不同的四项之一），
+    // 所以这里取的是**行棋方那一套**，不是 `coefficients()` 那个「两侧同值时的旧读数」。
+    const ThreatCoefficients& coeffs = evaluator_.coeffs_for(color);
 
     for (const Position& pos : board.active_empty()) {
         // The candidate set is maintained by place_stone / undo_last_move, so an

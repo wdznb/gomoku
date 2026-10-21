@@ -82,6 +82,10 @@ public:
     // probe takes a lock.
     explicit SearchEngine(const ThreatCoefficients& coeffs,
                           TranspositionTable* table = nullptr);
+    // 丁-3：一台引擎可以按色持有两套系数（`CoefficientPair`）。两侧同值的那一对与
+    // 上面那个构造出来的是同一台引擎；表的所有权口径完全相同。
+    explicit SearchEngine(const CoefficientPair& coeffs,
+                          TranspositionTable* table = nullptr);
 
     SearchResult search(const Board& board, int color,
                         int max_depth, int time_limit_ms,
@@ -127,7 +131,12 @@ public:
     // and the resign probe still slice the millisecond budget.
     int max_nodes() const { return max_nodes_; }
 
+    // Swapping the coefficient set empties the transposition table: an entry is a
+    // score computed under the numbers that were active when it was written, and
+    // with per-colour sets the sign convention on `static_eval` (BLACK's side, see
+    // transposition.h) is only meaningful inside one pair. 指导书 §4 丁-3 注意 2.
     void set_coefficients(const ThreatCoefficients& coeffs);
+    void set_coefficients(const CoefficientPair& coeffs);
 
     // The book is owned by the caller and must stay alive and unmodified
     // while any search may be running against it.

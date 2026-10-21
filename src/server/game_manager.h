@@ -151,6 +151,8 @@ public:
     ReplaySnapshot replay_snapshot();
     
     void set_coefficients(const ThreatCoefficients& coeffs);
+    // 丁-3：按色的两套。两侧同值时与上面那句是同一台引擎、同一个评估器。
+    void set_coefficients(const CoefficientPair& coeffs);
     // soft_time_ms / max_nodes are optional overrides: a negative value means
     // "whatever this session already has", so the two older callers and a client
     // that names only the timeout keep the engine's own budget (0 on the soft window

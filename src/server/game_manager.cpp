@@ -656,6 +656,13 @@ void GameManager::check_game_over() {
 }
 
 void GameManager::set_coefficients(const ThreatCoefficients& coeffs) {
+    set_coefficients(CoefficientPair::shared(coeffs));
+}
+
+void GameManager::set_coefficients(const CoefficientPair& coeffs) {
+    // The engine's own setter clears its transposition table (指导书 §4 丁-3 注意 2);
+    // this evaluator is the one that prices the panel's per-move numbers, so it has
+    // to move to the same pair in the same call.
     evaluator_.set_coefficients(coeffs);
     engine_.set_coefficients(coeffs);
 }

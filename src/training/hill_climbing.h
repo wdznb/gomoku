@@ -27,9 +27,9 @@ public:
     // Coordinate-wise greedy walk: rescale one coefficient, keep it if the score
     // rises. Cheaper per step than the genetic search, and it only ever moves
     // away from a set that the evaluation function already likes.
-    ThreatCoefficients run(const ThreatCoefficients& base,
-                           int& iterations_run,
-                           double& best_fitness);
+    CoefficientPair run(const CoefficientPair& base,
+                        int& iterations_run,
+                        double& best_fitness);
 
     bool converged() const { return converged_; }
     int evaluations() const { return evaluations_; }

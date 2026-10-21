@@ -119,9 +119,11 @@ int main(int argc, char* argv[]) {
     // Trained coefficients are optional; a missing or malformed file is fatal
     // rather than silently ignored, because playing strength is exactly what the
     // caller believes it is changing.
-    gomoku::ThreatCoefficients coefficients;
+    gomoku::CoefficientPair coefficients;
     if (!params_path.empty()) {
         std::string error;
+        // 丁-3：按色的一对。今天那种扁平文件读进来两侧同值，所以这条路径上的
+        // 每一个数与改之前一样。
         if (!gomoku::CoefficientVector::load(params_path, coefficients, error)) {
             std::cerr << "Cannot load --params " << params_path << ": " << error << std::endl;
             return 1;

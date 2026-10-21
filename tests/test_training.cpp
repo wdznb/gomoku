@@ -83,6 +83,22 @@ double deviation_score(const ThreatCoefficients& coeffs) {
     return 1.0 / (1.0 + total);
 }
 
+// 丁-3：优化器看到的候选是一对系数，所以两侧各按同一把尺子量，取平均。只数黑侧的
+// 话白侧那一半没有梯度，`best > initial` 就成了运气而不是测量。
+double deviation_score(const CoefficientPair& pair) {
+    return 0.5 * (deviation_score(pair.black) + deviation_score(pair.white));
+}
+
+// 基因向量按色展开：0..13 是黑侧、14..27 是白侧。测试按名字取坐标，不把 14 写死。
+size_t black_gene(TunableParam gene) { return static_cast<size_t>(gene); }
+size_t white_gene(TunableParam gene) {
+    return static_cast<size_t>(gene) + static_cast<size_t>(TUNABLE_COUNT);
+}
+
+// 把上面那个读数当**回调**交出去时要一个没有歧义的名字：`deviation_score` 现在有两个
+// 重载，重载函数名进不了 `std::function` 的模板实参推导。
+double pair_deviation_score(const CoefficientPair& pair) { return deviation_score(pair); }
+
 SelfPlayConfig quick_play_config() {
     SelfPlayConfig settings;
     settings.max_depth = 2;
@@ -950,17 +966,17 @@ void test_augmented_samples_match_manual_transforms() {
 }
 
 void test_hill_climbing() {
-    ThreatCoefficients base;
+    CoefficientPair base;  // 两侧同值，就是改之前那一套默认系数
     const double initial = deviation_score(base);
 
     HillClimbingConfig settings;
     settings.max_iterations = 80;
     settings.stagnation_limit = 60;
 
-    HillClimbingOptimizer optimizer(deviation_score, settings, 4242);
+    HillClimbingOptimizer optimizer(pair_deviation_score, settings, 4242);
     int iterations = 0;
     double best = 0.0;
-    const ThreatCoefficients result = optimizer.run(base, iterations, best);
+    const CoefficientPair result = optimizer.run(base, iterations, best);
 
     assert(best > initial);
     assert(deviation_score(result) == best);
@@ -970,31 +986,45 @@ void test_hill_climbing() {
     assert(optimizer.best_history().front() <= optimizer.best_history().back());
 
     // Same seed, same walk.
-    HillClimbingOptimizer repeat(deviation_score, settings, 4242);
+    HillClimbingOptimizer repeat(pair_deviation_score, settings, 4242);
     int repeat_iterations = 0;
     double repeat_best = 0.0;
-    const ThreatCoefficients repeat_result = repeat.run(base, repeat_iterations, repeat_best);
+    const CoefficientPair repeat_result = repeat.run(base, repeat_iterations, repeat_best);
     assert(CoefficientVector::to_vector(repeat_result) ==
            CoefficientVector::to_vector(result));
 
     // A neighbour step rescales exactly one coordinate, and the result is still a
-    // legal parameter set.
+    // legal parameter set. Probed on a *positional* gene on purpose: the threat
+    // ladder has a cross-side band (指导书 §4 丁-3 注意 5), so a probe there moves the
+    // other colour too, and that is the next arm down.
     const std::vector<int> genes = CoefficientVector::to_vector(base);
-    const std::vector<int> grown = HillClimbingOptimizer::neighbor(genes, 0, 1.6);
+    assert(genes.size() == static_cast<size_t>(PAIR_GENE_COUNT));
+    const std::vector<int> grown =
+        HillClimbingOptimizer::neighbor(genes, black_gene(TunableParam::POSITION_WEIGHT_SCALE), 1.6);
     assert(grown.size() == genes.size());
-    assert(grown[0] == 16000);
-    for (size_t i = 1; i < genes.size(); ++i) assert(grown[i] == genes[i]);
+    assert(grown[black_gene(TunableParam::POSITION_WEIGHT_SCALE)] == 13);
+    for (size_t i = 0; i < genes.size(); ++i) {
+        if (i == black_gene(TunableParam::POSITION_WEIGHT_SCALE)) continue;
+        assert(grown[i] == genes[i]);
+    }
+
+    // 一条威胁阶梯上的探针会拖动另一侧：白侧被拉进「与黑侧 ±20 % 同阶」的那条带里，
+    // 因为带是按黑侧为基准算的（丁-3 让「白方是另一个引擎」这件事不可能被训练出来）。
+    const std::vector<int> dragged =
+        HillClimbingOptimizer::neighbor(genes, black_gene(TunableParam::LIVE_FOUR), 1.6);
+    assert(dragged[black_gene(TunableParam::LIVE_FOUR)] == 16000);
+    assert(dragged[white_gene(TunableParam::LIVE_FOUR)] == 12800);
 
     // Scaling the smallest threat down cannot go to zero or below its bound. Named
     // by gene rather than by offset from the end: the surface grew, and the last
     // two coordinates are candidate widths now, not threats.
     const std::vector<int> shrunk = HillClimbingOptimizer::neighbor(
-        genes, static_cast<size_t>(TunableParam::SLEEPY_TWO), 0.001);
-    assert(shrunk[static_cast<size_t>(TunableParam::SLEEPY_TWO)] >= 1);
+        genes, black_gene(TunableParam::SLEEPY_TWO), 0.001);
+    assert(shrunk[black_gene(TunableParam::SLEEPY_TWO)] >= 1);
     // An out-of-range coordinate is left alone instead of reading past the end.
     assert(HillClimbingOptimizer::neighbor(genes, genes.size(), 2.0) == genes);
 
-    ThreatCoefficients from_neighbour = CoefficientVector::from_vector(grown);
+    CoefficientPair from_neighbour = CoefficientVector::pair_from_vector(grown);
     CoefficientVector::sanitize(from_neighbour);
     assert(CoefficientVector::to_vector(from_neighbour) == grown);
 
@@ -1002,7 +1032,7 @@ void test_hill_climbing() {
     HillClimbingConfig stuck_settings;
     stuck_settings.max_iterations = 200;
     stuck_settings.stagnation_limit = 5;
-    HillClimbingOptimizer stuck([](const ThreatCoefficients&) { return 1.0; },
+    HillClimbingOptimizer stuck([](const CoefficientPair&) { return 1.0; },
                                 stuck_settings, 99);
     int stuck_iterations = 0;
     double stuck_best = 0.0;
@@ -1015,7 +1045,7 @@ void test_hill_climbing() {
 }
 
 void test_genetic() {
-    ThreatCoefficients base;
+    CoefficientPair base;  // 两侧同值 = 改之前的默认一套系数
     const double initial = deviation_score(base);
 
     GeneticConfig settings;
@@ -1023,10 +1053,10 @@ void test_genetic() {
     settings.max_generations = 12;
     settings.stagnation_generations = 20;
 
-    GeneticOptimizer optimizer(deviation_score, settings, 20261011);
+    GeneticOptimizer optimizer(pair_deviation_score, settings, 20261011);
     int generations = 0;
     double best = 0.0;
-    const ThreatCoefficients result = optimizer.run(base, generations, best);
+    const CoefficientPair result = optimizer.run(base, generations, best);
 
     assert(best > initial);
     assert(deviation_score(result) >= best - 1e-12);
@@ -1038,24 +1068,26 @@ void test_genetic() {
     double strongest = 0.0;
     for (const auto& member : optimizer.population()) {
         strongest = std::max(strongest, member.fitness);
-        // Every member is a legal parameter set, bounds and ladder included.
-        ThreatCoefficients check = member.coefficients;
+        // Every member is a legal parameter set, bounds, both colours' ladders
+        // and the cross-side band included.
+        CoefficientPair check = member.coefficients;
         CoefficientVector::sanitize(check);
         assert(CoefficientVector::to_vector(check) == member.genes);
     }
     assert(std::abs(strongest - best) < 1e-12);
 
-    GeneticOptimizer repeat(deviation_score, settings, 20261011);
+    GeneticOptimizer repeat(pair_deviation_score, settings, 20261011);
     int repeat_generations = 0;
     double repeat_best = 0.0;
-    const ThreatCoefficients repeat_result = repeat.run(base, repeat_generations, repeat_best);
+    const CoefficientPair repeat_result = repeat.run(base, repeat_generations, repeat_best);
     assert(CoefficientVector::to_vector(repeat_result) == CoefficientVector::to_vector(result));
 
     // Crossover keeps the vector length and stays within the convex hull of the
     // two parents before sanitising.
     std::mt19937_64 rng(7);
     const std::vector<int> lhs = CoefficientVector::to_vector(base);
-    const std::vector<int> rhs = CoefficientVector::to_vector(target_coefficients());
+    const std::vector<int> rhs =
+        CoefficientVector::to_vector(CoefficientPair::shared(target_coefficients()));
     const std::vector<int> child = GeneticOptimizer::crossover(lhs, rhs, 0.5, rng);
     assert(child.size() == lhs.size());
     for (size_t i = 0; i < child.size(); ++i) {
@@ -1067,7 +1099,7 @@ void test_genetic() {
     // stagnation instead of looping to max_generations.
     GeneticConfig flat_settings = settings;
     flat_settings.stagnation_generations = 2;
-    GeneticOptimizer flat([](const ThreatCoefficients&) { return 0.25; }, flat_settings, 5);
+    GeneticOptimizer flat([](const CoefficientPair&) { return 0.25; }, flat_settings, 5);
     int flat_generations = 0;
     double flat_best = 0.0;
     flat.run(base, flat_generations, flat_best);
@@ -1085,7 +1117,7 @@ void test_genetic() {
 // seeding time, which is exactly the region a wider search of these bounds
 // needs to start from.
 void test_genetic_seed_covers_the_whole_box() {
-    ThreatCoefficients base;
+    CoefficientPair base;  // 两侧同值的默认一套，就是改之前的那个 base
     const std::vector<int> base_genes = CoefficientVector::to_vector(base);
 
     GeneticConfig settings;
@@ -1106,6 +1138,10 @@ void test_genetic_seed_covers_the_whole_box() {
     // checked for every gene - which still guards R87, because the formula that
     // round deleted left every gene inside its own lower half, not double_four
     // alone.
+    //
+    // 丁-3 asks the question of the **reference** side only (genes 0..13). The white
+    // half's threat ladder is band-limited to ±20 % of black's, so its whole box is
+    // not reachable by construction - that is the invariant, not a shortfall.
     bool low_seen[TUNABLE_COUNT] = {};
     bool high_seen[TUNABLE_COUNT] = {};
 
@@ -1121,7 +1157,7 @@ void test_genetic_seed_covers_the_whole_box() {
     std::cout << "[r87r] nudge_budget=" << nudge_budget << std::endl;
 
     for (uint64_t seed : seeds) {
-        GeneticOptimizer optimizer([](const ThreatCoefficients&) { return 0.0; },
+        GeneticOptimizer optimizer([](const CoefficientPair&) { return 0.0; },
                                    settings, seed);
         int generations = -1;
         double best = -1.0;
@@ -1173,7 +1209,7 @@ void test_genetic_seed_covers_the_whole_box() {
 // trigger stagnation. A multiplier of 1.0 with sanitize makes every neighbor a
 // no-op for the base genes.
 void test_hill_climbing_empty_steps() {
-    ThreatCoefficients base;
+    CoefficientPair base;
     const std::vector<int> genes = CoefficientVector::to_vector(base);
     for (size_t g = 0; g < genes.size(); ++g) {
         assert(HillClimbingOptimizer::neighbor(genes, g, 1.0) == genes);
@@ -1183,7 +1219,7 @@ void test_hill_climbing_empty_steps() {
     settings.max_iterations = 40;
     settings.stagnation_limit = 12;
     settings.multipliers = {1.0};
-    HillClimbingOptimizer optimizer([](const ThreatCoefficients&) { return 0.0; },
+    HillClimbingOptimizer optimizer([](const CoefficientPair&) { return 0.0; },
                                     settings, 4242);
     int iterations = 0;
     double best = 0.0;
@@ -1200,12 +1236,12 @@ void test_hill_climbing_empty_steps() {
 // B6: invariant iterations_run == evaluations - 1 == best_history.size() - 1
 // holds when some steps are empty (mixed multipliers 1.0 and 1.6).
 void test_hill_climbing_effective_steps() {
-    ThreatCoefficients base;
+    CoefficientPair base;
     HillClimbingConfig settings;
     settings.max_iterations = 40;
     settings.stagnation_limit = 1000;
     settings.multipliers = {1.0, 1.6};
-    HillClimbingOptimizer optimizer([](const ThreatCoefficients& c) {
+    HillClimbingOptimizer optimizer([](const CoefficientPair& c) {
         long sum = 0;
         for (int v : CoefficientVector::to_vector(c)) sum += v;
         return static_cast<double>(sum);
@@ -1234,7 +1270,7 @@ void test_hill_climbing_effective_steps() {
 // elite re-scoring, and it was not independent of the seeding distribution.
 // What stays observable here is the elite slot and the evaluation count.
 void test_genetic_elite_single_evaluation() {
-    ThreatCoefficients base;
+    CoefficientPair base;
     GeneticConfig settings;
     settings.population_size = 8;
     settings.max_generations = 1;
@@ -1242,7 +1278,7 @@ void test_genetic_elite_single_evaluation() {
     settings.crossover_ratio = 0.85;
     settings.mutation_rate = 0.0;
 
-    auto sum_fitness = [](const ThreatCoefficients& c) -> double {
+    auto sum_fitness = [](const CoefficientPair& c) -> double {
         long sum = 0;
         for (int v : CoefficientVector::to_vector(c)) sum += v;
         return static_cast<double>(sum);
@@ -1251,7 +1287,7 @@ void test_genetic_elite_single_evaluation() {
     GeneticOptimizer optimizer(sum_fitness, settings, 3);
     int generations = 0;
     double best = 0.0;
-    ThreatCoefficients winner = optimizer.run(base, generations, best);
+    CoefficientPair winner = optimizer.run(base, generations, best);
 
     // Population is full (elite appended, not pre-filled before evaluate).
     assert(optimizer.population().size() == static_cast<size_t>(settings.population_size));
@@ -1311,9 +1347,9 @@ void test_trainer_round_promotes() {
     config.checkpoint_path = temp_path("trainer_checkpoint.json").string();
 
     Trainer trainer(ThreatCoefficients(), config);
-    trainer.set_fitness_override(deviation_score);
+    trainer.set_fitness_override(pair_deviation_score);
 
-    const ThreatCoefficients before = trainer.champion();
+    const CoefficientPair before = trainer.champion();
     const TrainerRound round = trainer.run_round();
 
     assert(round.round == 1);
@@ -1331,7 +1367,7 @@ void test_trainer_round_promotes() {
     assert(trainer.ratings().player(1).elo > 1500.0);
 
     std::string error;
-    ThreatCoefficients from_file;
+    CoefficientPair from_file;
     assert(CoefficientVector::load(config.params_path, from_file, error));
     assert(CoefficientVector::to_vector(from_file) == CoefficientVector::to_vector(trainer.champion()));
 
@@ -1360,9 +1396,9 @@ void test_trainer_round_rejects_regression() {
     Trainer trainer(ThreatCoefficients(), config);
     // A constant objective: no candidate can score above the champion, so nothing
     // may be promoted and no parameter file may appear.
-    trainer.set_fitness_override([](const ThreatCoefficients&) { return 0.4; });
+    trainer.set_fitness_override([](const CoefficientPair&) { return 0.4; });
 
-    const ThreatCoefficients before = trainer.champion();
+    const CoefficientPair before = trainer.champion();
     const TrainerRound round = trainer.run_round();
 
     assert(!round.accepted);
@@ -1400,20 +1436,28 @@ void test_trainer_keeps_rule_constants_through_promotion() {
     base.forbidden_penalty = 77777;
 
     Trainer trainer(base, config);
-    trainer.set_fitness_override(deviation_score);
+    trainer.set_fitness_override(pair_deviation_score);
 
     const TrainerRound round = trainer.run_round();
     assert(round.accepted);                       // the injected objective promotes
-    assert(round.candidate.five == 88888);
-    assert(round.candidate.forbidden_penalty == 77777);
-    assert(trainer.champion().five == 88888);
-    assert(trainer.champion().forbidden_penalty == 77777);
+    // 丁-3：规则常量按色带过去——两侧都是启动那一份，因为帽取的是两侧 `five` 的
+    // 较小者，一个「黑方 88888 / 白方 100000」的冠军会把将杀带切成两种。
+    assert(round.candidate.black.five == 88888);
+    assert(round.candidate.black.forbidden_penalty == 77777);
+    assert(round.candidate.white.five == 88888);
+    assert(round.candidate.white.forbidden_penalty == 77777);
+    assert(trainer.champion().black.five == 88888);
+    assert(trainer.champion().black.forbidden_penalty == 77777);
+    assert(trainer.champion().white.five == 88888);
+    assert(trainer.champion().white.forbidden_penalty == 77777);
 
     std::string error;
-    ThreatCoefficients from_file;
+    CoefficientPair from_file;
     assert(CoefficientVector::load(config.params_path, from_file, error));
-    assert(from_file.five == 88888);
-    assert(from_file.forbidden_penalty == 77777);
+    assert(from_file.black.five == 88888);
+    assert(from_file.black.forbidden_penalty == 77777);
+    assert(from_file.white.five == 88888);
+    assert(from_file.white.forbidden_penalty == 77777);
 
     std::ifstream checkpoint(config.checkpoint_path);
     assert(checkpoint.is_open());
@@ -1432,7 +1476,7 @@ void test_trainer_genetic_round_and_status() {
 
     std::vector<std::string> log_lines;
     Trainer trainer(ThreatCoefficients(), config);
-    trainer.set_fitness_override(deviation_score);
+    trainer.set_fitness_override(pair_deviation_score);
     trainer.set_log_callback([&log_lines](const std::string& line) {
         log_lines.push_back(line);
     });
@@ -1883,7 +1927,7 @@ void test_play_game_counts_only_valid_games() {
     // and cannot cross the promotion line: an undecided game must never read
     // as a win.
     Trainer matcher(ThreatCoefficients(), config);
-    const double match = matcher.play_match(ThreatCoefficients(), ThreatCoefficients(), 2);
+    const double match = matcher.play_match(CoefficientPair(), CoefficientPair(), 2);
     assert(match == 0.5);
     assert(match < config.accept_score);
     assert(matcher.games_played() == 2);
@@ -1891,11 +1935,13 @@ void test_play_game_counts_only_valid_games() {
     // The injected-objective fast path is untouched by the counting change:
     // win, loss and draw are still decided by the two scores.
     Trainer fast(ThreatCoefficients(), config);
-    fast.set_fitness_override([](const ThreatCoefficients& c) { return c.live_four > 15000 ? 1.0 : 0.0; });
-    ThreatCoefficients strong;
-    strong.live_four = 20000;
-    ThreatCoefficients weak;
-    weak.live_four = 5000;
+    fast.set_fitness_override([](const CoefficientPair& c) { return c.black.live_four > 15000 ? 1.0 : 0.0; });
+    ThreatCoefficients strong_set;
+    strong_set.live_four = 20000;
+    ThreatCoefficients weak_set;
+    weak_set.live_four = 5000;
+    const CoefficientPair strong = CoefficientPair::shared(strong_set);
+    const CoefficientPair weak = CoefficientPair::shared(weak_set);
     assert(fast.play_match(strong, weak, 2) == 1.0);
     assert(fast.play_match(weak, strong, 2) == 0.0);
     assert(fast.play_match(strong, strong, 2) == 0.5);
@@ -2229,14 +2275,15 @@ void test_play_match_rounds_up_to_even() {
 
     Trainer trainer(ThreatCoefficients(), config);
     const int before = trainer.games_played();
-    const double score = trainer.play_match(ThreatCoefficients(), target_coefficients(), 3);
+    const double score = trainer.play_match(CoefficientPair(),
+                                            CoefficientPair::shared(target_coefficients()), 3);
     assert(trainer.games_played() - before == 4);
     // Eight plies cannot finish a five, so every game is a MOVE_LIMIT draw:
     // four halves over four games pins the normalisation to exactly 0.5.
     assert(std::abs(score - 0.5) < 1e-12);
 
     const int before_single = trainer.games_played();
-    trainer.play_match(ThreatCoefficients(), target_coefficients(), 1);
+    trainer.play_match(CoefficientPair(), CoefficientPair::shared(target_coefficients()), 1);
     assert(trainer.games_played() - before_single == 2);
 
     std::cout << "test_play_match_rounds_up_to_even passed" << std::endl;
@@ -2259,7 +2306,7 @@ void test_write_failures_report_to_stderr() {
     config.params_path = (blocker / "params.json").string();
     config.checkpoint_path = (blocker / "checkpoint.json").string();
     Trainer trainer(ThreatCoefficients(), config);
-    trainer.set_fitness_override([](const ThreatCoefficients&) { return 0.5; });
+    trainer.set_fitness_override([](const CoefficientPair&) { return 0.5; });
     std::ostringstream round_log;
     std::streambuf* previous = std::cerr.rdbuf(round_log.rdbuf());
     const TrainerRound round = trainer.run_round();
@@ -3166,8 +3213,12 @@ void test_measure_fitness_flattens_rule_constants_for_candidates() {
 
     std::vector<std::pair<int, int>> seen;  // five / forbidden_penalty per call
     Trainer trainer(base, config);
-    trainer.set_fitness_override([&seen](const ThreatCoefficients& coeffs) {
-        seen.emplace_back(coeffs.five, coeffs.forbidden_penalty);
+    trainer.set_fitness_override([&seen](const CoefficientPair& coeffs) {
+        // 丁-3：两侧各自带着冠军的规则常量进来（`run_round` 逐色搬），所以这里记的
+        // 还是「一套」——但要钉住两侧一致，否则将杀带会随颜色变。
+        assert(coeffs.white.five == coeffs.black.five);
+        assert(coeffs.white.forbidden_penalty == coeffs.black.forbidden_penalty);
+        seen.emplace_back(coeffs.black.five, coeffs.black.forbidden_penalty);
         return deviation_score(coeffs);
     });
 
@@ -3197,8 +3248,10 @@ void test_measure_fitness_leaves_default_rule_constants_alone() {
     const ThreatCoefficients defaults;
     std::vector<std::pair<int, int>> seen;
     Trainer trainer(defaults, config);
-    trainer.set_fitness_override([&seen](const ThreatCoefficients& coeffs) {
-        seen.emplace_back(coeffs.five, coeffs.forbidden_penalty);
+    trainer.set_fitness_override([&seen](const CoefficientPair& coeffs) {
+        assert(coeffs.white.five == coeffs.black.five);
+        assert(coeffs.white.forbidden_penalty == coeffs.black.forbidden_penalty);
+        seen.emplace_back(coeffs.black.five, coeffs.black.forbidden_penalty);
         return deviation_score(coeffs);
     });
 
@@ -3732,14 +3785,14 @@ void test_trainer_refuses_one_file_for_both_out_and_checkpoint() {
 // exactly one new member (the incumbent carries over unscored), fixing a run's cost at
 // population_size + generations * (population_size - 1).
 void test_genetic_stagnation_count_is_per_run() {
-    ThreatCoefficients base;
+    CoefficientPair base;
 
     GeneticConfig settings;
     settings.population_size = 2;
     settings.stagnation_generations = 2;
     settings.max_generations = 2;
 
-    auto flat = [](const ThreatCoefficients&) { return 1.0; };
+    auto flat = [](const CoefficientPair&) { return 1.0; };
 
     GeneticOptimizer optimizer(flat, settings, 20261015);
     int first_generations = 0;
@@ -4785,7 +4838,7 @@ void test_a_closed_sprt_ends_the_match_early() {
     Trainer at_default(ThreatCoefficients(), config);
     const int before_default = at_default.games_played();
     const MatchOutcome open =
-        at_default.score_match(ThreatCoefficients(), ThreatCoefficients(), 8);
+        at_default.score_match(CoefficientPair(), CoefficientPair(), 8);
     assert(at_default.games_played() - before_default == 8);
     assert(open.games == 8);
     assert(open.verdict == SprtVerdict::OPEN);
@@ -4796,7 +4849,7 @@ void test_a_closed_sprt_ends_the_match_early() {
     Trainer strict(ThreatCoefficients(), config);
     const int before_strict = strict.games_played();
     const MatchOutcome closed =
-        strict.score_match(ThreatCoefficients(), ThreatCoefficients(), 8);
+        strict.score_match(CoefficientPair(), CoefficientPair(), 8);
     // Six games the ceiling allowed are never played, and the two that were are a
     // full pair: the ratio crossed the bound on the first game of the pair, and
     // the match still played the second colour.
@@ -4810,7 +4863,7 @@ void test_a_closed_sprt_ends_the_match_early() {
     Trainer fixed(ThreatCoefficients(), config);
     const int before_fixed = fixed.games_played();
     const MatchOutcome played =
-        fixed.score_match(ThreatCoefficients(), ThreatCoefficients(), 8);
+        fixed.score_match(CoefficientPair(), CoefficientPair(), 8);
     assert(fixed.games_played() - before_fixed == 8);
     assert(played.games == 8);
     assert(played.verdict == SprtVerdict::OPEN);
@@ -4821,7 +4874,7 @@ void test_a_closed_sprt_ends_the_match_early() {
     // the same number the outcome's score field does - the fitness signal did not
     // move with this change.
     Trainer wrapper(ThreatCoefficients(), config);
-    assert(std::abs(wrapper.play_match(ThreatCoefficients(), ThreatCoefficients(), 8) -
+    assert(std::abs(wrapper.play_match(CoefficientPair(), CoefficientPair(), 8) -
                      played.score) < 1e-12);
 
     std::cout << "  [r128] one 8-game request: default 300 played 8 and stayed open, "
@@ -4854,7 +4907,7 @@ void test_a_reject_verdict_keeps_a_candidate_the_bar_would_promote() {
     assert(!stopped.accepted);
     assert(strict.rounds_completed() == 1);
     assert(CoefficientVector::to_vector(strict.champion()) ==
-           CoefficientVector::to_vector(ThreatCoefficients()));
+           CoefficientVector::to_vector(CoefficientPair::shared(ThreatCoefficients())));
     assert(strict.status_text().find("champion=v0") != std::string::npos);
 
     config.sprt_elo = 0;
@@ -5127,7 +5180,7 @@ void test_a_match_rotates_through_the_opening_set() {
     Trainer shallow(ThreatCoefficients(), config);
     const int before_shallow = shallow.games_played();
     const MatchOutcome pairs =
-        shallow.score_match(ThreatCoefficients(), ThreatCoefficients(), 8);
+        shallow.score_match(CoefficientPair(), CoefficientPair(), 8);
     std::cout << "  [r129] 8-game match at 4 opening plies: " << pairs.games
               << " games counted, score " << pairs.score << std::endl;
     assert(pairs.games == 8);
@@ -5136,7 +5189,7 @@ void test_a_match_rotates_through_the_opening_set() {
     config.match_opening_plies = 6;
     Trainer deep(ThreatCoefficients(), config);
     const int before_deep = deep.games_played();
-    const MatchOutcome deeper = deep.score_match(ThreatCoefficients(), ThreatCoefficients(), 8);
+    const MatchOutcome deeper = deep.score_match(CoefficientPair(), CoefficientPair(), 8);
     std::cout << "  [r129] 8-game match at 6 opening plies: " << deeper.games
               << " games counted, score " << deeper.score << std::endl;
     assert(deeper.games == 8);
@@ -5148,7 +5201,7 @@ void test_a_match_rotates_through_the_opening_set() {
     Trainer empty_start(ThreatCoefficients(), config);
     const int before_empty = empty_start.games_played();
     const MatchOutcome old =
-        empty_start.score_match(ThreatCoefficients(), ThreatCoefficients(), 8);
+        empty_start.score_match(CoefficientPair(), CoefficientPair(), 8);
     assert(old.games == 8);
     assert(empty_start.games_played() - before_empty == 8);
 
@@ -5877,8 +5930,8 @@ void test_a_margin_weight_blends_the_real_match_score_off_the_lattice() {
     config.params_path = temp_path("margin_blend_params.json").string();
     config.checkpoint_path = temp_path("margin_blend_checkpoint.json").string();
 
-    const ThreatCoefficients candidate = ThreatCoefficients();
-    const ThreatCoefficients reference = target_coefficients();
+    const CoefficientPair candidate = CoefficientPair::shared(ThreatCoefficients());
+    const CoefficientPair reference = CoefficientPair::shared(target_coefficients());
 
     Trainer plain(ThreatCoefficients(), config);
     const MatchOutcome binary = plain.score_match(candidate, reference, 2, 0.0);
@@ -6146,6 +6199,153 @@ void test_reset_returns_to_the_start_line_not_the_empty_board() {
     std::cout << "test_reset_returns_to_the_start_line_not_the_empty_board passed" << std::endl;
 }
 
+// 丁-3（v2 §3.4 S6）验收 4 —— 序列化兼容。指导书 §4 丁-3 注意 3：「单份文件读成两侧
+// 同值，不要造新格式」。钉三件事：两侧同值的那一对写出的字节与旧的一套**逐字相同**；
+// 旧文件读回来两侧同值；两侧真的分开了才多一个 "white" 子对象，而只会读单套的那条路
+// 遇到这种文件必须**拒绝**——把黑侧当成两套会静默丢掉 丁-4 的补偿。
+void test_d3_flat_file_reads_as_shared_and_a_split_file_adds_one_object() {
+    const ThreatCoefficients set = target_coefficients();
+    std::string error;
+
+    // 1) 旧格式 → 两侧同值。
+    const std::string path = temp_path("d3_flat_params.json").string();
+    assert(CoefficientVector::save(path, set, error));
+    CoefficientPair loaded;
+    assert(CoefficientVector::load(path, loaded, error));
+    assert(loaded.identical());
+    assert(CoefficientVector::to_vector(loaded.black) == CoefficientVector::to_vector(set));
+    assert(CoefficientVector::to_vector(loaded.white) == CoefficientVector::to_vector(set));
+
+    // 2) 两侧同值写出来的字节 = 改之前的字节（checkpoint 的 versions[] 就是这个形状）。
+    const std::string flat_bytes = CoefficientVector::to_json_string(set);
+    assert(CoefficientVector::to_json_string(loaded) == flat_bytes);
+    assert(flat_bytes.find("white") == std::string::npos);
+
+    // 3) 两侧分开：多一个子对象，读回来各是各的。
+    CoefficientPair split = CoefficientPair::shared(set);
+    split.white.edge_penalty = 40;
+    split.white.position_weight_scale = 1;
+    const std::string paired_bytes = CoefficientVector::to_json_string(split);
+    assert(paired_bytes.find("\"white\"") != std::string::npos);
+    CoefficientPair back;
+    assert(CoefficientVector::pair_from_json_string(paired_bytes, back, error));
+    assert(back.white.edge_penalty == 40);
+    assert(back.black.edge_penalty == set.edge_penalty);
+    assert(CoefficientVector::to_vector(back) == CoefficientVector::to_vector(split));
+
+    // 4) 单套读法拒绝按色的文件（而不是拿黑侧糊过去）。
+    ThreatCoefficients single;
+    assert(!CoefficientVector::from_json_string(paired_bytes, single, error));
+    assert(error.find("pair") != std::string::npos);
+    std::cout << "  [丁-3] flat " << flat_bytes.size() << " bytes, paired "
+              << paired_bytes.size() << " bytes, refusal: " << error << std::endl;
+
+    std::cout << "test_d3_flat_file_reads_as_shared_and_a_split_file_adds_one_object passed"
+              << std::endl;
+}
+
+// 丁-3 注意 6 —— 基因数从 14 变 28，`to_vector/from_vector` 跟着改。钉的是索引口径
+// （`side * TUNABLE_COUNT + gene`，黑 0..13 / 白 14..27）、宽度守恒（14 进来 14 出去，
+// 28 进来 28 出去）与边界查表也按同一个口径。
+void test_d3_gene_vector_is_side_major_and_keeps_its_width() {
+    assert(PAIR_GENE_COUNT == 28);
+    assert(TUNABLE_COUNT == 14);
+
+    CoefficientPair pair;
+    pair.white.cand_width_root = 30;
+    const std::vector<int> genes = CoefficientVector::to_vector(pair);
+    assert(genes.size() == static_cast<size_t>(PAIR_GENE_COUNT));
+    const std::vector<int> black_genes = CoefficientVector::to_vector(pair.black);
+    const std::vector<int> white_genes = CoefficientVector::to_vector(pair.white);
+    assert(black_genes.size() == static_cast<size_t>(TUNABLE_COUNT));
+    for (int g = 0; g < TUNABLE_COUNT; ++g) {
+        assert(genes[black_gene(static_cast<TunableParam>(g))] == black_genes[g]);
+        assert(genes[white_gene(static_cast<TunableParam>(g))] == white_genes[g]);
+    }
+
+    // 宽度守恒：一个扁平基因组仍然是扁平的（旧 checkpoint 与旧基因组都走这条路），
+    // 不许被「配对化」撑成 28 个。
+    std::vector<int> flat = CoefficientVector::to_vector(ThreatCoefficients());
+    assert(flat.size() == static_cast<size_t>(TUNABLE_COUNT));
+    CoefficientVector::sanitize_pair_vector(flat);
+    assert(flat.size() == static_cast<size_t>(TUNABLE_COUNT));
+    const CoefficientPair from_flat = CoefficientVector::pair_from_vector(flat);
+    assert(from_flat.identical());
+
+    // sanitize_vector 按宽度决定它洗的是什么：同一个 28 wide 的向量交给它，结果与
+    // sanitize_pair_vector 一致（否则优化器有一半的基因是被错的规则修的）。
+    std::vector<int> wide = genes;
+    wide[white_gene(TunableParam::CAND_WIDTH_ROOT)] = 999;   // 越界，被夹回 64
+    wide[black_gene(TunableParam::SLEEPY_TWO)] = 9000;        // 比活四还高，被阶梯压回
+    std::vector<int> via_vector = wide;
+    CoefficientVector::sanitize_vector(via_vector);
+    std::vector<int> via_pair = wide;
+    CoefficientVector::sanitize_pair_vector(via_pair);
+    assert(via_vector == via_pair);
+    assert(via_vector[white_gene(TunableParam::CAND_WIDTH_ROOT)] == 64);
+    assert(via_vector[black_gene(TunableParam::SLEEPY_TWO)] ==
+           via_vector[black_gene(TunableParam::LIVE_TWO)]);
+
+    // 边界查表也是同一个口径：第 20 号基因就是白侧的第 6 号。
+    assert(CoefficientVector::bound_for_gene(20).min_value ==
+           CoefficientVector::bound_for(static_cast<TunableParam>(20 - TUNABLE_COUNT)).min_value);
+    assert(CoefficientVector::bound_for_gene(0).max_value ==
+           CoefficientVector::bound_for(TunableParam::LIVE_FOUR).max_value);
+
+    std::cout << "test_d3_gene_vector_is_side_major_and_keeps_its_width passed" << std::endl;
+}
+
+// 丁-3 注意 4 + 5 —— 两套系数各洗各的（`sanitize` 与 `CrossRule` 逐色跑一遍），
+// 再叠一条「威胁阶梯两侧必须同阶（±20 %）」：越带的是**白侧**被拉回带内（黑侧是基准），
+// 位置项没有带。文件那一侧同一条判据是**拒绝**，不是修。
+void test_d3_ladder_band_moves_white_and_the_reader_refuses() {
+    const ThreatCoefficients base;
+    CoefficientPair pair = CoefficientPair::shared(base);
+    pair.white.live_four = 40000;     // 黑侧 10000，超带三倍
+    pair.white.rush_four = 9000;      // 黑侧 1000
+    pair.white.edge_penalty = 140;    // 位置项，没有带
+    CoefficientVector::sanitize(pair);
+    // 带顶 = 10000 × 1.2；先落带，再按白侧自己的阶梯把 冲四 压到 活四 之下。
+    assert(pair.white.live_four == 12000);
+    assert(pair.white.rush_four == 1200);
+    assert(pair.black.live_four == 10000);
+    assert(pair.white.edge_penalty == 140);
+    // 幂等：再洗一次一个字都不动（优化器每步都洗，不幂等的话冠军会自己漂走）。
+    const std::vector<int> once = CoefficientVector::to_vector(pair);
+    CoefficientVector::sanitize(pair);
+    assert(CoefficientVector::to_vector(pair) == once);
+
+    // 文件那一侧：同样一个越带的白侧，读它必须失败。白侧自己的阶梯要先合法，否则
+    // 报出来的是「组合分低于活四」那条单色判据，±20 % 这一条根本没被跑到。
+    CoefficientPair wild = CoefficientPair::shared(ThreatCoefficients());
+    wild.white.live_four = 40000;
+    wild.white.rush_four = 1000;
+    wild.white.live_three = 900;
+    wild.white.sleepy_three = 100;
+    wild.white.live_two = 50;
+    wild.white.sleepy_two = 10;
+    wild.white.double_four = 50000;
+    wild.white.double_three = 45000;
+    wild.white.four_three = 42000;
+    std::string error;
+    assert(!CoefficientVector::pair_from_json_string(
+        CoefficientVector::to_json_string(wild), wild, error));
+    assert(error.find("live_four") != std::string::npos);
+    // 钉的是「哪一条判据把这份文件拦下来的」：带，不是单色的阶梯。
+    assert(error.find("away from black") != std::string::npos);
+    std::cout << "  [丁-3] band refusal: " << error << std::endl;
+
+    // 规则常量两侧必须同值：`five` 是将杀阈值、帽取两侧较小者，一个「黑 88888 白 100000」
+    // 的文件会把将杀带切成两种颜色。
+    CoefficientPair rulesplit = CoefficientPair::shared(ThreatCoefficients());
+    rulesplit.white.five = 90000;
+    assert(!CoefficientVector::pair_from_json_string(
+        CoefficientVector::to_json_string(rulesplit), rulesplit, error));
+    assert(error.find("both colours") != std::string::npos);
+
+    std::cout << "test_d3_ladder_band_moves_white_and_the_reader_refuses passed" << std::endl;
+}
+
 int main() {
     std::cout << "Running training tests..." << std::endl;
 
@@ -6272,6 +6472,9 @@ int main() {
     test_self_play_records_a_teacher_answer_without_touching_the_student();
     test_a_taught_tactical_ply_becomes_a_sample();
     test_reset_returns_to_the_start_line_not_the_empty_board();
+    test_d3_flat_file_reads_as_shared_and_a_split_file_adds_one_object();
+    test_d3_gene_vector_is_side_major_and_keeps_its_width();
+    test_d3_ladder_band_moves_white_and_the_reader_refuses();
 
     std::cout << "All training tests passed" << std::endl;
     return 0;

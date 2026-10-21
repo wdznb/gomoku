@@ -7771,11 +7771,11 @@ long long c3_addend_truth(const Evaluator& evaluator, const CandidateCache::Cell
     const bool black_is_mine = (color == BLACK);
     const long long from_record = evaluator.board_pair_value(
         black_is_mine ? found.black : found.white, black_is_mine ? found.white : found.black,
-        row, col, black_is_mine);
+        row, col, color);
     const long long from_pass =
         evaluator.board_pair_value(black_is_mine ? fresh_black : fresh_white,
                                    black_is_mine ? fresh_white : fresh_black, row, col,
-                                   black_is_mine);
+                                   color);
     assert(from_record == from_pass);
     // The same square asked by the other colour is the same number with its sign moved -
     // and a record that answered the writer's side rather than the reader's would break
@@ -7783,7 +7783,7 @@ long long c3_addend_truth(const Evaluator& evaluator, const CandidateCache::Cell
     const long long other_side =
         evaluator.board_pair_value(black_is_mine ? fresh_white : fresh_black,
                                    black_is_mine ? fresh_black : fresh_white, row, col,
-                                   !black_is_mine);
+                                   opponent(color));
     assert(other_side == -from_pass);
     return from_pass;
 }
@@ -9246,7 +9246,7 @@ void test_the_board_sum_cache_answers_every_cell_of_the_census_and_keeps_the_cap
                         const PositionPattern& mine = side == BLACK ? found->black : found->white;
                         const PositionPattern& theirs = side == BLACK ? found->white : found->black;
                         cached_addend = evaluator.board_pair_value(mine, theirs, row, col,
-                                                                   side == BLACK);
+                                                                   side);
                         assert(c2_patterns_equal(mine, fresh_mine));
                         assert(c2_patterns_equal(theirs, fresh_theirs));
                         assert(cached_addend == fresh_addend);
@@ -9296,6 +9296,51 @@ void test_the_board_sum_cache_answers_every_cell_of_the_census_and_keeps_the_cap
               << " passed (18,900 组逐格相同：" << from_records << " 格读记录、"
               << zeros_from_occupied << " 格占了子答 0；cap " << cap << " 只在求和之后落，"
               << "未夹的和 " << uncapped << " 被夹回)" << std::endl;
+}
+
+// 丁-3 注意 2：换系数集必须清 TT。`static_eval` 只按 BLACK 那一个符号存
+// （src/optimization/transposition.h:44-52），这个约定只在**同一套系数**内成立；按色两套
+// 之后，一张表里躺着的是两种颜色各自的价格。钉三件事：搜过之后表非空、换一套之后表空、
+// 换的是**同一套**也清（判据是「换过系数」，不是「值不同才清」——后者要调用方去比
+// 14 × 2 个数，而漏比一次的代价是把新系数按旧价格来用）。
+void test_a_coefficient_change_empties_the_transposition_table() {
+    const Board board = quiet_think_board();
+    std::atomic<bool> stop(false);
+
+    SearchEngine engine;
+    quieten(engine);
+    engine.set_max_nodes(20000);
+    const SearchResult first = engine.search(board, WHITE, 4, 600000, stop);
+    assert(first.nodes_searched > 0);
+    assert(first.tt_hits >= 0);
+    std::cout << "  [丁-3] after think: hashfull=" << engine.transposition_table().hashfull()
+              << " generation=" << static_cast<int>(engine.transposition_table().generation())
+              << std::endl;
+    assert(engine.transposition_table().hashfull() > 0);
+
+    ThreatCoefficients other;
+    other.live_four = 12345;
+    engine.set_coefficients(other);
+    assert(engine.transposition_table().hashfull() == 0);
+    assert(engine.transposition_table().generation() == 0);
+
+    // 换回同一套也清：上面那两条判据在「值相同」的分支上必须仍然成立。
+    engine.set_max_nodes(20000);
+    engine.search(board, WHITE, 4, 600000, stop);
+    assert(engine.transposition_table().hashfull() > 0);
+    engine.set_coefficients(other);
+    assert(engine.transposition_table().hashfull() == 0);
+
+    // 按色那一路：一对系数进来同样清表。
+    engine.set_max_nodes(20000);
+    engine.search(board, WHITE, 4, 600000, stop);
+    assert(engine.transposition_table().hashfull() > 0);
+    CoefficientPair pair;
+    pair.white.position_weight_scale = 3;
+    engine.set_coefficients(pair);
+    assert(engine.transposition_table().hashfull() == 0);
+
+    std::cout << "test_a_coefficient_change_empties_the_transposition_table passed" << std::endl;
 }
 
 int main() {
@@ -9498,6 +9543,7 @@ int main() {
     test_a_ponder_costs_only_its_budget_and_says_nothing_on_the_hook();
     test_a_pondering_session_arms_a_pre_search_that_commits_nothing();
     test_the_board_sum_cache_answers_every_cell_of_the_census_and_keeps_the_cap_outside();
+    test_a_coefficient_change_empties_the_transposition_table();
 
     std::cout << "All search tests passed!" << std::endl;
     return 0;

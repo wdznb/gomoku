@@ -51,13 +51,62 @@ struct ThreatCoefficients {
     ThreatCoefficients() = default;
 };
 
+// 丁-3（v2 §3.6 S6）：黑白各一套系数。
+//
+// 指导书 §4 丁-3 实现思路 1 把这个结构写在 `params.h`，这里写在 `evaluator.h`：
+// `params.h` 已经 `#include "../core/evaluator.h"`（它要 `ThreatCoefficients` 做基因边界），
+// 放在那边会形成一个循环包含，而「一套还是两套系数」是评估器的事实，不是训练器的事实。
+//
+// 反对称性（`eval(W) == -eval(B)`）是 negamax、TT 的单符号约定与根层比较三处的地基，
+// 所以这个结构只允许「按子的颜色取系数」这一种读法：见 `Evaluator::coeffs_for`。
+struct CoefficientPair {
+    ThreatCoefficients black;
+    ThreatCoefficients white;
+
+    CoefficientPair() = default;
+
+    // 两侧同一套 —— 旧文件、旧调用点、以及「等价臂」验收读的都是这一个形状。
+    static CoefficientPair shared(const ThreatCoefficients& coeffs) {
+        CoefficientPair pair;
+        pair.black = coeffs;
+        pair.white = coeffs;
+        return pair;
+    }
+
+    const ThreatCoefficients& for_color(int color) const { return color == BLACK ? black : white; }
+    ThreatCoefficients& for_color(int color) { return color == BLACK ? black : white; }
+
+    // 14 个可调量加两个规则常量全部逐字相同。帽、TT 是否要清、以及验收那一口
+    // 「等价臂与今天逐字节相同」都问的是这一句，不是「两个对象看着差不多」。
+    bool identical() const {
+        return black.five == white.five && black.live_four == white.live_four &&
+               black.rush_four == white.rush_four && black.live_three == white.live_three &&
+               black.sleepy_three == white.sleepy_three && black.live_two == white.live_two &&
+               black.sleepy_two == white.sleepy_two && black.double_four == white.double_four &&
+               black.double_three == white.double_three && black.four_three == white.four_three &&
+               black.forbidden_penalty == white.forbidden_penalty &&
+               black.position_weight_scale == white.position_weight_scale &&
+               black.distance_to_stones == white.distance_to_stones &&
+               black.edge_penalty == white.edge_penalty &&
+               black.cand_width_root == white.cand_width_root &&
+               black.cand_width_deep == white.cand_width_deep;
+    }
+};
+
 class Evaluator {
 public:
     Evaluator();
     explicit Evaluator(const ThreatCoefficients& coeffs);
+    explicit Evaluator(const CoefficientPair& pair);
     
     void set_coefficients(const ThreatCoefficients& coeffs);
-    const ThreatCoefficients& coefficients() const { return coeffs_; }
+    void set_coefficients(const CoefficientPair& pair);
+    // 两侧同一套时这就是改之前的那个读数；按色取一律走 `coeffs_for`。
+    const ThreatCoefficients& coefficients() const { return pair_.black; }
+    const CoefficientPair& coefficient_pair() const { return pair_; }
+    // 唯一被允许的按色读法。反对称的支点就在这句与 `pattern_score` 的颜色参数上：
+    // 一个形状值多少，取决于**摆它的是哪一色**。
+    const ThreatCoefficients& coeffs_for(int color) const { return pair_.for_color(color); }
     
     int evaluate_position(const Board& board, int row, int col, int color) const;
     // Overload for callers that already ran recognize_position on this square
@@ -96,20 +145,28 @@ public:
     // board sum adds pattern scores - each side judged by the forbidden rule
     // evaluated on its own pattern - and is the number that gets capped.
     int board_pair_value(const PositionPattern& my_pattern, const PositionPattern& opp_pattern,
-                         int row, int col, bool black_is_mine) const;
+                         int row, int col, int my_color) const;
     int evaluate_board_from(long long pattern_total, const Board& board, int my_color) const;
     
-    int get_position_weight(int row, int col) const;
+    // 丁-3：位置项按色可训，所以这张表是两份。旧的两参形式保留成「问行棋方那一侧」，
+    // 因为 `candidate_value` 里用它的那一处本来就是在给这一色的候选定价。
+    int get_position_weight(int row, int col, int color) const;
+    int get_position_weight(int row, int col) const { return get_position_weight(row, col, BLACK); }
     
 private:
-    ThreatCoefficients coeffs_;
-    int position_weights_[BOARD_SIZE][BOARD_SIZE];
+    CoefficientPair pair_;
+    // [colour][row][col]：两侧可以有不同的 `position_weight_scale`，
+    // 而这张表在每次换系数时重建，所以它永远不会比 `pair_` 旧。
+    // 第一维按**颜色枚举值**索引，而 `BLACK = 1`、`WHITE = 2`（`types.h:12`），
+    // 所以它是 3 而不是 2：按 `[2]` 开会让白方那一格写到数组外面去。
+    int position_weights_[3][BOARD_SIZE][BOARD_SIZE];
     
     void init_position_weights();
     // `row`/`col` are the candidate the pattern was read at: the shape itself does
     // not say where on the board it sits, and a line the edge closes has to be
-    // worth less than the same line with room to grow.
-    int pattern_score(const PositionPattern& pattern, int row, int col) const;
+    // worth less than the same line with room to grow. `color` is whose stones the
+    // pattern describes - that is the one and only place the pair is selected.
+    int pattern_score(const PositionPattern& pattern, int row, int col, int color) const;
     // Sum of the centre weights over the stones of one colour, and the price of the
     // ones standing in the outer two rows or columns. Both are read one colour at a
     // time and subtracted from each other by the caller, so the whole-board value

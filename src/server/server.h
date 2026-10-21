@@ -88,7 +88,7 @@ public:
     // to run without persistence.
     GameServer(int port = 8080, const std::string& web_dir = "web",
                const std::string& book_path = "data/opening_book.json",
-               const ThreatCoefficients* coefficients = nullptr,
+               const CoefficientPair* coefficients = nullptr,
                const std::string& sessions_dir = "data/sessions",
                const std::string& records_path = "data/training/records.jsonl",
                // Design doc 2.4.3 ②, server-wide policy: the share of a finished think
@@ -156,7 +156,8 @@ private:
     OpeningBook book_;
     // Trained coefficients from --params. Applied to every new game because each
     // GameManager owns its own engine; the file is read once here, never again.
-    ThreatCoefficients coefficients_;
+    // 丁-3：一对——按色的参数文件要能真的按下色去玩。两侧同值时这就是原来那一份。
+    CoefficientPair coefficients_;
     bool use_loaded_coefficients_ = false;
     // --ponder, handed to every session the server opens (see the constructor).
     int ponder_percent_ = 0;

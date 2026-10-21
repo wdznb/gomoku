@@ -183,8 +183,8 @@ std::string file_named(const std::string& path) {
     return resolved.string();
 }
 
-void print_coefficients(const ThreatCoefficients& coeffs) {
-    std::cout << "champion coefficients:\n"
+void print_one_side(const char* label, const ThreatCoefficients& coeffs) {
+    std::cout << "champion coefficients" << label << ":\n"
               << "  live_four        = " << coeffs.live_four << "\n"
               << "  rush_four        = " << coeffs.rush_four << "\n"
               << "  live_three       = " << coeffs.live_three << "\n"
@@ -196,6 +196,13 @@ void print_coefficients(const ThreatCoefficients& coeffs) {
               << "  four_three       = " << coeffs.four_three << "\n"
               << "  position_scale   = " << coeffs.position_weight_scale << "\n"
               << "  five             = " << coeffs.five << " (never tuned)\n";
+}
+
+void print_coefficients(const CoefficientPair& pair) {
+    // 两侧同值（丁-3 的等价臂）只打印一份，标题与改之前逐字节相同；只有真的分开了
+    // 才多一栏——「白方是另一个引擎」这件事要在输出里看得见，不是一个隐含开关。
+    print_one_side(":", pair.black);
+    if (!pair.identical()) print_one_side(" (white side)", pair.white);
 }
 
 }
@@ -422,9 +429,11 @@ int main(int argc, char** argv) {
     config.params_path = out_path;
     config.checkpoint_path = checkpoint_path;
 
-    ThreatCoefficients base;
+    CoefficientPair base;
     if (!base_params.empty()) {
         std::string error;
+        // The pair reader takes today's flat file too - both sides get the one set
+        // it names - so this is the same load with room for a per-colour file.
         if (!CoefficientVector::load(base_params, base, error)) {
             std::cerr << "Error: cannot use --params " << base_params << ": " << error << std::endl;
             return 1;

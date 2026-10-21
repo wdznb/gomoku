@@ -546,7 +546,7 @@ void WebSocketSession::send_http_response() {
 
 GameServer::GameServer(int port, const std::string& web_dir,
                        const std::string& book_path,
-                       const ThreatCoefficients* coefficients,
+                       const CoefficientPair* coefficients,
                        const std::string& sessions_dir,
                        const std::string& records_path,
                        int ponder_percent)
@@ -1829,7 +1829,11 @@ void GameServer::handle_analyze_request(std::shared_ptr<WebSocketSession> sessio
 
     AnalysisRequest request;
     request.record = snap.record;
-    request.coeffs = use_loaded_coefficients_ ? coefficients_ : ThreatCoefficients{};
+    // 复盘与筛题按一套系数定价，取的是黑方那一半：`coeffs_sha` 报的就是这个数，
+    // 缓存键与算它的那套数字因此始终一致。按色的复盘不是丁-3 的范围（指导书 §4
+    // 丁-3 实现思路只把「下棋」的一侧交给 `CoefficientPair`），两侧同值时这里与改之前
+    // 取到的是同一套。
+    request.coeffs = use_loaded_coefficients_ ? coefficients_.black : ThreatCoefficients{};
     request.coeffs_sha = coefficients_fingerprint(request.coeffs);
     request.review.max_depth = clamp_analyze_depth(get_int_or(msg, "depth", kAnalyzeDefaultDepth));
     request.review.budget = clamp_analyze_budget(get_int_or(msg, "budget", kAnalyzeDefaultBudget));

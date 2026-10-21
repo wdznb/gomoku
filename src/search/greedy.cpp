@@ -8,7 +8,13 @@ GreedySearch::GreedySearch() {}
 
 GreedySearch::GreedySearch(const ThreatCoefficients& coeffs) : evaluator_(coeffs) {}
 
+GreedySearch::GreedySearch(const CoefficientPair& coeffs) : evaluator_(coeffs) {}
+
 void GreedySearch::set_coefficients(const ThreatCoefficients& coeffs) {
+    evaluator_.set_coefficients(coeffs);
+}
+
+void GreedySearch::set_coefficients(const CoefficientPair& coeffs) {
     evaluator_.set_coefficients(coeffs);
 }
 

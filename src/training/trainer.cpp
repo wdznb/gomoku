@@ -26,6 +26,9 @@ std::string version_name(size_t index) {
 }
 
 Trainer::Trainer(const ThreatCoefficients& base, const TrainingConfig& config)
+    : Trainer(CoefficientPair::shared(base), config) {}
+
+Trainer::Trainer(const CoefficientPair& base, const TrainingConfig& config)
     : config_(config), elo_(1500.0, 32.0) {
     versions_.push_back(base);
     elo_.add_player(version_name(0));
@@ -35,15 +38,19 @@ void Trainer::set_fitness_override(CoefficientFitness fitness) {
     fitness_override_ = std::move(fitness);
 }
 
-double Trainer::measure_fitness(const ThreatCoefficients& coefficients) {
+double Trainer::measure_fitness(const CoefficientPair& coefficients) {
     // Rule constants are not genes (README:607-608): from_vector default-constructs
     // on purpose because sanitize relies on those defaults, so a candidate arrives
     // carrying the compiled-in five and forbidden_penalty while the champion carries
     // the parameter file's. Flatten the baseline before comparing - the override
-    // included, so a test hook measures the same pairing the games do.
-    ThreatCoefficients scored = coefficients;
-    scored.five = champion().five;
-    scored.forbidden_penalty = champion().forbidden_penalty;
+    // included, so a test hook measures the same pairing the games do. Each side
+    // keeps its own constants; the evaluation cap is the smaller of the two fives,
+    // so a pair whose sides disagree still has one colour-independent ceiling.
+    CoefficientPair scored = coefficients;
+    scored.black.five = champion().black.five;
+    scored.black.forbidden_penalty = champion().black.forbidden_penalty;
+    scored.white.five = champion().white.five;
+    scored.white.forbidden_penalty = champion().white.forbidden_penalty;
     if (fitness_override_) return fitness_override_(scored);
     return play_match(scored, champion(), config_.fitness_games,
                       config_.fitness_margin_weight);
@@ -164,14 +171,14 @@ double Trainer::game_margin(const GameRecord& record, int max_moves) {
     return 0.5 * terminal + 0.3 * speed + 0.2 * depth_term;
 }
 
-double Trainer::play_match(const ThreatCoefficients& candidate,
-                           const ThreatCoefficients& reference,
+double Trainer::play_match(const CoefficientPair& candidate,
+                           const CoefficientPair& reference,
                            int games, double margin_weight) {
     return score_match(candidate, reference, games, margin_weight).score;
 }
 
-MatchOutcome Trainer::score_match(const ThreatCoefficients& candidate,
-                                  const ThreatCoefficients& reference,
+MatchOutcome Trainer::score_match(const CoefficientPair& candidate,
+                                  const CoefficientPair& reference,
                                   int games, double margin_weight) {
     MatchOutcome outcome;
     if (fitness_override_) {
@@ -329,7 +336,7 @@ int Trainer::generate_data_games(int games, int threads) {
     // which README:181's append stream has to keep separable.
     std::atomic<int> next_data_id{games_played_ + 1};
     DataCollector collector;
-    const ThreatCoefficients current_champion = champion();
+    const CoefficientPair current_champion = champion();
 
     // Design doc 2.8 #1. Built here rather than in the constructor so a --no-data run
     // never pays for a table it would not touch, and filled before any worker exists so
@@ -471,12 +478,12 @@ TrainerRound Trainer::run_round() {
     result.champion = champion();
     result.champion_fitness = fitness_override_ ? fitness_override_(champion()) : 0.5;
 
-    CoefficientFitness fitness = [this](const ThreatCoefficients& coefficients) {
+    CoefficientFitness fitness = [this](const CoefficientPair& coefficients) {
         return measure_fitness(coefficients);
     };
 
     const uint64_t round_seed = config_.seed + static_cast<uint64_t>(rounds_completed_) * 7919;
-    ThreatCoefficients candidate;
+    CoefficientPair candidate;
 
     if (config_.optimizer == OptimizerKind::GENETIC) {
         GeneticConfig settings;
@@ -515,9 +522,13 @@ TrainerRound Trainer::run_round() {
     // Rule constants are not genes: the optimisers rebuild candidates from a
     // default-constructed struct, so carry the champion's values over or the
     // verification match compares two different rule sets and a promotion would
-    // rewrite the parameter file's constants with defaults.
-    candidate.five = result.champion.five;
-    candidate.forbidden_penalty = result.champion.forbidden_penalty;
+    // rewrite the parameter file's constants with defaults. Each side carries its
+    // own - `five` is what that colour's threats are capped against, and the
+    // evaluation cap is the smaller of the two, so this stays colour-independent.
+    candidate.black.five = result.champion.black.five;
+    candidate.black.forbidden_penalty = result.champion.black.forbidden_penalty;
+    candidate.white.five = result.champion.white.five;
+    candidate.white.forbidden_penalty = result.champion.white.forbidden_penalty;
     result.candidate = candidate;
 
     const MatchOutcome check =
@@ -671,10 +682,10 @@ bool Trainer::load_checkpoint(const std::string& path, std::string& error) {
         return false;
     }
 
-    std::vector<ThreatCoefficients> restored_versions;
+    std::vector<CoefficientPair> restored_versions;
     for (const auto& entry : root["versions"]) {
-        ThreatCoefficients coefficients;
-        if (!CoefficientVector::from_json_string(entry.dump(), coefficients, error)) {
+        CoefficientPair coefficients;
+        if (!CoefficientVector::pair_from_json_string(entry.dump(), coefficients, error)) {
             error = "checkpoint version is malformed: " + error;
             return false;
         }

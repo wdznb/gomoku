@@ -53,13 +53,22 @@ Evaluator::Evaluator() {
     init_position_weights();
 }
 
-Evaluator::Evaluator(const ThreatCoefficients& coeffs) : coeffs_(coeffs) {
+Evaluator::Evaluator(const ThreatCoefficients& coeffs)
+    : pair_(CoefficientPair::shared(coeffs)) {
+    init_position_weights();
+}
+
+Evaluator::Evaluator(const CoefficientPair& pair) : pair_(pair) {
     init_position_weights();
 }
 
 void Evaluator::set_coefficients(const ThreatCoefficients& coeffs) {
-    coeffs_ = coeffs;
-    // position_weights_ are built from coeffs_.position_weight_scale at
+    set_coefficients(CoefficientPair::shared(coeffs));
+}
+
+void Evaluator::set_coefficients(const CoefficientPair& pair) {
+    pair_ = pair;
+    // position_weights_ are built from each side's position_weight_scale at
     // construction; without a rebuild a runtime coefficient change leaves the
     // center-bias table stale and move ordering dominated by old weights.
     init_position_weights();
@@ -67,22 +76,29 @@ void Evaluator::set_coefficients(const ThreatCoefficients& coeffs) {
 
 void Evaluator::init_position_weights() {
     int center = BOARD_SIZE / 2;
-    for (int r = 0; r < BOARD_SIZE; ++r) {
-        for (int c = 0; c < BOARD_SIZE; ++c) {
-            int dist_r = std::abs(r - center);
-            int dist_c = std::abs(c - center);
-            int max_dist = center * 2;
-            int dist = dist_r + dist_c;
-            position_weights_[r][c] = (max_dist - dist) * coeffs_.position_weight_scale;
+    for (int color = BLACK; color <= WHITE; ++color) {
+        const int scale = pair_.for_color(color).position_weight_scale;
+        for (int r = 0; r < BOARD_SIZE; ++r) {
+            for (int c = 0; c < BOARD_SIZE; ++c) {
+                int dist_r = std::abs(r - center);
+                int dist_c = std::abs(c - center);
+                int max_dist = center * 2;
+                int dist = dist_r + dist_c;
+                position_weights_[color][r][c] = (max_dist - dist) * scale;
+            }
         }
     }
 }
 
-int Evaluator::get_position_weight(int row, int col) const {
-    return position_weights_[row][col];
+int Evaluator::get_position_weight(int row, int col, int color) const {
+    return position_weights_[color][row][col];
 }
 
-int Evaluator::pattern_score(const PositionPattern& pattern, int row, int col) const {
+int Evaluator::pattern_score(const PositionPattern& pattern, int row, int col,
+                             int color) const {
+    // 丁-3：一个形状值多少，取决于摆它的是哪一色。这是全套反对称论证的支点——
+    // 只有「按子的颜色取系数」才让 eval(W) 恒等于 -eval(B)，按「我方/对方」取就破了。
+    const ThreatCoefficients& coeffs = pair_.for_color(color);
     int score = 0;
 
     // FIVE is only counted here, not via has_live_four / four_count, so
@@ -92,45 +108,45 @@ int Evaluator::pattern_score(const PositionPattern& pattern, int row, int col) c
     // one-ply mate threats and returns an over-optimistic score.
     for (int d = 0; d < 4; ++d) {
         if (pattern.directions[d].type == PatternType::FIVE) {
-            score += coeffs_.five;
+            score += coeffs.five;
         }
     }
 
     if (pattern.has_live_four) {
-        score += coeffs_.live_four * pattern.live_four_count;
+        score += coeffs.live_four * pattern.live_four_count;
     }
     
     if (pattern.has_rush_four) {
-        score += coeffs_.rush_four * pattern.rush_four_count;
+        score += coeffs.rush_four * pattern.rush_four_count;
     }
     
     if (pattern.has_live_three) {
-        score += coeffs_.live_three * pattern.live_three_count;
+        score += coeffs.live_three * pattern.live_three_count;
     }
     
     for (int d = 0; d < 4; ++d) {
         if (pattern.directions[d].type == PatternType::SLEEPY_THREE) {
-            score += coeffs_.sleepy_three;
+            score += coeffs.sleepy_three;
         } else if (pattern.directions[d].type == PatternType::LIVE_TWO) {
-            score += coeffs_.live_two;
+            score += coeffs.live_two;
         } else if (pattern.directions[d].type == PatternType::SLEEPY_TWO) {
-            score += coeffs_.sleepy_two;
+            score += coeffs.sleepy_two;
         }
     }
     
     if (pattern.has_four_four) {
-        score += coeffs_.double_four;
+        score += coeffs.double_four;
     }
     if (pattern.has_four_three) {
-        score += coeffs_.four_three;
+        score += coeffs.four_three;
     }
     if (pattern.has_three_three) {
-        score += coeffs_.double_three;
+        score += coeffs.double_three;
     }
 
     // The shape's price assumes room. A live four / live three / live two is worth
     // what it is because both ends can grow, and the table cannot tell that an end
-    // here is the edge of the board rather than a stone, so the correction has to
+    // here is the board edge rather than a stone, so the correction has to
     // come from where the candidate sits (design doc 2.5.4 - the shape table itself
     // stays untouched, because it is the bitboard/scalar matcher's consistency
     // proof, not a place to put a preference).
@@ -138,7 +154,7 @@ int Evaluator::pattern_score(const PositionPattern& pattern, int row, int col) c
         const PatternType type = pattern.directions[d].type;
         if (type == PatternType::LIVE_FOUR || type == PatternType::LIVE_THREE ||
             type == PatternType::LIVE_TWO) {
-            score -= coeffs_.edge_penalty * kBlockedEnds.v[row][col][d];
+            score -= coeffs.edge_penalty * kBlockedEnds.v[row][col][d];
         }
     }
 
@@ -164,7 +180,7 @@ int Evaluator::candidate_value(int row, int col, const PositionPattern& pattern,
                                int color) const {
     for (int d = 0; d < 4; ++d) {
         if (pattern.directions[d].type == PatternType::FIVE) {
-            return coeffs_.five;
+            return pair_.for_color(color).five;
         }
     }
 
@@ -174,8 +190,8 @@ int Evaluator::candidate_value(int row, int col, const PositionPattern& pattern,
     // the same rule evaluate_board applies to each side of a candidate square.
     if (color == BLACK && PatternRecognizer::is_forbidden_from_pattern(pattern)) return 0;
 
-    int score = pattern_score(pattern, row, col);
-    score += get_position_weight(row, col);
+    int score = pattern_score(pattern, row, col, color);
+    score += get_position_weight(row, col, color);
 
     return score;
 }
@@ -199,7 +215,7 @@ int Evaluator::evaluate_position_both(const Board& board, int row, int col, int 
     if (!board.is_empty(row, col)) return 0;
 
     if (PatternRecognizer::is_forbidden(board, row, col, my_color)) {
-        return -coeffs_.forbidden_penalty;
+        return -pair_.for_color(my_color).forbidden_penalty;
     }
 
     return evaluate_position_pair(board, row, col, my_color);
@@ -213,9 +229,9 @@ int Evaluator::position_term(const Board& board, int color) const {
     long long total = 0;
     for (const Move& move : board.move_history()) {
         if (move.color != color) continue;
-        total += position_weights_[move.pos.row][move.pos.col];
+        total += position_weights_[color][move.pos.row][move.pos.col];
     }
-    return static_cast<int>(total * coeffs_.distance_to_stones);
+    return static_cast<int>(total * pair_.for_color(color).distance_to_stones);
 }
 
 int Evaluator::edge_penalty_term(const Board& board, int color) const {
@@ -229,23 +245,29 @@ int Evaluator::edge_penalty_term(const Board& board, int color) const {
         if (col <= 1 || col >= BOARD_SIZE - 2) ++closed;
         total += closed;
     }
-    return static_cast<int>(total * coeffs_.edge_penalty);
+    return static_cast<int>(total * pair_.for_color(color).edge_penalty);
 }
 
 int Evaluator::board_pair_value(const PositionPattern& my_pattern,
                                 const PositionPattern& opp_pattern, int row, int col,
-                                bool black_is_mine) const {
+                                int my_color) const {
     long long total = 0;
 
     // pattern_score pays out double_four / double_three / four_three, so a
     // shape BLACK can never legally play would bank points for a stone the
     // move generator refuses to place. Each side is judged on its own pattern:
     // the square may be forbidden for BLACK and a live four for WHITE.
-    if (!black_is_mine || !PatternRecognizer::is_forbidden_from_pattern(my_pattern)) {
-        total += pattern_score(my_pattern, row, col);
+    //
+    // 指导书 §4 丁-3 注意 1 指的「反对称唯一支点」就是这两行：两侧按**子的颜色**取系数
+    // （`my_color` 与 `opponent(my_color)`），不按「我方/对方」取同一套。于是
+    // eval(W) = S_W − S_B、eval(B) = S_B − S_W，恒等取负。换成按我方取，
+    // 帽与 `distance_to_stones` 就会在同一盘上给出不对称的两个数，负分不再是正分的镜像。
+    const int opp_color = opponent(my_color);
+    if (my_color != BLACK || !PatternRecognizer::is_forbidden_from_pattern(my_pattern)) {
+        total += pattern_score(my_pattern, row, col, my_color);
     }
-    if (black_is_mine || !PatternRecognizer::is_forbidden_from_pattern(opp_pattern)) {
-        total -= pattern_score(opp_pattern, row, col);
+    if (opp_color != BLACK || !PatternRecognizer::is_forbidden_from_pattern(opp_pattern)) {
+        total -= pattern_score(opp_pattern, row, col, opp_color);
     }
     return static_cast<int>(total);
 }
@@ -267,7 +289,13 @@ int Evaluator::evaluate_board_from(long long pattern_total, const Board& board,
     // mate threshold (100000) that AlphaBeta uses to detect forced wins and
     // terminate iterative deepening. Static evaluation must never reach a mate
     // score or the root will break early on what is really just a busy board.
-    long long cap = static_cast<long long>(coeffs_.five) - 1;
+    //
+    // 丁-3：帽必须**与颜色无关**，否则反对称在帽这个地方先破——两侧各自的 `five`
+    // 一旦不同，同一盘的 |eval| 上限就不同，`eval(W) == -eval(B)` 会在饱和处失守。
+    // 取两侧较小者，是让「谁都不得摸到将杀分」这句对两色同时成立。
+    const long long black_five = pair_.black.five;
+    const long long white_five = pair_.white.five;
+    const long long cap = (black_five < white_five ? black_five : white_five) - 1;
     if (diff > cap) diff = cap;
     if (diff < -cap) diff = -cap;
     return static_cast<int>(diff);
@@ -277,7 +305,6 @@ int Evaluator::evaluate_board(const Board& board, int my_color) const {
     long long my_total = 0;
 
     const auto& candidates = board.active_empty();
-    const bool black_is_mine = (my_color == BLACK);
 
     for (const auto& pos : candidates) {
         // One shared pass over the four directions yields both colours; two
@@ -286,7 +313,7 @@ int Evaluator::evaluate_board(const Board& board, int my_color) const {
         PatternRecognizer::recognize_position_both(board, pos.row, pos.col, my_color,
                                                   my_pattern, opp_pattern);
 
-        my_total += board_pair_value(my_pattern, opp_pattern, pos.row, pos.col, black_is_mine);
+        my_total += board_pair_value(my_pattern, opp_pattern, pos.row, pos.col, my_color);
     }
 
     return evaluate_board_from(my_total, board, my_color);
