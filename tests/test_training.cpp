@@ -6346,6 +6346,259 @@ void test_d3_ladder_band_moves_white_and_the_reader_refuses() {
     std::cout << "test_d3_ladder_band_moves_white_and_the_reader_refuses passed" << std::endl;
 }
 
+// 丁-6（v2 §3.2 S2）第一条：判据本身。指导书思路 2 写的是「双方胜率落在 [0.25,0.75]」，
+// 轮次160 实测那条点不着（同一座位的 K 局逐字相同 ⇒ 每色胜率只能是 0 或 1），所以按注意 2
+// 「换判据而不是放宽阈值」换成：**两局由不同座位赢 = 座位不决定结果 = 这一对能区分玩家**。
+// 这里不打对局，直接摆读数——判据是纯函数，摆出来才钉得住每一个分支。
+void test_d6_keeps_only_the_pairs_the_seat_does_not_decide() {
+    OpeningScreenReport report;
+    report.config.candidates = 5;
+    report.config.path = temp_path("d6_openings.json").string();
+
+    auto add = [&](int as_black, int as_white, int games) {
+        OpeningReading reading;
+        reading.line.push_back(Move(7, 7, BLACK));
+        reading.line.push_back(Move(7, 8, WHITE));
+        reading.line.push_back(Move(8, 7, BLACK));
+        reading.as_candidate_black = as_black;
+        reading.as_candidate_white = as_white;
+        reading.games = games;
+        reading.plies = 20;
+        reading.valid = games == 2 && as_black != 2 && as_white != 2 && as_black != 0 &&
+                        as_white != 0;
+        reading.seat_decided = !reading.discriminates();
+        reading.kept = reading.discriminates();
+        report.readings.push_back(reading);
+    };
+    add(1, -1, 2);   // 黑座位赢第一局、白座位赢第二局 ⇒ 玩家决定 ⇒ 留
+    add(-1, 1, 2);   // 同上，方向反过来 ⇒ 留
+    add(1, 1, 2);    // 黑座位通吃 ⇒ 这一对恒为 0.5 ⇒ 剔
+    add(-1, -1, 2);  // 白座位通吃 ⇒ 剔
+    add(0, 1, 2);    // 有一局未分胜负 ⇒ 不判、也不计进「筛前那一档」
+    add(2, 1, 0);    // 有一局作废 ⇒ 同上
+
+    assert(report.lines().size() == 2u);
+    assert(report.readings[0].discriminates() && report.readings[1].discriminates());
+    assert(!report.readings[2].discriminates() && !report.readings[3].discriminates());
+    assert(!report.readings[4].valid && !report.readings[5].valid);
+
+    // 落盘 → 读回：计数从读数重算，`reused` 标出「一份局都没跑」。
+    std::string error;
+    report.set_sha = "hand-built";   // save 只写不带校验的字段，load 要比的是调用方给的 sha
+    assert(OpeningScreen::save(report, error));
+    OpeningScreenReport back;
+    back.config = report.config;
+    assert(OpeningScreen::load(report.config.path, "hand-built", back, error));
+    assert(back.reused);
+    assert(back.readings.size() == 6u);
+    assert(back.kept == 2);
+    assert(back.swept_before == 2);   // 两条被座位通吃的；未分/作废的不算
+    assert(back.swept_after == 0);   // 留下的里面一个通吃都不该有（判据正确性的那一句）
+    assert(back.lines().size() == 2u);
+    assert(back.set_sha == "hand-built");
+
+    // sha 不匹配 = 系数或档位换了：旧集不作数，错误里两个键都要能看见。
+    OpeningScreenReport stale;
+    stale.config = report.config;
+    assert(!OpeningScreen::load(report.config.path, "other-key", stale, error));
+    assert(error.find("hand-built") != std::string::npos);
+    assert(error.find("other-key") != std::string::npos);
+    std::cout << "  [丁-6] kept " << back.kept << "/6 readings, seat-decided before "
+              << back.swept_before << ", after " << back.swept_after << std::endl;
+
+    std::filesystem::remove(report.config.path);
+    std::cout << "test_d6_keeps_only_the_pairs_the_seat_does_not_decide passed" << std::endl;
+}
+
+// 丁-6 第二条：`coeffs_sha` 是真的键。四半套系数（两个玩家 × 两侧）与档位四项，动任何
+// 一个都必须换键——否则 丁-4/丁-6 换过系数以后，旧筛选集会静默冒充新那一代的结果。
+void test_d6_the_screen_key_moves_with_either_player_and_with_the_regime() {
+    const CoefficientPair same;
+    OpeningScreenConfig cfg;
+    cfg.candidates = 8;
+    const std::string base = OpeningScreen::set_sha(same, same, cfg);
+    assert(base == OpeningScreen::set_sha(same, same, cfg));   // 稳定：同输入同键
+    // 键的开头确实是那四个指纹按顺序拼起来的（不是自己另起一套哈希），后面才是档位。
+    const std::string wanted_prefix = coefficients_fingerprint(same.black) + "-" +
+                                      coefficients_fingerprint(same.white) + "-" +
+                                      coefficients_fingerprint(same.black) + "-" +
+                                      coefficients_fingerprint(same.white);
+    assert(base.substr(0, wanted_prefix.size()) == wanted_prefix);
+    const std::string regime = base.substr(wanted_prefix.size());
+    assert(regime == "-s" + std::to_string(cfg.stones) + "d" + std::to_string(cfg.depth) + "n" +
+                     std::to_string(cfg.max_nodes) + "c" + std::to_string(cfg.candidates) + "k" +
+                     std::to_string(cfg.seed_stride));
+
+    CoefficientPair a_black_changed = same;
+    a_black_changed.black.rush_four = 900;
+    assert(OpeningScreen::set_sha(a_black_changed, same, cfg) != base);
+    CoefficientPair a_white_changed = same;
+    a_white_changed.white.position_weight_scale = 5;   // 丁-3 之后白侧也能单独不同
+    assert(OpeningScreen::set_sha(a_white_changed, same, cfg) != base);
+    CoefficientPair b_black_changed = same;
+    b_black_changed.black.live_three = 400;
+    assert(OpeningScreen::set_sha(same, b_black_changed, cfg) != base);
+    CoefficientPair b_white_changed = same;
+    b_white_changed.white.edge_penalty = 140;
+    assert(OpeningScreen::set_sha(same, b_white_changed, cfg) != base);
+
+    // 两侧同值的两套系数与「一套系数」是同一件事，但两个玩家互换不是：键里前四半是
+    // 候选、后四半是参照，反过来就是另一个键（筛选问的是「这一对」谁能分开）。
+    CoefficientPair shifted = same;
+    shifted.white.cand_width_root = 20;
+    assert(OpeningScreen::set_sha(shifted, same, cfg) != OpeningScreen::set_sha(same, shifted, cfg));
+
+    OpeningScreenConfig fewer = cfg;
+    fewer.candidates = 7;
+    assert(OpeningScreen::set_sha(same, same, fewer) != base);
+    OpeningScreenConfig deeper = cfg;
+    deeper.depth = 5;
+    assert(OpeningScreen::set_sha(same, same, deeper) != base);
+    OpeningScreenConfig wider = cfg;
+    wider.max_nodes = 2000;
+    assert(OpeningScreen::set_sha(same, same, wider) != base);
+    OpeningScreenConfig longer = cfg;
+    longer.stones = 4;
+    assert(OpeningScreen::set_sha(same, same, longer) != base);
+    OpeningScreenConfig other_seeds = cfg;
+    other_seeds.seed_stride = 2000;   // 换一批候选开局 = 换键，不能拿旧集的读数冒充
+    assert(OpeningScreen::set_sha(same, same, other_seeds) != base);
+
+    std::cout << "  [丁-6] key " << base << std::endl;
+    std::cout << "test_d6_the_screen_key_moves_with_either_player_and_with_the_regime passed"
+              << std::endl;
+}
+
+// 丁-6 第三条（旧行为不变）：缺省关着时，开局一处都不动。`match_opening_for` 在没有筛出
+// 可用集时必须逐字回到 `match_opening_line`——这条不是「大概一样」，是三档 × 16 个索引
+// 的逐手比对。
+void test_d6_a_closed_screen_leaves_the_fixed_rotation_byte_for_byte() {
+    TrainingConfig config;
+    assert(config.opening_screen_candidates == 0);   // 缺省 = 关
+    Trainer trainer(ThreatCoefficients(), config);
+
+    const int plies[] = {0, 2, 4};
+    for (const int p : plies) {
+        config.match_opening_plies = p;
+        Trainer scoped(ThreatCoefficients(), config);
+        for (int i = 0; i < 16; ++i) {
+            const std::vector<Move> today = scoped.match_opening_line(i, p);
+            const std::vector<Move> routed = scoped.match_opening_for(i);
+            assert(routed.size() == today.size());
+            for (size_t s = 0; s < today.size(); ++s) {
+                assert(routed[s].pos.row == today[s].pos.row &&
+                       routed[s].pos.col == today[s].pos.col && routed[s].color == today[s].color);
+            }
+        }
+    }
+    // 关着的时候既不落盘也不跑局：`openings_screen_done_` 翻起来了，集合仍是空的。
+    assert(trainer.screened_openings_.empty());
+    assert(trainer.games_played() == 0);
+    std::filesystem::path cache = std::filesystem::temp_directory_path() /
+                                  "gomoku_training_d6_openings.json";
+    std::error_code ec;
+    assert(!std::filesystem::exists(cache, ec));
+
+    // 反过来：筛出 ≥ `kMatchOpeningSet` 条之后，配对局真的从这套里取，而且取法是
+    // 「(轮次 + 对序) mod 池大小」——同一轮里候选与冠军必须拿到同一批局面，否则配对
+    // 就不是配对。这里直接把池子注入进去（`openings_screen_done_` 置真 = 这一代已经筛过），
+    // 量的是「用没用 + 怎么取」，不掺对局，也不会往 data/ 落盘。
+    TrainingConfig armed;
+    armed.match_opening_plies = 0;
+    armed.opening_screen_candidates = 0;
+    armed.openings_path = temp_path("d6_unused_cache.json").string();
+    Trainer with_pool(ThreatCoefficients(), armed);
+    with_pool.openings_screen_done_ = true;
+    for (int i = 0; i < 9; ++i) {
+        std::vector<Move> marker;
+        marker.push_back(Move(0, i, BLACK));
+        marker.push_back(Move(1, i, WHITE));
+        marker.push_back(Move(2, i, BLACK));
+        with_pool.screened_openings_.push_back(marker);
+    }
+    assert(Trainer::kMatchOpeningSet == 8);
+    for (int i = 0; i < 20; ++i) {
+        const std::vector<Move> picked = with_pool.match_opening_for(i);
+        assert(picked.size() == 3u);
+        assert(picked[0].pos.row == 0 && picked[0].pos.col == i % 9);   // 用的是池子，不是天元开局
+        assert(picked[1].color == WHITE && picked[2].color == BLACK);
+        // 同一索引两次取到同一条：配对的两局必须同一局面，否则颜色差又被算进读数里。
+        assert(with_pool.match_opening_for(i)[1].pos.col == picked[1].pos.col);
+    }
+    assert(with_pool.games_played() == 0);   // 注入的这一代一局都没跑
+    // 池子不够（< 8）时退回固定轮换：这一支是杀线后半段的出口，不能静默用半套。
+    Trainer short_pool(ThreatCoefficients(), armed);
+    short_pool.openings_screen_done_ = true;
+    for (int i = 0; i < 7; ++i) {
+        std::vector<Move> marker;
+        marker.push_back(Move(0, i, BLACK));
+        short_pool.screened_openings_.push_back(marker);
+    }
+    assert(short_pool.match_opening_for(3) == Trainer::match_opening_line(3, 0));
+
+    std::cout << "test_d6_a_closed_screen_leaves_the_fixed_rotation_byte_for_byte passed"
+              << std::endl;
+}
+
+// 丁-6 第四条（成本，也就是这一单元的杀线口径）：筛 N 条候选要付 2N 局，且同一代第二次
+// 用必须从盘上读回来、一局不跑。档取训练真用的那一档（depth 4、节点帽 1500/手、max_moves 60）——
+// 判定用节点帽，所以这四个读数是确定的（§9.2：搜索类断言的超时就是节点帽）。
+void test_d6_two_candidates_cost_four_games_and_the_second_use_reads_the_cache() {
+    OpeningScreenConfig cfg;
+    cfg.candidates = 2;
+    cfg.stones = 3;
+    cfg.depth = 4;
+    cfg.max_nodes = 1500;
+    cfg.max_moves = 60;
+    cfg.path = temp_path("d6_screen_cache.json").string();
+
+    CoefficientPair pair;
+    pair.white.rush_four = 300;   // 轮次160 实测「能动这一读的只有威胁阶梯」那一项
+    std::string error;
+    const OpeningScreenReport first = OpeningScreen::run(pair, CoefficientPair(), cfg, error);
+    assert(error.empty());
+    assert(first.reused == false);
+    assert(first.readings.size() == 2u);
+    assert(first.games_played == 4);           // 2 条候选 × 两局，一分不多
+    // 两条候选各是一个分支：第 0 条黑座位通吃（剔），第 1 条两座位各赢一局（留）。
+    assert(first.readings[0].as_candidate_black == 1 && first.readings[0].as_candidate_white == 1);
+    assert(first.readings[0].valid && !first.readings[0].kept);
+    assert(first.readings[1].as_candidate_black == 1 && first.readings[1].as_candidate_white == -1);
+    assert(first.readings[1].kept);
+    assert(first.kept == 1);
+    assert(first.swept_before == 1);
+    assert(first.swept_after == 0);            // 留下的里面没有一条还被座位决定
+    assert(first.lines().size() == 1u);
+    assert(first.lines()[0].size() == 3u);
+    std::cout << "  [丁-6] screen of 2: kept " << first.kept << " swept " << first.swept_before
+              << " games " << first.games_played << std::endl;
+
+    // 存下来再读：同一代不重筛（`games_played == 0` 就是「一局都没跑」的凭据）。
+    assert(OpeningScreen::save(first, error));
+    OpeningScreenReport again;
+    again.config = cfg;
+    assert(OpeningScreen::load(cfg.path, first.set_sha, again, error));
+    assert(again.reused);
+    assert(again.games_played == 0);
+    assert(again.readings.size() == 2u);
+    assert(again.kept == 1 && again.swept_before == 1 && again.swept_after == 0);
+    assert(again.set_sha == first.set_sha);
+    assert(again.lines().size() == 1u);
+
+    // 换一代系数（白侧 `rush_four` 改回去）→ 键变了 → 旧集必须拒绝，而不是被当成筛过。
+    OpeningScreenReport stale;
+    stale.config = cfg;
+    CoefficientPair moved;
+    const std::string moved_sha = OpeningScreen::set_sha(moved, CoefficientPair(), cfg);
+    assert(moved_sha != first.set_sha);
+    assert(!OpeningScreen::load(cfg.path, moved_sha, stale, error));
+    assert(error.find("was screened under") != std::string::npos);
+
+    std::filesystem::remove(cfg.path);
+    std::cout << "test_d6_two_candidates_cost_four_games_and_the_second_use_reads_the_cache passed"
+              << std::endl;
+}
+
 int main() {
     std::cout << "Running training tests..." << std::endl;
 
@@ -6475,6 +6728,11 @@ int main() {
     test_d3_flat_file_reads_as_shared_and_a_split_file_adds_one_object();
     test_d3_gene_vector_is_side_major_and_keeps_its_width();
     test_d3_ladder_band_moves_white_and_the_reader_refuses();
+    // 丁-6，按契约顺序：判据本身 → 键 → 关着时旧行为不变 → 成本与复用。
+    test_d6_keeps_only_the_pairs_the_seat_does_not_decide();
+    test_d6_the_screen_key_moves_with_either_player_and_with_the_regime();
+    test_d6_a_closed_screen_leaves_the_fixed_rotation_byte_for_byte();
+    test_d6_two_candidates_cost_four_games_and_the_second_use_reads_the_cache();
 
     std::cout << "All training tests passed" << std::endl;
     return 0;

@@ -220,8 +220,7 @@ MatchOutcome Trainer::score_match(const CoefficientPair& candidate,
         // Rotating the position by round and pair index is what stops every match
         // of a run from asking the same question about the same two stones
         // (design doc 2.8 #4).
-        const std::vector<Move> opening =
-            match_opening_line(rounds_completed_ + i, config_.match_opening_plies);
+        const std::vector<Move> opening = match_opening_for(rounds_completed_ + i);
         bool valid = false;
         const double first =
             play_game(candidate_engine, reference_engine, 1, opening, &valid, margin_weight);
@@ -765,6 +764,336 @@ bool Trainer::load_checkpoint(const std::string& path, std::string& error) {
     samples_collected_ = static_cast<size_t>(restored_samples);
     config_.seed = restored_seed;
     return true;
+}
+
+// `tactics_card.h:66` 的那个符号在这里重述一次声明，而不是往文件顶部加 `#include`：
+// 加一行 include 会把本文件被按行号指认的那几处（`measure_fitness` 41-57、`score_match`
+// 180-257、checkpoint 的 `versions[]` 626-629）整体推走。
+std::string coefficients_fingerprint(const ThreatCoefficients& coeffs);
+
+namespace {
+
+// 开局棋谱的 JSON 形状与题卡一致（`[[r,c,"black"], …]`）。没有共用 `tactics_card.cpp`
+// 里那对同名助手，是因为要把它们导出来就得在 `tactics_card.h` 里加声明，而那行的下面
+// 压着被按行号指认的 `coefficients_fingerprint`。
+const char* opening_color_name(int color) {
+    return color == BLACK ? "black" : (color == WHITE ? "white" : "none");
+}
+
+int opening_color_from_name(const std::string& name) {
+    if (name == "b" || name == "black") return BLACK;
+    if (name == "w" || name == "white") return WHITE;
+    return EMPTY;
+}
+
+// 一局：`candidate_is_black` 决定候选坐哪一侧，两侧各持自己那一套系数。返回值以**座位**计。
+int play_opening_screen_game(const std::vector<Move>& line, bool candidate_is_black,
+                             const CoefficientPair& candidate, const CoefficientPair& reference,
+                             const SelfPlayConfig& settings, int& plies) {
+    SearchEngine black(candidate_is_black ? candidate : reference);
+    SearchEngine white(candidate_is_black ? reference : candidate);
+    black.set_book_enabled(false);
+    white.set_book_enabled(false);
+    black.set_resign_detection(true);
+    white.set_resign_detection(true);
+    SelfPlay play(black, white, settings);
+    std::atomic<bool> stop(false);
+    const GameRecord rec = play.run(line, nullptr, &stop);
+    plies += static_cast<int>(rec.moves.size());
+    if (rec.reason == GameEndReason::INVALID) return 2;
+    if (rec.winner == BLACK) return 1;
+    if (rec.winner == WHITE) return -1;
+    return 0;
+}
+
+// 三个计数都从读数重算：跑出来的与读回来的走同一条口径。
+void recount_openings(OpeningScreenReport& report) {
+    report.swept_before = 0;
+    report.swept_after = 0;
+    report.kept = 0;
+    for (const OpeningReading& reading : report.readings) {
+        if (reading.valid && !reading.discriminates()) report.swept_before++;
+        if (reading.kept) {
+            report.kept++;
+            if (reading.seat_decided) report.swept_after++;
+        }
+    }
+}
+
+}  // namespace
+
+std::string OpeningScreen::set_sha(const CoefficientPair& candidate,
+                                   const CoefficientPair& reference,
+                                   const OpeningScreenConfig& config) {
+    return coefficients_fingerprint(candidate.black) + "-" +
+           coefficients_fingerprint(candidate.white) + "-" +
+           coefficients_fingerprint(reference.black) + "-" +
+           coefficients_fingerprint(reference.white) +
+           "-s" + std::to_string(config.stones) + "d" + std::to_string(config.depth) + "n" +
+           std::to_string(config.max_nodes) + "c" + std::to_string(config.candidates) + "k" +
+           std::to_string(config.seed_stride);
+}
+
+bool OpeningScreen::load(const std::string& path, const std::string& sha, OpeningScreenReport& out,
+                         std::string& error) {
+    std::ifstream file(path);
+    if (!file.is_open()) {
+        error = "cannot open " + path;
+        return false;
+    }
+    std::ostringstream buffer;
+    buffer << file.rdbuf();
+    json root;
+    try {
+        root = json::parse(buffer.str());
+    } catch (const json::exception& e) {
+        error = std::string("opening set is not valid JSON: ") + e.what();
+        return false;
+    }
+    if (!root.is_object() || !root.contains("set_sha") || !root["set_sha"].is_string()) {
+        error = "opening set has no set_sha";
+        return false;
+    }
+    const std::string stored = root["set_sha"].get<std::string>();
+    if (stored != sha) {
+        // 换系数或换档：旧筛选留下的是**另一对玩家**下有胜机的开局，留着比没有更糟。
+        error = "opening set was screened under " + stored + ", this pair needs " + sha;
+        return false;
+    }
+    if (!root.contains("readings") || !root["readings"].is_array()) {
+        error = "opening set has no readings";
+        return false;
+    }
+
+    OpeningScreenReport report;
+    report.config = out.config;   // 档位由调用方给，它也是 sha 的来源
+    report.set_sha = stored;
+    for (const json& item : root["readings"]) {
+        if (!item.is_object()) {
+            error = "opening reading is not an object";
+            return false;
+        }
+        OpeningReading reading;
+        if (!item.contains("line") || !item["line"].is_array()) {
+            error = "opening reading has no line";
+            return false;
+        }
+        for (const json& stone : item["line"]) {
+            if (!stone.is_array() || stone.size() < 3 || !stone[2].is_string()) {
+                error = "opening reading has an unreadable stone";
+                return false;
+            }
+            reading.line.push_back(Move(stone[0].get<int>(), stone[1].get<int>(),
+                                        opening_color_from_name(stone[2].get<std::string>())));
+        }
+        for (const char* key : {"as_candidate_black", "as_candidate_white", "plies", "games"}) {
+            if (!item.contains(key) || !item[key].is_number_integer()) {
+                error = std::string("opening reading is missing ") + key;
+                return false;
+            }
+        }
+        reading.as_candidate_black = item["as_candidate_black"].get<int>();
+        reading.as_candidate_white = item["as_candidate_white"].get<int>();
+        reading.plies = item["plies"].get<int>();
+        reading.games = item["games"].get<int>();
+        reading.valid = reading.games == 2 && reading.as_candidate_black != 2 &&
+                        reading.as_candidate_white != 2 && reading.as_candidate_black != 0 &&
+                        reading.as_candidate_white != 0;
+        reading.seat_decided = !reading.discriminates();
+        reading.kept = reading.discriminates();
+        report.readings.push_back(reading);
+    }
+    recount_openings(report);
+    report.reused = true;
+    out = report;
+    return true;
+}
+
+bool OpeningScreen::save(const OpeningScreenReport& report, std::string& error) {
+    json root;
+    root["schema"] = "openings/1";
+    root["set_sha"] = report.set_sha;
+    root["games_played"] = report.games_played;
+    root["swept_before"] = report.swept_before;
+    root["swept_after"] = report.swept_after;
+    root["kept"] = report.kept;
+    root["candidate_count"] = static_cast<int>(report.readings.size());
+    root["stones"] = report.config.stones;
+    root["depth"] = report.config.depth;
+    root["max_nodes"] = report.config.max_nodes;
+
+    json readings = json::array();
+    for (const OpeningReading& reading : report.readings) {
+        json stones = json::array();
+        for (const Move& stone : reading.line) {
+            stones.push_back(
+                json::array({stone.pos.row, stone.pos.col, opening_color_name(stone.color)}));
+        }
+        json item;
+        item["line"] = std::move(stones);
+        item["as_candidate_black"] = reading.as_candidate_black;
+        item["as_candidate_white"] = reading.as_candidate_white;
+        item["plies"] = reading.plies;
+        item["games"] = reading.games;
+        item["kept"] = reading.kept;
+        readings.push_back(std::move(item));
+    }
+    root["readings"] = std::move(readings);
+
+    // 与参数文件、checkpoint 同一个写法：先写临时文件再改名，半写的一份不会顶掉能用的那份。
+    const std::string tmp = report.config.path + ".tmp";
+    {
+        std::ofstream file(tmp, std::ios::trunc);
+        if (!file.is_open()) {
+            error = "cannot write " + tmp;
+            return false;
+        }
+        file << root.dump(2);
+        file.flush();
+        if (!file.good()) {
+            error = "failed while writing " + tmp;
+            std::error_code remove_ec;
+            std::filesystem::remove(tmp, remove_ec);
+            return false;
+        }
+    }
+    std::error_code ec;
+    std::filesystem::rename(tmp, report.config.path, ec);
+    if (ec) {
+        std::error_code remove_ec;
+        std::filesystem::remove(tmp, remove_ec);
+        error = "cannot replace " + report.config.path + ": " + ec.message();
+        return false;
+    }
+    return true;
+}
+
+OpeningScreenReport OpeningScreen::run(const CoefficientPair& candidate,
+                                       const CoefficientPair& reference,
+                                       const OpeningScreenConfig& config, std::string& error) {
+    OpeningScreenReport report;
+    report.config = config;
+    report.set_sha = set_sha(candidate, reference, config);
+    if (config.candidates <= 0) return report;
+
+    SelfPlayConfig settings;
+    settings.max_depth = config.depth;
+    // 时限只防死循环：判定用节点帽，这样一条开局在空机与满载机上给出同一个答案（§9.2）。
+    settings.timeout_ms = 60000;
+    settings.max_nodes = config.max_nodes;
+    settings.max_moves = config.max_moves;
+
+    for (int i = 0; i < config.candidates; ++i) {
+        OpeningReading reading;
+        reading.line = Trainer::random_opening_line(config.stones,
+                                                    static_cast<uint64_t>(config.seed_stride) + i);
+        if (static_cast<int>(reading.line.size()) < config.stones) continue;
+        Board prefix;
+        bool placeable = true;
+        for (const Move& stone : reading.line) {
+            if (!prefix.place_stone(stone.pos.row, stone.pos.col, stone.color)) placeable = false;
+        }
+        if (!placeable) continue;
+
+        reading.as_candidate_black =
+            play_opening_screen_game(reading.line, true, candidate, reference, settings,
+                                     reading.plies);
+        reading.as_candidate_white =
+            play_opening_screen_game(reading.line, false, candidate, reference, settings,
+                                     reading.plies);
+        reading.games = (reading.as_candidate_black == 2 || reading.as_candidate_white == 2) ? 0 : 2;
+        report.games_played += reading.games;
+        reading.valid = reading.games == 2 && reading.as_candidate_black != 0 &&
+                        reading.as_candidate_white != 0;
+        reading.seat_decided = !reading.discriminates();
+        reading.kept = reading.discriminates();
+        report.readings.push_back(reading);
+    }
+    recount_openings(report);
+    (void)error;
+    return report;
+}
+
+std::vector<std::vector<Move>> OpeningScreenReport::lines() const {
+    std::vector<std::vector<Move>> kept_lines;
+    for (const OpeningReading& reading : readings) {
+        if (reading.kept) kept_lines.push_back(reading.line);
+    }
+    return kept_lines;
+}
+
+std::string OpeningScreen::summarize(const OpeningScreenReport& report) {
+    const int judged = report.swept_before + report.kept;
+    std::ostringstream out;
+    out << "opening screen: kept " << report.kept << " of " << report.readings.size()
+        << " candidates (" << judged << " judged, "
+        << (judged ? 100.0 * report.swept_before / judged : 0.0)
+        << "% seat-decided before, " << report.swept_after << " after; " << report.games_played
+        << " games, sha " << report.set_sha
+        << (report.reused ? " (reused from disk)" : " (screened now)");
+    return out.str();
+}
+
+std::vector<Move> Trainer::match_opening_for(int index) {
+    ensure_openings_screened();
+    const int pool = static_cast<int>(screened_openings_.size());
+    if (pool >= kMatchOpeningSet) {
+        // 与固定轮换同一个取法：按 (轮次 + 对序) 取模，同一轮里候选与冠军拿到同一批局面。
+        const int wrapped = ((index % pool) + pool) % pool;
+        return screened_openings_[static_cast<size_t>(wrapped)];
+    }
+    return match_opening_line(index, config_.match_opening_plies);
+}
+
+void Trainer::ensure_openings_screened() {
+    if (openings_screen_done_) return;
+    openings_screen_done_ = true;
+    if (config_.opening_screen_candidates <= 0 || fitness_override_) return;
+
+    // 「这两个玩家」取的是**本轮的起点系数 vs 当前冠军**：这是一整轮里唯一固定的那对，
+    // 也是适配度赛真正要比的那对——候选是谁并不影响「这条开局能不能把两个不同的
+    // 系数集分开」。两侧同值（v0 就是冠军，比如没换参数的续训）时这条判据只会留下
+    // 0 条，下面的门槛会把这一代退回固定轮换，不会拿一个空集去训。
+    OpeningScreenConfig screen;
+    screen.candidates = config_.opening_screen_candidates;
+    screen.path = config_.openings_path;
+    screen.depth = config_.search_depth;
+    screen.max_nodes = config_.max_nodes > 0 ? config_.max_nodes : screen.max_nodes;
+    screen.max_moves = config_.max_moves;
+
+    const CoefficientPair base = versions_.empty() ? champion() : versions_[0];
+    const CoefficientPair reference = champion();
+    const std::string sha = OpeningScreen::set_sha(base, reference, screen);
+
+    OpeningScreenReport report;
+    std::string error;
+    report.config = screen;
+    if (OpeningScreen::load(config_.openings_path, sha, report, error)) {
+        if (log_) log_(OpeningScreen::summarize(report));
+    } else {
+        // 「盘上没有」与「盘上那份是别的系数筛的」都不是故障，重筛就是了；
+        // 只有后者值得让读日志的人看见（它说明键真的在管换代）。
+        if (log_ && error.find("cannot open") == std::string::npos) {
+            log_("opening set on disk not reusable: " + error);
+        }
+        error.clear();
+        report = OpeningScreen::run(base, reference, screen, error);
+        if (!error.empty() && log_) log_("opening screen failed: " + error);
+        if (!report.readings.empty()) {
+            std::string save_error;
+            if (!OpeningScreen::save(report, save_error) && log_) {
+                log_("opening set not saved: " + save_error);
+            }
+        }
+        if (log_) log_(OpeningScreen::summarize(report));
+    }
+    screened_openings_ = report.lines();
+    if (static_cast<int>(screened_openings_.size()) < kMatchOpeningSet && log_) {
+        log_("opening screen kept " + std::to_string(screened_openings_.size()) +
+             " < " + std::to_string(kMatchOpeningSet) +
+             ": 筛不出可用的集，本轮起退回固定 8 条轮换（指导书 §4 丁-6 杀线的后半段）");
+        screened_openings_.clear();
+    }
 }
 
 }

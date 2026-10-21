@@ -51,6 +51,14 @@ void print_usage(const char* program) {
         "                              0 turns it off and must exceed --depth otherwise (0)\n"
         "  --teacher-max-nodes N      The teacher's per-move node ceiling, same yardstick as\n"
         "                              --max-nodes; 0 lets the ms budget set it (0)\n"
+        "  --screen-openings N         丁-6: before the first match, play each of N candidate\n"
+        "                              openings once in each colour and keep only those whose\n"
+        "                              two games split by colour - a pair that the seat decides\n"
+        "                              scores exactly 0.5 whoever is stronger. 0 screens\n"
+        "                              nothing and keeps today's fixed 8-opening rotation (0)\n"
+        "  --openings-path P           Where that screened set is cached; it is reused only\n"
+        "                              while both players' coefficients and the regime match\n"
+        "                              (data/training/openings.json)\n"
         "  --verification-games N      Ceiling on the games a candidate must beat the\n"
         "                              champion over before promotion (8)\n"
         "  --accept-score X            Promotion threshold, >0.5 and <=1.0 (0.56)\n"
@@ -270,6 +278,11 @@ int main(int argc, char** argv) {
                 // 丁-1：适配度里连续分量的权重。默认 0 = 今天；它只改优化器看到的那个数，
                 // 验证赛的 SPRT 序列不动。
                 config.fitness_margin_weight = require_double("--fitness-margin-weight", i, argc, argv);
+            } else if (flag == "--screen-openings") {
+                // 0 = 关（缺省）。负数是「一次都不要跑」的意思都没有，拒掉。
+                config.opening_screen_candidates = require_int("--screen-openings", i, argc, argv, 0);
+            } else if (flag == "--openings-path") {
+                config.openings_path = require_value("--openings-path", i, argc, argv);
             } else if (flag == "--teacher-depth") {
                 // 丁-2：深搜蒸馏的老师深度，0 = 关（缺省）。只进数据采集的对局。
                 config.teacher_depth = require_int("--teacher-depth", i, argc, argv, 0);
@@ -339,6 +352,15 @@ int main(int argc, char** argv) {
     }
     if (config.teacher_depth < 0 || config.teacher_max_nodes < 0) {
         std::cerr << "Error: --teacher-depth and --teacher-max-nodes cannot be negative"
+                  << std::endl;
+        return 1;
+    }
+    // 丁-6 的杀线是「筛选成本 > 省下的训练局数」。一条候选两局，N 条就是 2N 局，
+    // 所以这一项的上限不是审美问题：200 条 = 400 局，比一整轮（population × fitness_games
+    // + 验证赛）还贵一个数量级，而留下的开局只要够 8 条就能用一整代。
+    if (config.opening_screen_candidates < 0 || config.opening_screen_candidates > 200) {
+        std::cerr << "Error: --screen-openings must be in [0, 200] (2 games per candidate;"
+                      " the screen's own kill line is spending more than it saves)"
                   << std::endl;
         return 1;
     }
