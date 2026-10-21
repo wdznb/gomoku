@@ -22,6 +22,15 @@
 // `--only A|B|C|D` 单独补一臂）：
 //   cmake --build build --target opening_rule_screen -j4
 //   ./build/opening_rule_screen --openings 48 --weak-openings 24
+//
+// 丁-6（S2 开局筛选）另用两类读数，同一台仪器：
+//   `--repeat R`  同一局面对同一座位连下 R 局，报「结果是否每次都相同」。这一条量的是
+//                 **筛选判据能不能成立**：指导书 §4 丁-6 思路 2 的判据是「双方胜率都落在
+//                 [0.25, 0.75]」，而引擎是确定性的——同一局面、同一座位的 K 局若逐字相同，
+//                 那 K 局的胜率只能是 0 或 1，那条判据永远点不着。先量这个，再谈换判据。
+//   `--params-b P` 第二个玩家改为从参数文件读（默认那套 vs `data/training/best_params.json`
+//                 = 树里现成的真实候选/冠军对），并汇总「非座位通吃」的开局数 = 按「换判据
+//                 后」的口径能留下的开局数。
 #include "core/evaluator.h"
 #include "core/pattern.h"
 #include "search/search_engine.h"
@@ -46,7 +55,9 @@ struct Args {
     int nodes = 1500;
     int depth = 4;
     int max_moves = 60;
-    std::string only = "all";   // A|B|C|D 或 all
+    int repeat = 1;
+    std::string only = "all";
+    std::string params_b;   // 第二个玩家的系数来自参数文件（真实对）
 };
 
 int need(int& i, int argc, char** argv) {
@@ -68,6 +79,8 @@ Args parse(int argc, char** argv) {
         else if (f == "--depth") a.depth = need(i, argc, argv);
         else if (f == "--moves") a.max_moves = need(i, argc, argv);
         else if (f == "--only") a.only = argv[++i];
+        else if (f == "--params-b") a.params_b = argv[++i];
+        else if (f == "--repeat") a.repeat = need(i, argc, argv);
         else {
             std::fprintf(stderr, "未知参数 %s\n", f.c_str());
             std::exit(2);
@@ -169,6 +182,62 @@ bool wanted(const Args& a, char tag) {
     return a.only == "all" || (a.only.size() == 1 && a.only[0] == tag);
 }
 
+// 一个前缀在两局里各自被重复 R 次：确定性引擎下同一座位的 R 局必须逐字相同，
+// 这条量的是「同一局面同座位的 K 局能不能凑出 0.25~0.75 之间的胜率」——若 R 局全同，
+// 每色的 K 局胜率只能是 0 或 1，指导书 §4 丁-6 思路 2 那条判据就永远点不着。
+void run_determinism(const Args& a, const CoefficientPair& cand, const CoefficientPair& ref,
+                     const SelfPlayConfig& settings) {
+    std::printf("=== determinism: openings=%d repeat=%d\n", a.openings, a.repeat);
+    int repeats = 0, identical = 0, differing = 0;
+    for (int i = 0; i < a.openings; ++i) {
+        const std::vector<Move> opening = Trainer::random_opening_line(a.stones, 1000 + i);
+        if (static_cast<int>(opening.size()) < a.stones) continue;
+        Board prefix;
+        bool ok = true;
+        for (const Move& m : opening) {
+            if (!prefix.place_stone(m.pos.row, m.pos.col, m.color)) ok = false;
+        }
+        if (!ok) continue;
+        for (int g = 0; g < 2; ++g) {
+            std::vector<std::string> signatures;
+            for (int r = 0; r < a.repeat; ++r) {
+                SearchEngine black(g == 0 ? cand : ref);
+                SearchEngine white(g == 0 ? ref : cand);
+                black.set_book_enabled(false);
+                white.set_book_enabled(false);
+                SelfPlay play(black, white, settings);
+                std::atomic<bool> stop(false);
+                const GameRecord rec = play.run(opening, nullptr, &stop);
+                std::string sig = std::to_string(static_cast<int>(rec.winner)) + "/"
+                                + std::to_string(rec.moves.size());
+                for (const MoveRecord& mr : rec.moves) {
+                    sig += " " + std::to_string(mr.move.pos.row) + ","
+                         + std::to_string(mr.move.pos.col);
+                }
+                signatures.push_back(std::move(sig));
+                ++repeats;
+            }
+            bool same = true;
+            for (size_t s = 1; s < signatures.size(); ++s) {
+                if (signatures[s] != signatures[0]) same = false;
+            }
+            if (same) ++identical;
+            else {
+                ++differing;
+                std::printf("%d seat%d DIFFERS: %s | %s\n", i, g, signatures[0].c_str(),
+                            signatures[1].c_str());
+            }
+        }
+        std::printf("# 开局 %d: 两座位各 %d 次重复，逐字相同的座位组数累计 %d/%d\n", i, a.repeat,
+                    identical, repeats / 2);
+        std::fflush(stdout);
+    }
+    std::printf("# determinism: 重复局数=%d 同座位组全部相同=%d 出现不同=%d ⇒ 同座位的 K 局"
+                "给出的是同一个数，每色胜率只能取 0 或 1\n",
+                repeats, identical, differing);
+    std::fflush(stdout);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -184,11 +253,28 @@ int main(int argc, char** argv) {
     settings.max_nodes = a.nodes;
     settings.max_moves = a.max_moves;
 
-    Counters c_a, c_b, c_c, c_d;
+    Counters c_a, c_b, c_c, c_d, c_e;
     if (wanted(a, 'A')) run_arm('A', a, a.openings, false, false, cand, cand, settings, c_a);
     if (wanted(a, 'B')) run_arm('B', a, a.openings, true, false, cand, cand, settings, c_b);
     if (wanted(a, 'C')) run_arm('C', a, a.weak_openings, false, true, cand, ref, settings, c_c);
     if (wanted(a, 'D')) run_arm('D', a, a.weak_openings, true, true, cand, ref, settings, c_d);
+    // E 臂：把「合成弱侧」换成树里现成的**真实**一对（缺省系数 vs `--params-b` 读来的
+    // 那套）。丁-6 的筛集判据要在这对上量才有意义。
+    if (wanted(a, 'E')) {
+        if (a.params_b.empty()) {
+            std::printf("=== arm E skipped: 需要 --params-b <文件>\n");
+        } else {
+            CoefficientPair loaded;
+            std::string error;
+            if (!CoefficientVector::load(a.params_b, loaded, error)) {
+                std::fprintf(stderr, "--params-b 读不进来: %s\n", error.c_str());
+                return 2;
+            }
+            std::printf("=== arm E 用的第二套系数来自 %s\n", a.params_b.c_str());
+            run_arm('E', a, a.weak_openings, false, false, cand, loaded, settings, c_e);
+        }
+    }
+    if (a.repeat > 1) run_determinism(a, cand, cand, settings);
     std::printf("# 杀线口径：座位通吃 > 60 %% → 这些开局本身就是必胜局，换规则不解决问题 → 转 S2\n");
     std::printf("# 反向证据口径：玩家通吃降而座位通吃升 = 局分被钉到 0.5，判别力反而更差\n");
     return 0;

@@ -1980,6 +1980,56 @@ additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cp
 no existing assertion was edited.
 
 
+## 轮次161 引擎重构 丁-6 第一段：把 S2 的判据与成本先量出来——同一座位的重复局 32/32 逐字相同（所以「双方胜率落在 [0.25, 0.75]」那条判据点不着），真实一对的 48 条三面开局是 38 被座位钉死 / 9 留下（18.8 %），事前筛因此要 96 局 > 一轮训练的 ~28 局 ⇒ 机制按用户裁决改成**事后退役**，本轮交仪器的两只新臂与读数 — engine redesign stage 丁-6 part 1: measure S2's criterion and cost first — repeated games for the same seat are 32/32 byte-identical (so the "[0.25, 0.75] win-rate band" criterion can never fire), a real coefficient pair leaves 38/48 openings seat-decided and 9 kept (18.8 %), which prices the pre-screen at 96 games against a round's ~28, so the mechanism was redirected to post-hoc retirement by the user and this round delivers the instrument's two new arms plus the readings
+
+`tools/opening_rule_screen.cpp` 本轮长出来两只新臂，都是为丁-6 服务的：
+
+1. **`--repeat R`：判据能不能成立**。8 条开局 × 两座位 × 2 次重复 = 32 局，
+   **同座位的重复局逐字相同（出现不同 = 0）**。引擎是确定性的，所以同一局面同一座位跑 K 局
+   给出的是同一个数——指导书 §4 丁-6 思路 2 那句「双方胜率都落在 [0.25, 0.75]」在这种样本上
+   **永远点不着**（胜率只能取 0 或 1）。这不是阈值松紧的问题，是判据的形状不对，
+   而本单元注意 2 自己写了口径：「筛选判据选错时，**换判据而不是放宽阈值**」。
+   提交前用同一份文件复跑一遍（`./build/opening_rule_screen --openings 8 --only Z --repeat 2`，
+   `--only Z` 那个不存在的标签是把五臂全跳过的写法）：**重复局数 = 32、出现不同 = 0、
+   同座位组全部相同 = 16/16**，与上面那条读数同形。
+2. **`--params-b P` + E 臂：真实一对下的起跑线**。文档指定的仪器是「同一套系数下」，那正是
+   轮次160 的 A 臂（47/48 被座位决定）。E 臂换成树里现成的真实一对——缺省系数 vs
+   `data/training/best_params.json`（两者只差 `cand_width_root` 24 / 15）——48 条三面开局
+   实测 **38 对被座位钉死（79.2 %）、9 条留下（18.8 %）、1 对含未分胜负**，成本 96 局。
+   同一批开局在 24 条上是 19/5，比例一致，说明这个留下率不是抽样噪声。
+3. **判据换完之后长什么样**（写实现前定死，免得又建一台量不到东西的仪器）：一条开局被观察满
+   `min_pairs` 对，其中每对都是「同一座位赢下两局」⇒ 退役；含未分胜负的对不算证据。
+   观察的来源是**本来就要跑的适配度赛**，所以新增成本为 0 局——这正是这一单元杀线的后半句
+   （「筛选成本 > 省下的训练局数 → 降 K 并复用落盘；两者都救不回来 → 作废」）的第三条出路：
+   不是降 K，也不是作废，而是**不再事前跑**。
+
+**这一轮的另一条读数（写实现之前就该知道的成本）**：事前筛若按文档原样落地，可用的筛出率
+需要 48 条候选 = 96 局，而一轮训练的总成本是 population 8 × fitness 2 + 验证赛 8 ≈ 28 局，
+且键含冠军系数 ⇒ **每次晋升重付 96 局**。杀线在数值上被击中，用户据此裁决改走事后退役。
+
+**结构缺陷（本轮修的，缺陷本身是这四轮一起造出来的）**：每次把新小节「插在上一节之上」的那次编辑，
+`old_string` 收在上一节的标题行上、`new_string` 又没有把它原样放回，于是**每写一轮就吃掉上一轮的标题**——
+正文与内容一字未损，只是从 `## 轮次NNN` 变成一段无主正文。逐提交查下来：`f6084ef`（轮次158）吃掉 157、
+`c185a48`（159）吃掉 158、`4d19abc`（160）吃掉 159，本轮 161 的那次编辑差一点吃掉 160（当场补回）。
+本轮从各提交里取回标题原文补在各自正文之前（`git show <commit>:REVIEW_LOG.md | grep '^## 轮次NNN'`），
+现在 161/160/159/158/157/156 连续。以后每次插入之后跑这条检，它比读一遍便宜：
+`grep -oP '^## 轮次\K[0-9]+' REVIEW_LOG.md | awk 'NR>1 && prev-$1>1 {print prev"->"$1} {prev=$1}'`，
+没有输出才算干净（`121->119` 是**既有**形状：轮次121 有十五个小节共用同一个轮次号，不是丢东西）。
+
+**留待下一轮**：`src/training/` 里那版事前筛（基线提交 `af0b6e0`，四套用例全绿 +
+端到端一次：`opening screen: kept 0 of 4 candidates (4 judged, 100% seat-decided before…)`、
+`kept 0 < 8: 退回固定 8 条轮换`）改造成账本式事后退役：删掉打局的那条 `run`，加 `record`，
+键只挂在**本轮起点系数**上（冠军换代不该把已经花掉的对局证据清空），轮转改从未退役的开局里取，
+四条用例相应改写。**本轮的 diff 不动 `src/`**，但那份基线 `af0b6e0` 与本轮一起推送，为的是「基线长什么样」在远程里也查得到。
+
+**门禁**：本轮 diff 只改 `tools/` 与文档，但推送出去的树里含 `af0b6e0` 那份 `src/` 基线
+⇒ 按 §2「`src/` 动了就走全量」跑九套件而不是七套件：`ctest` **9/9 全绿（848.77 s；test_search
+478.78 s、test_pinned 243.63 s、test_training 103.90 s，其余 ≤ 9.11 s）**、`readme_anchor_check`
+122/0、`web_frontend_check` 111/111。`opening_rule_screen` 用 `-- -B` 强制重编（26 个 TU），除既有的
+`data_collector.cpp:95` unused parameter 之外无新 warning——缺省那一次 `cmake --build` 报的是
+`recompiles=0`（工作树与 `build/` 本来就同步），所以那句 `warnings=0` 是空读数、不引。
+仪器读数全部来自 `./build/opening_rule_screen` 的真实运行，复现命令写在工具头部注释里。
+
 ## 轮次160 引擎重构 丁-5：开局规则的验收仪器进了树（`tools/opening_rule_screen.cpp`），跑完四个臂之后这一单元的杀线自己命中——`swap` 下座位通吃仍是 **47/48 = 97.9 %**（阈值 60 %），而且与不动交换的对照臂**逐字相同**；原因是结构性的：交换判决只是局面的函数，而训练赛的换色对本来就把同一局面在两色各下一遍 ⇒ 机制一行未写，转 S2（丁-6） — engine redesign stage 丁-5: the S1 acceptance instrument is committed as a tool target and, once run, the unit's own kill line fires — under `swap` the seat-sweep rate is 47/48 = 97.9 % against the 60 % bar and bit-identical to the no-swap control, because the swap decision is a pure function of the position while the training pair already plays that position in both colours; no mechanism was written and the gap was handed to S2
 
 两条歧义先由用户裁决（本轮因此只交仪器与读数，不交机制）：`swap` 按时序按**标准 swap2**
@@ -2045,7 +2095,7 @@ A 与 B、C 与 D 的四个关键数**一字不差**。这不是巧合，是这�
 `./build/opening_rule_screen --openings 48 --weak-openings 24`（约 25 分钟 / 288 局；
 `--only A|B|C|D` 可单独补一臂）。
 
-
+## 轮次159 引擎重构 丁-4：平衡控制器在写第一行代码之前判**不落地**——它要动的四个旋钮把白侧中心权重抹到 0 或抬到 20（±100 %／+150 %，是 5 步封顶的 10~30 倍）、把候选宽度砍到 2，按色读数一字不动（0/16 → 0/16），而能翻转这读数的只有威胁阶梯（白侧 `rush_four` 1000 → 300 把 16 局全白胜变成 16 局全黑胜），那正是丁-3 与丁-4 两处都不许动的 — engine redesign stage 丁-4: the balance controller is judged 不落地 before any code was written, because every knob it is allowed to move leaves the per-colour reading bit-identical even at 10-30x its own step size, while the only lever that flips it is the threat ladder, which 丁-3 and 丁-4 both forbid
 
 指导书 §4 丁-4 的验收自己写了出口：「三步内按色胜率差必须缩小；**否则回对称系数并作废**」。
 本轮量的就是「缩小」这件事有没有杠杆，量完发现没有——于是代码一行没写，`src/` 与 `tests/`
@@ -2112,7 +2162,7 @@ A 与 B、C 与 D 的四个关键数**一字不差**。这不是巧合，是这�
 门禁：本轮 `src/` 与 `tests/` 一字未动，按 §2 那条「只改文档与工具可以跳过全量 ctest」——
 交的是 anchor 与 web 两道 + `git status` 干净证明（HEAD 仍是丁-3 的 `f6084ef`）。
 
-
+## 轮次158 引擎重构 丁-3：S6 的系数第一次有两个主人——`Evaluator` 改持 `CoefficientPair`、按摆子的那一色取系数；两侧同值时整棵树逐字节是改之前的形状（`test_pinned` 六臂的 221,774 / 156,428 / 300,347 / 175,088 / 1,408,083 / 2,378,724 一字未动），两侧分开时 `eval(W) == -eval(B)` 在 9,450 组探盘上逐组成立 — engine redesign stage 丁-3: the evaluator holds a per-colour CoefficientPair and prices every shape by the colour that plays it; with equal sides the whole tree is byte-identical (all six pinned node counts unchanged), with split sides antisymmetry still holds on every one of the 9,450 census probes
 
 指导书 §4 丁-3 的验收写的是三条（等价臂逐字节、`eval(W) == -eval(B)` 在 42 副 × 225 格、旧文件
 读成两侧同值），注意写的是六条，实现思路五条。全部照做，只有两处按现场事实改口径，都记在下面。
@@ -2202,7 +2252,7 @@ valgrind memcheck 直跑 `test_evaluator`（63,756 allocs 全回收）与 `test_
 `CMakeLists.txt:331/336` 那两行的实测注释按新读数改了（test_evaluator 5 s、test_training 41 s，原来的
 「13 s / 166 s」是丁-3 之前）。
 
-
+## 轮次157 引擎重构 丁-2：S4 深搜蒸馏落地——每一手在学生落子之前由独立引擎、独立置换表的老师再想一次，战术层的 ply 第一次进得了样本（456 → 672 条，+47 %），关着的时候逐字节是 S4 之前的形状 — engine redesign stage 丁-2: a deeper teacher thinks before each data-game ply with its own transposition table; samples cover the tactical plies for the first time (456 → 672) and the default-off path writes byte-identical records
 
 指导书 §4 丁-2 要「每手棋由当时的引擎和一个更贵的老师各给一个答案，两者分开记」，四条实现要点
 （独立 TT、落子前搜、深度显式记、顺手修 `RetryExplorer::reset()`）与三条验收（出现
