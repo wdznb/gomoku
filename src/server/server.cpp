@@ -12,7 +12,7 @@
 #include <atomic>
 #include <map>
 #include <random>
-
+#include "param_schema.h"  // 戊-2：参数清册就是这一份表（占掉原来那行空行，为了不把下面被按行号指认的那些行推走）
 namespace gomoku {
 
 namespace {
@@ -712,7 +712,7 @@ void GameServer::handle_message(std::shared_ptr<WebSocketSession> session, const
         handle_resume(session, msg);
         return;
     }
-    if (type != "ping" && type != "check_position") {
+    if (type != "ping" && type != "check_position" && type != "config_schema") {
         // Every game message is played in a session: the socket's own if it
         // already has one, a new one otherwise. `ping` is excluded because a
         // keepalive is not a player, and `resume` because it brings its own.
@@ -746,6 +746,7 @@ void GameServer::handle_message(std::shared_ptr<WebSocketSession> session, const
         handle_analyze_request(session, msg);
     } else if (type == "set_config") {
         handle_set_config(session, msg);
+    } else if (type == "config_schema" || type == "config_set" || type == "config_preview") { handle_config_frame(session, msg);
     } else if (type == "ping") {
         // Keepalive. Receiving anything already slid the session's idle deadline
         // forward, so the reply exists only to let the client tell a live socket
@@ -1835,10 +1836,10 @@ void GameServer::handle_analyze_request(std::shared_ptr<WebSocketSession> sessio
     // 取到的是同一套。
     request.coeffs = use_loaded_coefficients_ ? coefficients_.black : ThreatCoefficients{};
     request.coeffs_sha = coefficients_fingerprint(request.coeffs);
-    request.review.max_depth = clamp_analyze_depth(get_int_or(msg, "depth", kAnalyzeDefaultDepth));
-    request.review.budget = clamp_analyze_budget(get_int_or(msg, "budget", kAnalyzeDefaultBudget));
+    request.review.max_depth = clamp_analyze_depth(get_int_or(msg, "depth", analyze_depth_default_));
+    request.review.budget = clamp_analyze_budget(get_int_or(msg, "budget", analyze_budget_default_));
     request.max_candidates =
-        clamp_analyze_candidates(get_int_or(msg, "max_candidates", kAnalyzeDefaultCandidates));
+        clamp_analyze_candidates(get_int_or(msg, "max_candidates", analyze_candidates_default_));
 
     entry->analyze_stop->store(false);
     entry->analyzing = true;
@@ -1962,3 +1963,202 @@ void GameServer::stop_analyze(TrackedGame& entry) {
 }
 
 }
+
+#include "preview_arms.h"  // 针臂的定义在本文件末尾（戊-2）
+namespace gomoku {
+// 戊-2（v2 §4.5.2、§5；指导书 §4 戊-2 思路 2）：`config_schema` / `config_set` /
+// `config_preview` 三条帧都从这一条函数进。分派写在 handle_message 的那一行里而不是另起分支，
+// 是因为 `server.cpp` 里 :939-942 与 :1626-1634 两处被 test_server 按行号指认——多一行就会
+// 把它们推走（本轮的行号指针见 REVIEW_LOG 对应轮次）。
+
+// 预览的固定针臂：quiet / scattered 各跑两侧，pos24 再跑一次黑方，一共 5 臂。
+// 三副盘面都刻意选「没有一手是逼出来的」那种：只有这样才能量出深度/节点预算改变的是什么，
+// 而不是让一个杀棋把三条臂的答案压成同一个数。
+//
+// pos24 这一副与 `tests/pinned_positions.h` 的 `pinned_pos24()` 是同一摆法。两份定义不能各说各话，
+// 所以 test_server 里有一条臂逐子比对二者（生产码不引测试头，那等于把压测夹具链进服务端）。
+const std::vector<std::pair<Board, int>>& preview_arms() {
+    static const std::vector<std::pair<Board, int>> arms = [] {
+        const int quiet[][3] = {{7, 7, BLACK}, {7, 8, WHITE}, {8, 8, BLACK},
+                                {6, 6, WHITE}, {8, 6, BLACK}, {6, 8, WHITE}};
+        const int scattered[][3] = {{3, 3, BLACK}, {11, 4, WHITE}, {4, 10, BLACK}, {13, 12, WHITE},
+                                    {7, 2, BLACK}, {2, 12, WHITE}, {12, 7, BLACK}, {8, 9, WHITE}};
+        const int pos24[][3] = {
+            {9, 11, BLACK}, {0, 14, WHITE}, {10, 2, BLACK}, {6, 6, WHITE},
+            {10, 4, BLACK}, {9, 2, WHITE},  {4, 2, BLACK},  {5, 3, WHITE},
+            {2, 3, BLACK},  {10, 1, WHITE}, {12, 12, BLACK}, {2, 6, WHITE},
+            {1, 8, BLACK},  {14, 8, WHITE}, {4, 1, BLACK},  {13, 4, WHITE},
+            {1, 14, BLACK}, {8, 11, WHITE}, {10, 10, BLACK}, {8, 7, WHITE},
+            {12, 1, BLACK}, {11, 6, WHITE}, {5, 2, BLACK},   {0, 7, WHITE},
+        };
+        auto build = [](const int stones[][3], size_t count) {
+            Board board;
+            for (size_t i = 0; i < count; ++i) {
+                board.place_stone(stones[i][0], stones[i][1], stones[i][2]);
+            }
+            return board;
+        };
+        const Board quiet_board = build(quiet, sizeof(quiet) / sizeof(quiet[0]));
+        const Board scattered_board = build(scattered, sizeof(scattered) / sizeof(scattered[0]));
+        const Board pos24_board = build(pos24, sizeof(pos24) / sizeof(pos24[0]));
+        std::vector<std::pair<Board, int>> out;
+        for (const int side : {BLACK, WHITE}) {
+            out.emplace_back(quiet_board, side);
+            out.emplace_back(scattered_board, side);
+        }
+        out.emplace_back(pos24_board, BLACK);
+        return out;
+    }();
+    return arms;
+}
+
+// 针臂的节点帽。预览要在同一台机器上跑两遍给出同样的数字，所以按节点定价而不是按时钟
+// （指导书 §9.2：搜索类读数的超时就是节点帽）；时钟留着当防死循环的兜底。
+
+
+void GameServer::handle_config_frame(std::shared_ptr<WebSocketSession> session, const json& msg) {
+    const std::string type = msg.value("type", std::string());
+    if (type == "config_schema") {
+        // 清单是服务端给的，不是前端抄的：前端只按这一份渲染（指导书 戊-2 注意 1 的「零硬编码」）。
+        json reply;
+        reply["type"] = "config_schema";
+        reply["params"] = ParamRegistry::schema_json()["params"];
+        send_message(session, reply);
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(games_mutex_);
+    const std::shared_ptr<TrackedGame> entry = entry_locked(session.get());
+    if (!entry) return;
+    std::shared_ptr<GameManager> game = entry->game;
+
+    const std::string key = msg.contains("key") && msg["key"].is_string()
+                                ? msg["key"].get<std::string>()
+                                : std::string();
+    json reject;
+    reject["type"] = "config_reject";
+    reject["key"] = key;
+    const ParamSpec* spec = ParamRegistry::find(key);
+    if (!spec) {
+        // 「这条参数不存在」与「这条越界」必须分开报：前端收到后者会去检查一个根本没有的旋钮。
+        reject["why"] = key.empty() ? "config_set 需要点名一条参数"
+                                    : ("代码里没有这条参数：" + key);
+        send_message(session, reject);
+        return;
+    }
+    ParamCheck checked;
+    if (!msg.contains("value")) {
+        reject["why"] = std::string("`") + spec->key + "` 需要给一个值";
+        send_message(session, reject);
+        return;
+    }
+    if (!ParamRegistry::check(*spec, msg["value"], checked)) {
+        reject["why"] = checked.problem;
+        send_message(session, reject);
+        return;
+    }
+
+    if (type == "config_preview") {
+        if (game->is_ai_thinking()) {
+            // 与复盘同一口径：预览也跑真搜索，玩家那手的时钟不能分给它（指导书 §7 那一行）。
+            send_error(session, "AI 正在思考这一手，预览会偷走它的时钟；等它落定再预览。");
+            return;
+        }
+        json preview;
+        preview["type"] = "config_preview";
+        preview["key"] = spec->key;
+        preview["value"] = msg["value"];
+        // 只有「针臂真的能表达」的参数可预览：软时限改的是收尾时机、ponder 与表容量要重启，
+        // 拿针臂跑它们只会给一个看起来像结论的噪音。
+        const bool expressible = std::string(spec->key) == "max_depth" ||
+                                 std::string(spec->key) == "timeout_ms" ||
+                                 std::string(spec->key) == "max_nodes";
+        preview["previewable"] = expressible;
+        if (!expressible) {
+            preview["why_not"] = "这条参数改变不了固定针臂的读数（" +
+                                 std::string(spec->when_live == WhenLive::Restart
+                                                    ? "它要重启，进程没起来之前针臂跑不到它"
+                                                    : "它只影响收尾时机，而针臂是按节点帽定价的") +
+                                 "）";
+            send_message(session, preview);
+            return;
+        }
+        int depth = game->max_depth();
+        int cap = game->max_nodes();
+        if (spec->key == std::string("max_depth")) depth = static_cast<int>(checked.numeric);
+        if (spec->key == std::string("max_nodes")) cap = static_cast<int>(checked.numeric);
+        if (cap <= 0) cap = kPreviewNodeCap;
+        SearchEngine engine(coefficients_);
+        engine.set_max_nodes(cap);
+        if (use_loaded_coefficients_) engine.set_book_enabled(false);
+        std::atomic<bool> stop{false};
+        json arms = json::array();
+        long long total_nodes = 0;
+        long long total_ms = 0;
+        long long checksum = 0;
+        for (const auto& arm : preview_arms()) {
+            const SearchResult result = engine.search(arm.first, arm.second, depth, kPreviewWallMs,
+                                                      stop);
+            json one;
+            one["side"] = arm.second == BLACK ? "black" : "white";
+            one["depth"] = result.depth;
+            one["nodes"] = result.nodes_searched;
+            one["elapsed_ms"] = result.elapsed_ms;
+            one["nps"] = result.elapsed_ms > 0
+                            ? static_cast<double>(result.nodes_searched) * 1000.0 /
+                                  static_cast<double>(result.elapsed_ms)
+                            : 0.0;
+            one["move"] = std::to_string(result.best_move.pos.row) + "," +
+                          std::to_string(result.best_move.pos.col);
+            one["score"] = result.score;
+            one["stopped"] = result.stopped;
+            arms.push_back(one);
+            total_nodes += result.nodes_searched;
+            total_ms += result.elapsed_ms;
+            checksum = checksum * 131 + result.depth * 7 + result.nodes_searched +
+                       result.score * 3 + result.best_move.pos.row * 100 + result.best_move.pos.col;
+        }
+        preview["arms"] = arms;
+        preview["total_nodes"] = total_nodes;
+        // 墙钟与 nps 只作参考：这台机器的绝对时间不可复现（轮次163 的吞吐表），
+        // 所以「两次预览一致」这条判据比的是节点、深度、着法、分值与校验和。
+        preview["total_ms"] = total_ms;
+        preview["checksum"] = checksum;
+        preview["committed"] = false;   // 预览不改任何状态：参数没写进会话，棋局也没动
+        send_message(session, preview);
+        return;
+    }
+
+    // 到这里就是 `config_set`。
+    if (spec->when_live == WhenLive::Restart) {
+        reject["why"] = std::string("`") + spec->key + "` 要重启进程才生效（" + spec->effect_note +
+                        "），面板该把它禁掉而不是改了再告诉你没用";
+        send_message(session, reject);
+        return;
+    }
+    const std::string group = spec->group;
+    if (group == "play") {
+        const int numeric = static_cast<int>(checked.numeric);
+        game->set_config(spec->key == std::string("timeout_ms") ? numeric : game->timeout_ms(),
+                         spec->key == std::string("max_depth") ? numeric : game->max_depth(),
+                         spec->key == std::string("soft_time_ms") ? numeric : game->soft_time_ms(),
+                         spec->key == std::string("max_nodes") ? numeric : game->max_nodes());
+    } else if (group == "analyze") {
+        const int numeric = static_cast<int>(checked.numeric);
+        if (spec->key == std::string("analyze_depth")) analyze_depth_default_ = numeric;
+        else if (spec->key == std::string("analyze_budget")) analyze_budget_default_ = numeric;
+        else analyze_candidates_default_ = numeric;
+    } else {
+        reject["why"] = std::string("`") + spec->key + "` 这一组服务端不代收（" + group + "）";
+        send_message(session, reject);
+        return;
+    }
+    json ack;
+    ack["type"] = "config_ack";
+    ack["key"] = spec->key;
+    ack["value"] = msg["value"];
+    ack["when_live"] = ParamRegistry::when_live_name(spec->when_live);
+    send_message(session, ack);
+}
+
+}  // namespace gomoku

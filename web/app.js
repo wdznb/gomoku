@@ -143,6 +143,9 @@ class GomokuGame {
             this.everConnected = true;
             this.wsAttempts = 0;
             this.startPing();
+            // 面板的输入界由服务端那份清册给（指导书 戊-2 注意 1：前端零硬编码）。每次连上都重问一遍，
+            // 不缓存默认值：缓存了就等于把「代码改了、面板还写着旧的数」这件事做进了产品里。
+            this.sendMessage({ type: 'config_schema' });
             if (this.sessionToken) {
                 // Ask before anything else: the server holds the board, the move
                 // list and the AI's turn, and every later message is played in the
@@ -661,6 +664,61 @@ class GomokuGame {
         this.sendMessage({ type: 'set_config', timeout_ms: timeout * 1000, max_depth: depth });
     }
 
+    // 清册里取一条参数的一个字段；没有清册（还没到、或者服务端没答）就返回 null，
+    // 调用方据此**什么都不改**——不去兜底成任何一个数字，因为兜底的那个数字就是硬编码。
+    paramSpec(key) {
+        const params = Array.isArray(this.paramSchema) ? this.paramSchema : null;
+        if (!params) return null;
+        return params.find(entry => entry && entry.key === key) || null;
+    }
+
+    // 面板的渲染：拿到清册之后，深度框的 min/max/step 全部来自它（默认值只在框是空的时候用）。
+    applyParamSchema(params) {
+        this.paramSchema = Array.isArray(params) ? params : null;
+        const depth = this.paramSpec('max_depth');
+        if (!depth) return;
+        const depthEl = document.getElementById('depth');
+        depthEl.min = String(depth.min);
+        depthEl.max = String(depth.max);
+        depthEl.step = String(depth.step);
+        this.syncTimeoutBounds('bounds');
+    }
+
+    // 改一条参数：走 `config_set`，越界由服务端点名拒绝（面板不自己截断，也不猜它能不能改）。
+    applyParam(key, value) {
+        this.pendingParam = key;
+        this.sendMessage({ type: 'config_set', key, value });
+    }
+
+    // 预览一条参数：跑固定针臂，不回填。面板把它读到的东西写成一行话。
+    previewParam(key, value) {
+        this.pendingParam = key;
+        this.sendMessage({ type: 'config_preview', key, value });
+    }
+
+    handleConfigAck(msg) {
+        const spec = this.paramSpec(msg.key);
+        const when = msg.when_live || (spec ? spec.when_live : '');
+        const note = when === 'live' ? '立即生效' : (when === 'restart' ? '要重启' : '下一手起生效');
+        this.updateStatus(`已改 ${msg.key} = ${JSON.stringify(msg.value)}（${note}）`, 'idle');
+    }
+
+    handleConfigReject(msg) {
+        // 拒绝不是一句「失败了」：要让人看见是哪一条、为什么，面板才知道该不该把它禁掉。
+        this.updateStatus(`没改 ${msg.key}：${msg.why || '服务端拒绝'}`, 'error');
+    }
+
+    handleConfigPreview(msg) {
+        if (!msg.previewable) {
+            this.updateStatus(`这条预览不了：${msg.why_not || '针臂表达不了它'}`, 'idle');
+            return;
+        }
+        const nodes = Number.isFinite(msg.total_nodes) ? msg.total_nodes : 0;
+        const ms = Number.isFinite(msg.total_ms) ? msg.total_ms : 0;
+        this.updateStatus(`预览 ${msg.key}=${JSON.stringify(msg.value)}：${(msg.arms || []).length} 臂共 ` +
+            `${nodes} 节点 / ${ms} ms（没有改任何设置）`, 'idle');
+    }
+
     // The deadline a search needs grows with the depth it is searching to, so the
     // timeout box is bounded by it: 2× to 4× the depth, in seconds. 'min' is a
     // depth change pulling the timeout to the new floor, 'clamp' is an edited
@@ -669,15 +727,20 @@ class GomokuGame {
     syncTimeoutBounds(mode) {
         const depthEl = document.getElementById('depth');
         const timeoutEl = document.getElementById('timeout');
+        const spec = this.paramSpec('max_depth');
+        if (!spec) return;   // 清册没到之前一个数字都不许写进输入框
         // The number inputs accept anything typed, and the bounds are multiples of
         // the depth, so the depth is pinned to its own range before they are read.
         // parseInt turns a typed 0 into a number, and 0 is out of range rather
         // than empty: only a non-number falls back to the default depth.
         const typed = parseInt(depthEl.value, 10);
-        const depth = Math.min(20, Math.max(2, Number.isInteger(typed) ? typed : 8));
+        const depth = Math.min(spec.max, Math.max(spec.min,
+            Number.isInteger(typed) ? typed : spec.default));
         depthEl.value = String(depth);
         const min = depth * 2;
         const max = depth * 4;
+        // 超时框的 2×..4× 是**页面自己的**换算（deadline 随深度长），不是某个参数的默认值，
+        // 所以它留在前端；而 timeout_ms 能取到哪是服务端说了算——改过了界会收到点名的拒绝。
         timeoutEl.min = String(min);
         timeoutEl.max = String(max);
         const current = parseInt(timeoutEl.value, 10);
@@ -1857,6 +1920,18 @@ class GomokuGame {
     
     handleServerMessage(msg) {
         switch (msg.type) {
+            case 'config_schema':
+                this.applyParamSchema(msg.params);
+                break;
+            case 'config_ack':
+                this.handleConfigAck(msg);
+                break;
+            case 'config_reject':
+                this.handleConfigReject(msg);
+                break;
+            case 'config_preview':
+                this.handleConfigPreview(msg);
+                break;
             case 'session':
                 this.handleSession(msg);
                 break;

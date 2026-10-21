@@ -1980,6 +1980,47 @@ additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cp
 no existing assertion was edited.
 
 
+## 轮次165 引擎重构 戊-2 I 控制面：参数从三处散落成一份注册表，网页面板的界从服务端拉而不是自带——十条 `ParamSpec` 注册的都是「代码真的读的那一行」，`docs/ENGINE_REDESIGN_V2.md` §5 表里代码没读的那几行按文档漂移登记，不进注册表而不是假装存在；三条帧 `config_schema`/`config_set`/`config_preview` 从 `server.cpp:749` 那一行分派，越界**不截断**而是点名带区间「[2, 20]」，`restart` 那一档直接拒收，未知键报「代码里没有这条参数」而不是混报成越界；预览在 5 臂固定针臂（quiet×{黑,白}、scattered×{黑,白}、pos24×黑）上按节点定价（`kPreviewNodeCap = 20000` / `kPreviewWallMs = 300000`），pos24 与 `tests/pinned_positions.h::pinned_pos24()` 逐子比对，`game->is_ai_thinking()` 时拒收而不是排队，`committed:false` 且会话状态一个字没改；前端 `index.html:83,86` 的 `#depth`/`#timeout` 不带 `min`/`max`/`step` 了，界由 `applyParamSchema` 从 `config_schema` 拉——杀线「注册表缺省 ≠ 服务端此刻用的那个数」由 `test_config_schema_carries_the_fields_the_panel_needs` 直接查两条漂移守（`game->max_depth() == depth->default_value` 与 `analyze_depth_default_ == ParamRegistry::find("analyze_depth")->default_value`），漂了就 rc=134 — engine redesign stage 戊-2: parameters collapse from three scattered sources (params.h, main.cpp flags, hard-coded panel bounds) into one registry — the 10-row `ParamSpec` list registers only knobs the code actually reads (§5 rows the code doesn't read stay documented as drift, not pretended); three frames dispatch from `server.cpp:749`, out-of-range refuses with the interval spelled out (`[2, 20]`), `restart` refuses outright, unknown keys say "the code doesn't have that knob" instead of masquerading as out-of-range; preview runs the five pinned arms priced by nodes, `pinned_pos24()` matched cell-by-cell, refused while the AI is thinking, `committed:false` and no session state touched; `index.html` inputs lose their min/max/step and `applyParamSchema` drives the bounds from `config_schema`; the kill line "registry default ≠ what the server actually uses" is queried directly by `test_config_schema_carries_the_fields_the_panel_needs` — drift is rc=134.
+
+**交付**（本轮）
+
+- `src/server/param_schema.{h,cpp}`：`ParamSpec` 十二字段（key / group / kind / min_value / max_value / default_value / choices / default_text / step / unit / when_live / desc_plain / effect_note / suggest）＋ `ParamRegistry::kRegistry[]` 十条 ＋ `check()` ＋ `schema_json()`；`ParamKind` {Int, Double, Bool, Choice, Path}、`WhenLive` {Live, NextThink, Restart}；整数码的区间话术是 `[2, 20]` 而不是 `[2.000000, 20.000000]`（面板直接读这一行）。
+- `src/server/preview_arms.h`：`preview_arms()` 返回 5 臂，`kPreviewNodeCap = 20000`、`kPreviewWallMs = 300000`；生产码头不引 `pinned_positions.h`（那等于把压测夹具链进服务端），pos24 靠 `test_preview_arms_are_the_pinned_poses` 逐子比对钉住不漂移。
+- `src/server/server.cpp:2019-2162` `handle_config_frame`：`config_schema` 一帧回全部；`config_set` 走 `find→check→when_live==Restart 拒→group 分派`；`config_preview` 走 `is_ai_thinking 拒→previewable 判→SearchEngine 建→5 臂跑→checksum`；三条帧都从 `server.cpp:749` 那一行分派，`:939-942` 与 `:1626-1634` 那两处被 `test_server` 按行号指认的 assert 因此没漂。
+- `src/server/server.h:163,210`：`analyze_depth_default_` / `analyze_budget_default_` / `analyze_candidates_default_` 从清册回填而不是硬编码 8/20000/12，`handle_config_frame` 声明行内并进 `handle_resume` 那一条，server.h 一字未移（278 行不变）。
+- `tests/test_server.cpp:3067-3325`：六条新用例（形状与漂移、越界不截断、三类 `when_live` 各一例、两次预览同形、思考中拒、pos24 与 `pinned_pos24()` 同摆法）。
+- `web/index.html:83,86`：`#depth`/`#timeout` 输入框去掉 `min`/`max`/`step`（138 行不变）。
+- `web/app.js`：`applyParamSchema` / `syncTimeoutBounds`（spec 驱动）/ `applyParam` / `previewParam` / `handleConfigAck` / `handleConfigReject` / `handleConfigPreview`；每次 connect 发一次 `config_schema`；旧 `set_config` 保留但面板不再调它，老前端仍可用。
+- `tests/web_frontend_check.js`：B4 clamp 用例先 `applyParamSchema`；两条新用例「面板由 schema 渲染」与「改参与预览都走服务端 + 源码级 grep」。
+- `README.md` 346/348 两条 bullet 行内扩（765 不变），把「面板的界来自清册、`config_set` 严格门、`config_preview` 固定针臂」写进现有的两行里，不新起段。
+- `docs/IMPLEMENTATION_GUIDE.md` 541 与 820：戊-2 状态段从「未做」改写为「已落地 + 三条遗留登记」；§9.4 戊-2 行按六 + 二条用例改写（849 不变）。
+
+**读数**（shipped tree）
+
+- `test_server` 47 s（Timeout 300 保持）· All server tests passed。
+- 预览节点（`kPreviewNodeCap = 20000` 定稿时）：`max_depth=4` 一跑 → `total_nodes 65934`（三臂自然结束、二臂撞 20 k）；`max_depth=8` → `total_nodes 100000`（五臂全撞满 20 k）。两次 d4 预览的 `checksum` 与每臂的 `depth` / `nodes` / `move` / `score` 逐字段同形。
+- schema 十条：live 5 / next_think 2 / restart 3。
+
+**变异矩阵**（六臂全部 rc=134；`file:line` 是 shipped tree 上跑到的 assert，arms.sh 每条臂跑之前会 `restore` 一次，`awk` 逐行只匹配第一处）
+
+- N1 range-check-off：`param_schema.cpp` 里 `if (as_double < spec.min_value || as_double > spec.max_value)` → `if (false)` ⇒ 越界的 `max_depth 99` 不再被拒；死在 `test_server.cpp:3160`。
+- N2 restart-guard-off：`server.cpp` 里 `if (spec->when_live == WhenLive::Restart)` → `if (false)` ⇒ `shared_tt_bits` 落到「这一组服务端不代收」那条 else 而不是「要重启」那条 reject ⇒ 死在 `test_server.cpp:3190` 的 `reboot.find("重启")`。
+- N3 schema-field-missing：`entry["step"]` → `entry["stepp"]` ⇒ 少一个字段就等于面板要回去硬编码，`CHECK_MESSAGE(entry.contains(field))` 在 `test_server.cpp:3112` 抓到。
+- N4 preview-think-guard-off：`if (game->is_ai_thinking())` → `if (false)` ⇒ `test_config_preview_is_refused_while_the_ai_is_thinking` 看到 `config_preview` 帧（原本该只有 `error`）；死在 `test_server.cpp:3297`。
+- N5 preview-cap-too-tight：`if (cap <= 0) cap = kPreviewNodeCap` → `cap = 500` ⇒ 五臂全部撞在 500 上 ⇒ 死在 `test_config_preview_is_repeatable_and_commits_nothing` 那条「同一仪器量不到东西」（`test_server.cpp:3267`）。**第一版取 20,000 时抓不到**（`rc=0`）：d4 与 d8 在 20k 帽下的 `total_nodes` 仍然分得开（d4 三臂自然结束 ≈ 60k，d8 五臂撞满 ≈ 100k），说明「帽太紧 ⇒ 深度不再敏感」这条判据要在帽比自然规模更小时才成立；本轮把 `cap = 20000` 的读数保留在 arms 日志里、把 `cap = 500` 的作为 N5 交付。
+- N6 no-ack-on-apply：`ack["type"] = "config_ack"` → `"config_reject"` ⇒ `test_config_set_applies_each_live_class_and_acks_it` 死在「合法的值要回 config_ack」（`test_server.cpp:3209`）与「不该同时被拒」（`:3212`）两条。
+
+**遗留登记**（本轮不假装做了）
+
+- `solve_rate@8k`（指导书 §553 明列的一栏）本轮没跑：每条臂要额外再跑一次 8k 预算的定搜索 ⇒ 五臂 × 每次预览翻一倍。取舍：先交「深度 / 节点 / 墙钟 / nps / 着法 / 分值 / 校验和」这一份七项，`solve_rate` 留给下一轮或不交。
+- 预览**同步跑在 io 线程**上：`kPreviewNodeCap = 20000` / `kPreviewWallMs = 300000` ⇒ 单条预览最坏 ~25 s，会把同 `io_context` 里其他会话冻在这个窗口内。与复盘那条 `analyze_thread` 相比是显式取舍，本轮按「先能改、能拒、能重放」这条主路先交，并线在 §4 戊-3 之后再补。
+- `docs/ENGINE_REDESIGN_V2.md` §5 表里那些「代码没读」的行（训练配额、日志级别…）不进注册表而是作为文档漂移登记。指导书 §4 戊-2 注意 2 那句「表格改而代码不改等于没有单一真源」——本轮把「代码没读」这一半挑明：注册表不代它，也不假装它存在。
+- 旧 `set_config` 的夹取契约（`app.js:646-651`）保留（不改老前端），只是面板不再调它；`test_set_config_keeps_the_two_optional_budgets` 那一条仍在原地。
+
+**行号守恒**：README.md 765 · docs/IMPLEMENTATION_GUIDE.md 849 · src/server/server.h 278 · CMakeLists.txt 424 · web/index.html 138；`handle_config_frame` 加在文件末尾那个 `namespace gomoku {}` 之内，`:939-942` 与 `:1626-1634` 两处被 `test_server` 按行号指认的 assert 因此没漂；CMakeLists.txt 的 `param_schema.cpp` 追加在 server 源那一条**行内**（不新增行），因此 :115 与 :267 那两行的目标列表仍然对得上。
+
+**门禁**：`ctest` 9/9（873.31 s：`test_board` 0.05 / `test_pattern` 0.08 / `test_evaluator` 5.09 / `test_search` 474.47 / `test_position` 7.88 / `test_session` 0.03 / `test_server` 50.22 / `test_training` 94.41 / `test_pinned` 241.08）· `readme_anchor_check.js` 122/0 · `web_frontend_check.js` 113/113 · `memcheck test_server` **clean**（1887 s，reports=0 / invalid_read=0 / invalid_write=0 / uninitialised=0 / definite_leak=0） · 本轮不并线（预览仍同步跑在 io 线程，见上方遗留 (b)），故**没有新增进程内共享态**：TSan 不重跑，登记为「本轮无新共享态」而不是「跑了但读 0」。
+
 ## 轮次164 引擎重构 戊-1 第二段：进程模型的两半都接上了——`gomoku_train --worker <task>` 跑的是与线程模式**同一条**数据采集路（同一批局、除去墙钟逐字相同），`gomoku_broker` 负责派活／收账／看门／让位，五条进程级臂把 §4.3 与 §4.4 的三条验收钉住：`SIGKILL` 之后任务账与文件账在 N 秒内重新对齐、一行没写完的 spool 让**整批**作废（绝不把半行补完再读）、`pause` 之后一个新任务都不派；三档 think 的 p99 相对全停档实测 **100.1 %**（饱和档）与 **101.1 %**（把时间帽抬到 20 s 让分布不饱和再测一遍），判据「劣化 ≤ 20 %」两档都成立 ⇒ 绑核生效 — engine redesign stage 戊-1 part 2: both halves of the process model are wired together — the worker runs the *same* collection path as the threaded build (identical games, byte-equal once the wall clock is stripped), a broker does dispatch / accounting / watchdog / yielding, and five process-level arms pin the three acceptance lines of §4.3–§4.4; the human-think p99 comes in at 100.1 % of the stopped baseline in the saturated regime and 101.1 % when the time cap is lifted so the distribution is no longer pinned at the cap
 
 **交的东西**（一行训练逻辑都没复制，这是指导书思路 2 的执行处）：

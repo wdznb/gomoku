@@ -85,6 +85,9 @@
 // pulls in is pre-included above.
 #include "server/game_manager.h"
 #include "server/server.h"
+#include "server/param_schema.h"  // 戊-2：清单就是被测对象
+#include "server/preview_arms.h"
+#include "pinned_positions.h"       // 预览针臂与乙-2 那批定格盘面的对照
 #undef private
 
 using namespace gomoku;
@@ -3050,6 +3053,277 @@ void test_analyze_refuses_the_positions_it_cannot_rebuild_and_the_games_it_canno
               << " passed (empty game and 摆棋 game both answer one error frame, no analyze_*)"
               << std::endl;
 }
+// 断言带一句「这条钉的是哪句话」：宏在调用点展开，所以 assert 报的 file:line 就是这一臂自己的行，
+// 而消息是人话（既有用例只 assert 条件；新加的这几条要能被 mutation 臂按行指认）。
+#define CHECK_MESSAGE(cond, msg) assert((msg) && (cond))
+#define CHECK_EQ(a, b) assert((((a) == (b)) ? 1 : 0) && #a " == " #b)
+
+// ── 戊-2 参数单一真源 + 网页控制面：协议侧（v2 §5、§4.5.2；指导书 §4 戊-2 验收三条）────
+//
+// 三条口径各有一臂：清单里每条都必须带满面板要的那几个字段（少一个前端就得回去硬编码）；
+// `config_set` 越界是**拒绝并点名**，不是截断（旧的那条 `set_config` 保留 clamp，两边互不影响）；
+// 预览跑固定针臂、**不写任何状态**，所以同一份参数预览两次必须给出同样的节点/深度/着法。
+
+namespace {
+
+std::vector<json> config_frames(GameServer& server, std::shared_ptr<WebSocketSession> socket,
+                                size_t& seen) {
+    std::vector<json> out;
+    for (const std::string& frame : drain_frames(server, socket, seen)) {
+        json parsed = json::parse(frame, nullptr, false);
+        if (!parsed.is_discarded() && parsed.contains("type")) out.push_back(parsed);
+    }
+    return out;
+}
+
+const json& only_frame(const std::vector<json>& frames, const std::string& type) {
+    static const json empty;
+    for (const json& frame : frames) {
+        if (frame["type"] == type) return frame;
+    }
+    return empty;
+}
+
+}  // namespace
+
+void test_config_schema_carries_the_fields_the_panel_needs() {
+    const auto dir = scratch("r165_config_schema");
+    Harness h(dir, std::string());
+    size_t seen = 0;
+    h.server.handle_config_frame(h.socket, json{{"type", "config_schema"}});
+    const std::vector<json> frames = config_frames(h.server, h.socket, seen);
+    CHECK_EQ(frames.size(), 1u);
+    const json& schema = only_frame(frames, "config_schema");
+    assert(!schema.is_null());
+    assert(schema.contains("params") && schema["params"].is_array());
+    const json& params = schema["params"];
+    assert(params.size() >= 8u);
+
+    const char* const kRequired[] = {"key",  "group",  "type",     "min",    "max",
+                                     "default", "step", "when_live", "unit"};
+    int live = 0;
+    int next_think = 0;
+    int restart = 0;
+    for (const json& entry : params) {
+        for (const char* field : kRequired) {
+            // 「每条都有那 9 个字段」这一条不是排版要求：前端就是靠它渲染，缺一个就得回去硬编码。
+            const std::string missing =
+                std::string(entry.value("key", std::string("?"))) + " 少了字段 " + field;
+            CHECK_MESSAGE(entry.contains(field), missing.c_str());
+        }
+        CHECK_MESSAGE(entry.contains("desc_plain") && entry.contains("effect_note") &&
+                                entry.contains("suggest"),
+                            "白话/效果/建议档是面板的三行说明，缺一条就等于把解释工作推回前端");
+        const std::string when = entry["when_live"].get<std::string>();
+        if (when == "live") ++live;
+        else if (when == "next_think") ++next_think;
+        else if (when == "restart") ++restart;
+        else assert(false);
+        const std::string type = entry["type"].get<std::string>();
+        if (type == "int" || type == "double") {
+            const double lo = entry["min"].get<double>();
+            const double hi = entry["max"].get<double>();
+            const double def = entry["default"].get<double>();
+            CHECK_MESSAGE(lo < hi, "区间是空的");
+            CHECK_MESSAGE(def >= lo && def <= hi, "默认值落在自己的区间之外");
+        }
+    }
+    // 三类 when_live 各至少一例（指导书 戊-2 验收第 1 条的最后一项）。
+    CHECK_MESSAGE(live > 0 && next_think > 0 && restart > 0,
+                        "三类 when_live 必须都能出现在清单里，否则面板学不到「改了要重启」这件事");
+
+    // 单一真源的反证：默认值必须是代码此刻真的在用的那个数，不是文档里的数。
+    const ParamSpec* depth = ParamRegistry::find("max_depth");
+    assert(depth != nullptr);
+    CHECK_MESSAGE(h.entry->game->max_depth() == static_cast<int>(depth->default_value),
+                        "面板缺省与服务端实际缺省不一致 ⇒ 清册只是装饰");
+    CHECK_MESSAGE(h.server.analyze_depth_default_ ==
+                            static_cast<int>(ParamRegistry::find("analyze_depth")->default_value),
+                        "复盘缺省与清册漂移了");
+    std::cout << "  [r165] schema rows=" << params.size() << " live/next/restart=" << live << "/"
+              << next_think << "/" << restart << std::endl;
+    std::cout << "test_config_schema_carries_the_fields_the_panel_needs passed" << std::endl;
+}
+
+void test_config_set_refuses_out_of_range_without_touching_the_session() {
+    const auto dir = scratch("r165_config_reject");
+    Harness h(dir, std::string());
+    assert(h.entry->game->restore_game(playing_restore(2)));
+    size_t seen = 0;
+    const int depth_before = h.entry->game->max_depth();
+    const int timeout_before = h.entry->game->timeout_ms();
+
+    auto reject_for = [&](const json& frame, const std::string& expect_key) {
+        h.server.handle_config_frame(h.socket, frame);
+        const std::vector<json> frames = config_frames(h.server, h.socket, seen);
+        const json& reject = only_frame(frames, "config_reject");
+        CHECK_MESSAGE(!reject.is_null(), "越界必须回 config_reject，不能沉默");
+        CHECK_MESSAGE(reject["key"] == expect_key,
+                            "拒绝要点名是哪一条参数");
+        CHECK_MESSAGE(reject.contains("why") && !reject["why"].get<std::string>().empty(),
+                            "拒绝要带一句能给人看的话");
+        CHECK_MESSAGE(only_frame(frames, "config_ack").is_null(),
+                            "同一条不能既拒绝又确认");
+        return reject["why"].get<std::string>();
+    };
+
+    // 超过上限：话术里带着区间，而且没有把值截到 20 再用（指导书 戊-2 注意 3）。
+    const std::string over = reject_for(json{{"type", "config_set"}, {"key", "max_depth"},
+                                             {"value", 99}},
+                                        "max_depth");
+    std::cout << "  [r165] max_depth 99 => " << over << std::endl;
+    CHECK_MESSAGE(over.find("[2, 20]") != std::string::npos, "拒绝话术要带区间");
+    // 小数、负数、字符串、不存在的键、缺 value：五样都被拒，且都不改会话。
+    const std::string fractional = reject_for(json{{"type", "config_set"}, {"key", "max_depth"},
+                                                   {"value", 6.5}}, "max_depth");
+    std::cout << "  [r165] max_depth 6.5 => " << fractional << std::endl;
+    reject_for(json{{"type", "config_set"}, {"key", "timeout_ms"}, {"value", 50}}, "timeout_ms");
+    reject_for(json{{"type", "config_set"}, {"key", "max_nodes"}, {"value", "many"}}, "max_nodes");
+    const std::string unknown = reject_for(json{{"type", "config_set"}, {"key", "no_such_knob"},
+                                                {"value", 1}}, "no_such_knob");
+    CHECK_MESSAGE(unknown.find("没有这条参数") != std::string::npos,
+                        "「这条不存在」不能混报成「越界」");
+    reject_for(json{{"type", "config_set"}, {"key", "max_depth"}}, "max_depth");
+    // 要重启才生效的那一条也是拒绝，而不是「收了再说改了」：面板据此禁用。
+    const std::string reboot = reject_for(json{{"type", "config_set"}, {"key", "shared_tt_bits"},
+                                               {"value", 20}}, "shared_tt_bits");
+    CHECK_MESSAGE(reboot.find("重启") != std::string::npos, "restart 那一档要写明要重启");
+
+    CHECK_MESSAGE(h.entry->game->max_depth() == depth_before, "被拒的值不许改变会话");
+    CHECK_MESSAGE(h.entry->game->timeout_ms() == timeout_before, "被拒的值不许改变会话");
+    std::cout << "test_config_set_refuses_out_of_range_without_touching_the_session passed"
+              << std::endl;
+}
+
+void test_config_set_applies_each_live_class_and_acks_it() {
+    const auto dir = scratch("r165_config_apply");
+    Harness h(dir, std::string());
+    assert(h.entry->game->restore_game(playing_restore(2)));
+    size_t seen = 0;
+
+    auto apply = [&](const std::string& key, const json& value) {
+        h.server.handle_config_frame(h.socket,
+                                     json{{"type", "config_set"}, {"key", key}, {"value", value}});
+        const std::vector<json> frames = config_frames(h.server, h.socket, seen);
+        const json& ack = only_frame(frames, "config_ack");
+        CHECK_MESSAGE(!ack.is_null(), "合法的值要回 config_ack");
+        CHECK_MESSAGE(ack["key"] == key, "ack 要指认改的是哪一条");
+        CHECK_MESSAGE(ack["value"] == value, "ack 要回显生效的值");
+        CHECK_MESSAGE(only_frame(frames, "config_reject").is_null(), "不该同时被拒");
+        return ack["when_live"].get<std::string>();
+    };
+
+    CHECK_MESSAGE(apply("timeout_ms", 5000) == "live", "timeout_ms 是 live 那一档");
+    CHECK_MESSAGE(h.entry->game->timeout_ms() == 5000, "ack 说生效就得真生效");
+    CHECK_MESSAGE(apply("max_depth", 12) == "next_think", "max_depth 是 next_think 那一档");
+    CHECK_MESSAGE(h.entry->game->max_depth() == 12, "ack 说生效就得真生效");
+    // 改一条不许顺手把另一条打回缺省（与旧 `set_config` 同一条 per-key 规则）。
+    CHECK_MESSAGE(h.entry->game->timeout_ms() == 5000, "改 max_depth 不许动 timeout_ms");
+    apply("soft_time_ms", 3000);
+    CHECK_MESSAGE(h.entry->game->soft_time_ms() == 3000, "soft_time_ms 要落地");
+    apply("max_nodes", 60000);
+    CHECK_MESSAGE(h.entry->game->max_nodes() == 60000, "max_nodes 要落地");
+    CHECK_MESSAGE(h.entry->game->timeout_ms() == 5000, "后两条不许把 timeout 打回缺省");
+    // 复盘那一组落在服务端状态上：下一次 analyze 没点名 depth 时读的就是这个数。
+    apply("analyze_depth", 10);
+    CHECK_MESSAGE(h.server.analyze_depth_default_ == 10, "复盘缺重要能被改");
+    std::cout << "test_config_set_applies_each_live_class_and_acks_it passed" << std::endl;
+}
+
+void test_config_preview_is_repeatable_and_commits_nothing() {
+    const auto dir = scratch("r165_preview");
+    Harness h(dir, std::string());
+    assert(h.entry->game->restore_game(playing_restore(2)));
+    size_t seen = 0;
+    const int depth_before = h.entry->game->max_depth();
+    const int timeout_before = h.entry->game->timeout_ms();
+
+    auto preview = [&](const std::string& key, const json& value) {
+        h.server.handle_config_frame(h.socket, json{{"type", "config_preview"},
+                                                    {"key", key}, {"value", value}});
+        const std::vector<json> frames = config_frames(h.server, h.socket, seen);
+        const json& out = only_frame(frames, "config_preview");
+        CHECK_MESSAGE(!out.is_null(), "预览要回一帧 config_preview");
+        return out;
+    };
+
+    const json first = preview("max_depth", 4);
+    CHECK_MESSAGE(first["committed"] == false, "预览不许写进任何状态");
+    CHECK_MESSAGE(first["previewable"] == true, "深度是针臂能表达的");
+    CHECK_EQ(first["arms"].size(), 5u);
+    const json second = preview("max_depth", 4);
+    // 两次预览逐字段对得上：针臂按节点定价，所以时间不参与（指导书 §9.2）。
+    CHECK_MESSAGE(first["checksum"] == second["checksum"], "同一份参数的两次预览校验和不同");
+    CHECK_MESSAGE(first["total_nodes"] == second["total_nodes"], "两次预览的节点数不同");
+    for (size_t i = 0; i < first["arms"].size(); ++i) {
+        const json& a = first["arms"][i];
+        const json& b = second["arms"][i];
+        CHECK_MESSAGE(a["depth"] == b["depth"] && a["nodes"] == b["nodes"] &&
+                                a["move"] == b["move"] && a["score"] == b["score"],
+                            "两次预览的某一臂读数不同");
+    }
+    // 换一档参数必须真的换个读数，否则这台仪器什么都没量。
+    const json deeper = preview("max_depth", 8);
+    CHECK_MESSAGE(deeper["checksum"] != first["checksum"] ||
+                            deeper["total_nodes"] != first["total_nodes"],
+                        "预览对不同的深度给出同一份读数 ⇒ 针臂没在跑");
+    std::cout << "  [r165] preview nodes d4=" << first["total_nodes"]
+              << " d14=" << deeper["total_nodes"] << std::endl;
+    // 针臂表达不了的参数直说「不可预览」并给理由，而不是演一遍像样的读数。
+    const json soft = preview("soft_time_ms", 2000);
+    CHECK_MESSAGE(soft["previewable"] == false, "软时限不该被说成可预览");
+    CHECK_MESSAGE(!soft["why_not"].get<std::string>().empty(), "不可预览要给理由");
+    const json ponder = preview("ponder_percent", 50);
+    CHECK_MESSAGE(ponder["previewable"] == false, "要重启的那一条不该有预览读数");
+    CHECK_MESSAGE(h.entry->game->max_depth() == depth_before &&
+                            h.entry->game->timeout_ms() == timeout_before,
+                        "预览改动了会话状态");
+    std::cout << "test_config_preview_is_repeatable_and_commits_nothing passed" << std::endl;
+}
+
+void test_config_preview_is_refused_while_the_ai_is_thinking() {
+    const auto dir = scratch("r165_preview_busy");
+    Harness h(dir, std::string());
+    h.entry->game->set_config(120000, 20);
+    assert(h.entry->game->restore_game(playing_restore(2)));
+    size_t seen = 0;
+    h.server.handle_make_move(h.socket, json{{"row", 5}, {"col", 5}});
+    CHECK_MESSAGE(h.entry->game->is_ai_thinking(), "这一臂的前提：AI 正在想");
+
+    h.server.handle_config_frame(h.socket,
+                                 json{{"type", "config_preview"}, {"key", "max_depth"},
+                                      {"value", 12}});
+    const std::vector<json> frames = config_frames(h.server, h.socket, seen);
+    CHECK_MESSAGE(only_frame(frames, "config_preview").is_null(),
+                        "玩家那手正在思考时不许跑预览");
+    CHECK_MESSAGE(!only_frame(frames, "error").is_null(), "要回一帧 error 说明为什么不做");
+    h.server.handle_stop_thinking(h.socket);
+    std::cout << "test_config_preview_is_refused_while_the_ai_is_thinking passed" << std::endl;
+}
+
+void test_preview_arms_are_the_pinned_poses() {
+    const std::vector<std::pair<Board, int>>& arms = preview_arms();
+    CHECK_EQ(arms.size(), 5u);
+    // 臂序就是清单里写的那个：quiet×{黑,白}、scattered×{黑,白}、pos24×黑。
+    CHECK_MESSAGE(arms[0].second == BLACK && arms[1].second == BLACK &&
+                            arms[2].second == WHITE && arms[3].second == WHITE &&
+                            arms[4].second == BLACK,
+                        "针臂的执子顺序变了，读数就不再多可比重");
+    const Board pinned = pinned_pos24();
+    for (int row = 0; row < BOARD_SIZE; ++row) {
+        for (int col = 0; col < BOARD_SIZE; ++col) {
+            // 生产码不引测试头（那等于把夹具链进服务端），所以两边各有一份定义，靠这条钉住。
+            CHECK_MESSAGE(arms[4].first.get(row, col) == pinned.get(row, col),
+                                "预览的 pos24 与 tests/pinned_positions.h 的那一份不是同一摆法");
+        }
+    }
+    CHECK_EQ(arms[4].first.move_count(), 24);
+    CHECK_MESSAGE(arms[0].first.move_count() < arms[4].first.move_count() &&
+                            arms[2].first.move_count() > 0,
+                        "针臂的三副盘面空了");
+    std::cout << "test_preview_arms_are_the_pinned_poses passed" << std::endl;
+}
+
 
 int main() {
     std::cout << "Running server tests..." << std::endl;
@@ -3095,6 +3369,12 @@ int main() {
     test_thinking_progress_carries_partial_fields();
     test_replay_roundtrip_keeps_new_fields();
     test_set_config_keeps_the_two_optional_budgets();
+    test_config_schema_carries_the_fields_the_panel_needs();
+    test_config_set_refuses_out_of_range_without_touching_the_session();
+    test_config_set_applies_each_live_class_and_acks_it();
+    test_config_preview_is_repeatable_and_commits_nothing();
+    test_config_preview_is_refused_while_the_ai_is_thinking();
+    test_preview_arms_are_the_pinned_poses();
 
     test_analyze_progress_then_exactly_one_result_per_ply();
     test_analyze_is_refused_while_the_ai_is_thinking();

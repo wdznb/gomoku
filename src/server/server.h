@@ -160,7 +160,7 @@ private:
     CoefficientPair coefficients_;
     bool use_loaded_coefficients_ = false;
     // --ponder, handed to every session the server opens (see the constructor).
-    int ponder_percent_ = 0;
+    int ponder_percent_ = 0; int analyze_depth_default_ = 8; int analyze_budget_default_ = 20000; int analyze_candidates_default_ = 12;
     std::map<WebSocketSession*, std::shared_ptr<GameManager>> games_;
     std::map<std::string, std::shared_ptr<TrackedGame>> sessions_;
     std::map<WebSocketSession*, std::string> socket_tokens_;
@@ -207,7 +207,7 @@ private:
     void handle_stop_thinking(std::shared_ptr<WebSocketSession> session);
     void handle_set_config(std::shared_ptr<WebSocketSession> session, const json& msg);
     void handle_restart(std::shared_ptr<WebSocketSession> session);
-    void handle_resume(std::shared_ptr<WebSocketSession> session, const json& msg);
+    void handle_resume(std::shared_ptr<WebSocketSession> session, const json& msg); void handle_config_frame(std::shared_ptr<WebSocketSession> session, const json& msg);
     // 复盘面板的请求帧（§6.9）：读参数、取整局快照、起一条后台分析线程。玩家正在
     // 让 AI 思考时直接拒绝，不排队——复盘要跑真搜索，而那一局的时间属于这一手。
     void handle_analyze_request(std::shared_ptr<WebSocketSession> session, const json& msg);

@@ -1112,7 +1112,9 @@ check('B4 typed depth zero clamps to two', () => {
     const game = newGame();
     const depthEl = el('depth');
     const timeoutEl = el('timeout');
-
+    // 戊-2：界现在由清册给（这条用例钉的仍是「typed 0 → 落到最小界」，只是那个最小界不再写在页面里）。
+    game.applyParamSchema([{ key: 'max_depth', type: 'int', min: 2, max: 20, default: 8, step: 1 }]);
+    timeoutEl.value = '16';
     depthEl.value = '0';
     game.syncTimeoutBounds('min');
     assert(depthEl.value === '2', 'a typed 0 clamps to the minimum depth 2, got ' + depthEl.value);
@@ -3946,6 +3948,60 @@ check('甲-3 没有复盘时，曲线的折线与红点和以前逐点相同（�
            'the curve is untouched by a stale review, got: ' + arcs.length + '/' + lines.length);
     assert(calls.rects.filter(r => r.w === 5).length === 0,
            'and a stale verdict list draws no mark');
+});
+check('戊-2 面板的界由 config_schema 给：改 max 就跟着变', () => {
+    const game = newGame();
+    const depthEl = el('depth');
+    game.applyParamSchema([
+        { key: 'max_depth', type: 'int', min: 3, max: 11, default: 6, step: 2, when_live: 'next_think' },
+    ]);
+    assert(depthEl.min === '3' && depthEl.max === '11' && depthEl.step === '2',
+           `界没跟着清册走：${depthEl.min}..${depthEl.max}/${depthEl.step}`);
+    // 框里空着时用的也是清册的默认值，不是页面里写的某个数。
+    depthEl.value = '';
+    game.syncTimeoutBounds('min');
+    assert(depthEl.value === '6', '空框该落到清册的默认 6，got ' + depthEl.value);
+    // 换一份清册，界就换：这条断言是「零硬编码」的正面读数。
+    game.applyParamSchema([{ key: 'max_depth', type: 'int', min: 2, max: 20, default: 8, step: 1 }]);
+    assert(depthEl.min === '2' && depthEl.max === '20', '第二份清册没有生效');
+    depthEl.value = '';
+    game.syncTimeoutBounds('min');
+    assert(depthEl.value === '8', '空框的默认值没跟着换，got ' + depthEl.value);
+});
+
+check('戊-2 改参与预览都走服务端，前端不再自己写死界', () => {
+    const game = newGame();
+    const sent = [];
+    game.sendMessage = msg => sent.push(msg);
+    game.applyParam('max_depth', 12);
+    game.previewParam('timeout_ms', 9000);
+    assert(sent.length === 2 && sent[0].type === 'config_set' && sent[0].key === 'max_depth' &&
+           sent[0].value === 12, '改参数必须走 config_set 并点名参数');
+    assert(sent[1].type === 'config_preview' && sent[1].key === 'timeout_ms',
+           '预览必须走 config_preview');
+    // ack / reject / preview 三帧都要有落地反应，且 reject 的话术原样给人看。
+    game.handleConfigAck({ key: 'max_depth', value: 12, when_live: 'next_think' });
+    assert(el('status').textContent.indexOf('已改 max_depth') === 0,
+           'ack 没有写成一行话：' + el('status').textContent);
+    game.handleConfigReject({ key: 'max_depth', why: '`max_depth` 超出范围 [2, 20]' });
+    assert(el('status').textContent.indexOf('超出范围 [2, 20]') > 0,
+           '拒绝话术要带着服务端给的那句话：' + el('status').textContent);
+    game.handleConfigPreview({ key: 'max_depth', value: 4, previewable: true,
+                               arms: [1, 2, 3, 4, 5], total_nodes: 77490, total_ms: 900 });
+    assert(el('status').textContent.indexOf('77490') > 0 &&
+           el('status').textContent.indexOf('没有改任何设置') > 0,
+           '预览读数要说明它没改状态：' + el('status').textContent);
+    game.handleConfigPreview({ key: 'soft_time_ms', previewable: false, why_not: '针臂表达不了它' });
+    assert(el('status').textContent.indexOf('预览不了') > 0, '不可预览要给理由');
+    // 源码级：深度的界不许再写死在 app.js 里，连接时必须去问服务端要清册。
+    assert(!/Math\.min\(20,\s*Math\.max\(2,/.test(source), 'app.js 里还留着写死的深度界');
+    assert(source.indexOf("type: 'config_schema'") > 0, '连接时没去拉 config_schema');
+    // 页面里也不许再留界：留着就是「服务端改了、面板还画着旧的那条尺」。
+    const html = fs.readFileSync(path.join(__dirname, '..', 'web', 'index.html'), 'utf8');
+    assert(!/id="depth"[^>]*\bmin=/.test(html) && !/id="depth"[^>]*\bmax=/.test(html),
+           'index.html 的深度框还写着界');
+    assert(!/id="timeout"[^>]*\bmin=/.test(html) && !/id="timeout"[^>]*\bmax=/.test(html),
+           'index.html 的超时框还写着界');
 });
 
 let failed = 0;

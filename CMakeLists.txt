@@ -70,7 +70,7 @@ set(GOMOKU_SOURCES
     src/training/game_record.cpp
     # 复盘面板（甲-3）：段 A/B/C 的解析器，服务端自己跑，不走训练流水线。
     ${GOMOKU_TACTICS_SOURCES}
-    src/server/server.cpp
+    src/server/server.cpp src/server/param_schema.cpp
     src/server/game_manager.cpp
     src/server/position_json.cpp
     src/server/session_store.cpp
@@ -264,7 +264,7 @@ add_executable(test_server
     src/training/game_record.cpp
     # 复盘面板（甲-3）：段 A/B/C 的解析器，服务端自己跑，不走训练流水线。
     ${GOMOKU_TACTICS_SOURCES}
-    src/server/server.cpp
+    src/server/server.cpp src/server/param_schema.cpp
     src/server/game_manager.cpp
     src/server/position_json.cpp
     src/server/session_store.cpp
