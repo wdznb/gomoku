@@ -1980,6 +1980,168 @@ additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cp
 no existing assertion was edited.
 
 
+## 轮次156 引擎重构 丁-1：S3 的适配度第一次有了连续分量——`w = 0` 逐字回到那 5 档，`w = 0.35` 下同一颗 seed 读出 0.879687 与 0.556875，两轮同 seed 的晋升结论一字不动 — engine redesign stage 丁-1: fitness gains a per-game continuous margin (terminal score gap, ply count, resign depth) behind a switchable weight; with w = 0 the match score is still the win/loss lattice, with w = 0.35 the same seed produces off-lattice values and identical promotions
+
+指导书 §4 丁-1 要「给适配度加连续分量，让『赢得多漂亮』也进入信号」，形状是
+`胜负对 × (1-w) + 连续分量 × w`，权重进 `TrainingConfig` 且**必须可关**，
+验收是「`--fitness-games 2` 下档数从 5 涨成连续 ＋ 同 seed 跑两轮晋升结论一致」，
+杀线是「同 seed 翻面且权重降到 0 仍翻 → 作废」。落点按 §9.4 那一格：`test_training`。
+
+### 三个读数都从 `GameRecord` 现算，其中指导书点名的那一个换过来源
+
+`Trainer::game_margin(record, max_moves)`（`src/training/trainer.cpp:113-165`）：
+
+1. **终局分差**：赢方最后一手与输方最后一手各自报出的 `MoveRecord.score` 之差，
+   折进 `clamp01(0.5 + gap / 20000)`。
+   **这里与 §4 丁-1 实现思路 2 的第一条不一致，理由是实测**：那条写的是「终局局面
+   `Evaluator::evaluate_board` 的两色差」，但 `evaluate_board` 扫的是 `active_empty()` 里
+   每个空格「还长出什么」，盘面上**已经摆成的五连不在它的评价里**。本轮先按原句实现，
+   两个黑棋已成五的终局分别读出 **−1,814** 与 **+304**（不是将杀带里的十万），
+   于是 terminal 分量系统性地把「赢定了」评成「没有优势」，钉值算不出来。
+   改成记录里的搜索分之后同一形状给 100,000 − 900 ⇒ 饱和到 1.0 ✓。
+   这与 §711 那行「连续分量从哪取｜从 `GameRecord` 现算」是同一条纪律，
+   `method` 为 `replay` / `book` 的手也跳过（它们不含决策，与 §6.4 筛题卡同一条）。
+2. **手数**：`clamp01(1 − plies / max_moves)`，同样的赢，赢得快就是更高。
+3. **认输的深度差**：只有 `GameEndReason::RESIGN` 才进，取两侧最后一个**非零** `depth`
+   （战术手报 0 是结构性的不是「没想」，与甲-3 筛题卡同一条），
+   `clamp01(0.5 + gap/8)`；其余局面给中性 0.5。
+   合成 `0.5·terminal + 0.3·speed + 0.2·depth`，三个系数与两个尺度都是写死的常数——
+   **可调的只有外面那个 w**：旋钮越多，「同 seed 不许翻面」这条判据要量的面就越大。
+
+未分胜负与 `INVALID` 都是 0.5：连续分量不许替棋盘编一个优势。
+
+### 权重只进优化器看的那个数，不进验证赛
+
+`blend_fitness(binary, margin, weight)`（`trainer.cpp:95-101`）是 `w = 0` 的执行处，
+`play_game` 在 `margin_weight <= 0.0` 时早退。链路：`measure_fitness` 传
+`config_.fitness_margin_weight`，而 `trainer.cpp:499` 那次**验证赛**调用保持默认 0。
+这不是保守，是定义问题：SPRT 的 llr 是按胜率写的顺序检验（`sprt.h`），
+把 0.325 这种小数喂进 `add_game` 之后，`:443` 那张「晋升只认 accept_score 与 llr」的表
+就不是它声称的东西了。**这一条写在 `trainer.h:55-58` 的字段注释里**，
+免得下一次有人把它当成遗漏补上。
+
+顺带一句 FP 事实：`w = 0` 的「逐字节一致」其实有两层保障——早退那一层，以及
+`(1.0 - 0.0) * binary + 0.0 * margin == binary` 在 IEEE 下本来就精确成立。
+所以本轮的钉值用例（`test_the_margin_blend_is_identity_at_zero_weight`）把两种写法都钉了，
+而不是只钉早退那一句。
+
+### 读数
+
+单元层（`tests/test_training.cpp`，三口新用例）：
+
+- 手算钉值：九手黑胜（最后一手报 100,000、对手最后报 900、`max_moves` 60）⇒
+  `game_margin = 0.5·1.0 + 0.3·(1 − 9/60) + 0.2·0.5 = **0.855**`；
+  同一形状把分差压到 2,000 ⇒ **0.655**（terminal 不再饱和，证明尺度真的在起作用）；
+  `max_moves` 60 → 30 的差正好是 `0.3·(9/30 − 9/60) = 0.045`；
+  认输深度差 8 对 4 ⇒ `+0.1`，反向 4 对 8 ⇒ `−0.1`，24 对 4 与 8 对 4 同值（被尺度截断），
+  全零深度回到中性；和局／`INVALID`／全是 `replay` 的手 ⇒ 精确 `0.5`。
+- 真下一场两局赛（depth 2、每手 800 节点、`--no-sprt` 的形状、`max_moves 14`）：
+  `w = 0` 读出 **0.25**（还在轮次128 记的那 5 档格点上），
+  同一场赛 `w = 0.4` 读出 **0.325** ——不在格点上，也不越出 `0.6·s0 ≤ s ≤ 0.6·s0 + 0.4`
+  这条算得出的界。这就是「档数从 5 涨成连续」在单元层能钉到的那一句。
+
+CLI 层（`--method hill --rounds 2 --hill-iterations 6 --fitness-games 2 --verification-games 4
+--depth 2 --timeout-ms 3000 --max-nodes 1500 --max-moves 24 --no-data --no-sprt --seed 20261011`，
+每组跑两遍）：
+
+| w | round 1 best fitness | round 2 best fitness | 两轮验证赛分数与结论 |
+|---|---|---|---|
+| 0（第 1 遍／第 2 遍） | 1.000000／1.000000 | 0.500000／0.500000 | 0.75 promoted ／ 0.5 kept —— 两遍一字不差 |
+| 0.35（第 1 遍／第 2 遍） | **0.879687**／0.879687 | **0.556875**／0.556875 | 0.75 promoted ／ 0.5 kept —— 两遍一字不差 |
+
+- 同 seed 两遍完全一致（含 `out_*.json` 的 md5：`605c6e6a…` 四份同名）⇒「同 seed 结论不许翻面」这一条过。
+- **杀线未触发**：`w = 0` 与 `w = 0.35` 的晋升结论逐轮相同（0.75 promoted / 0.5 kept）。
+- 那场小赛里两种 w 的**冠军系数相同**（`out_*.json` 四份 md5 一致），所以它只证明「优化器看到的
+  数变了」；换轴是否改变它**选谁**，由更大的一场回答（下面那一组）。
+
+### 换轴真的会改变选择：`--seed 4242`、3 轮 × 20 邻域、depth 3、每手 3,000 节点、`--no-sprt`
+
+| w | 三轮 best fitness | 三轮验证分与结论 | 冠军相对 `w = 0` 的差 |
+|---|---|---|---|
+| 0 | 1.000000／1.000000／1.000000 | 0.75 promoted／0.75 promoted／0.75 promoted（三次晋升） | — |
+| 0.35 | **0.580500／0.580500／0.859125** | 0.5 kept／0.5 kept／0.75 promoted（一次晋升） | `live_three 500→800`、`cand_width_root 24→15`、`sleepy_three 160→100` |
+| 0.7 | 0.661000／0.661000／0.662750 | 0.5 kept／0.5 kept／0.75 promoted | 又是另一份系数（md5 三者互不相同） |
+
+这一组把上面那个缺口补上了：**连续分量会改变优化器留下的候选**，最终冠军系数三个 w 各不相同。
+「晋升结论不同」不是杀线说的翻面——杀线要的是「同 seed 翻面**且权重降到 0 仍翻**」，
+而 `w = 0` 那一列逐字就是今天的形状（早退 + 5 档格点 + 与 HEAD 同一套读数）。
+不同 w 走出不一样的一串候选，是信号起了作用，不是判据不稳。也正因为它改的是**轨迹**，
+缺省保持 **0（关掉）**，与 D-4 的开局轮换、轮次141 的 ponder 同一个先例：
+没有赛前强度读数之前，不把换轴默认打开。
+
+### 门禁
+
+- `ctest` **9/9 passed / 755.03 s**（`test_search` 473.07 对基线 470.28、`test_pinned` 243.50 对 240.19、
+  `test_training` 20.13 对 16.54 —— 新增的那口真赛用例值这 3.6 s，套件仍远在它 300 s 的水位下）。
+- 变异臂六支，各 `rc=134` 并报出 `file:line`：M1 把 `0.855` 的钉值拧成 `0.86`（断在
+  `tests/test_training.cpp:5783`）；M2 把 `blend_fitness(1.0, 0.3, 1.0)` 的期望从 `0.3` 拧成 `0.4`
+  （断在 `:5849`）；M3 把和局／`INVALID` 的中性 `0.5` 拧成 `0.4`（断在 `:5789`）；
+  M4 把 speed 系数 0.3 拧成 0.35、M5 把 `kScoreScale` 20,000 拧成 200,000、
+  M6 把 `plies` 多加 1 手——三支代码变异都断在 `:5783` 那一条手算钉值上。
+  还原 `restored-clean`，重编绿跑 `rc=0`。
+  **一支没做的变异要说明**：把 `blend_fitness` 的 `w <= 0` 早退改成 `w < 0` 不会变红，
+  因为 IEEE 下 `(1-0)·b + 0·m` 本来就等于 `b`——早退省的是 `game_margin` 那趟扫描，
+  不是正确性。这一句写在这里而不是悄悄略过。
+- valgrind memcheck（`tools/valgrind_check.sh memcheck test_training`）：**clean，reports=0**
+  （invalid_read / invalid_write / uninitialised / definite_leak 全 0，544 s）。构建里那条 `test_training.cpp:3594` 的 `-Wrange-loop-construct` 是既有的，不是本轮引入。
+- `readme_anchor_check` **122 citations / 0 problems**（README 只在末尾追加一节「训练信号的连续分量（丁-1）」，
+  663 → 676 行，所以 `README:NNN` 那批被引用的行号一个没动）；`web_frontend_check` **111/111 passed**。
+
+### 改了哪几处
+
+| 位置 | 改动 |
+|---|---|
+| `src/training/trainer.h:55-58` | `TrainingConfig::fitness_margin_weight`（默认 0），注释写明它只进适配度、不进 SPRT |
+| `src/training/trainer.h:204-222` | `score_match` / `play_match` / `play_game` 各带一个权重参数（默认 0），新增两个静态入口 `game_margin` 与 `blend_fitness` |
+| `src/training/trainer.cpp:95-101` | `blend_fitness`：`w <= 0` 逐字回到胜负，`w >= 1` 是纯连续分量 |
+| `src/training/trainer.cpp:100-165` | `game_margin` 的三个读数与两条中性分支 |
+| `src/training/trainer.cpp:44-50`、`:61-93`、`:167-232` | 链路：`measure_fitness` 带权重、`play_game` 混合、`score_match` 转发；验证赛那一处不动 |
+| `src/training/main_trainer.cpp:46-48`、`:257-260`、`:318-321` | `--fitness-margin-weight` 的解析、`[0,1)` 校验与 usage 三行 |
+| `tests/test_training.cpp:5745-5910` | 三口新用例（手算钉值／混合恒等／真赛换轴） |
+| `README.md:664-676`（末尾追加，不动已被引用的行号） | 「训练信号的连续分量（丁-1）」一节：flag、三个读数、W 不进 SPRT、实测读数 |
+
+### 申报
+
+- 三个 w 的对照只跑了一遍（`--seed 4242` 那一组）；同 seed 的**两遍一致性**是在
+  `--seed 20261011` 那组上验的（fitness 与验证分逐字相同、冠军文件 md5 相同）。
+  大场上每 w 跑两遍的重复读数本轮没有。
+- `20000` 这个尺度与 `0.5/0.3/0.2` 三个系数是本轮定的常数，依据是「一手活四的量级是 10,000、
+  将杀带是 100,000」，不是训练出来的；它们和 w 不一样，不在参数文件里。
+  要有人想把它们也变成可调的，那要先重做「同 seed 不许翻面」这条判据的面。
+- 连续分量在**和局**上恒等于 0.5，所以「一和一滴」这种组合只会被一半地改动（本轮的 0.25 → 0.325
+  就是这个形状）；这是定义而不是缺陷，但直方图里那些没有变动的档要这样解释。
+- 深度项只在 `RESIGN` 时有意义；`--no-resign` 的训练跑里它恒为中性，等价于只有两个读数。
+- `evaluate_board` 读不出已成五的那一条，是本轮踩出来的事实，写在这里也写给丙-* 之后任何
+  想复用「终局静态分」的人：它评的是空格的潜力，不是盘面的既成事实。
+
+### 本轮把 `src/training/trainer.cpp` 撑长 91 行，档内引用跟着挪（写给丁-2／丁-3）
+
+指导书与 v2 里按行号引 `trainer.cpp` 的地方共八处，`game_margin`／`blend_fitness` 插在
+`play_game` 之后（`:88-165`），所以它之后的每一个指针都 **+91**；它之前的两个没动：
+
+| 谁引的 | 旧指针 | 现在的位置 |
+|---|---|---|
+| 指导书 §4 丁-1 思路 1 | `trainer.cpp:38-49` | `:38-50`（`measure_fitness` 本体，未挪） |
+| 指导书 §4 丁-1 注意／丁-3 第 6 步 | `trainer.cpp:44-46` | `:44-46`（未挪） |
+| 指导书 §4 丁-3 第 6 步 | `trainer.cpp:111-112` | `:202-203`（`score_match` 的配对注释） |
+| v2 §3.4 与指导书丁-2 现状 | `trainer.cpp:101-102` | `:192-193`（两台引擎各建一张表） |
+| 指导书 §4 丁-2 思路 2 | `trainer.cpp:215` | `:367`（worker 自己的 engine） |
+| 指导书 §4 丁-2 注意 1 | `trainer.cpp:286` | `:337-339`（`shared_tt_` 的建与用） |
+| 指导书 §4 丁-2 注意 4 | `trainer.cpp:296` | `:377`（`explorer.set_start_line`） |
+| 指导书 §4 丁-3 第 3 步 | `trainer.cpp:509-513` | `:590-594`（checkpoint 的 `versions[]`） |
+
+`main_trainer.cpp` 加了 11 行（usage 三行在 `:46-48`、解析四行在 `:257-260`、校验四行在
+`:318-321`），它内部的旧行号引用因此分别 **+3 / +7 / +11**；本轮没有逐条去改那些历史句子里的
+行号（那是另一条工作线），只把偏移记在这里。`tests/test_training.cpp` 的三口用例插在
+`main()` 之前（`:5758`／`:5845`／`:5864`，`main` 从 5754 挪到 `:5912`），
+历史句子引的那些行（`:243`、`:1053`、`:1287`、`:1479`、`:1922`、`:2258`）都在插入点之前，**没挪**。
+
+### 给指导书的一句
+
+§4 丁-1 的实现思路 2 第一条（终局 `evaluate_board` 的两色差）应按 §711 那行执行——**分量从
+`GameRecord` 现算**；`evaluate_board` 那一句要加一条脚注：它扫 `active_empty()` 的潜力，
+已成的五连不在评价里（实测 −1,814／+304），不能当终局优势用。
+
 ## 轮次155 引擎重构 丙-4：O1 把 `finish_direction` 的走线折成 ±6 线窗表——等价性四条全过（75,600 组、18,900 格、531,441 键 × 8 变体全部 0 例外），但取窗实测 **100 条指令**对文档估的「约 10 条」，整节点 Ir **+5.86 %**（六臂 +7.20 %）⇒ 按杀线判不落地，代码全部撤回 — engine redesign stage 丙-4: the line table is provably equivalent (75,600 groups, 18,900 aggregate squares, 531,441 keys × 8 outer variants, zero exceptions) but the 13-trit key costs 100 Ir/call against the doc's ~10-instruction estimate, and whole-node Ir rises 5.86 % (7.20 % on six arms), so the unit's own kill line rejects it and the tree is reverted
 
 指导书 §4 丙-4 的四条验收与两条杀线，本轮全部量到了读数。结论是：**这张表做对了，但它不该做**——

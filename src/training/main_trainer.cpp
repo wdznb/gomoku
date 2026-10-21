@@ -43,6 +43,9 @@ void print_usage(const char* program) {
         "  --max-moves N               Ply cap for a training game (60)\n"
         "  --fitness-games N           Games used to score one candidate, unless\n"
         "                              the sequential test ends the match first (2)\n"
+        "  --fitness-margin-weight W   Blend W of a per-game continuous margin (final score\n"
+        "                              gap, move count, resign depth) into the fitness\n"
+        "                              score; 0 keeps the plain win/loss tiers (0)\n"
         "  --verification-games N      Ceiling on the games a candidate must beat the\n"
         "                              champion over before promotion (8)\n"
         "  --accept-score X            Promotion threshold, >0.5 and <=1.0 (0.56)\n"
@@ -251,6 +254,10 @@ int main(int argc, char** argv) {
                 config.verification_games = require_int("--verification-games", i, argc, argv);
             } else if (flag == "--accept-score") {
                 config.accept_score = require_double("--accept-score", i, argc, argv);
+            } else if (flag == "--fitness-margin-weight") {
+                // 丁-1：适配度里连续分量的权重。默认 0 = 今天；它只改优化器看到的那个数，
+                // 验证赛的 SPRT 序列不动。
+                config.fitness_margin_weight = require_double("--fitness-margin-weight", i, argc, argv);
             } else if (flag == "--sprt-elo") {
                 // Zero is this knob's own answer - "no sequential test, play every
                 // pair" - so it parses where the game counts would not, and only
@@ -308,6 +315,10 @@ int main(int argc, char** argv) {
     }
     // 0.5 is a draw score, so anything at or below it would promote a candidate
     // that merely survived.
+    if (config.fitness_margin_weight < 0.0 || config.fitness_margin_weight >= 1.0) {
+        std::cerr << "Error: --fitness-margin-weight must be in [0,1)" << std::endl;
+        return 1;
+    }
     if (config.accept_score <= 0.5 || config.accept_score > 1.0) {
         std::cerr << "Error: --accept-score must be greater than 0.5 and at most 1.0"
                   << std::endl;

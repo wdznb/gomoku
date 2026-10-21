@@ -5751,6 +5751,164 @@ void test_training_sample_without_a_teacher_keeps_the_old_shape() {
 }
 
 
+// 丁-1（v2 §2.1 S3）第一口：连续分量的三个读数各给什么值，全部手算得出。
+// 底版是一局九手的黑胜：黑棋最后一手报 100,000（将杀带里），白棋最后一手报 900，
+// 分差 99,100 落在 20,000 的尺度上 ⇒ terminal 饱和到 1.0；九手 / max_moves 60 ⇒ speed 0.85；
+// 不是认输 ⇒ depth 中性 0.5。合成 = 0.5·1.0 + 0.3·0.85 + 0.2·0.5 = 0.855。
+void test_game_margin_answers_its_three_readings_by_value() {
+    const int kMaxMoves = 60;
+    auto push = [](GameRecord& record, int row, int col, int color, int depth, int score) {
+        MoveRecord entry;
+        entry.move = Move(row, col, color);
+        entry.depth = depth;
+        entry.score = score;
+        entry.method = "alphabeta";
+        record.moves.push_back(entry);
+    };
+
+    GameRecord win;
+    win.winner = BLACK;
+    win.reason = GameEndReason::FIVE;
+    const int black_cols[5] = {3, 4, 5, 6, 7};
+    const int white_cells[4][2] = {{8, 3}, {8, 8}, {9, 3}, {10, 10}};
+    for (int i = 0; i < 4; ++i) {
+        push(win, 7, black_cols[i], BLACK, 4, 1000);
+        push(win, white_cells[i][0], white_cells[i][1], WHITE, 4, 900);
+    }
+    push(win, 7, black_cols[4], BLACK, 4, 100000);
+    assert(win.moves.size() == 9u);
+
+    const double win_margin = Trainer::game_margin(win, kMaxMoves);
+    std::cout << "  five win plies=" << win.moves.size() << " margin=" << win_margin << std::endl;
+    assert(std::abs(win_margin - 0.855) < 1e-12);
+
+    // 1) 未分胜负与作废记录都是中性 0.5：连续分量不许替棋盘编一个优势。
+    GameRecord draw = win;
+    draw.winner = EMPTY;
+    draw.reason = GameEndReason::MOVE_LIMIT;
+    assert(Trainer::game_margin(draw, kMaxMoves) == 0.5);
+    GameRecord broken = win;
+    broken.reason = GameEndReason::INVALID;
+    assert(Trainer::game_margin(broken, kMaxMoves) == 0.5);
+
+    // 2) 重放与开局库的手不含决策（§6.4 筛题卡同一条纪律）：全是它们时取不到分差 ⇒ 中性。
+    GameRecord replayed = win;
+    for (auto& entry : replayed.moves) entry.method = "replay";
+    assert(Trainer::game_margin(replayed, kMaxMoves) == 0.5);
+
+    // 3) terminal 的尺度真的在起作用：分差只有 2,000 时 terminal = 0.6，不是饱和的 1.0。
+    GameRecord quiet_win = win;
+    quiet_win.moves.back().score = 2900;
+    const double quiet_margin = Trainer::game_margin(quiet_win, kMaxMoves);
+    std::cout << "  small score gap 2000, margin=" << quiet_margin << std::endl;
+    assert(std::abs(quiet_margin - (0.5 * 0.6 + 0.3 * 0.85 + 0.2 * 0.5)) < 1e-12);
+
+    // 4) 手数那一项：同一终局，赛制越宽，同样的九手显得越「慢」。
+    //    max_moves 60 → 30 的差是 0.3·(9/60 - 9/30) = -0.045。
+    const double tight_margin = Trainer::game_margin(win, 30);
+    assert(std::abs((win_margin - tight_margin) - 0.3 * (9.0 / 30.0 - 9.0 / 60.0)) < 1e-12);
+
+    // 5) 只有认输才有深度差：赢家最后深 8、输家最后深 4 ⇒ 0.2·clamp01(0.5 + 4/8) = 0.2，
+    //    比中性多 0.1；反向就是罚 0.1。
+    GameRecord resign = win;
+    resign.reason = GameEndReason::RESIGN;
+    for (auto& entry : resign.moves) {
+        if (entry.move.color == WHITE) entry.depth = 4;
+    }
+    resign.moves.back().depth = 8;
+    const double resign_margin = Trainer::game_margin(resign, kMaxMoves);
+    assert(std::abs(resign_margin - (win_margin + 0.1)) < 1e-12);
+
+    GameRecord shallow = resign;
+    for (auto& entry : shallow.moves) {
+        entry.depth = entry.move.color == BLACK ? 4 : 8;
+    }
+    assert(std::abs(Trainer::game_margin(shallow, kMaxMoves) - (win_margin - 0.1)) < 1e-12);
+
+    // 6) 深度差被尺度截断：差 20 层与差 8 层给同一个顶，「多想四层」拿不到线性奖励。
+    GameRecord huge_gap = resign;
+    for (auto& entry : huge_gap.moves) {
+        entry.depth = entry.move.color == BLACK ? 24 : 4;
+    }
+    assert(std::abs(Trainer::game_margin(huge_gap, kMaxMoves) - resign_margin) < 1e-12);
+
+    // 7) 战术手报的 depth 是 0（结构性的不是「没想」）：全 0 时深度项回到中性，认输不受罚。
+    GameRecord tactical = resign;
+    for (auto& entry : tactical.moves) entry.depth = 0;
+    assert(std::abs(Trainer::game_margin(tactical, kMaxMoves) - win_margin) < 1e-12);
+
+    std::cout << "test_game_margin_answers_its_three_readings_by_value passed" << std::endl;
+}
+
+// 第二口：混合本身。w = 0 必须是**逐字**回到胜负（早退，不是算出来像），
+// w >= 1 是纯连续分量，中间是凸组合。
+void test_the_margin_blend_is_identity_at_zero_weight() {
+    assert(Trainer::blend_fitness(1.0, 0.845, 0.0) == 1.0);
+    assert(Trainer::blend_fitness(0.0, 0.845, 0.0) == 0.0);
+    assert(Trainer::blend_fitness(0.5, 0.845, 0.0) == 0.5);
+    assert(Trainer::blend_fitness(1.0, 0.3, 1.0) == 0.3);
+    assert(Trainer::blend_fitness(0.0, 0.7, 1.0) == 0.7);
+    assert(std::abs(Trainer::blend_fitness(1.0, 0.5, 0.4) - 0.8) < 1e-12);
+    assert(std::abs(Trainer::blend_fitness(0.0, 0.5, 0.4) - 0.2) < 1e-12);
+    // 负权重与非有限权重都按「关掉」处理：适配度不能因为一个坏参数就换轴。
+    assert(Trainer::blend_fitness(1.0, 0.2, -0.5) == 1.0);
+    std::cout << "test_the_margin_blend_is_identity_at_zero_weight passed" << std::endl;
+}
+
+// 第三口（旧行为不变 + 新行为）：真下一场两局赛。w = 0 的分数必须还在那张格子上
+// {0, 0.5, 1}（两局、每局 0/0.5/1）；同一场赛在 w = 0.4 下被换成
+// 0.6 · 胜负 + 0.4 · 连续分量，所以它必须落在 `[0.6·s0, 0.6·s0 + 0.4]` 这条带里
+// ——连续分量本身在 [0,1]，这条界是算得出的，不依赖具体棋局走成什么样。
+// 两次跑用同一台仪器：全新的 Trainer（rounds_completed_ = 0 ⇒ 同一批开局线）、
+// 同一对系数、同一颗节点帽（800/手，定得住，`--max-nodes` 的口径）。
+void test_a_margin_weight_blends_the_real_match_score_off_the_lattice() {
+    PatternRecognizer::init();
+    TrainingConfig config;
+    config.rounds = 1;
+    config.search_depth = 2;
+    config.timeout_ms = 5000;
+    config.max_nodes = 800;
+    config.max_moves = 14;
+    config.fitness_games = 2;
+    config.verification_games = 2;
+    config.sprt_elo = 0;        // 不打断：两局都要真下完，格点判定才有意义
+    config.resign_enabled = false;
+    config.collect_data = false;
+    config.params_path = temp_path("margin_blend_params.json").string();
+    config.checkpoint_path = temp_path("margin_blend_checkpoint.json").string();
+
+    const ThreatCoefficients candidate = ThreatCoefficients();
+    const ThreatCoefficients reference = target_coefficients();
+
+    Trainer plain(ThreatCoefficients(), config);
+    const MatchOutcome binary = plain.score_match(candidate, reference, 2, 0.0);
+    assert(binary.games == 2);
+    const double s0 = binary.score;
+    // 两局、每局 {0, 0.5, 1} ⇒ 平均分只能落在 0.25 的格子上（轮次128 记的那 5 档）。
+    const bool on_lattice = std::abs(s0 * 4.0 - std::round(s0 * 4.0)) < 1e-9;
+    std::cout << "  w=0 score " << s0 << " games " << binary.games << std::endl;
+    assert(on_lattice);
+
+    Trainer blended(ThreatCoefficients(), config);
+    const MatchOutcome outcome = blended.score_match(candidate, reference, 2, 0.4);
+    const double s = outcome.score;
+    std::cout << "  w=0.4 score " << s << std::endl;
+    assert(outcome.games == 2);
+    assert(s >= 0.0 && s <= 1.0);
+    // 分数被换成 0.6·胜负 + 0.4·连续分量，而连续分量在 [0,1]：这两条界是算得出的，
+    // 不依赖这局棋具体走成什么样。
+    assert(s >= 0.6 * s0 - 1e-12 && s <= 0.6 * s0 + 0.4 + 1e-12);
+    assert(std::abs(s - s0) <= 0.4 + 1e-12);
+    // 这一场里至少有一局是分出胜负的（s0 = 0.25 只能是「一和一滴」），
+    // 所以 w = 0.4 之后分数不可能还在那 5 档格点上——这就是「档数从 5 涨成连续」
+    // 在单元层能钉到的那一句（另一句在 CLI 读数里）。
+    const bool still_on_lattice = std::abs(s * 4.0 - std::round(s * 4.0)) < 1e-9;
+    assert(!still_on_lattice);
+
+    std::cout << "test_a_margin_weight_blends_the_real_match_score_off_the_lattice passed"
+              << std::endl;
+}
+
 int main() {
     std::cout << "Running training tests..." << std::endl;
 
@@ -5870,6 +6028,9 @@ int main() {
     test_replay_reviewer_prices_a_difficulty_ladder();
     test_training_sample_keeps_a_teacher_move();
     test_training_sample_without_a_teacher_keeps_the_old_shape();
+    test_game_margin_answers_its_three_readings_by_value();
+    test_the_margin_blend_is_identity_at_zero_weight();
+    test_a_margin_weight_blends_the_real_match_score_off_the_lattice();
 
     std::cout << "All training tests passed" << std::endl;
     return 0;

@@ -45,7 +45,8 @@ double Trainer::measure_fitness(const ThreatCoefficients& coefficients) {
     scored.five = champion().five;
     scored.forbidden_penalty = champion().forbidden_penalty;
     if (fitness_override_) return fitness_override_(scored);
-    return play_match(scored, champion(), config_.fitness_games);
+    return play_match(scored, champion(), config_.fitness_games,
+                      config_.fitness_margin_weight);
 }
 
 SearchEngine& Trainer::prepare(SearchEngine& engine) const {
@@ -58,7 +59,8 @@ SearchEngine& Trainer::prepare(SearchEngine& engine) const {
 }
 
 double Trainer::play_game(SearchEngine& black, SearchEngine& white, int black_owner,
-                          const std::vector<Move>& opening, bool* played) {
+                          const std::vector<Move>& opening, bool* played,
+                          double margin_weight) {
     SelfPlayConfig settings;
     settings.max_depth = config_.search_depth;
     settings.timeout_ms = config_.timeout_ms;
@@ -80,18 +82,97 @@ double Trainer::play_game(SearchEngine& black, SearchEngine& white, int black_ow
         return 0.5;
     }
     const int winner_owner = record.winner == BLACK ? black_owner : 3 - black_owner;
-    return winner_owner == 1 ? 1.0 : 0.0;
+    const double binary = winner_owner == 1 ? 1.0 : 0.0;
+    if (margin_weight <= 0.0) {
+        // 默认形状：胜负对原样返回。这一句早退是「w = 0 与今天逐字节一致」那条
+        // 要求（指导书 §4 丁-1 实现思路 3）的执行处，不是省几行浮点。
+        return binary;
+    }
+    const double margin = game_margin(record, settings.max_moves);
+    return blend_fitness(binary, margin, margin_weight);
+}
+
+double Trainer::blend_fitness(double binary, double margin, double weight) {
+    if (weight <= 0.0) return binary;
+    if (weight >= 1.0) return margin;
+    return (1.0 - weight) * binary + weight * margin;
+}
+
+namespace {
+
+double clamp_unit(double v) { return v < 0.0 ? 0.0 : (v > 1.0 ? 1.0 : v); }
+
+}  // namespace
+
+// 丁-1 的连续分量。三个读数都从**已有产物**取，不新增基础设施：
+//   1. 终局分差——赢方最后一手与输方最后一手各自报出的搜索分；
+//   2. 先成五一方用了多少手——手数越短越高；
+//   3. 认输时两侧的搜索深度差——只有 `RESIGN` 才有这一项，其余给中性 0.5。
+// 尺度是写死的常数，不是可拧的旋钮：可调的只有外面那个权重 w（指导书要求「必须可关」，
+// 旋钮越多，「同 seed 不许翻面」那条判据要量的面就越大）。
+double Trainer::game_margin(const GameRecord& record, int max_moves) {
+    constexpr double kScoreScale = 20000.0;  // 两手报告的搜索分差拉满所需的量级
+    constexpr double kDepthScale = 8.0;      // 深度差 8 层算拉满
+
+    if (record.reason == GameEndReason::INVALID || record.winner == EMPTY) return 0.5;
+
+    // 终局分差用**记录里已经写下的搜索分**，而不是把终局盘再评一遍：
+    // `Evaluator::evaluate_board` 扫的是空格的「还能长出什么」（`active_empty()` 的循环），
+    // 盘面上已经摆成的五连不在它的评价里——本轮实测过，一个黑棋成五的终局它给 -10，
+    // 所以那个读数会系统性地把「赢定了」评成「没有优势」。而一手棋的 `score` 正是
+    // 当时那一方自己报的分，成五的手在将杀带里。重放与开局库的手不含决策（score 是 0
+    // 或上一手的残值），与 §6.4 筛题卡时同一条纪律，跳过。
+    int winner_score = 0;
+    int loser_score = 0;
+    bool winner_seen = false;
+    bool loser_seen = false;
+    for (const MoveRecord& entry : record.moves) {
+        if (entry.method == "replay" || entry.method == "book") continue;
+        if (entry.move.color == record.winner) {
+            winner_score = entry.score;
+            winner_seen = true;
+        } else {
+            loser_score = entry.score;
+            loser_seen = true;
+        }
+    }
+    if (!winner_seen || !loser_seen) return 0.5;
+    const double gap = static_cast<double>(winner_score) - static_cast<double>(loser_score);
+    const double terminal = clamp_unit(0.5 + gap / kScoreScale);
+
+    // 用了多少手：同样的赢，赢得快就是更高。
+    const double plies = static_cast<double>(record.moves.size());
+    const double speed =
+        clamp_unit(1.0 - plies / static_cast<double>(std::max(1, max_moves)));
+
+    // 深度差只有认输那一局才有意义：认输是「我算清了这盘救不回来」，
+    // 所以两侧最后各搜了多深值得进信号。战术手（vcf / must_block）报 depth = 0 是
+    // 结构性的不是「没想」，取最后一个非零深度；取不到就中性。
+    double depth_term = 0.5;
+    if (record.reason == GameEndReason::RESIGN) {
+        int winner_depth = 0;
+        int loser_depth = 0;
+        for (const MoveRecord& entry : record.moves) {
+            if (entry.depth <= 0) continue;
+            if (entry.move.color == record.winner) winner_depth = entry.depth;
+            else loser_depth = entry.depth;
+        }
+        if (winner_depth > 0 || loser_depth > 0) {
+            depth_term = clamp_unit(0.5 + (winner_depth - loser_depth) / kDepthScale);
+        }
+    }
+    return 0.5 * terminal + 0.3 * speed + 0.2 * depth_term;
 }
 
 double Trainer::play_match(const ThreatCoefficients& candidate,
                            const ThreatCoefficients& reference,
-                           int games) {
-    return score_match(candidate, reference, games).score;
+                           int games, double margin_weight) {
+    return score_match(candidate, reference, games, margin_weight).score;
 }
 
 MatchOutcome Trainer::score_match(const ThreatCoefficients& candidate,
                                   const ThreatCoefficients& reference,
-                                  int games) {
+                                  int games, double margin_weight) {
     MatchOutcome outcome;
     if (fitness_override_) {
         const double candidate_score = fitness_override_(candidate);
@@ -136,7 +217,7 @@ MatchOutcome Trainer::score_match(const ThreatCoefficients& candidate,
             match_opening_line(rounds_completed_ + i, config_.match_opening_plies);
         bool valid = false;
         const double first =
-            play_game(candidate_engine, reference_engine, 1, opening, &valid);
+            play_game(candidate_engine, reference_engine, 1, opening, &valid, margin_weight);
         if (valid) {
             score += first;
             ++played_games;
@@ -144,7 +225,7 @@ MatchOutcome Trainer::score_match(const ThreatCoefficients& candidate,
         }
         valid = false;
         const double second =
-            play_game(reference_engine, candidate_engine, 2, opening, &valid);
+            play_game(reference_engine, candidate_engine, 2, opening, &valid, margin_weight);
         if (valid) {
             score += second;
             ++played_games;

@@ -52,6 +52,10 @@ struct TrainingConfig {
     int verification_games = 8;
     // A candidate must beat the champion by this score to be promoted.
     double accept_score = 0.56;
+    // 丁-1（v2 §2.1 S3）：适配度里连续分量的权重 w。默认 0 就是今天的形状。
+    // 它只进**优化器看到的那个数**（`measure_fitness`）；验证赛那条 SPRT 序列永远是纯胜负——
+    // 把小数喂给一个按胜率写的顺序检验，_promote_ 判据就不再是它声称的东西了。
+    double fitness_margin_weight = 0.0;
     // The Elo gap a match's results are tested against (design doc 2.8 #3). Both
     // doors above are ceilings now: a match stops at a pair boundary as soon as
     // the sequential test leaves the bounds, so an eight-game verification costs
@@ -195,16 +199,27 @@ public:
 
 private:
     double measure_fitness(const ThreatCoefficients& coefficients);
+    // `margin_weight` 是丁-1 的连续分量权重：> 0 时每一手胜负被换成
+    // 「胜负 × (1-w) + 连续分量 × w」，= 0（默认，也是验证赛那一侧）逐字节回到今天。
     MatchOutcome score_match(const ThreatCoefficients& candidate,
-                             const ThreatCoefficients& reference, int games);
+                             const ThreatCoefficients& reference, int games,
+                             double margin_weight = 0.0);
     double play_match(const ThreatCoefficients& candidate, const ThreatCoefficients& reference,
-                      int games);
+                      int games, double margin_weight = 0.0);
+    // 一局棋「赢得多漂亮」：三个读数都从已有产物取——终局的分差（赢方最后一手与输方
+    // 最后一手各自报出的搜索分）、用了多少手、认输时两侧的搜索深度差。赢方视角，折进 [0,1]；
+    // 未分胜负与作废记录给中性 0.5。
+    static double game_margin(const GameRecord& record, int max_moves);
+    // 混合本身单列成一个纯函数：`w = 0` 必须**逐字**回到胜负，这一句话值得被单独钉住
+    //（指导书 §4 丁-1 实现思路 3 的后半）。
+    static double blend_fitness(double binary, double margin, double weight);
     // Score for whoever holds the stones passed as `black_owner` (1 = the
     // candidate, 2 = the reference). `played` says whether the game happened at
     // all: a discarded INVALID one is not a draw and leaves the denominator.
     // Both games of a pair get the same `opening`, once with each colour.
     double play_game(SearchEngine& black, SearchEngine& white, int black_owner,
-                     const std::vector<Move>& opening, bool* played = nullptr);
+                     const std::vector<Move>& opening, bool* played = nullptr,
+                     double margin_weight = 0.0);
     SearchEngine& prepare(SearchEngine& engine) const;
     int generate_data_games(int games, int threads);
 
