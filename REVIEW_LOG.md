@@ -1980,6 +1980,92 @@ additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cp
 no existing assertion was edited.
 
 
+## 轮次162 引擎重构 丁-6 第二段：S2 落地成「事后退役账本」——一条开局被看满 N 对、每一对两局都由同一座位赢下才出局，而观察全部取自本来就要跑的适配度赛与验证赛（新增 0 局），键挂这次 run 的起点系数、判决一律从读数重算，缺省 `--opening-pool 0` 关着时路由逐字是今天的形状 — engine redesign stage 丁-6 part 2: S2 lands as a post-hoc retirement ledger — an opening retires only after N observed pairs were every one of them decided by the seat, every pair comes from matches the run plays anyway (zero extra games), the key is the run's starting coefficients, verdicts are recomputed from the readings, and with the default `--opening-pool 0` the rotation is byte-for-byte today's
+
+**做了什么**：新文件 `src/training/opening_ledger.h`（`OpeningLedgerConfig` / `OpeningLedgerEntry` /
+`OpeningLedgerState` / `OpeningLedger` 四个类型，三段读数写在头部注释里）；`src/training/trainer.cpp`
+尾部那一整块事前筛（`OpeningScreen::*` 与打局的 `play_opening_screen_game`）换成账本实现
+（`set_sha` / `fresh` / `load` / `save` / `record_game` / `active_lines` / `summarize`）；证据的入口只有
+一行——`Trainer::play_game` 里原本那句 `if (valid) games_played_++;` 现在是
+`if (valid) { games_played_++; note_opening_game(record, opening); }`（`src/training/trainer.cpp:83`），
+跑完一局就把**座位赢家**（1 黑 / -1 白 / 0 未分胜负）交给 `OpeningLedger::record_game`，同一开局的两局
+自动凑成一对。`Trainer::match_opening_for` 改从未退役的开局里取，未退役的不足 8 条时退回固定 8 条。
+CLI 那道旋钮跟着改名：`--screen-openings` → `--opening-pool`（缺省 0 = 关），`--openings-path` 不动。
+
+**判据（与指导书思路 2 的差别写在指导书里）**：一条开局被看满 `opening_min_pairs`（缺省 2）对，且
+**每一对**的两局都由同一座位赢下 ⇒ 退役。含未分胜负的对**不算证据**——它既没被钉死，也没证明这条开局
+能把两个人分开；但只要出现过一对能区分的，这条开局就再也退不回去（`pinned == pairs` 里那个能区分的对子
+永远留在账上）。判决是读数的纯函数：退役可以恢复，落盘文件里那个 `retired` 布尔不作数，读回来时一律重算。
+
+**三处按现场事实改口径，都记在这里**
+1. **键挂的是这次 run 的起点系数（`versions_[0]`），不是「那两个玩家」**。事前筛那版必须固定一对玩家才能
+   问「这条开局谁能分开」；改成事后之后，观察来自适配度赛与验证赛，那两个玩家本来就每轮都在换，而
+   「被座位钉死」问的是座位还是玩家，不是谁跟谁。代价是账本会跨候选复用——这正是 轮次161 算过的那笔账：
+   键含冠军系数 ⇒ 每次晋升重付 96 局，现在把换代的钱收回来了。起点换了（续训、换参数文件）仍然作废，
+   `load` 会报「这本账是哪一套键记的 vs 现在这套」。
+2. **`opening_min_pairs` 没有 CLI 旋钮**（缺省 2，给用例与以后的 checkpoint 用）。指导书只要求池子可关，
+   门槛拧动的不是成本而是判决的证据量，先不给它加一张旋钮（丁-1 的教训：旋钮越多，「同 seed 不许翻面」
+   那条判据要量的面就越大）。
+3. **只有判决翻转才写盘**（`record_game` 返回 1/-1 时）。半途的那一局不落盘，读回来一定是空的。
+
+**线程**：这一处不需要锁，理由量过而不是猜的——`genetic.cpp:64` 与 `hill_climbing.cpp:43/67` 都在普通
+循环里调适配度函数，`trainer.cpp:325` 那组 `std::thread` 只跑数据采集，而采集那条路不经过
+`play_game`。所以账本只有一个写者（主线程），`note_opening_game` 也是被 `play_game` 同步调用的。
+
+**成本读数（就是这一单元杀线的口径）**：实测一场 2 局的配对赛 = 2 局 + 1 对观察，多花的局是 **0**。
+`tests/test_training.cpp` 第四条里那两个相同玩家对打的一对在 depth 4 / 节点帽 1500 下正好被座位钉死
+（局分 0.5、`pinned_pairs` 1、`retired` true、`games_played` 2），随后同一代第二个 Trainer 从盘上读回来、
+一局不跑（`reused` true、读数一字不变）。轮次161 量的事前筛是 96 局换 48 条候选。
+
+**事故（本轮自己造的，记录在这里而不是抹掉）**：变异臂脚本第一版用 `git checkout -- src/training/trainer.cpp`
+撤回改动，而那个文件带着**本轮未提交**的账本实现——checkout 把实现一起丢掉了（六臂里后四臂因此报
+`anchor_count=0`，日志的 `git status` 里也没有它）。恢复办法是把本轮记录在案的六处编辑重打一遍，
+然后 `diff` 与快照一致、套件重跑 100 例全绿。从这一版起，臂与臂之间的撤回一律
+`cp /tmp/r162/trainer_ledger.cpp $SRC`，快照在实现完成时就地留下。第二个坑：`sed "s|a|b|"` 的替换串里
+`&&` 被当成「整段匹配」展开，于是 A2/A4 第一版**自以为改了**——脚本的 `sed_did_not_land` 检查把它拦成了
+SKIP，改成 awk 的字面替换（`index()` + `substr()`）之后两臂才真的改掉。还有一条既有的坑再次出现：注释
+编辑之后 `test_training.cpp.o` 没有重编（vmhgfs 的 mtime），四臂报出的行号是**改动前**那份源的；八臂报的
+断言文本逐条与当前文件核对过（下表给的是当前行号，A3/A4/A6/A8 比臂日志里的号大 1，原因就在这）。
+
+**变异臂八条，全部非零退出（rc=134）并报出断言**
+
+| 臂 | 撤掉的那一句 | 断在 |
+|---|---|---|
+| A1 | 退役不看「每一对都被钉死」，只看够不够数 | `tests/test_training.cpp:6399` |
+| A2 | 「被钉死」不再要求同一个座位赢下两局 | `:6397` |
+| A3 | 键里少了 `min_pairs` 那一项 | `:6454` |
+| A4 | 读回来的判决不看读数（门槛拧到永远不满足） | `:6502` |
+| A5 | 轮转不看退役（未退役集合 = 全池） | `:6392` |
+| A6 | 证据来源断掉：跑完的局不再记账 | `:6696` |
+| A8 | 不足 8 条时不再退回固定轮换（杀线后半段的出口） | `:6668` |
+| A11 | 含未分胜负的对也算证据 | `:6407` |
+
+A5 打在第一条而不是第三条，是因为第一条里 `active_lines()` 的计数先撞上——同一条撤掉的两处被两处钉着，
+这仍算一条臂，不补第二条的说法。没做的臂也写着：只拆 `note_opening_game` 那道缺省守卫不成立，
+`ensure_openings_loaded()` 自己带着同一道守卫，行为不变（这条写在脚本里而不是假装量过）。
+
+**未测**：退役之后训练是不是真的更好（要一场赛或 §6 的卡片流水线，本轮没有跑）；池子该开多大（12 还是 48）
+没量过——缺省关着，所以这不是缺省行为的一部分；账本跨 run 复用时的陈旧判决（起点系数没变但棋盘上的
+玩家已经换代）只由「每一对都被钉死」这一条兜着，没有另加时间戳。
+
+**端到端一次（真实 CLI，不是用例）**：`gomoku_train --rounds 1 --method hill --hill-iterations 1 --depth 2
+--max-nodes 150 --match-opening-plies 3 --fitness-games 2 --verification-games 2 --no-data --opening-pool 3
+--openings-path /tmp/r162/smoke_openings.json --seed 7` 打出三行机制自己的话——
+`opening ledger: 3 lines, 0 pairs observed, 0 retired (min_pairs 2, sha b7db6f41-b7db6f41-s3d2n150m60p3q2;
+kept in this run)`、`opening ledger leaves 3 < 8: 可用的开局不够一轮轮换，退回固定 8 条（指导书 §4 丁-6
+杀线的后半段）`、`opening retired: 这一对两局都由同一座位赢下，累计看满 2 对都是这样 ⇒ 这条开局出局`，
+整场 `games=6`，没有一局是为筛选跑的。它写的 `data/training/checkpoint.json` 与 `best_params.json` 都在
+gitignore 里，且这一场候选被拒、冠军未变，两个文件里的系数与之前一字相同。
+
+**门禁**：`cmake --build build -j4` 在 `touch` 之后重编 7 个 TU（唯一一条 warning 是既有的
+`tests/test_training.cpp:3647` range-loop-construct，HEAD 就在）；`ctest` **9/9 全绿（806.96 s；
+test_search 478.57、test_pinned 244.23、test_training 57.97——上一轮那一百零三秒里有一整条打 4 局事前筛的
+用例，换成事后账本之后它只剩两局真赛）**；`valgrind --tool=memcheck` 跑 `test_training`（build-vg，Debug
+`-UNDEBUG`）**clean：reports=0、invalid_read=0、invalid_write=0、uninitialised=0、definite_leak=0**——第一遍
+906 s 是在最后那次日志串改动之前建的二进制上跑的，改完再强制重编 `build-vg` 跑第二遍，同一份读数、
+905 s（这两秒的差是墙，不是结论；引的是计数器）；
+`readme_anchor_check` 122/0、`web_frontend_check` 111/111。
+
 ## 轮次161 引擎重构 丁-6 第一段：把 S2 的判据与成本先量出来——同一座位的重复局 32/32 逐字相同（所以「双方胜率落在 [0.25, 0.75]」那条判据点不着），真实一对的 48 条三面开局是 38 被座位钉死 / 9 留下（18.8 %），事前筛因此要 96 局 > 一轮训练的 ~28 局 ⇒ 机制按用户裁决改成**事后退役**，本轮交仪器的两只新臂与读数 — engine redesign stage 丁-6 part 1: measure S2's criterion and cost first — repeated games for the same seat are 32/32 byte-identical (so the "[0.25, 0.75] win-rate band" criterion can never fire), a real coefficient pair leaves 38/48 openings seat-decided and 9 kept (18.8 %), which prices the pre-screen at 96 games against a round's ~28, so the mechanism was redirected to post-hoc retirement by the user and this round delivers the instrument's two new arms plus the readings
 
 `tools/opening_rule_screen.cpp` 本轮长出来两只新臂，都是为丁-6 服务的：

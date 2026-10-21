@@ -80,7 +80,7 @@ double Trainer::play_game(SearchEngine& black, SearchEngine& white, int black_ow
     if (played) *played = valid;
     // Same yardstick as the data side: an INVALID game is discarded, so it
     // must not inflate games_played_ in the checkpoint or the progress line.
-    if (valid) games_played_++;
+    if (valid) { games_played_++; note_opening_game(record, opening); }
     if (!valid) return 0.0;
 
     if (record.winner == EMPTY) {
@@ -786,55 +786,69 @@ int opening_color_from_name(const std::string& name) {
     return EMPTY;
 }
 
-// 一局：`candidate_is_black` 决定候选坐哪一侧，两侧各持自己那一套系数。返回值以**座位**计。
-int play_opening_screen_game(const std::vector<Move>& line, bool candidate_is_black,
-                             const CoefficientPair& candidate, const CoefficientPair& reference,
-                             const SelfPlayConfig& settings, int& plies) {
-    SearchEngine black(candidate_is_black ? candidate : reference);
-    SearchEngine white(candidate_is_black ? reference : candidate);
-    black.set_book_enabled(false);
-    white.set_book_enabled(false);
-    black.set_resign_detection(true);
-    white.set_resign_detection(true);
-    SelfPlay play(black, white, settings);
-    std::atomic<bool> stop(false);
-    const GameRecord rec = play.run(line, nullptr, &stop);
-    plies += static_cast<int>(rec.moves.size());
-    if (rec.reason == GameEndReason::INVALID) return 2;
-    if (rec.winner == BLACK) return 1;
-    if (rec.winner == WHITE) return -1;
+// 一局跑完之后由 `Trainer::play_game` 递过来的**座位**赢家。
+int opening_seat_winner(const GameRecord& record) {
+    if (record.winner == BLACK) return 1;
+    if (record.winner == WHITE) return -1;
     return 0;
 }
 
-// 三个计数都从读数重算：跑出来的与读回来的走同一条口径。
-void recount_openings(OpeningScreenReport& report) {
-    report.swept_before = 0;
-    report.swept_after = 0;
-    report.kept = 0;
-    for (const OpeningReading& reading : report.readings) {
-        if (reading.valid && !reading.discriminates()) report.swept_before++;
-        if (reading.kept) {
-            report.kept++;
-            if (reading.seat_decided) report.swept_after++;
+bool same_opening_line(const std::vector<Move>& a, const std::vector<Move>& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (a[i].pos.row != b[i].pos.row || a[i].pos.col != b[i].pos.col ||
+            a[i].color != b[i].color) {
+            return false;
         }
+    }
+    return true;
+}
+
+// 两个计数都从读数重算：写下去的与读回来的走同一条口径。
+void recount_ledger(OpeningLedgerState& state) {
+    state.observed_pairs = 0;
+    state.retired = 0;
+    for (const OpeningLedgerEntry& entry : state.entries) {
+        state.observed_pairs += entry.pairs;
+        if (entry.retired) state.retired++;
     }
 }
 
 }  // namespace
 
-std::string OpeningScreen::set_sha(const CoefficientPair& candidate,
-                                   const CoefficientPair& reference,
-                                   const OpeningScreenConfig& config) {
-    return coefficients_fingerprint(candidate.black) + "-" +
-           coefficients_fingerprint(candidate.white) + "-" +
-           coefficients_fingerprint(reference.black) + "-" +
-           coefficients_fingerprint(reference.white) +
+std::string OpeningLedger::set_sha(const CoefficientPair& base,
+                                   const OpeningLedgerConfig& config) {
+    // 键是**这次 run 起点那一套系数**（`versions_[0]`）的黑白两个半套指纹，加上产生这些证据的
+    // 档位。冠军换代不动它——已经花掉的对局证据不该被清空；起点换了（续训、换参数文件）才作废。
+    return coefficients_fingerprint(base.black) + "-" +
+           coefficients_fingerprint(base.white) +
            "-s" + std::to_string(config.stones) + "d" + std::to_string(config.depth) + "n" +
-           std::to_string(config.max_nodes) + "c" + std::to_string(config.candidates) + "k" +
-           std::to_string(config.seed_stride);
+           std::to_string(config.max_nodes) + "m" + std::to_string(config.max_moves) + "p" +
+           std::to_string(config.pool) + "q" + std::to_string(config.min_pairs);
 }
 
-bool OpeningScreen::load(const std::string& path, const std::string& sha, OpeningScreenReport& out,
+OpeningLedgerState OpeningLedger::fresh(const OpeningLedgerConfig& config,
+                                        const std::string& sha) {
+    OpeningLedgerState state;
+    state.config = config;
+    state.set_sha = sha;
+    for (int i = 0; i < config.pool; ++i) {
+        OpeningLedgerEntry entry;
+        entry.line = Trainer::match_opening_line(i, config.stones);
+        // 生成器一路都走 `legal_moves`，唯一可能的短是盘面提前满了；那种开局不进池子。
+        if (static_cast<int>(entry.line.size()) != config.stones) continue;
+        Board prefix;
+        bool placeable = true;
+        for (const Move& stone : entry.line) {
+            if (!prefix.place_stone(stone.pos.row, stone.pos.col, stone.color)) placeable = false;
+        }
+        if (placeable) state.entries.push_back(std::move(entry));
+    }
+    recount_ledger(state);
+    return state;
+}
+
+bool OpeningLedger::load(const std::string& path, const std::string& sha, OpeningLedgerState& out,
                          std::string& error) {
     std::ifstream file(path);
     if (!file.is_open()) {
@@ -847,101 +861,97 @@ bool OpeningScreen::load(const std::string& path, const std::string& sha, Openin
     try {
         root = json::parse(buffer.str());
     } catch (const json::exception& e) {
-        error = std::string("opening set is not valid JSON: ") + e.what();
+        error = std::string("opening ledger is not valid JSON: ") + e.what();
         return false;
     }
     if (!root.is_object() || !root.contains("set_sha") || !root["set_sha"].is_string()) {
-        error = "opening set has no set_sha";
+        error = "opening ledger has no set_sha";
         return false;
     }
     const std::string stored = root["set_sha"].get<std::string>();
     if (stored != sha) {
-        // 换系数或换档：旧筛选留下的是**另一对玩家**下有胜机的开局，留着比没有更糟。
-        error = "opening set was screened under " + stored + ", this pair needs " + sha;
+        // 换起点系数或换档：那本账记的是**另一对玩家**在哪一档下被座位钉死，留着比没有更糟。
+        error = "opening ledger was kept under " + stored + ", this run needs " + sha;
         return false;
     }
-    if (!root.contains("readings") || !root["readings"].is_array()) {
-        error = "opening set has no readings";
+    if (!root.contains("entries") || !root["entries"].is_array()) {
+        error = "opening ledger has no entries";
         return false;
     }
 
-    OpeningScreenReport report;
-    report.config = out.config;   // 档位由调用方给，它也是 sha 的来源
-    report.set_sha = stored;
-    for (const json& item : root["readings"]) {
+    OpeningLedgerState state;
+    state.config = out.config;   // 档位由调用方给，它也是 sha 的来源
+    state.set_sha = stored;
+    for (const json& item : root["entries"]) {
         if (!item.is_object()) {
-            error = "opening reading is not an object";
+            error = "opening ledger entry is not an object";
             return false;
         }
-        OpeningReading reading;
         if (!item.contains("line") || !item["line"].is_array()) {
-            error = "opening reading has no line";
+            error = "opening ledger entry has no line";
             return false;
         }
+        OpeningLedgerEntry entry;
         for (const json& stone : item["line"]) {
             if (!stone.is_array() || stone.size() < 3 || !stone[2].is_string()) {
-                error = "opening reading has an unreadable stone";
+                error = "opening ledger entry has an unreadable stone";
                 return false;
             }
-            reading.line.push_back(Move(stone[0].get<int>(), stone[1].get<int>(),
-                                        opening_color_from_name(stone[2].get<std::string>())));
+            entry.line.push_back(Move(stone[0].get<int>(), stone[1].get<int>(),
+                                      opening_color_from_name(stone[2].get<std::string>())));
         }
-        for (const char* key : {"as_candidate_black", "as_candidate_white", "plies", "games"}) {
+        for (const char* key : {"pairs", "pinned_pairs"}) {
             if (!item.contains(key) || !item[key].is_number_integer()) {
-                error = std::string("opening reading is missing ") + key;
+                error = std::string("opening ledger entry is missing ") + key;
                 return false;
             }
         }
-        reading.as_candidate_black = item["as_candidate_black"].get<int>();
-        reading.as_candidate_white = item["as_candidate_white"].get<int>();
-        reading.plies = item["plies"].get<int>();
-        reading.games = item["games"].get<int>();
-        reading.valid = reading.games == 2 && reading.as_candidate_black != 2 &&
-                        reading.as_candidate_white != 2 && reading.as_candidate_black != 0 &&
-                        reading.as_candidate_white != 0;
-        reading.seat_decided = !reading.discriminates();
-        reading.kept = reading.discriminates();
-        report.readings.push_back(reading);
+        entry.pairs = item["pairs"].get<int>();
+        entry.pinned_pairs = item["pinned_pairs"].get<int>();
+        // 判决本身也从读数重算，不信文件里写的那个布尔：一本「pairs 够、全被钉死」的账
+        // 必须退役，写反了的文件改不过来它。
+        entry.retired = entry.pairs >= state.config.min_pairs &&
+                        entry.pairs > 0 && entry.pinned_pairs == entry.pairs;
+        // 半途的那一局不落盘：读回来时它总是空的，下次跑到同一开局会重新凑一对。
+        state.entries.push_back(std::move(entry));
     }
-    recount_openings(report);
-    report.reused = true;
-    out = report;
+    recount_ledger(state);
+    state.reused = true;
+    out = state;
     return true;
 }
 
-bool OpeningScreen::save(const OpeningScreenReport& report, std::string& error) {
+bool OpeningLedger::save(const OpeningLedgerState& state, std::string& error) {
     json root;
-    root["schema"] = "openings/1";
-    root["set_sha"] = report.set_sha;
-    root["games_played"] = report.games_played;
-    root["swept_before"] = report.swept_before;
-    root["swept_after"] = report.swept_after;
-    root["kept"] = report.kept;
-    root["candidate_count"] = static_cast<int>(report.readings.size());
-    root["stones"] = report.config.stones;
-    root["depth"] = report.config.depth;
-    root["max_nodes"] = report.config.max_nodes;
+    root["schema"] = "openings/2";
+    root["set_sha"] = state.set_sha;
+    root["observed_pairs"] = state.observed_pairs;
+    root["retired"] = state.retired;
+    root["pool"] = static_cast<int>(state.entries.size());
+    root["min_pairs"] = state.config.min_pairs;
+    root["stones"] = state.config.stones;
+    root["depth"] = state.config.depth;
+    root["max_nodes"] = state.config.max_nodes;
+    root["max_moves"] = state.config.max_moves;
 
-    json readings = json::array();
-    for (const OpeningReading& reading : report.readings) {
+    json entries = json::array();
+    for (const OpeningLedgerEntry& entry : state.entries) {
         json stones = json::array();
-        for (const Move& stone : reading.line) {
+        for (const Move& stone : entry.line) {
             stones.push_back(
                 json::array({stone.pos.row, stone.pos.col, opening_color_name(stone.color)}));
         }
         json item;
         item["line"] = std::move(stones);
-        item["as_candidate_black"] = reading.as_candidate_black;
-        item["as_candidate_white"] = reading.as_candidate_white;
-        item["plies"] = reading.plies;
-        item["games"] = reading.games;
-        item["kept"] = reading.kept;
-        readings.push_back(std::move(item));
+        item["pairs"] = entry.pairs;
+        item["pinned_pairs"] = entry.pinned_pairs;
+        item["retired"] = entry.retired;
+        entries.push_back(std::move(item));
     }
-    root["readings"] = std::move(readings);
+    root["entries"] = std::move(entries);
 
     // 与参数文件、checkpoint 同一个写法：先写临时文件再改名，半写的一份不会顶掉能用的那份。
-    const std::string tmp = report.config.path + ".tmp";
+    const std::string tmp = state.config.path + ".tmp";
     {
         std::ofstream file(tmp, std::ios::trunc);
         if (!file.is_open()) {
@@ -958,141 +968,154 @@ bool OpeningScreen::save(const OpeningScreenReport& report, std::string& error) 
         }
     }
     std::error_code ec;
-    std::filesystem::rename(tmp, report.config.path, ec);
+    std::filesystem::rename(tmp, state.config.path, ec);
     if (ec) {
         std::error_code remove_ec;
         std::filesystem::remove(tmp, remove_ec);
-        error = "cannot replace " + report.config.path + ": " + ec.message();
+        error = "cannot replace " + state.config.path + ": " + ec.message();
         return false;
     }
     return true;
 }
 
-OpeningScreenReport OpeningScreen::run(const CoefficientPair& candidate,
-                                       const CoefficientPair& reference,
-                                       const OpeningScreenConfig& config, std::string& error) {
-    OpeningScreenReport report;
-    report.config = config;
-    report.set_sha = set_sha(candidate, reference, config);
-    if (config.candidates <= 0) return report;
-
-    SelfPlayConfig settings;
-    settings.max_depth = config.depth;
-    // 时限只防死循环：判定用节点帽，这样一条开局在空机与满载机上给出同一个答案（§9.2）。
-    settings.timeout_ms = 60000;
-    settings.max_nodes = config.max_nodes;
-    settings.max_moves = config.max_moves;
-
-    for (int i = 0; i < config.candidates; ++i) {
-        OpeningReading reading;
-        reading.line = Trainer::random_opening_line(config.stones,
-                                                    static_cast<uint64_t>(config.seed_stride) + i);
-        if (static_cast<int>(reading.line.size()) < config.stones) continue;
-        Board prefix;
-        bool placeable = true;
-        for (const Move& stone : reading.line) {
-            if (!prefix.place_stone(stone.pos.row, stone.pos.col, stone.color)) placeable = false;
+int OpeningLedger::record_game(OpeningLedgerState& state, const std::vector<Move>& line,
+                               int seat_winner) {
+    if (state.set_sha.empty() || state.config.pool <= 0) return 0;
+    OpeningLedgerEntry* target = nullptr;
+    for (OpeningLedgerEntry& entry : state.entries) {
+        if (same_opening_line(entry.line, line)) {
+            target = &entry;
+            break;
         }
-        if (!placeable) continue;
-
-        reading.as_candidate_black =
-            play_opening_screen_game(reading.line, true, candidate, reference, settings,
-                                     reading.plies);
-        reading.as_candidate_white =
-            play_opening_screen_game(reading.line, false, candidate, reference, settings,
-                                     reading.plies);
-        reading.games = (reading.as_candidate_black == 2 || reading.as_candidate_white == 2) ? 0 : 2;
-        report.games_played += reading.games;
-        reading.valid = reading.games == 2 && reading.as_candidate_black != 0 &&
-                        reading.as_candidate_white != 0;
-        reading.seat_decided = !reading.discriminates();
-        reading.kept = reading.discriminates();
-        report.readings.push_back(reading);
     }
-    recount_openings(report);
-    (void)error;
-    return report;
+    // 池外的开局不记：账本只对自己那几条负责，固定轮换兜底时用的就是同一批线，正常都在池里。
+    if (target == nullptr) return 0;
+
+    if (!target->has_pending) {   // 半个对子先站着，等它的姊妹局
+        target->has_pending = true;
+        target->pending_seat = seat_winner;
+        return 0;
+    }
+    const int first = target->pending_seat;
+    const int second = seat_winner;
+    target->has_pending = false;
+    target->pending_seat = 0;
+
+    target->pairs++;
+    state.observed_pairs++;
+    // 「被座位钉死」要求两局**都分了胜负**且赢家是同一个座位。含未分胜负的对不算证据：
+    // 它既没被钉死，也没证明这条开局能把两个人分开，两种意思都不能由它说。
+    const bool pinned = first != 0 && second != 0 && first == second;
+    if (pinned) target->pinned_pairs++;
+
+    // 判决是读数的纯函数：够数且**每一对**都被钉死才退役，出现过一对能区分的就恢复。
+    const bool should_retire = target->pairs >= state.config.min_pairs &&
+                               target->pinned_pairs == target->pairs;
+    if (should_retire && !target->retired) {
+        target->retired = true;
+        state.retired++;
+        return 1;
+    }
+    if (!should_retire && target->retired) {
+        target->retired = false;
+        state.retired--;
+        return -1;
+    }
+    return 0;
 }
 
-std::vector<std::vector<Move>> OpeningScreenReport::lines() const {
-    std::vector<std::vector<Move>> kept_lines;
-    for (const OpeningReading& reading : readings) {
-        if (reading.kept) kept_lines.push_back(reading.line);
+std::vector<std::vector<Move>> OpeningLedgerState::active_lines() const {
+    std::vector<std::vector<Move>> active;
+    for (const OpeningLedgerEntry& entry : entries) {
+        if (!entry.retired) active.push_back(entry.line);
     }
-    return kept_lines;
+    return active;
 }
 
-std::string OpeningScreen::summarize(const OpeningScreenReport& report) {
-    const int judged = report.swept_before + report.kept;
+std::string OpeningLedger::summarize(const OpeningLedgerState& state) {
     std::ostringstream out;
-    out << "opening screen: kept " << report.kept << " of " << report.readings.size()
-        << " candidates (" << judged << " judged, "
-        << (judged ? 100.0 * report.swept_before / judged : 0.0)
-        << "% seat-decided before, " << report.swept_after << " after; " << report.games_played
-        << " games, sha " << report.set_sha
-        << (report.reused ? " (reused from disk)" : " (screened now)");
+    out << "opening ledger: " << state.entries.size() << " lines, " << state.observed_pairs
+        << " pairs observed, " << state.retired << " retired (min_pairs "
+        << state.config.min_pairs << ", sha " << state.set_sha
+        << (state.reused ? "; reused from disk)" : "; kept in this run)");
     return out.str();
 }
 
 std::vector<Move> Trainer::match_opening_for(int index) {
-    ensure_openings_screened();
-    const int pool = static_cast<int>(screened_openings_.size());
+    ensure_openings_loaded();
+    const std::vector<std::vector<Move>> active = openings_.active_lines();
+    const int pool = static_cast<int>(active.size());
     if (pool >= kMatchOpeningSet) {
         // 与固定轮换同一个取法：按 (轮次 + 对序) 取模，同一轮里候选与冠军拿到同一批局面。
         const int wrapped = ((index % pool) + pool) % pool;
-        return screened_openings_[static_cast<size_t>(wrapped)];
+        return active[static_cast<size_t>(wrapped)];
     }
     return match_opening_line(index, config_.match_opening_plies);
 }
 
-void Trainer::ensure_openings_screened() {
-    if (openings_screen_done_) return;
-    openings_screen_done_ = true;
-    if (config_.opening_screen_candidates <= 0 || fitness_override_) return;
+void Trainer::note_opening_game(const GameRecord& record, const std::vector<Move>& opening) {
+    if (config_.opening_pool <= 0 || fitness_override_) return;
+    ensure_openings_loaded();
+    if (openings_.set_sha.empty()) return;
 
-    // 「这两个玩家」取的是**本轮的起点系数 vs 当前冠军**：这是一整轮里唯一固定的那对，
-    // 也是适配度赛真正要比的那对——候选是谁并不影响「这条开局能不能把两个不同的
-    // 系数集分开」。两侧同值（v0 就是冠军，比如没换参数的续训）时这条判据只会留下
-    // 0 条，下面的门槛会把这一代退回固定轮换，不会拿一个空集去训。
-    OpeningScreenConfig screen;
-    screen.candidates = config_.opening_screen_candidates;
-    screen.path = config_.openings_path;
-    screen.depth = config_.search_depth;
-    screen.max_nodes = config_.max_nodes > 0 ? config_.max_nodes : screen.max_nodes;
-    screen.max_moves = config_.max_moves;
-
-    const CoefficientPair base = versions_.empty() ? champion() : versions_[0];
-    const CoefficientPair reference = champion();
-    const std::string sha = OpeningScreen::set_sha(base, reference, screen);
-
-    OpeningScreenReport report;
+    const int change = OpeningLedger::record_game(openings_, opening, opening_seat_winner(record));
+    if (change == 0) return;
+    // 只有判决翻转才写盘：账本小（≤ pool 条），但一局一写会把适配度赛变成磁盘赛。
     std::string error;
-    report.config = screen;
-    if (OpeningScreen::load(config_.openings_path, sha, report, error)) {
-        if (log_) log_(OpeningScreen::summarize(report));
+    if (!OpeningLedger::save(openings_, error) && log_) {
+        log_("opening ledger not saved: " + error);
+    }
+    if (log_) {
+        log_(change > 0 ? "opening retired: 这一对两局都由同一座位赢下，累计看满 " +
+                              std::to_string(openings_.config.min_pairs) +
+                              " 对都是这样 ⇒ 这条开局出局（§4 丁-6 的事后退役）"
+                        : "opening restored: 退役过的开局出现一对能区分两个玩家 ⇒ 回到轮换里");
+    }
+}
+
+void Trainer::ensure_openings_loaded() {
+    if (openings_loaded_) return;
+    openings_loaded_ = true;
+    if (config_.opening_pool <= 0 || fitness_override_) return;
+
+    OpeningLedgerConfig ledger;
+    ledger.pool = config_.opening_pool;
+    ledger.min_pairs = config_.opening_min_pairs > 0 ? config_.opening_min_pairs : 1;
+    ledger.path = config_.openings_path;
+    ledger.stones = config_.match_opening_plies;
+    ledger.depth = config_.search_depth;
+    ledger.max_nodes = config_.max_nodes;
+    ledger.max_moves = config_.max_moves;
+
+    // 「这一本账是谁的」取的是**这次 run 起点的系数**（`versions_[0]`），不是当前冠军：证据是从
+    // 适配度赛里顺手记的，冠军换代不该把已经花掉的对局清空；起点变了才该重记。
+    const CoefficientPair base = versions_.empty() ? champion() : versions_[0];
+    const std::string sha = OpeningLedger::set_sha(base, ledger);
+
+    OpeningLedgerState state;
+    state.config = ledger;
+    std::string error;
+    if (OpeningLedger::load(config_.openings_path, sha, state, error)) {
+        if (log_) log_(OpeningLedger::summarize(state));
     } else {
-        // 「盘上没有」与「盘上那份是别的系数筛的」都不是故障，重筛就是了；
+        // 「盘上没有」与「盘上那本是别的起点记的」都不是故障，重开一本就是了；
         // 只有后者值得让读日志的人看见（它说明键真的在管换代）。
         if (log_ && error.find("cannot open") == std::string::npos) {
-            log_("opening set on disk not reusable: " + error);
+            log_("opening ledger on disk not reusable: " + error);
         }
-        error.clear();
-        report = OpeningScreen::run(base, reference, screen, error);
-        if (!error.empty() && log_) log_("opening screen failed: " + error);
-        if (!report.readings.empty()) {
-            std::string save_error;
-            if (!OpeningScreen::save(report, save_error) && log_) {
-                log_("opening set not saved: " + save_error);
-            }
+        state = OpeningLedger::fresh(ledger, sha);
+        std::string save_error;
+        if (!OpeningLedger::save(state, save_error) && log_) {
+            log_("opening ledger not saved: " + save_error);
         }
-        if (log_) log_(OpeningScreen::summarize(report));
+        if (log_) log_(OpeningLedger::summarize(state));
     }
-    screened_openings_ = report.lines();
-    if (static_cast<int>(screened_openings_.size()) < kMatchOpeningSet && log_) {
-        log_("opening screen kept " + std::to_string(screened_openings_.size()) +
-             " < " + std::to_string(kMatchOpeningSet) +
-             ": 筛不出可用的集，本轮起退回固定 8 条轮换（指导书 §4 丁-6 杀线的后半段）");
-        screened_openings_.clear();
+    openings_ = std::move(state);
+    if (static_cast<int>(openings_.active_lines().size()) < kMatchOpeningSet && log_) {
+        log_("opening ledger leaves " +
+             std::to_string(openings_.active_lines().size()) + " < " +
+             std::to_string(kMatchOpeningSet) +
+             ": 可用的开局不够一轮轮换，退回固定 8 条（指导书 §4 丁-6 杀线的后半段）");
     }
 }
 

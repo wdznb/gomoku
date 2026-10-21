@@ -1,6 +1,6 @@
 #ifndef GOMOKU_TRAINER_H
 #define GOMOKU_TRAINER_H
-
+#include "opening_ledger.h"
 #include "../core/evaluator.h"
 #include "../search/search_engine.h"
 #include "data_collector.h"
@@ -111,11 +111,11 @@ struct TrainingConfig {
     int teacher_depth = 0;
     int teacher_max_nodes = 0;
 
-    // 丁-6（v2 §3.2 S2）：开局集按双方胜机筛选。**0 = 关**（缺省），这时一条筛选局
-    // 都不跑，开局仍是上面那套固定 8 条轮换（`match_opening_line`），逐字节是今天的样子。
-    // 开了就是「跑之前先花 2×N 局问一遍：这条开局能不能区分这两个玩家」，留下的才用；
-    // 结果按 sha 落盘复用（`openings_path`），系数换代自动重筛。
-    int opening_screen_candidates = 0;
+    // 丁-6（v2 §3.2 S2，事后退役版）：开局账本。**pool = 0 是缺省，也就是关**：一条额外的局都
+    // 不跑、一个字节都不多写，开局仍是上面那套固定 8 条轮换。开了之后证据全部来自**本来就要跑的**
+    // 适配度赛与验证赛：一条开局的两局（候选各坐一次色）都被同一座位赢下 = 被座位钉死，钉满 N 对退役。
+    int opening_pool = 0;
+    int opening_min_pairs = 2;
     std::string openings_path = "data/training/openings.json";
 
     uint64_t seed = 20261011;
@@ -244,15 +244,15 @@ private:
     SearchEngine& prepare(SearchEngine& engine) const;
     int generate_data_games(int games, int threads);
 
-    // 这一场配对局从哪条开局起。关着筛选（缺省）时就是 `match_opening_line(index,
-    // config_.match_opening_plies)`，一个字的差别都没有。
+    // 这一场配对局从哪条开局起。账本关着（缺省 `opening_pool = 0`）时就是 `match_opening_line(
+    // index, config_.match_opening_plies)`，一个字的差别都没有。
     std::vector<Move> match_opening_for(int index);
-    // 第一次需要开局时跑一次筛选（或从落盘读回来），整个 run 只付一次成本。
-    void ensure_openings_screened();
-    // 筛出来留下的开局；少于 `kMatchOpeningSet` 条时视为「筛不出可用的集」，
-    // 退回固定轮换（指导书 §4 丁-6 杀线的后半段）。
-    std::vector<std::vector<Move>> screened_openings_;
-    bool openings_screen_done_ = false;
+    // 第一次需要开局时把账本读回来（盘上没有就从零建池子），整个 run 只付一次。
+    void ensure_openings_loaded();
+    // 一局跑完记一笔：证据来自本来就要跑的赛，所以这里只**记账**，一句都不多问成本。
+    void note_opening_game(const GameRecord& record, const std::vector<Move>& opening);
+    OpeningLedgerState openings_;
+    bool openings_loaded_ = false;
 
     TrainingConfig config_;
     std::vector<CoefficientPair> versions_;
@@ -273,83 +273,9 @@ private:
     int rounds_completed_ = 0;
 };
 
-// v2 §3.2 S2（指导书 §4 丁-6）：开局集按双方胜机筛选。
-//
-// 一句话：训练赛的一局棋要能**区分两个玩家**才有资格进训练集。一条开局在两局里（候选分别
-// 坐黑、坐白）如果都是同一个座位赢，那一对的局分恒等于 0.5——谁强看不出来。留下来的正是
-// 「两个座位各赢一局」的那部分。
-//
-// 为什么不是指导书思路 2 那条判据：那句是「双方胜率都落在 [0.25, 0.75]」，量的是同一座位跑
-// K 局的胜率。轮次160 实测（`tools/opening_rule_screen.cpp --repeat 2`：8 条开局 × 两座位 ×
-// 2 次重复 = 32 局，出现不同 = 0）：**同一局面对同一座位的重复局逐字相同**——引擎是确定性
-// 的，所以每色的 K 局胜率只能取 0 或 1，那条判据永远点不着。指导书 §4 丁-6 注意 2 自己写了
-// 怎么办：「筛选判据选错时，**换判据而不是放宽阈值**」。换完的判据就是上面那句，且它只需要
-// 每条开局两局（K = 1），正是 注意 1「K 与候选数要小，否则筛选成本超过省下的训练局数」要的。
-//
-// 起跑线与出口（同一轮实测）：真实一对（缺省系数 vs `data/training/best_params.json`，两者只
-// 差 `cand_width_root` 24/15）在 48 条三面开局上是 38 通吃 / 9 留下（18.8 %）/ 1 未分胜负，
-// 成本 96 局一次、按 sha 落盘复用。留下的开局数 9 ≥ `Trainer::kMatchOpeningSet`，够用；
-// 若某一代筛出 < 8 条，`Trainer` 会退回今天那套固定 8 条轮换并说明原因（思路的杀线后半段）。
-//
-// 缺省 `candidates = 0` 就是**关**：一条筛选局都不跑，开局仍是 `match_opening_line` 那 8 条。
-struct OpeningScreenConfig {
-    int candidates = 0;      // 0 = 关
-    int stones = 3;          // 每条候选几颗子（第 1 手被 random_opening_line 钉在天元）
-    int depth = 4;
-    int max_nodes = 1500;    // 判定用节点帽，时限只防死循环
-    int max_moves = 60;
-    int seed_stride = 1000;  // 第 i 条候选的 seed = seed_stride + i
-    std::string path = "data/training/openings.json";
-};
-
-struct OpeningReading {
-    std::vector<Move> line;
-    // 两局都以**座位**计：+1 黑座位胜、-1 白座位胜、0 未分胜负、2 作废。
-    int as_candidate_black = 0;  // 候选坐黑（开场方是它）
-    int as_candidate_white = 0;  // 候选坐白（开场方是对方）
-    int plies = 0;               // 两局手数之和，只做诊断
-    int games = 0;               // 真跑完的局数（作废的不算）
-    bool valid = false;          // 两局都跑完且都分了胜负
-    bool seat_decided = true;    // 同一座位赢下两局 ⇒ 这一对恒为 0.5，该剔
-    bool kept = false;
-
-    // 座位不决定结果 = 两个座位各赢一局 = 这一对能区分两个玩家。
-    bool discriminates() const { return valid && as_candidate_black != as_candidate_white; }
-};
-
-struct OpeningScreenReport {
-    OpeningScreenConfig config;
-    std::string set_sha;   // 四半套系数 + 档位的指纹：落盘复用的键
-    std::vector<OpeningReading> readings;
-    int swept_before = 0;  // 筛前被座位决定的对数
-    int swept_after = 0;   // 留下的里面还剩几个（判据正确时应为 0）
-    int kept = 0;
-    int games_played = 0;
-    bool reused = false;   // true = 从落盘读回来的，一局没跑
-
-    std::vector<std::vector<Move>> lines() const;
-};
-
-class OpeningScreen {
-public:
-    // 指纹覆盖两个玩家各自的两侧系数与档位。筛选结论是**这一对玩家**的相对强弱决定的，
-    // 换任一方的系数或换档，旧结果就不作数——与题卡的 `coeffs_sha` 同一个道理。
-    static std::string set_sha(const CoefficientPair& candidate, const CoefficientPair& reference,
-                               const OpeningScreenConfig& config);
-
-    // sha 不匹配时返回 false 并在 error 里说清「是哪一套键筛的 vs 现在这套」，
-    // 让调用方知道重筛的成本从哪来。
-    static bool load(const std::string& path, const std::string& sha, OpeningScreenReport& out,
-                     std::string& error);
-    static bool save(const OpeningScreenReport& report, std::string& error);
-
-    // 跑一遍：每条候选两局。`error` 只在真正跑不动时非空。
-    static OpeningScreenReport run(const CoefficientPair& candidate, const CoefficientPair& reference,
-                                   const OpeningScreenConfig& config, std::string& error);
-
-    // 一句人话摘要，进训练日志与 `train_status`。
-    static std::string summarize(const OpeningScreenReport& report);
-};
+// 丁-6（v2 §3.2 S2）的开局账本类型在 `training/opening_ledger.h`——它们必须在 `Trainer` 之前
+// 可见（`openings_` 是按值成员），所以不能留在这个类后面。判据、成本、起跑线那三段读数也写
+// 在那里。
 
 }
 
