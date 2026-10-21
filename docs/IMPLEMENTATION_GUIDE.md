@@ -508,7 +508,7 @@ git push origin master                # 然后核对 git log --oneline -1 origin
 
 ### 戊-1 H：进程模型（`gomoku_broker` ＋ `gomoku_train --worker`）
 
-**状态**：未做。现在是**进程内 `std::thread`**（`trainer.cpp:268-327`），没有 broker、没有 worker 模式、没有绑核。
+**状态**：**轮次163 交的是第一段：成本仪器 + 吞吐实测 + IPC 核心**。新仪器 `tools/worker_nps_probe.cpp`（目标 `worker_nps_probe`，追加在 CMake 末尾）与 `src/training/run_spool.h/.cpp`（任务文件 + spool 行 + 只往前读的 tail，五条 `test_h1_*` 用例 + 九条变异臂）。**实测（同一批 42 副普查棋盘、同一个 depth 4 与节点帽 20000，每一行的 `nodes`/`checksum` 都逐字相同）**：单进程基线 16,395-21,914 nps（绝对值随桌面负载走，所以只比同一遍内的比值），**2 份绑核 = 100.5 / 97.9 %，3 份 = 96.2 / 94.6 / 95.9 %，4 份 = 87.9 / 87.0 / 88.6 %**；4 份**不绑核**的控制臂 = 89.0 / 88.8 / 89.2 %（与绑核那一臂同形，差 −0.7～−2.0 %），把表从 2^18 条（RSS 12.2 MB）缩到 512 条（5.2 MB）仍是 88.2 %。⇒ 绑核确实生效（15 份 pinned 拷贝各自报 `affinity=2/3/4/5`），但**掉的那 11 % 不是绑核没生效、也不是 cache 容量**，而是这台 6 核 VMware 虚机的共享物理核；**本单元验收第 1 条（每 worker ≥ 单进程 90 %）在本机于 4 worker 达不到、于 ≤3 worker 达到**。由此定下：**缺省配额按实测取 3**（`reserved_cores` 缺省从文档的 2 改成 3，公式 `workers = max(1, 物理核 − reserved_cores)` 不动）——§4.4 写的那句「超过说明绑核没生效，不是机器不够」被控制臂证伪，已在本行登记。**第二段（worker 模式 + broker + 让位三档的 think p50/p99）尚未落地**，所以第 2、3 条验收本轮交不出；§4.2 那四条理由（崩溃隔离、`--threads` 惰性、核要让给玩家、TT 每引擎一张）在轮次124/125/127/141 已有实测，不受吞吐这一格影响。**另一处文档要改**：思路 1 说 broker「每轮末跑一次 `BalanceController`」，而丁-4 已判不落地、树里没有这个类——派活的一方不能调度一个不存在的组件，这一条要等丁-4 的复测条件成熟再挂回去。现在是**进程内 `std::thread`**（`trainer.cpp:268-327`），没有 broker、没有 worker 模式、没有绑核。
 
 **目标效果**：supervisor 进程（broker）派活给 N 个 worker 进程，每个 worker 绑一个物理核；玩家下棋时 worker 让位；崩溃只死一个任务。
 
@@ -816,7 +816,7 @@ set_tests_properties(test_training  PROPERTIES TIMEOUT 300)   # 实测 13 s，me
 | 丁-4 平衡控制器 | **未交用例**（轮次159 判不落地，机制未写） | 原判据（Wilson、一步一项、5 步封顶、回滚）改为读数记在轮次159：每色 4 局只有 4-0 才点火、误点火 12.5 % | — |
 | 丁-5 S1 交换规则 | **未交用例**（轮次160 判不落地）；仪器在 `tools/opening_rule_screen.cpp` | 原判据（`none` 逐字节、交换回合、非法规则被拒）改为读数记在轮次160：`swap` 臂与对照臂逐字相同（47/48 = 97.9 %、两局判决不同 = 0） | 仪器约 25 min / 288 局 |
 | 丁-6 S2 开局筛选 | `test_training`（轮次162 四条 `test_d6_*`：判据逐分支、键与落盘、关着逐字不变、真实一对的成本） | 判据边界、落盘复用（同 sha 不重记）；**事后退役口径**：每对两局皆分胜负且同一座位赢下才算证据、含未分胜负的对不算、账本只挂这次 run 的起点系数（冠军换代不清空）、未退役集合轮转 + 不足 8 条退回固定 8 条 | 300 s |
-| 戊-1 H 进程模型 | 新 `test_broker`（或 shell 臂） | 半行写丢弃并重排、`SIGKILL` 后账对齐、绑核生效 | 脚本 `timeout 300` |
+| 戊-1 H 进程模型 | 轮次163 交的是 IPC 核心：`test_training` 里五条 `test_h1_*`（任务文件契约、payload 逐字、半行与断号丢弃并重排、attempt 各自成序列且尾读只往前、真的 `fork`+`SIGKILL` 两型）；**新 `test_broker` 仍未交** | 半行写丢弃并重排、`SIGKILL` 后账对齐、绑核生效 | 脚本 `timeout 300` |
 | 戊-2 I 控制面 | `test_server` ＋ `web_frontend_check.js` | schema 形状、越界拒绝、三类 `when_live`、前端零硬编码 | 180 s |
 | 戊-3 K 一键训练 | `test_training` | 同 seed 两次相序列与 checkpoint 逐字节相同 | 300 s |
 

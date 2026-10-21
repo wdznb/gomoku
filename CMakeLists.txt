@@ -57,8 +57,8 @@ set(GOMOKU_TRAINING_SOURCES
     src/training/genetic.cpp
     src/training/hill_climbing.cpp
     src/training/trainer.cpp
+    src/training/run_spool.cpp
 )
-
 set(GOMOKU_SOURCES
     src/main.cpp
     ${GOMOKU_CORE_SOURCES}
@@ -366,4 +366,23 @@ if(MSVC)
     target_compile_options(opening_rule_screen PRIVATE /W4)
 else()
     target_compile_options(opening_rule_screen PRIVATE -Wall -Wextra -O2 -Wno-template-body -Wno-template-id-cdtor)
+endif()
+
+# 进程模型的成本仪器（v2 §4.7 第 1 条 / 指导书 §4 戊-1）。同一批普查棋盘、同一个节点帽，
+# 单进程与 2 / 4 份并发各报一次 nps；绑核由进程自己（--pin）或由外面的 taskset 做，两条都要能响。
+# 继续追加在文件末尾：上面那些目标行被 REVIEW_LOG 按行号指认（`:166-180`、`:313-327`、
+# `:331/336`、`:337`、`:339`、`:352-369`）。
+add_executable(worker_nps_probe
+    tools/worker_nps_probe.cpp
+    ${GOMOKU_CORE_SOURCES}
+)
+target_include_directories(worker_nps_probe PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/tests)
+target_link_libraries(worker_nps_probe PRIVATE Threads::Threads nlohmann_json::nlohmann_json)
+if(UNIX)
+    target_link_libraries(worker_nps_probe PRIVATE pthread)
+endif()
+if(MSVC)
+    target_compile_options(worker_nps_probe PRIVATE /W4)
+else()
+    target_compile_options(worker_nps_probe PRIVATE -Wall -Wextra -O2 -Wno-template-body -Wno-template-id-cdtor)
 endif()

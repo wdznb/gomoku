@@ -1980,6 +1980,99 @@ additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cp
 no existing assertion was edited.
 
 
+## 轮次163 引擎重构 戊-1 第一段：进程模型先量成本再建——同一批普查棋盘上 2 份绑核 = 100.5/97.9 %、3 份 = 96.2/94.6/95.9 %、4 份 = 87.9/87.0/88.6 %，而**不绑核的控制臂是 89.0/88.8/89.2 %**（差 −0.7 %～−2.0 %），把置换表从 2^18 条缩到 512 条（RSS 12.2 MB → 5.2 MB）仍是 88.2 % ⇒ 掉的那 11 % 不是绑核没生效也不是 cache，是这台 6 核虚机的共享物理核；缺省配额因此按实测取 **3**（用户裁决），一起交的还有 §4.3 的 IPC 核心（任务文件 + spool 行 + 只往前读的 tail，五条用例、九条变异臂），worker 模式与 broker 与让位三档的 p50/p99 **本轮不交** — engine redesign stage 戊-1 part 1: price the process model before building it — 2/3/4 pinned copies hold 100/96/88 % of the single-process nps while the unpinned control sits at the same 89 %, and a 512-entry table changes nothing, so the loss is the VM's shared physical cores rather than affinity; the default quota is 3 by measurement, and what ships with it is the §4.3 IPC core (task file + spool line + forward-only tail, five cases, nine arms); worker mode, the broker and the three-regime think latency are explicitly deferred
+
+**这一段交什么、不交什么**。交：`tools/worker_nps_probe.cpp`（新目标 `worker_nps_probe`，追加在
+CMake 末尾，不动那些被按行号指认的目标行）＋ 三张吞吐表 ＋ `src/training/run_spool.h/.cpp`
+（v2 §4.3 那三条口径的实现）＋ 五条 `test_h1_*` 用例 ＋ 九条变异臂。不交：`gomoku_train --worker`
+那条模式、`gomoku_broker`、§4.4 三档下的 think p50/p99。**所以指导书 §4 戊-1 验收的第 2、3 条本轮
+是空白**，这一句写在这里而不是含糊过去。
+
+**仪器与读数**（42 副普查棋盘 × `depth 4` × 节点帽 20000 × 时限 60 s 只防死循环；每一行的
+`nodes` 与 `checksum` 都逐字相同，所以「每份在做同一件事」这个前提是被检查过的而不是假设的）：
+
+| 臂 | 第 1 遍 | 第 2 遍 | 第 3 遍 | 每 worker nps / 同遍内单进程基线 |
+|---|---|---|---|---|
+| 2 份各自绑核 | 100.5 % | 97.9 % | — | 达标 |
+| 3 份各自绑核 | 96.2 % | 94.6 % | 95.9 % | 达标 |
+| 4 份各自绑核 | 87.9 % | 87.0 % | 88.6 % | **低于 90 %** |
+| 4 份不绑核（控制） | 89.0 % | 88.8 % | 89.2 % | 与绑核同形，差 −0.7 %～−2.0 % |
+| 4 份，表 512 条 | 88.2 % | — | — | 不是 cache 容量 |
+
+分母本身要先讲清楚：单进程绝对 nps 在两个时间点分别是 21,440 与 16,395（桌面 1 分钟负载从 2.0
+走到 5.4），**绝对值跨行不可比**，所以第二版脚本把基线与并发行在同一遍里交替跑三遍，只比同遍内的
+比值。**复现**：`./build/worker_nps_probe --reps 2 --depth 4 --nodes 20000 [--pin <CPU>]`，每份自己
+绑一个核、基线那份不带 `--pin`，比值 = 并发各份 nps 的均值 ÷ **同一遍内**基线的均值；表容量那一档再加
+`--tt-entries 4096`／`--tt-entries 512`（换了表就是换了工作本身，所以只在同一个 `--tt-entries` 之内比）。
+绑核本身有证据，不靠「我调了 `sched_setaffinity`」这句话：15 份 pinned 拷贝各自打出
+`affinity=2`…`affinity=5`，15 份未绑的打出 `affinity=0,1,2,3,4,5`。表容量那一档是从 2^18 条
+（RSS 12,240 kB）到 4096 条（5,296 kB）到 512 条（5,200 kB），比值 89.4 / 88.2 / 88.2 %。
+
+**裁决（用户选的）**：公式 `workers = max(1, 物理核 − reserved_cores)` 不动，`reserved_cores` 的
+**缺省从文档的 2 改成 3**，理由是上面那张表——本机可达上限是 3 份。**§4.4 写的那句诊断被控制臂证伪**：
+「劣化超过 20 % 说明绑核没生效，不是机器不够」——这里绑核确实生效（affinity 逐份核过）、劣化照样在，
+所以那句要改成「先用一条不绑核的对照臂分清是哪一种」。
+
+**为什么这一格红不触发「作废」**：v2 §4.2 给进程化的四条理由各有实测（轮次124 的 assert 带走整个
+trainer、轮次125 的 `--threads` 惰性、轮次127 的每引擎一张表、轮次141 的 ponder 让位），四条都与
+「每 worker 保住多少个 nps」无关；而吞吐这一格在 3 worker 是达标的。杀线（§4.2 末那条可移植性）
+本轮也未被触发：**Windows 那一侧一行未写**，所以形状就是它规定的出路——POSIX-only ＋ Windows 保持
+线程模式，而不是「两边都有但一边没测」。
+
+**IPC 核心实现的三条口径**，每条都有臂：
+1. 任务文件是契约不是约定：十二个键全部必填、类型与范围逐一查（`read_json_int` / `read_json_uint`
+   那两条防线沿用），装不进 int 的负数 `first_game_id` 是拒而不是截断；写走 `tmp` + `rename`。
+2. 一行 spool = 信封（`run_id`/`seq`/`attempt`/`index`/`kind`）+ **原样的** payload。payload 存成
+   JSON 字符串而不是子对象，为的是进程模式不许另起一套数据形状：测试里那一条真的对局记录写进去、
+   读出来，仍能被既有的 `GameRecord::from_json` 原样读回（一个字节都没动）。
+3. 截断与断号都是**丢弃并重排**，绝不补完再读：偏移只走到最后一个换行为止，那半条留在原地；
+   断号之后同一 `(seq, attempt)` 的行一条都不入账（把「丢了中间一条」读成「少跑了一条」是两种
+   结论）；重排后的第二个 attempt 有它自己从 1 起的序列；别人 run 的行丢掉但不算需要重排（那是
+   隔离，不是残缺）；文件比记住的偏移短了直接报错，不猜。
+
+**五条用例**（`tests/test_training.cpp`，全部 `test_h1_*`）：任务文件的契约与四种坏法；信封与
+payload 逐字（含完成标记里声明的条数）；半行 + 断号 + 坏 JSON + 外 run 四种丢弃；重排的 attempt
+各自成序列、尾读只往前、追加只入新行、文件变短要拒；真的 `fork` + `SIGKILL` 两型——四型由父进程
+杀在一个正在慢慢写的写者手里（断不变量：半行永不入账、入账的行逐字完整、没有完成标记），四型由
+写者自己把半行落盘之后 `raise(SIGKILL)`（断确定值：`accepted == 4`、`truncated_tail`、`needs_requeue`）。
+后一型是必要的：前一型八次实测**一次也没有**杀在 write 中间（每条之间睡 250 µs，父进程 1 ms 一轮
+轮询），所以那一臂单独看并不能证明截断判法真的被走过——读数就写着「8 次里截断 4 次、干净收尾 4 次」。
+
+**九条变异臂，全部 rc=134 并报出断言**
+
+| 臂 | 撤掉的那一句 | 断在 |
+|---|---|---|
+| M1 | 派活那一侧不再挡 `games = 0` | `tests/test_training.cpp:6760` |
+| M2 | 读的一侧把坏 `first_game_id` 当合法 | `:6750` |
+| M3 | payload 被换成 kind（信封不再原样带数据） | `:6864` |
+| M4 | 偏移跨过那半条 = 把截断当一行读 | `:6907` |
+| M5 | 断号之后重新对齐而不是作废 | `:6943` |
+| M6 | 偏移不前进（每轮把整个文件重算） | `:6871` |
+| M7 | 两个 attempt 共用一条序号序列 | `:6999` |
+| M8 | 别人 run 的行也入账 | `:6969` |
+| M9 | 文件被换短了不报，静默从头读 | `:7033` |
+
+**指导书要改的两处**（已写进 §4 戊-1 的状态行）：思路 1 说 broker「每轮末跑一次
+`BalanceController`」，而丁-4 已判不落地、树里没有这个类——派活的一方不能调度一个不存在的组件；
+§4.4 的那句诊断如上。
+
+**未测**：`gomoku_train --worker` 与今天线程模式产出的数据是否等价（要下一轮）；SIGKILL 之后
+broker 的「任务账与文件账在 N 秒内对齐」（broker 未到，本轮只有尾读侧的判法）；三档让位的
+think p50/p99；`physical_cores` 在别的机器上怎么数（虚机把 6 个逻辑 CPU 各报成一个 core_id，
+本机按这个数走）。**还有一条脆弱点写在脸上**：`fork` 那一臂的杀点是墙钟（父进程最多等 5 s 看到
+第一行）——memcheck 下这一臂仍然通过（930 s clean），但插桩把慢的那一侧放大之后，这条边界迟早会
+自己响；下一次动这个文件时把它换成管道握手（写者落地第一行就 write 一个字节，父进程 read 阻塞），
+那才是与插桩无关的等待。
+
+**门禁**：`cmake --build build -j4`（`touch` 之后）recompiles=10、唯一一条 warning 仍是既有的
+`tests/test_training.cpp:3647`；`worker_nps_probe` 以 `-- -B` 强制重编 16 个 TU、**0 warning**；
+`ctest` **9/9 全绿（801.24 s；test_search 477.63、test_pinned 243.72、test_training 58.01）**；
+`valgrind --tool=memcheck test_training`（build-vg，Debug `-UNDEBUG`）**clean：reports=0、
+invalid_read=0、invalid_write=0、uninitialised=0、definite_leak=0，930 s**；`readme_anchor_check`
+122/0、`web_frontend_check` 111/111；九条变异臂全部 rc=134。**TSan 本轮主动不跑**：spool 没有在
+进程内共享的可变状态（一个写者、一个读者，写者是 `fork` 出来的独立进程），TSan 要覆盖的形状——
+broker 的 tail 线程、心跳、暂停队列——随第二段一起到；这不是「跑了没响」，是没跑。
+
 ## 轮次162 引擎重构 丁-6 第二段：S2 落地成「事后退役账本」——一条开局被看满 N 对、每一对两局都由同一座位赢下才出局，而观察全部取自本来就要跑的适配度赛与验证赛（新增 0 局），键挂这次 run 的起点系数、判决一律从读数重算，缺省 `--opening-pool 0` 关着时路由逐字是今天的形状 — engine redesign stage 丁-6 part 2: S2 lands as a post-hoc retirement ledger — an opening retires only after N observed pairs were every one of them decided by the seat, every pair comes from matches the run plays anyway (zero extra games), the key is the run's starting coefficients, verdicts are recomputed from the readings, and with the default `--opening-pool 0` the rotation is byte-for-byte today's
 
 **做了什么**：新文件 `src/training/opening_ledger.h`（`OpeningLedgerConfig` / `OpeningLedgerEntry` /

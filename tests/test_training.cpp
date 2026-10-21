@@ -41,7 +41,7 @@
 #define private public
 #include "training/trainer.h"
 #undef private
-
+#include "training/run_spool.h"
 using namespace gomoku;
 
 namespace {
@@ -6723,6 +6723,446 @@ void test_d6_a_real_pair_is_the_evidence_and_costs_no_extra_game() {
     std::cout << "test_d6_a_real_pair_is_the_evidence_and_costs_no_extra_game passed" << std::endl;
 }
 
+// 戊-1（v2 §4.3，指导书 §4）第一条：任务文件是一份契约，不是一段约定。少一个键、类型不对、
+// 一个数装不进 int，都是拒——worker 拿到的活不许靠默认值猜出来。
+void test_h1_task_file_is_a_contract_and_a_broken_one_is_refused() {
+    RunTask task;
+    task.run_id = "run-7";
+    task.seq = 3;
+    task.attempt = 2;
+    task.games = 5;
+    task.first_game_id = 41;
+    task.depth = 4;
+    task.max_nodes = 1500;
+    task.max_moves = 60;
+    task.pin_cpu = 3;
+    task.params_path = "data/training/best_params.json";
+    task.spool_path = temp_path("h1_task_spool.jsonl").string();
+    task.done_path = temp_path("h1_task_done.json").string();
+
+    const std::string path = temp_path("h1_task.json").string();
+    std::string error;
+    assert(write_task_file(path, task, error));
+    assert(error.empty());
+    RunTask back;
+    assert(read_task_file(path, back, error));
+    assert(back.run_id == "run-7" && back.seq == 3 && back.attempt == 2 && back.games == 5);
+    assert(back.first_game_id == 41 && back.depth == 4 && back.max_nodes == 1500);
+    assert(back.max_moves == 60 && back.pin_cpu == 3);
+    assert(back.params_path == "data/training/best_params.json");
+    assert(back.spool_path == task.spool_path && back.done_path == task.done_path);
+    // 原子写：临时文件不能留在原地冒充一个任务。
+    assert(!std::filesystem::exists(path + ".tmp"));
+
+    // 派活的一侧自己先挡住不合格的活：games = 0 的任务只会写一个空 spool 然后报完成。
+    RunTask nogames = task;
+    nogames.games = 0;
+    assert(!write_task_file(temp_path("h1_no_games.json").string(), nogames, error));
+    assert(error.find("games > 0") != std::string::npos);
+    RunTask norun = task;
+    norun.run_id.clear();
+    assert(!write_task_file(temp_path("h1_no_run.json").string(), norun, error));
+    assert(error.find("no run_id") != std::string::npos);
+
+    // 读的三种坏法都要点名：缺键、类型不对、装不进。
+    const std::string broken = temp_path("h1_broken.json").string();
+    RunTask half;
+    {
+        std::ofstream f(broken, std::ios::trunc);
+        f << R"({"run_id":"r","seq":1,"attempt":1})";
+    }
+    assert(!read_task_file(broken, half, error));
+    assert(error.find("missing games") != std::string::npos);
+    {
+        std::ofstream f(broken, std::ios::trunc);
+        f << R"({"run_id":"r","seq":"3","attempt":1,"games":1,"first_game_id":1,"depth":4)"
+             R"(,"max_nodes":0,"max_moves":60,"pin_cpu":-1,"spool_path":"s","done_path":"d"})";
+    }
+    assert(!read_task_file(broken, half, error));
+    assert(error.find("seq must be an int") != std::string::npos);
+    {
+        std::ofstream f(broken, std::ios::trunc);
+        f << R"({"run_id":"r","seq":1,"attempt":1,"games":1,"first_game_id":-5,"depth":4)"
+             R"(,"max_nodes":0,"max_moves":60,"pin_cpu":-1,"spool_path":"s","done_path":"d"})";
+    }
+    assert(!read_task_file(broken, half, error));
+    assert(error.find("first_game_id must be a non-negative integer") != std::string::npos);
+    {
+        std::ofstream f(broken, std::ios::trunc);
+        f << "{ not json";
+    }
+    assert(!read_task_file(broken, half, error));
+    assert(error.find("not valid JSON") != std::string::npos);
+    assert(!read_task_file(temp_path("h1_absent.json").string(), half, error));
+    assert(error.find("cannot open") != std::string::npos);
+
+    std::filesystem::remove(path);
+    std::filesystem::remove(broken);
+    std::cout << "test_h1_task_file_is_a_contract_and_a_broken_one_is_refused passed" << std::endl;
+}
+
+// 戊-1 第二条：spool 的一行 = 信封 + **原样的** payload。这里用的 payload 是一条真的对局记录，
+// 回读之后必须还能用既有的 `GameRecord::from_json` 读出来——进程模型不许另起一套数据形状。
+void test_h1_a_spool_line_carries_the_payload_without_touching_it() {
+    GameRecord record;
+    record.winner = WHITE;
+    record.reason = GameEndReason::RESIGN;
+    record.total_nodes = 9000;
+    record.max_depth = 4;
+    for (int i = 0; i < 3; ++i) {
+        MoveRecord entry;
+        entry.move = Move(7 + i, 7 + (i % 2), i % 2 == 0 ? BLACK : WHITE);
+        entry.score = 1000 + i;
+        entry.depth = 2;
+        entry.nodes = 300 + i;
+        entry.elapsed_ms = 20 + i;
+        entry.method = "alphabeta";
+        record.moves.push_back(entry);
+    }
+    const std::string payload = record.to_json();
+
+    RunTask task;
+    task.run_id = "run-9";
+    task.seq = 1;
+    task.attempt = 1;
+    task.games = 1;
+    task.spool_path = temp_path("h1_spool.jsonl").string();
+    task.done_path = temp_path("h1_done.json").string();
+    std::string error;
+
+    SpoolWriter writer;
+    assert(writer.open(task, error));
+    assert(writer.written() == 0);
+    assert(writer.append("game", payload, error));
+    assert(writer.written() == 1);
+    assert(writer.append("sample", "{\"features\":[1,2,3]}", error));
+    assert(writer.append("sample", "{\"features\":[]}", error));
+    assert(writer.written() == 3);
+    assert(writer.finish(error));
+    assert(std::filesystem::exists(task.done_path));
+
+    // 完成标记里声明的条数是账对齐的另一半：读者数到的行数少于它，这一尝试就没跑完。
+    {
+        std::ifstream done(task.done_path);
+        std::ostringstream buffer;
+        buffer << done.rdbuf();
+        const std::string declared = buffer.str();
+        assert(declared.find(R"("run_id":"run-9")") != std::string::npos);
+        assert(declared.find(R"("seq":1)") != std::string::npos);
+        assert(declared.find(R"("attempt":1)") != std::string::npos);
+        assert(declared.find(R"("lines":3)") != std::string::npos);
+    }
+
+    std::vector<SpoolLine> lines;
+    SpoolTail tail("run-9");
+    TailReport report;
+    assert(tail.read_file(task.spool_path, lines, report, error));
+    assert(report.accepted == 3);
+    assert(!report.needs_requeue());
+    assert(lines[0].index == 1 && lines[0].seq == 1 && lines[0].attempt == 1);
+    assert(lines[0].kind == "game");
+    assert(lines[0].payload == payload);   // 逐字，一个字节都没被改写
+    GameRecord restored;
+    assert(GameRecord::from_json(lines[0].payload, restored, error));   // 既有读者读得动
+    assert(restored.winner == WHITE && restored.moves.size() == 3u);
+    assert(lines[1].index == 2 && lines[2].index == 3);
+    const std::size_t whole = static_cast<std::size_t>(
+        std::filesystem::file_size(task.spool_path));
+    assert(tail.offset(task.spool_path) == whole);   // 三条都带换行 ⇒ 偏移吃掉整个文件
+
+    std::filesystem::remove(task.spool_path);
+    std::filesystem::remove(task.done_path);
+    std::cout << "test_h1_a_spool_line_carries_the_payload_without_touching_it passed" << std::endl;
+}
+
+// 戊-1 第三条（这一单元的杀线口径）：半行与断号都要**丢弃并重排**，绝不把一行被截断的 JSON 补完
+// 再读。截断由「偏移停在最后一个换行之前」表达；断号之后同一 attempt 的行一条都不入账。
+void test_h1_a_half_line_and_a_gap_are_dropped_and_requeued_never_repaired() {
+    RunTask task;
+    task.run_id = "run-4";
+    task.seq = 2;
+    task.attempt = 1;
+    task.games = 3;
+    task.spool_path = temp_path("h1_half.jsonl").string();
+    task.done_path = temp_path("h1_half_done.json").string();
+    std::string error;
+
+    SpoolWriter writer;
+    assert(writer.open(task, error));
+    assert(writer.append("game", "{\"a\":1}", error));
+    assert(writer.append("game", "{\"b\":2}", error));
+    assert(writer.written() == 2);
+    // 被 SIGKILL 打断的写者留下的那半条：没有换行结尾。
+    {
+        std::ofstream half(task.spool_path, std::ios::app);
+        half << R"({"run_id":"run-4","seq":2,"attempt":1,"index":3,"kind":"game","pay)";
+    }
+
+    std::vector<SpoolLine> lines;
+    SpoolTail tail("run-4");
+    TailReport first;
+    assert(tail.read_file(task.spool_path, lines, first, error));
+    assert(first.accepted == 2);
+    assert(lines.size() == 2u);
+    assert(first.truncated_tail);
+    assert(first.needs_requeue());
+    assert(first.first_drop.find("partial line") != std::string::npos);
+    const std::size_t paused = tail.offset(task.spool_path);
+    const std::size_t whole = static_cast<std::size_t>(
+        std::filesystem::file_size(task.spool_path));
+    assert(paused < whole);   // 偏移没有跨过那半条
+
+    // 写者自己活过来把那一行写完（是它补的，不是读者猜的）：同一尾读第二次，这一条正常入账，
+    // 且不重复入账前面那两条——「只往前」这条在这里被钉住。
+    {
+        std::ofstream rest(task.spool_path, std::ios::app);
+        rest << R"(load":"{\"c\":3}"})" << "\n";
+    }
+    lines.clear();
+    TailReport second;
+    assert(tail.read_file(task.spool_path, lines, second, error));
+    assert(second.accepted == 1);
+    assert(lines.size() == 1u);
+    assert(lines[0].index == 3 && lines[0].payload == R"({"c":3})");
+    assert(!second.truncated_tail);
+    assert(!second.needs_requeue());
+    assert(tail.offset(task.spool_path) == static_cast<std::size_t>(
+               std::filesystem::file_size(task.spool_path)));
+
+    // 断号：1、2、4 —— 第 4 条不入账，而且它之后同一 attempt 的行一条都不入账。
+    std::ofstream f(task.spool_path, std::ios::trunc);
+    f << R"({"run_id":"run-4","seq":2,"attempt":1,"index":1,"kind":"game","payload":"{}"})" << "\n";
+    f << R"({"run_id":"run-4","seq":2,"attempt":1,"index":2,"kind":"game","payload":"{}"})" << "\n";
+    f << R"({"run_id":"run-4","seq":2,"attempt":1,"index":4,"kind":"game","payload":"{}"})" << "\n";
+    f << R"({"run_id":"run-4","seq":2,"attempt":1,"index":5,"kind":"game","payload":"{}"})" << "\n";
+    f.close();
+    SpoolTail gap("run-4");
+    std::vector<SpoolLine> gap_lines;
+    TailReport gap_report;
+    assert(gap.read_file(task.spool_path, gap_lines, gap_report, error));
+    assert(gap_report.accepted == 2);
+    assert(gap_report.dropped_sequence == 2);   // 断号那一条 + 它后面那一条
+    assert(gap_report.needs_requeue());
+    assert(gap_report.first_drop.find("expected 3") != std::string::npos);
+
+    // 不解析的一行（这里是坏 JSON）算 unparsable，同样触发重排。
+    std::ofstream g(task.spool_path, std::ios::trunc);
+    g << "{ not json\n";
+    g << R"({"run_id":"run-4","seq":5,"attempt":1,"index":1,"kind":"game","payload":"{}"})" << "\n";
+    g.close();
+    SpoolTail broken("run-4");
+    std::vector<SpoolLine> broken_lines;
+    TailReport broken_report;
+    assert(broken.read_file(task.spool_path, broken_lines, broken_report, error));
+    assert(broken_report.accepted == 1);
+    assert(broken_report.dropped_unparsable == 1);
+    assert(broken_report.needs_requeue());
+
+    // 别人 run 的行：丢掉，但**不算**这一份需要重排——那是隔离，不是残缺。
+    std::ofstream h(task.spool_path, std::ios::trunc);
+    h << R"({"run_id":"other-run","seq":1,"attempt":1,"index":1,"kind":"game","payload":"{}"})" << "\n";
+    h.close();
+    SpoolTail foreign("run-4");
+    std::vector<SpoolLine> foreign_lines;
+    TailReport foreign_report;
+    assert(foreign.read_file(task.spool_path, foreign_lines, foreign_report, error));
+    assert(foreign_report.accepted == 0);
+    assert(foreign_report.dropped_other_run == 1);
+    assert(!foreign_report.needs_requeue());
+
+    std::filesystem::remove(task.spool_path);
+    std::cout << "test_h1_a_half_line_and_a_gap_are_dropped_and_requeued_never_repaired passed"
+              << std::endl;
+}
+
+// 戊-1 第四条：重排之后同一个 seq 的第二个 attempt 有它自己的一条 index 序列（两条互不干扰），
+// 而尾读只做一件事——往前。文件被换短了要报错，不猜。
+void test_h1_a_requeued_attempt_keeps_its_own_sequence_and_the_tail_only_moves_forward() {
+    const std::string path = temp_path("h1_attempts.jsonl").string();
+    std::string error;
+    {
+        std::ofstream f(path, std::ios::trunc);
+        for (int index = 1; index <= 2; ++index) {
+            f << R"({"run_id":"run-5","seq":7,"attempt":1,"index":)" << index
+              << R"(,"kind":"game","payload":"{}"})" << "\n";
+        }
+        // 第一次尝试被杀在这里；下面是重排后的第二次尝试，index 从 1 重新起。
+        for (int index = 1; index <= 3; ++index) {
+            f << R"({"run_id":"run-5","seq":7,"attempt":2,"index":)" << index
+              << R"(,"kind":"game","payload":"{}"})" << "\n";
+        }
+    }
+    SpoolTail tail("run-5");
+    std::vector<SpoolLine> lines;
+    TailReport report;
+    assert(tail.read_file(path, lines, report, error));
+    assert(report.accepted == 5);
+    assert(!report.needs_requeue());
+    assert(tail.expected_index(path, 7, 1) == 3);   // 第一次尝试停在它被杀的那一条
+    assert(tail.expected_index(path, 7, 2) == 4);   // 第二次跑到第三条
+    const std::size_t forward = tail.offset(path);
+
+    // 再读一次：偏移已经吃掉整个文件，所以一条都不重复入账。
+    lines.clear();
+    TailReport again;
+    assert(tail.read_file(path, lines, again, error));
+    assert(again.accepted == 0 && lines.empty());
+    assert(tail.offset(path) == forward);
+
+    // 追加第四条（第二次尝试继续跑）：只有新的一条入账。
+    {
+        std::ofstream f(path, std::ios::app);
+        f << R"({"run_id":"run-5","seq":7,"attempt":2,"index":4,"kind":"game","payload":"{}"})"
+          << "\n";
+    }
+    lines.clear();
+    TailReport grown;
+    assert(tail.read_file(path, lines, grown, error));
+    assert(grown.accepted == 1);
+    assert(lines.size() == 1u && lines[0].index == 4);
+
+    // 文件被换成更短的一份 = 有人在账本之外动了它。报出来，不猜它被截掉了什么。
+    {
+        std::ofstream f(path, std::ios::trunc);
+        f << R"({"run_id":"run-5","seq":7,"attempt":2,"index":1,"kind":"game","payload":"{}"})"
+          << "\n";
+    }
+    lines.clear();
+    TailReport shrunk;
+    error.clear();
+    assert(!tail.read_file(path, lines, shrunk, error));
+    assert(error.find("shrank below the recorded offset") != std::string::npos);
+
+    std::filesystem::remove(path);
+    std::cout << "test_h1_a_requeued_attempt_keeps_its_own_sequence_and_the_tail_only_moves_forward"
+              << " passed" << std::endl;
+}
+
+// 戊-1 第五条（§4.7 第 3 条的崩溃那一臂）：一个真的写者被 SIGKILL 打断之后，文件里留下的必须是
+// 「若干条完整的行 + 至多一条没有换行的尾巴」。这一条不靠手摆字节，而是 fork 出一个子进程真的
+// 在循环 append，然后在它跑到一半时杀掉——量的对象是**不变量**而不是条数：杀点本身是时序敏感的
+// （§2 的「时序臂不可复现」在这里就按不变量来处理），任何杀点都不许让读者看到两条残缺。
+void test_h1_a_sigkilled_writer_leaves_at_most_one_partial_line() {
+    int saw_partial = 0;
+    int saw_clean = 0;
+    for (int round = 0; round < 8; ++round) {
+        const std::string path = temp_path("h1_kill_" + std::to_string(round) + ".jsonl").string();
+        RunTask task;
+        task.run_id = "run-kill";
+        task.seq = round + 1;
+        task.attempt = 1;
+        task.games = 400;
+        task.spool_path = path;
+        task.done_path = path + ".done";
+        const bool torn = round >= 4;   // 后四型：写者被杀在一次半行的落盘中间
+        std::error_code ec;
+
+        // 子进程写自己的那一份；父进程在它写到第 80 条左右杀它。
+        pid_t child = fork();
+        assert(child >= 0);
+        if (child == 0) {
+            std::string child_error;
+            SpoolWriter writer;
+            if (!writer.open(task, child_error)) _exit(3);
+            // 一条 64 KB：一次 append 因此是好几次 write 系统调用。
+            const std::string fat = "{\"n\":\"" + std::string(65536, 'x') + "\"}";
+            for (int i = 0; i < 4; ++i) {
+                if (!writer.append("game", fat, child_error)) _exit(4);
+            }
+            if (torn) {
+                // 撕裂那一型：写者自己把**半行**交出去（一次不带换行的 flush），然后在写中间被杀。
+                // 上面那种「睡 250 µs 再写一条」的形状里，父进程几乎总是杀在两次 append 之间，
+                // 于是这台仪器一次也没产出过半行——那不能算验证过截断，所以这里用真的进程、真的
+                // 落盘字节、真的 SIGKILL 把撕裂窗口摆出来给读的一侧看。
+                SpoolLine pending;
+                pending.run_id = task.run_id;
+                pending.seq = task.seq;
+                pending.attempt = task.attempt;
+                pending.index = 5;
+                pending.kind = "game";
+                pending.payload = fat;
+                const std::string text = spool_line_to_string(pending);
+                std::ofstream f(task.spool_path, std::ios::app);
+                f << text.substr(0, text.size() / 2);
+                f.flush();   // 半行已经落到盘上，换行永远不会来
+                raise(SIGKILL);
+                _exit(0);   // 到不了
+            }
+            // 只有跑完才会有完成标记：被杀的这一臂永远不该走到这里。
+            for (int i = 4; i < 400; ++i) {
+                if (!writer.append("game", fat, child_error)) _exit(4);
+                std::this_thread::sleep_for(std::chrono::microseconds(250));
+            }
+            if (!writer.finish(child_error)) _exit(5);
+            _exit(0);
+        }
+        // 父进程等它真的写出至少一整行再杀：太早杀会看到一个空文件，那也是一种合法形状，
+        // 但它检验的不是「半行」这一条。
+        int status = 0;
+        if (torn) {
+            // 撕裂型不由父进程挑杀点：写者自己把半行落盘之后 `raise(SIGKILL)`，父进程只等着。
+            // 这样「四条完整 + 一条半」是确定的，而不是赌时序。
+            waitpid(child, &status, 0);
+        } else {
+            std::size_t bytes = 0;
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (std::chrono::steady_clock::now() < deadline) {
+                if (std::filesystem::exists(path, ec)) {
+                    bytes = static_cast<std::size_t>(std::filesystem::file_size(path, ec));
+                    if (bytes > 0) break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            assert(bytes > 0);
+            kill(child, SIGKILL);
+            waitpid(child, &status, 0);
+        }
+        assert(WIFSIGNALED(status));
+        assert(WTERMSIG(status) == SIGKILL);
+        assert(!std::filesystem::exists(task.done_path));   // 被杀的写者不该留下完成标记
+
+        SpoolTail tail("run-kill");
+        std::vector<SpoolLine> lines;
+        TailReport report;
+        std::string error;
+        assert(tail.read_file(path, lines, report, error));
+        // 半条永不入账，也永不被“补完”：它要么被丢弃并判重排，要么这条不成立。
+        assert(report.dropped_unparsable == 0);
+        assert(report.dropped_sequence == 0);
+        if (torn) {
+            // 撕裂型的期望是确定的：前面那四条照常入账，那半条既不入账也不被“补完”，并且这一份
+            // 被判定需要重排。
+            assert(report.accepted == 4);
+            assert(report.truncated_tail);
+            assert(report.needs_requeue());
+            assert(report.first_drop.find("partial line") != std::string::npos);
+            ++saw_partial;
+        } else if (report.truncated_tail) {
+            ++saw_partial;
+            assert(report.needs_requeue());
+        } else {
+            ++saw_clean;
+            assert(!report.needs_requeue());
+        }
+        // 每一条入账的行都必须是自己那一整行：payload 逐字回得来，半行一条都没混进来。
+        const std::string fat = "{\"n\":\"" + std::string(65536, 'x') + "\"}";
+        for (size_t i = 0; i < lines.size(); ++i) {
+            assert(lines[i].index == static_cast<int>(i) + 1);
+            assert(lines[i].payload == fat);
+        }
+        std::filesystem::remove(path, ec);
+        std::filesystem::remove(task.done_path, ec);
+    }
+    // 前四型是「父进程杀在一个正在慢慢写的写者手里」——杀点本身是时序敏感的，所以那四型断的是
+    // 不变量（半行永不入账、入账的行逐字完整、没有完成标记），不断截断出现与否；后四型是写者自己
+    // 把半行落盘之后被杀，那一型必须每次都读到截断，否则这条判法就没有真的进程证据。
+    std::cout << "  [戊-1] sigkill 臂：8 次里截断 " << saw_partial << " 次、干净收尾 "
+              << saw_clean << " 次" << std::endl;
+    assert(saw_partial >= 4);   // 撕裂型必须每次都读到截断
+    assert(saw_partial + saw_clean == 8);
+    std::cout << "test_h1_a_sigkilled_writer_leaves_at_most_one_partial_line passed" << std::endl;
+}
+
 int main() {
     std::cout << "Running training tests..." << std::endl;
 
@@ -6857,6 +7297,11 @@ int main() {
     test_d6_ledger_key_is_the_starting_coefficients_plus_the_regime();
     test_d6_a_closed_ledger_leaves_the_fixed_rotation_byte_for_byte();
     test_d6_a_real_pair_is_the_evidence_and_costs_no_extra_game();
+    test_h1_task_file_is_a_contract_and_a_broken_one_is_refused();
+    test_h1_a_spool_line_carries_the_payload_without_touching_it();
+    test_h1_a_half_line_and_a_gap_are_dropped_and_requeued_never_repaired();
+    test_h1_a_requeued_attempt_keeps_its_own_sequence_and_the_tail_only_moves_forward();
+    test_h1_a_sigkilled_writer_leaves_at_most_one_partial_line();
 
     std::cout << "All training tests passed" << std::endl;
     return 0;

@@ -112,7 +112,7 @@ else
         ../src/training/data_collector.cpp \
         ../src/training/genetic.cpp \
         ../src/training/hill_climbing.cpp \
-        ../src/training/trainer.cpp \
+        ../src/training/trainer.cpp ../src/training/run_spool.cpp \
         -o gomoku_train \
         -lpthread
 
