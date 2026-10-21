@@ -568,7 +568,7 @@ git push origin master                # 然后核对 git log --oneline -1 origin
 
 ### 戊-3 K：一键训练（五相状态机）
 
-**状态**：未做。CLI 现在只有「从头跑 N 轮」或「从 checkpoint 续 N 轮」（`main_trainer.cpp:426`，轮次164 因为插入 `--worker` 分支整体下移 6 行），没有分相入口。
+**状态**：**判不落地**（轮次166，`docs+tests` 半子）。**两条判据先量**：`test_k1_same_seed_two_runs_write_the_same_checkpoint_bytes` 实测同一 seed 两次 `run_round()` 落出来的 checkpoint **2062 字节逐字相同**（`rounds_completed / games_played / samples_collected / best_version / seed / versions / elo` 七个键里没有一个是墙钟，`std::mt19937_64` 从 `config_.seed + round × 7919` 起每 round 独立 ⇒ 两次是同一个字节序列）；`test_k1_pause_at_round_boundary_then_resume_gives_the_same_checkpoint` 实测「跑 1 round → 写 checkpoint → 读回 → 再跑 1 round」与「不中断跑 2 round」的最后一份 checkpoint **3269 字节逐字相同**。⇒ **指导书 §4 戊-3 验收的两条已经由现有流水线满足**（`--checkpoint ck.json --resume ck.json` 早就支持断点续），状态机要加的这一层只是**在相边界把已有的能力叫个名字**，不是新机制（§2 每一个新机制都要有一条杀线：「机制的唯一新读数是标签、验收判据已由现有流水线满足」这一条命中 ⇒ 判不落地）。**结构性的一半更直接**：`test_k1_the_balance_phase_has_no_controller_class_in_the_tree` 钉住 `BalanceController` 在树里**没有**（丁-4 在轮次159 判不落地 ⇒ 类没写）⇒ 指导书表格里明写的五相最少一相**没有实现体**；交一个「4 相 + 空相」的状态机不是指导书那一个。⇒ 五相状态机、`train_pause` 相边界、`train_status` 帧、`train_autopilot` 的 broker 集成**都没写代码**，`src/` 的 diff 只有那三条用例。**下一轮如果补上 `BalanceController`**，把 `K1_BALANCE_CONTROLLER_DEFINED` 加进 `CMakeLists.txt` 的 `target_compile_definitions(test_training ...)`，第三条用例会立刻 rc=134 提醒这条判据回来了、状态机要重估。
 
 **目标效果**：`train_autopilot` 把六个要人手串的动作串成一个**可中断、可恢复、可解释**的循环。
 

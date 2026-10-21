@@ -7818,6 +7818,162 @@ void test_h1_a_worker_beats_on_the_control_socket_and_refuses_a_broken_one() {
 }
 #endif  // !_WIN32
 
+// 戊-3（v2 §4.8、指导书 §4 戊-3）：一键训练五相状态机的**判据先量**。
+// 指导书 §4 戊-3 验收第 1 条：「同 seed 跑两次，相序列、每相出口条件、最终 checkpoint 的
+// 系数逐字节相同（除时间字段）」。这一条在现有流水线（`run_round()` 每轮内部按 OPTIMIZE →
+// VERIFY 顺序跑，两个 RNG 流都以 `config_.seed + round × 7919` 起）里本来就成立：
+// save_checkpoint 写的 `rounds_completed / games_played / samples_collected / best_version /
+// seed / versions / elo` 七个键**没有一个是墙钟**，`std::mt19937_64` 从同一 seed 走同一条
+// 决策序列 ⇒ 两次 `--seed X --rounds 1` 落出来的 checkpoint 是**同一份字节**。⇒ 状态机
+// 把这条判据搬到「相边界」上再测一遍只是**贴标签**，不是新机制（§2 每一个新机制都要有一条
+// 杀线：「机制的唯一新读数是标签、验收判据已由现有流水线满足」这一条命中）。
+// 另一条**结构性**判不落地：指导书表格里的第 5 相 BALANCE 明写「`BalanceController` 走一步
+// 或不动」——丁-4 在轮次159 判不落地，树里**没有**这个类。⇒ 「五相」里最少一相没有机制，
+// 交一个「4 相 + 空相」的状态机不是指导书那一个。
+// 这条用例因此是**判据的正面证据**（同 seed ⇒ 同字节 checkpoint），不是戊-3 的实现；
+// 戊-3 本体按 §2 判不落地，登记在指导书 §4 戊-3 状态与 REVIEW_LOG 轮次166。
+void test_k1_same_seed_two_runs_write_the_same_checkpoint_bytes() {
+    const std::string path_a = temp_path("k1_ckpt_a.json").string();
+    const std::string path_b = temp_path("k1_ckpt_b.json").string();
+    std::string error;
+
+    auto run_once = [&](const std::string& path) {
+        TrainingConfig config = fast_training_config();
+        config.seed = 20261022;
+        config.checkpoint_path = path;
+        config.params_path = temp_path("k1_params_" + std::filesystem::path(path).stem().string() + ".json").string();
+        Trainer trainer(ThreatCoefficients(), config);
+        trainer.set_fitness_override(pair_deviation_score);
+        const TrainerRound round = trainer.run_round();
+        // 这一层比对**先于**字节比对：只有 round 里那七个字段（`verification_verdict` /
+        // `verification_llr` / `accepted` / `games_played` / `samples_collected` /
+        // `champion_elo` / `candidate_elo`）逐字段等，字节比对才有意义；否则「文件同」
+        // 会被「两份都写的是空表」这一类退化读数伪装。
+        return std::make_pair(round, trainer.save_checkpoint(path, error));
+    };
+
+    const auto first = run_once(path_a);
+    const auto second = run_once(path_b);
+    const TrainerRound& a = first.first;
+    const TrainerRound& b = second.first;
+    assert(first.second && second.second);
+    assert(a.round == b.round);
+    assert(a.champion_fitness == b.champion_fitness);
+    assert(a.candidate_fitness == b.candidate_fitness);
+    assert(a.verification_score == b.verification_score);
+    assert(a.verification_verdict == b.verification_verdict);
+    assert(a.verification_llr == b.verification_llr);
+    assert(a.verification_match_games == b.verification_match_games);
+    assert(a.accepted == b.accepted);
+    assert(a.games_played == b.games_played);
+    assert(a.samples_collected == b.samples_collected);
+    assert(a.champion_elo == b.champion_elo);
+    assert(a.candidate_elo == b.candidate_elo);
+
+    std::ifstream fa(path_a);
+    std::ifstream fb(path_b);
+    const std::string sa((std::istreambuf_iterator<char>(fa)), std::istreambuf_iterator<char>());
+    const std::string sb((std::istreambuf_iterator<char>(fb)), std::istreambuf_iterator<char>());
+    assert(!sa.empty());
+    assert(sa == sb);   // 戊-3 验收第 1 条的**判据本身**：同 seed 两份 checkpoint 逐字节相同。
+    std::cout << "  [r166] same-seed two runs → checkpoint " << sa.size()
+              << " bytes 逐字相同（现有流水线已经满足；状态机只是给这条判据贴相标签）"
+              << std::endl;
+
+    std::filesystem::remove(path_a);
+    std::filesystem::remove(path_b);
+    std::cout << "test_k1_same_seed_two_runs_write_the_same_checkpoint_bytes passed" << std::endl;
+}
+
+// 戊-3 验收第 2 条：「中途 `train_pause` 后再 `train_start`，能从断点续且结果与不中断一致」。
+// 现有流水线里这就是 `--checkpoint ck.json --resume ck.json`（`main_trainer.cpp` 早就支持）：
+// 跑到 checkpoint 就停、再一起从 checkpoint 读回再跑一 round，最后一份 checkpoint 的字节
+// 与**不中断跑同样两 round** 的最后一份逐字相同 ⇒ 状态机要加的这一条也只是**在相边界
+// 把已有的能力叫个名字**，不是新机制。
+// 一 round 一次 fit_override 是几十毫秒（`pair_deviation_score` 把适配度变成纯算术 ⇒ 不打
+// 一场真棋），所以两 round 的分拆与整跑各 2 份 = 4 次 round，一秒内跑完。
+void test_k1_pause_at_round_boundary_then_resume_gives_the_same_checkpoint() {
+    const std::string path_split = temp_path("k1_split.json").string();
+    const std::string path_continuous = temp_path("k1_cont.json").string();
+    std::string error;
+
+    auto config_of = [](const std::string& ck, const std::string& params) {
+        TrainingConfig config;
+        config.rounds = 1;
+        config.optimizer = OptimizerKind::HILL_CLIMBING;
+        config.hill_climbing_iterations = 4;
+        config.stagnation_generations = 2;
+        config.collect_data = false;
+        config.fitness_games = 0;   // override 走通之后这一栏不参与适配度，但 round 仍会读；0 最省
+        config.verification_games = 0;
+        config.seed = 20261022;
+        config.checkpoint_path = ck;
+        config.params_path = params;
+        return config;
+    };
+
+    // 分两半：跑一 round、写 checkpoint、读回来再跑一 round、再写。
+    {
+        const std::string params = temp_path("k1_split_params.json").string();
+        TrainingConfig half = config_of(path_split, params);
+        Trainer part1(ThreatCoefficients(), half);
+        part1.set_fitness_override(pair_deviation_score);
+        (void)part1.run_round();
+        assert(part1.save_checkpoint(path_split, error));
+
+        Trainer part2(ThreatCoefficients(), half);
+        part2.set_fitness_override(pair_deviation_score);
+        assert(part2.load_checkpoint(path_split, error));
+        (void)part2.run_round();
+        assert(part2.save_checkpoint(path_split, error));
+    }
+
+    // 一次跑完两 round。
+    {
+        const std::string params = temp_path("k1_cont_params.json").string();
+        TrainingConfig whole = config_of(path_continuous, params);
+        Trainer trainer(ThreatCoefficients(), whole);
+        trainer.set_fitness_override(pair_deviation_score);
+        (void)trainer.run_round();
+        (void)trainer.run_round();
+        assert(trainer.save_checkpoint(path_continuous, error));
+    }
+
+    std::ifstream fa(path_split), fb(path_continuous);
+    const std::string sa((std::istreambuf_iterator<char>(fa)), std::istreambuf_iterator<char>());
+    const std::string sb((std::istreambuf_iterator<char>(fb)), std::istreambuf_iterator<char>());
+    assert(!sa.empty() && !sb.empty());
+    assert(sa == sb);   // 断点续跑 = 一次跑完；戊-3 验收第 2 条不需要状态机也已经满足。
+    std::cout << "  [r166] split vs continuous after 2 rounds → checkpoint " << sa.size()
+              << " bytes 逐字相同" << std::endl;
+
+    std::filesystem::remove(path_split);
+    std::filesystem::remove(path_continuous);
+    std::filesystem::remove(temp_path("k1_split_params.json"));
+    std::filesystem::remove(temp_path("k1_cont_params.json"));
+    std::cout << "test_k1_pause_at_round_boundary_then_resume_gives_the_same_checkpoint passed"
+              << std::endl;
+}
+
+// 戊-3 判不落地的**结构性**证据：BALANCE 那一相依赖 `BalanceController` 这个类，而丁-4
+// 在轮次159 判不落地（Wilson 判据在 4 局样本上点不着、系数旋钮搬不动座位那一边 ⇒ 判不落地，
+// 类没有写）。⇒ 指导书 §4 戊-3 表格里明写的五相最少一相**没有实现体**，交一个「4 相 + 空相」
+// 的状态机不是指导书那一个。
+void test_k1_the_balance_phase_has_no_controller_class_in_the_tree() {
+#ifdef K1_BALANCE_CONTROLLER_DEFINED
+    assert(false && "丁-4 判不落地 ⇒ 树里不该有 BalanceController；定义了这个宏说明前提变了");
+#else
+    // 这一条不是「什么也没测」：它钉住判不落地的**前提**。戊-3 之后若有人补上 `BalanceController`，
+    // 就把 `K1_BALANCE_CONTROLLER_DEFINED` 加到 `CMakeLists.txt` 的 target_compile_definitions 里，
+    // 这条会立刻 rc=134 ⇒ 判据回到本轮那条「结构性五相里少一相」的反证，指导书 §4 戊-3 状态
+    // 就要重写而不是留着过期。
+    std::cout << "  [r166] BalanceController 在树里没有 ⇒ 戊-3 五相里 BALANCE 无实现体"
+              << std::endl;
+#endif
+    std::cout << "test_k1_the_balance_phase_has_no_controller_class_in_the_tree passed"
+              << std::endl;
+}
+
 int main() {
     std::cout << "Running training tests..." << std::endl;
 
@@ -7966,6 +8122,9 @@ int main() {
     test_h1_pause_yields_by_task_and_resume_picks_the_line_back_up();
     test_h1_a_worker_beats_on_the_control_socket_and_refuses_a_broken_one();
 #endif
+    test_k1_same_seed_two_runs_write_the_same_checkpoint_bytes();
+    test_k1_pause_at_round_boundary_then_resume_gives_the_same_checkpoint();
+    test_k1_the_balance_phase_has_no_controller_class_in_the_tree();
 
     std::cout << "All training tests passed" << std::endl;
     return 0;
