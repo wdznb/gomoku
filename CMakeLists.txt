@@ -492,3 +492,21 @@ if(MSVC)
 else()
     target_compile_options(side_asymmetry_probe PRIVATE -Wall -Wextra -O2 -Wno-template-body -Wno-template-id-cdtor)
 endif()
+
+# 基因可达性探针（轮次174）：一次评估函数的逐基因差分，回答「这一格改了对评分有没有影响」。
+# 轮次173 那次「晋升」的就是这样一格（黑 double_three），所以这条是训练线可信度的地基检查。
+# 继续追加在文件末尾（上面那些目标行被 REVIEW_LOG 按行号指认）。
+add_executable(gene_reach_probe
+    tools/gene_reach_probe.cpp
+    ${GOMOKU_CORE_SOURCES}
+)
+target_include_directories(gene_reach_probe PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/tests)
+target_link_libraries(gene_reach_probe PRIVATE Threads::Threads nlohmann_json::nlohmann_json)
+if(UNIX)
+    target_link_libraries(gene_reach_probe PRIVATE pthread)
+endif()
+if(MSVC)
+    target_compile_options(gene_reach_probe PRIVATE /W4)
+else()
+    target_compile_options(gene_reach_probe PRIVATE -Wall -Wextra -O2 -Wno-template-body -Wno-template-id-cdtor)
+endif()

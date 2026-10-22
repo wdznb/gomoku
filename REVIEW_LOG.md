@@ -1980,6 +1980,30 @@ additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cp
 no existing assertion was edited.
 
 
+## 轮次174 轮次173 那次晋升的是**两格死基因**，顺带量出赛具真正的噪声地板：黑侧的 `double_three` 与 `double_four` 在评估里没有任何出账点（改到 1 或 200000，45 个盘面 × 全空格 × 两色的评估总分**逐字不动**，基线 4,718,908），因为 `pattern_score` 只有两个调用点（`src/core/evaluator.cpp:267` += 自己、`:270` -= 对手）且都在禁手门内，而 `has_three_three` / `has_four_four` 恰恰就是 `is_forbidden_from_pattern` 判黑违规所看的那两个字段（`src/core/pattern.cpp:558,594`）；同一支探针里三个正控都动得了（白 `double_three` → 差 −419,986；黑 `four_three` → 差 −159,992；四三是合法形状）⇒ **「内建验证赛 0.625 通过、外部赛具 0 增益」不是巧合：那一轮抬的是一个不可能改变任何着法的数**。而端到端追这条时量到的第二件事更要紧：**同一份配置两跑，90 局里有 9 局的胜者会换**（开局库加载着跑），且**只加载一份与默认值逐字相同的参数档也会换 10/90** ⇒ 赛具的噪声地板不是 0 而是 ≈10 % 的局，成因就是轮次173 记下的「战术层不受节点帽管」 — round 173's promotion moved two dead genes: Black's `double_three` and `double_four` have no place to be paid at all (setting them to 1 or 200000 leaves the evaluator totals byte-identical across 45 boards × every empty square × both colours), because `pattern_score` has exactly two call sites and both sit behind the forbidden gate, while `has_three_three`/`has_four_four` are the very fields that gate uses. Three positive controls in the same probe do move. Chasing this end-to-end also measured the fixture's real noise floor: two runs of the *same* configuration flip 9 of 90 games once the opening book is loaded, and merely loading a params file whose values are byte-identical to the defaults flips 10 of 90 — so the floor is ≈10 % of games, not zero, caused by the wall-clock-sliced tactical phases recorded in 轮次173.
+
+**先更正轮次171 写下的半句话**：当时说「两台相同引擎两跑，除 ms 字段外逐字相同」。那是 **12 局样本的运气**（12 局里一次都没翻的概率约 28 %，并不稀奇）。90 局尺度上的实测地板是 **9/90 ⇒ 10 %**。这条改写了验收口径：**任何 A/B 都必须按 ≥10 % 的局翻动率配样本量**，而轮次173 那份读数的 12 个有信息的配对本身就泡在噪声里 —— 结论（量不出）不变，但它的理由现在更硬。
+
+**仪器**：`tools/gene_reach_probe.cpp` + `gene_reach_probe` 目标（`build/gene_reach_probe <开局档>`，秒级）。它把同一批盘面喂给两遍评估：基线一档，然后逐格改系数再算一遍，报「差=0 ⇒ 读不到」或「差≠0 ⇒ 读得到」。逐基因可达性这种东西**只能这么问**，从代码上推容易漏掉调用点。
+
+**读数（45 个盘面，基线评估总分 4,718,908）**
+
+| 改了哪一格 | 总分差 | 判定 |
+|---|---|---|
+| 黑 `double_three` → 1 / → 200000 | 0 / 0 | 不可达 |
+| 黑 `double_four` → 1 / → 200000 | 0 / 0 | 不可达 |
+| 白 `double_three` → 1 | −419,986 | 可达（正控一） |
+| 黑 `four_three` → 1 | −159,992 | 可达（正控二：四三对黑合法） |
+| 白 `double_four` → 200000 | 0 | **未触发**（这批盘面上白双四从没出现过 ⇒ 不等于不可达） |
+
+**端到端那一枪怎么打的**（三步，都在仓库根起服务，开局库两侧都加载 45 行 109 局）：`null_base` = 默认 vs 默认；`inert2` = 默认 vs 「只把黑 `double_three` 抬到带内上限 36000、白侧不动」；`ctl_flat` = 默认 vs 「加载一份与默认值逐字相同的扁平档」。结果 `diff(null_base, inert2) = 12/90`、`diff(null_base, ctl_flat) = 10/90`、`diff(null_base, 重跑的默认对默认) = 9/90` ⇒ **12 与 9/10 同量级，端到端读不出这个基因的效果**，与评估级结论一致；而 10/90 那一支说明「加载档」这个动作本身也不该被当成对照组 —— 以后做 A/B，**B 侧必须都带档、只换内容**，否则加载路径自己就是个变量。
+
+**顺带钉住一条我一直没记的约束**：两侧的**威胁阶梯**被「同带」规则限制在 ±20 %（`LADDER_MATCH_PERCENT = 20`，`src/training/params.cpp:121-159` 与 `:368-386`）——**从文件加载时违反就直接拒启**（只有优化器自己的 sanitize 才修），例如白 30000 / 黑 48000 会被拒；轮次173 那份冠军之所以能加载，是因为它把白侧一起抬到 38400（正好 20 %）。位置类基因不受这条带管（白 `position_weight_scale` 8→13 = +63 % 加载通过）。⇒ 这直接框住了「黑白侧重」在今天能表达的**最大幅度**：想让用户设想的那种「黑主攻、白主守」差得更远，要么动带内允许的范围（设计决策），要么走那条需要破 `eval(W) == -eval(B)` 的路线。
+
+**下一步（顺序有因）**：① 把 #76 提级——战术层按节点定价，噪声地板从 10 % 回到 0，否则任何系数级 A/B 都要拿几百个有信息的配对才敢判；② 优化器里把这两格对黑标成不可达（别再拿探针浪费在死基因上），这是 #77 的一部分；③ 开局集继续扩（12 对有信息撑不起判定）。
+
+
+
 ## 轮次173 真训练第一次喂数据：8 轮、47 分钟、内建验证赛 3 次晋升（第 3 轮 0.625 / 第 5 轮 **1.000 且 SPRT 提前接受** / 第 6 轮 0.8125），冠军**确实分家**（黑侧 `double_three` 30000→48000；白侧 `double_three`→38400 且 `position_weight_scale` 8→**13**），但独立开局集量不出增益 —— 同版 A/B 换坐两跑读 **默认 0.5444 [0.4418, 0.6434] / 训练 0.4556 [0.3566, 0.5582]**，两跑的配对结构逐字一致（**8 : 4 : 33** = 默认双坐通吃 8 对、训练 4 对、座位打平 33 对）⇒ **45 个样本里只有 12 对有信息**，8/12 的二项区间横跨一半 ⇒ 判「**量不出**」，不判「没变强」，且**不采纳**这份档（`data/training/best_params.json` 保持原样） — the first time the training pipeline was actually fed data: 8 rounds / 47 min / 3 internal promotions, and the champion really did split by colour (Black's `double_three` 30000→48000; White's →38400 plus `position_weight_scale` 8→13), yet the independent opening set cannot see a gain: two seat-swapped same-tree passes read **default 0.5444 [0.4418, 0.6434]** and **trained 0.4556 [0.3566, 0.5582]** with byte-identical pair structure (8 : 4 : 33), i.e. only 12 of 45 samples carry information, so the verdict is "cannot measure", not "did not improve", and the artefact is not adopted.
 
 **跑了什么**：`gomoku_train --method hill --rounds 8 --hill-iterations 24 --stagnation 8 --depth 8 --max-nodes 12000 --timeout-ms 3000 --fitness-games 4 --verification-games 8 --data-games 16 --threads 2 --seed 20261022`，产物全部写在 `/tmp/tm173/`（`--out`/`--checkpoint`/`--records` 都指到树外，仓库零污染）。单轮先价过：16 探针那一档 **332.66 s**，24 探针这档整链 **2829.63 s / 8 轮**。冠军 Elo 1500 → 1510.75（中途 1516.19）。
