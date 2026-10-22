@@ -1980,6 +1980,52 @@ additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cp
 no existing assertion was edited.
 
 
+## 轮次167 悔棋重下同一手要不要重新思考：预期成立，但机制不是「结果缓存」而是**置换表跨悔棋存活**——一手就悔 4312 → 1268 节点，下了两回合再悔 10375 → **144 节点（第一次的 1.4 %）**，答案（着法/分值/深度/method）逐字不变；控制臂钉住归因：同一张热表、悔棋之后**换一手**下立刻回到 7167 节点，所以那个 144 不是「搜索没跑」；`src/` 一字未动，三条 `test_server` 用例 + 三条变异臂全部 rc=134 — the user's expectation holds, but the mechanism is transposition-table survival across a takeback, not a result cache: replaying the same stone costs 1268 of 4312 nodes one move into the game and 144 of 10375 two rounds in, with a byte-identical answer, while a *different* stone on the equally warm table jumps straight back to 7167 nodes, which is what makes the saving attributable to position identity rather than to a search that never ran. `src/` untouched: three `test_server` cases and three mutation arms, all rc=134.
+
+**问题**（用户提出）：悔棋再重下相同位置，是否需要重新思考？预期是「不应该」。
+
+**答**：预期成立，但要说准它成立在哪一层。**没有**按位置缓存思考结果的机制（`grep` 全树没有 result-level cache；唯一的 `Reuse`/`take_hint` 是「求招」那一条，悔棋会 `has_hint_ = false` 清掉）。第二次仍然进 `engine_.search`。省下来的全部来自一件事：**`GameManager::undo` 不清置换表**——`engine_` 是 `GameManager` 的成员（`game_manager.h:194`），而 undo 只 `cancel_ponder()` + 弹子 + 弹 `analyses_`；`advance_generation()` 是**替换顺序**的时钟，`TranspositionTable` 的 probe 不参与代际判断（`transposition.cpp:78/133` 只在写入与逐出时读它），所以悔棋前写下的记录在悔棋后仍然可查。
+
+**读数**（`depth 4`、墙钟 120 s 不参与判定、节点帽 40000 也先不到 ⇒ 深度自然跑完，节点数是量不是钟；同一份针臂在两次独立会话里读数逐字相同）
+
+| 场景 | 该位置第一次 | 悔棋后重下同一手 | 省 |
+| --- | --- | --- | --- |
+| 空盘 → 人 (7,7) → AI | 4312 节点 / tt_hits 299 | **1268** / 182 | 70.6 % |
+| (7,7)→AI，(8,8)→AI | 10375 / 704 | **144** / 94 | **98.6 %** |
+| 控制：同一张热表，悔后换下 (0,0) | — | **7167** | 不省（这就是归因证据） |
+| 同一位置反复悔/下三次 | — | 144 / 144 / 144 | 不再变化，也不抖 |
+
+答案稳定性：两档场景里重下同一手与第一次的 `(着法, 分值, 完成深度, method)` 全部相同（(6,6)/−3934/4/alphabeta 与 (5,7)/−2006/4/alphabeta）。
+
+**交付**（只动 `tests/`）
+
+- `tests/test_server.cpp` 三条用例，注册在 `main` 末尾：
+  - `test_undo_then_the_same_stone_reuses_the_table_across_the_takeback`：钉 4312→1268 与 10375→144，且答案逐字相同。
+  - `test_a_different_stone_after_the_takeback_pays_a_fresh_think_again`：控制臂，钉 7167 与 `> 144 × 10`。
+  - `test_the_takeback_lands_on_the_same_position_and_a_repeat_stays_stable`：旧行为不变——undo 精确退回同一位置（**非空**位置的 zobrist 相等）、人在应手时没有 worker 还在写盘、反复悔三次读数不抖。
+- 等 worker 一律 **join `search_thread_`**，不轮询墙钟：memcheck 下墙钟放大 ~20 倍，任何「等 N ms」都会变成假失败（与 [[engine-round-harness-traps]] 那条同源）。
+- 插入点在被文档按行号指认的最高行（3297）**之后**，`src/server/server.cpp:939-942`、`:1626-1634` 与 3112/3160/3190/3209/3267/3297 全部原位（`awk 'NR==…'` 逐条复看）。
+
+**变异臂三条，全部 rc=134**
+
+- M1 `undo` 路径上加 `transposition_table().clear()` ⇒ 死在 `test_server.cpp:3399`（`replayed.nodes` 的钉值）。
+- M2 人落子时把 `advance_generation()` 换成 `clear()` ⇒ **也死在 3399**（两条变异打到同一条断言，不是两条独立证据，照实记）。
+- M3 `undo` 只退一子（`undo_count = 2` 那一支短路）⇒ 死在 `test_server.cpp:3392`（`moved == 0`）。
+- 锚点教训一条：M1 第一版挂在 `if (board_.move_count() == 0) return false;` 之前——那是**拒绝悔棋**的支路，清了也等于没清。改挂到正常路径上的 `int undo_count = 1;` 才真的动了。
+
+**本轮自己踩的三个仪器坑**（都不是引擎结论，是读数的可信度）
+
+1. `set_config(120000, 4, 0, 40000)` 里给 `soft_time_ms` 传 **0** 不是「不给」而是「软时限 = 0 ms」⇒ 思考一开工就被叫停，AI 不落子，`analyses_` 只有一条 human。要「不给」得传 **−1**。第一次跑出来「全是 0」就是这么来的。
+2. AI 落子要 `move_callback_` 非空才提交（`game_manager.cpp` 里 `if (move_callback_ && result.best_move.pos.is_valid())`）——裸 `GameManager` 没装回调，于是思考跑了、结果被丢。这是「0 不是读数，是那台仪器没说话」的又一个形状。
+3. 位置同一性第一次是用「undo 后的哈希 == 空盘哈希」证的，而**两者都是 0** ⇒ 恒等成立、什么也没证。改成比一个**非空**位置（人在应手那一刻的哈希 vs 悔棋之后的哈希），并加一条 `!= 0` 的守卫。
+4. 顺带一个 API 陷阱值得记：`undo(int& out_move_count, …)` 的出参是**退回之后盘上还剩几子**，不是「退掉几子」。第一版按名字理解写成 `moved == 2` 直接判错；断言里按契约钉值并把这句话写进注释。
+
+**门禁**：`src/` 未动（`git status` 只有 `tests/test_server.cpp`）· `ctest` **9/9 / 890.31 s**（`test_board` 0.03 / `test_pattern` 0.08 / `test_evaluator` 5.19 / `test_search` 473.75 / `test_position` 7.89 / `test_session` 0.03 / `test_server` 66.97 / `test_training` 94 / `test_pinned` 241.81）· `readme_anchor_check.js` 122/0 · `web_frontend_check.js` 113/113 · TSan 本轮无新共享态（只是 join 生产本来就会起的那条 worker）⇒ 不重跑，登记为「无新共享态」而不是「跑了但读 0」。
+
+**`memcheck test_server` 的泄漏子门本轮未拿到（not-run，理由可查）**：三次跑都在 23–26 s 中止于 `tests/test_server.cpp:1737` 的 `assert(hint_results == 0)`（`test_hint_answer_for_a_superseded_position`）。**把 `tests/test_server.cpp` 换回 HEAD 的版本重编重跑，同一行、同一断言、同一个 rc=134** ⇒ 与本改动无关，是那一条已知的 load-敏感用例（[[test-server-memcheck-hint-case-is-timing-fragile]]；轮次165 同一门禁在空载下跑完整 1887 s clean，本轮机器刚跑完 890 s 的 ctest）。另一条：用 `--leak-check=no` 的直跑把**整个套件**跑到了 `All server tests passed!` 且 invalid_read / invalid_write / uninitialised 全 0 —— 但那次不检泄漏，所以 `definite_leak` 不能从它这里拿。门禁脚本自身中止时只 tail 两行 stdout，断言文本要靠把 `2>` 留下来的直跑才拿得到（本轮就是这么定位到 1737 的）。`src/` 一字未动 ⇒ 本轮的泄漏面只在测试码。
+
+**顺带一条要交给下一轮的缺陷**：`tools/valgrind_check.sh memcheck test_server` 在负载下**跑不完**，于是一向把它当门禁的人会把「中止 + 四个 0」误读成 clean。要修的是那条用例本身（它等的是一个 `hint_result`/`error` 帧，而慢速构建下会有上一手的迟到帧），不是本轮的账。
+
 ## 轮次166 引擎重构 戊-3 K 一键训练：判不落地（结构性 + 已满足的两条判据），三条 `test_k1_*` 用例做**判据的正面证据**——指导书 §4 戊-3 验收的两条已经由现有流水线满足（同 seed 两次 `run_round` 落出来的 checkpoint **2062 字节逐字相同**；「跑 1 round → 写 checkpoint → 读回 → 再跑 1 round」与「不中断跑 2 round」的最后一份 checkpoint **3269 字节逐字相同** ⇒ `--checkpoint ck.json --resume ck.json` 早就是断点续），状态机要加的这一层只是**在相边界把已有能力叫个名字**、不是新机制（§2 每一个新机制都要有一条杀线：「机制的唯一新读数是标签、验收判据已由现有流水线满足」这一条命中 ⇒ 判不落地）；更直接的一半是**结构性**：`BalanceController` 在树里**没有**（丁-4 在轮次159 判不落地，类从未写 ⇒ `test_k1_the_balance_phase_has_no_controller_class_in_the_tree` 钉住这个前提），指导书表格里明写的**五相**最少一相没有实现体 ⇒ 交一个「4 相 + 空相」的状态机不是指导书那一个 — engine redesign stage 戊-3: judged NOT-TO-LAND (structural gap + acceptance already satisfied), three `test_k1_*` cases stand as the *positive evidence for the criterion*, not as the mechanism itself. Guide 戊-3 acceptance clause #1 (same-seed runs write byte-equal checkpoints) is verified by `2062 bytes` identical between two `run_round` invocations, clause #2 (pause at phase boundary + resume yields the same result as uninterrupted) is verified by `3269 bytes` identical between split and continuous paths — `--checkpoint ck.json --resume ck.json` already does exactly this in the shipped pipeline, so a state-machine wrapper around it would only re-label existing behaviour (§2's kill line "a mechanism whose only new observable is a label, when its acceptance is already met by the existing pipeline" fires). The other half is structural: `BalanceController` does not exist in the tree (丁-4 judged NOT-TO-LAND in 轮次159, class was never written), so one of the guide's five phases has no implementation body — shipping a "4-phase + empty" state machine would not be the state machine the guide specifies.
 
 **交付**（本轮 `src/` 一字未动，`docs+tests` 半子）

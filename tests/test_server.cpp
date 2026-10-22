@@ -3325,6 +3325,173 @@ void test_preview_arms_are_the_pinned_poses() {
 }
 
 
+// ── 悔棋重下同一手要不要重新思考（用户提出的预期：不应该从头重想）────────────────
+// 三次读数的形状是同一件事：答案不许变，成本要塌。塌下来的那部分全部来自置换表跨悔棋存活
+// ——`GameManager::undo` 不清表，只 `advance_generation()`（那是**替换顺序**的时钟，
+// 不是有效性：`transposition.cpp` 的 probe 不参与代际判断）。所以第二次思考仍然进
+// `engine_.search`，只是它几乎全程在读第一次写下的记录。
+//
+// 节点数在这里是**量**：`set_config(120000, 4, -1, 40000)` 给一个远在水位之上的墙钟 +
+// 一个不参与判定也不会先到的节点帽，深度 4 自然跑完（4312 / 10375 都远小于 40000），
+// 于是同一棵树在空机与满载机上给出同一个数（指导书 §9.2）。
+namespace {
+
+// 等 make_move 自己起的那条 worker 跑完：join 而不是轮询——memcheck 下墙钟会放大
+// ~20 倍，任何「等 N 毫秒」的写法都会变成假失败，而 join 没有时限。
+void join_think(GameManager& game) {
+    if (game.search_thread_ && game.search_thread_->joinable()) game.search_thread_->join();
+    assert(!game.is_ai_thinking());
+}
+
+struct Think {
+    int row = -1, col = 0, score = 0, depth = 0, nodes = 0, tt_hits = 0;
+    std::string method;
+};
+
+Think last_ai_think(const GameManager& game) {
+    Think t;
+    for (const MoveAnalysis& a : game.analyses_) {
+        if (a.method == "human") continue;
+        t.row = a.move.pos.row; t.col = a.move.pos.col; t.score = a.score;
+        t.depth = a.depth; t.nodes = a.nodes; t.tt_hits = a.tt_hits; t.method = a.method;
+    }
+    return t;
+}
+
+bool same_answer(const Think& a, const Think& b) {
+    return a.row == b.row && a.col == b.col && a.score == b.score && a.depth == b.depth &&
+           a.method == b.method;
+}
+
+// 一个新会话：人执黑，深度 4，墙钟远在水位之上，节点帽只是护栏。
+void arm_session(GameManager& game) {
+    game.reset();
+    game.set_move_callback([](const Move&, int, int) {});
+    game.set_game_over_callback([](int, const std::string&) {});
+    game.set_player_color(BLACK);
+    game.set_config(120000, 4, -1, 40000);
+}
+
+}  // namespace
+
+// 一：悔棋重下同一手 ⇒ 答案逐字相同、成本塌到零头。这是新 behaviour。
+void test_undo_then_the_same_stone_reuses_the_table_across_the_takeback() {
+    // (a) 一手就悔：空盘 → 人 (7,7) → AI → 悔 → 再人 (7,7) → AI。
+    GameManager once; arm_session(once);
+    assert(once.make_move(7, 7)); join_think(once);
+    const Think first = last_ai_think(once);
+    CHECK_EQ(first.nodes, 4312);            // 出厂针：该位置第一次思考的节点数
+    CHECK_EQ(first.tt_hits, 299);
+    CHECK_MESSAGE(first.method == "alphabeta", "第一次思考走的是分层搜索，不是快路");
+
+    int moved = 0;
+    GameStatus status = GameStatus::PLAYING;
+    assert(once.undo(moved, status));
+    // 注意 `undo` 的出参是**退回之后盘上剩几子**，不是「退掉几子」——空盘开局悔一手，
+    // 剩 0。把它读成「退掉的个数」会永远判错，所以这里按契约钉住值而不是名字。
+    CHECK_EQ(moved, 0);
+    CHECK_EQ(status, GameStatus::WAITING);   // 退到空盘 ⇒ 这一局回到「还没开」
+    assert(once.make_move(7, 7)); join_think(once);
+    const Think replayed = last_ai_think(once);
+    std::cout << "  [r167] 一手后悔棋：nodes " << first.nodes << " -> " << replayed.nodes
+              << ", tt_hits " << first.tt_hits << " -> " << replayed.tt_hits << std::endl;
+    CHECK_MESSAGE(same_answer(first, replayed), "悔棋重下同一手不许换个答案");
+    CHECK_EQ(replayed.nodes, 1268);         // 同一位置的第二次：读表，不重想
+    CHECK_MESSAGE(replayed.nodes < first.nodes / 3, "重下同一手要付不到第一次的三分之一");
+
+    // (b) 真实用法：下了两回合再悔（表已经被两次思考灌满）。
+    GameManager fresh_session; arm_session(fresh_session);
+    assert(fresh_session.make_move(7, 7)); join_think(fresh_session);
+    assert(fresh_session.make_move(8, 8)); join_think(fresh_session);
+    const Think cold_at_pair = last_ai_think(fresh_session);
+    CHECK_EQ(cold_at_pair.nodes, 10375);
+
+    GameManager warm_session; arm_session(warm_session);
+    assert(warm_session.make_move(7, 7)); join_think(warm_session);
+    assert(warm_session.make_move(8, 8)); join_think(warm_session);
+    int moved2 = 0;
+    GameStatus status2 = GameStatus::PLAYING;
+    assert(warm_session.undo(moved2, status2));
+    assert(warm_session.make_move(8, 8)); join_think(warm_session);
+    const Think replayed_at_pair = last_ai_think(warm_session);
+    std::cout << "  [r167] 两回合后悔棋：nodes " << cold_at_pair.nodes << " -> "
+              << replayed_at_pair.nodes << "（省 "
+              << (100.0 - 100.0 * replayed_at_pair.nodes / cold_at_pair.nodes) << " %）"
+              << std::endl;
+    CHECK_MESSAGE(same_answer(cold_at_pair, replayed_at_pair), "悔棋重下同一手不许换个答案");
+    CHECK_EQ(replayed_at_pair.nodes, 144);  // 1.4 % —— 实际上就是「没有重想」
+    std::cout << "test_undo_then_the_same_stone_reuses_the_table_across_the_takeback passed"
+              << std::endl;
+}
+
+// 二：反证——同一张热表，悔棋之后**换一手**下，成本必须回到正常量级。
+// 没有这一条，上面那个「144」也可以只是「搜索根本没跑 / 直接吐了个缓存着法」。
+void test_a_different_stone_after_the_takeback_pays_a_fresh_think_again() {
+    GameManager game; arm_session(game);
+    assert(game.make_move(7, 7)); join_think(game);
+    assert(game.make_move(8, 8)); join_think(game);
+    CHECK_EQ(last_ai_think(game).nodes, 10375);   // 位置 P 的第一次：全额
+    int moved0 = 0;
+    GameStatus status0 = GameStatus::PLAYING;
+    assert(game.undo(moved0, status0));
+    assert(game.make_move(8, 8)); join_think(game);
+    const Think warm_same = last_ai_think(game);   // 位置 P 的第二次：读表
+    CHECK_EQ(warm_same.nodes, 144);
+
+    int moved = 0;
+    GameStatus status = GameStatus::PLAYING;
+    assert(game.undo(moved, status));
+    assert(game.make_move(0, 0)); join_think(game);
+    const Think other = last_ai_think(game);
+    std::cout << "  [r167] 悔棋后换一手：(8,8) 重下 " << warm_same.nodes << " vs 换到 (0,0) "
+              << other.nodes << std::endl;
+    // 表一样热（前两手的思考完全一样），位置一变就要重新证 ⇒ 省法确实来自位置相同。
+    CHECK_MESSAGE(other.nodes > warm_same.nodes * 10,
+                        "换个位置还这么便宜 ⇒ 省法不是位置复用");
+    CHECK_EQ(other.nodes, 7167);            // 同一张热表，换个位置就是正常量级
+    std::cout << "test_a_different_stone_after_the_takeback_pays_a_fresh_think_again passed"
+              << std::endl;
+}
+
+// 三：旧 behaviour 不变——悔棋仍然精确退回原位、仍然不并发，而且反复悔/下不抖。
+void test_the_takeback_lands_on_the_same_position_and_a_repeat_stays_stable() {
+    GameManager game; arm_session(game);
+    assert(game.make_move(7, 7)); join_think(game);
+    const unsigned long long at_humans_hand = game.board_.zobrist_hash();
+    CHECK_MESSAGE(at_humans_hand != 0,
+                        "拿空盘那个恒 0 的哈希来比相等，等于什么都没证（本轮踩过）");
+    CHECK_MESSAGE(!game.is_ai_thinking(), "人在应手时不该有 worker 还在写棋盘");
+
+    assert(game.make_move(8, 8)); join_think(game);
+    int moved = 0;
+    GameStatus status = GameStatus::PLAYING;
+    assert(game.undo(moved, status));
+    CHECK_EQ(game.board_.zobrist_hash(), at_humans_hand);   // 精确退回，不是「大致退回」
+    CHECK_EQ(moved, 2);
+    CHECK_MESSAGE(!game.is_ai_thinking(), "悔棋之后不许留一条还在想的 worker");
+
+    // 同一手再反复悔/反复下三次：读数必须逐字相同。进循环之前该位置已经想过两次，
+    // 所以三次都是 144 —— 反复悔棋不会把表挤空，也不会一次比一次贵。
+    std::vector<int> reps;
+    for (int round = 0; round < 3; ++round) {
+        assert(game.make_move(8, 8)); join_think(game);
+        reps.push_back(last_ai_think(game).nodes);
+        int m = 0;
+        GameStatus s = GameStatus::PLAYING;
+        assert(game.undo(m, s));
+    }
+    std::cout << "  [r167] 同一位置连想三次：";
+    for (const int n : reps) std::cout << n << " ";
+    std::cout << std::endl;
+    CHECK_EQ(reps.size(), 3u);
+    CHECK_EQ(reps[1], reps[2]);            // 到表复用上限之后不再抖
+    CHECK_EQ(reps[2], 144);
+    CHECK_MESSAGE(reps[0] >= reps[1], "第二次不许比第一次更贵（表被挤掉了就是回归）");
+    std::cout << "test_the_takeback_lands_on_the_same_position_and_a_repeat_stays_stable passed"
+              << std::endl;
+}
+
+
 int main() {
     std::cout << "Running server tests..." << std::endl;
 
@@ -3375,6 +3542,9 @@ int main() {
     test_config_preview_is_repeatable_and_commits_nothing();
     test_config_preview_is_refused_while_the_ai_is_thinking();
     test_preview_arms_are_the_pinned_poses();
+    test_undo_then_the_same_stone_reuses_the_table_across_the_takeback();
+    test_a_different_stone_after_the_takeback_pays_a_fresh_think_again();
+    test_the_takeback_lands_on_the_same_position_and_a_repeat_stays_stable();
 
     test_analyze_progress_then_exactly_one_result_per_ply();
     test_analyze_is_refused_while_the_ai_is_thinking();
