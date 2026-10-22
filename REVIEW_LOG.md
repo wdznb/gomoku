@@ -1980,6 +1980,51 @@ additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cp
 no existing assertion was edited.
 
 
+## 轮次170 整树赛夹具落地（`:555` 方案 C 的前半）：两个 `gomoku_server` 进程经 WS 对打的赛具写出来了，而 null 对照先抓到夹具自己在偏——排程用 `g % 开局数` 定开局、`g % 2` 定座位，开局数是偶数时这两条同周期，**六条开局每条只被一个座位跑到**，于是两台**完全相同**的引擎打 12 局读到 0.1667（2 胜 10 负）；改成「同一开局连跑两个座位」的按对排程后，同一条 null 读到 **0.5000（6 胜 6 负、0 作废）**。首份跨树读数（新树 vs `v0.5.0-phase4`，500 ms/手、深度 8，连跑两遍共 48 局）：41 局计入 33 胜 8 负 ⇒ **0.8049，Wilson 95 % 区间 [0.660, 0.898]**，且新树两个座位都在赢（执黑 9/12、执白 8/8）⇒ 不是座位效应；同一口径两遍分别读 0.8500 与 0.7619，那 0.09 就是按墙钟出价的跑动噪声。正控一支（同一棵树、只把每手节点帽差开 10 倍）读 **0.9167** [0.646, 0.985] ⇒ 赛具量得出差别。作废的 7 局指向一条新事实而不是机器抖动：旧树执黑落下的点被新树 `make_move` 判「Invalid move」——同一个问题分别链到两棵树的 core 目标文件，`is_forbidden(BLACK,(3,2))` 新树 1 / 旧树 0，而两棵树的 `PatternRecognizer::is_forbidden` 源码 diff 为空 ⇒ 分歧在**棋型识别**（`src/core/pattern.cpp` 605 行 vs 555 行）不在禁手规则；盘面上那一点确实同时成两条两端皆空的活三（竖 3-2/4-2/5-2 与副对角 2-3/3-2/4-1），新树判三三禁手是判对了 — the whole-tree match fixture `:555` asked for now exists: two `gomoku_server` processes play over WS, one side per colour, seats paired per opening, aborted games excluded. The null control caught the harness itself biased — with the opening count even, `g % openings` and `g % 2` share a period, so each opening was only ever played from one seat, and two *identical* engines scored 0.1667 (2-10) over 12 games; pairing the two seats per opening takes that same null control to exactly **0.5000 (6-6, 0 aborted)**. The first cross-tree reading (HEAD vs tag `v0.5.0-phase4`, 500 ms/move, depth 8, two 24-game passes pooled = 48 games) is **0.8049, Wilson 95 % [0.6599, 0.8977]** over 41 decided games (33-8) — 9/12 as Black and 8/8 as White, so not a seat effect — while the two passes individually read 0.8500 and 0.7619, which is the run-to-run noise of a clock-priced match and gets reported as such. A positive control (same tree, only the per-move node cap differing by 10x) reads **0.9167 [0.646, 0.985]**, so the fixture can measure a difference. The 7 excluded games are a finding, not load noise: the old tree's Black lands on points the new tree refuses as "Invalid move", and the same probe linked against each tree's own objects answers `is_forbidden(BLACK,(3,2))` = 1 (new) vs 0 (old) while the two trees' `is_forbidden` source diffs empty — the divergence is in **pattern recognition**, not in the forbidden rule, and on that board the point really does make two open threes at once, so the new tree is the one reading the rules correctly.
+
+**改了什么**（`src/` 一字未动）
+
+- `tools/tree_match.cpp`（新增，604 行）：一个最小 WS 客户端（POSIX socket + RFC 6455 掩码帧，ping 就地回 pong、分片攒到 FIN）+ 对局循环 + 记分报告。它**不链引擎**，因为要量的就是「两个各自跑完整生命周期引擎的进程」，链进来成了进程内的近似。
+- `tools/match_openings.jsonl`（新增，6 条开局）：空盘、三条二子开局、quiet 四子、pos24 廿四子；开局文档就是协议里 `set_position` 收的那个形状，两棵树逐字同一份。
+- `CMakeLists.txt` 末尾追加 `gomoku_tree_match` 目标（追加而非插入：`:410` 那条「上面那些目标行被 REVIEW_LOG 按行号指认」的约定）。
+
+**赛具的两条口径，都是被读数教出来的**
+
+- 座位排程：**开局号 = `g/2`，座位 = `g%2`**，一条开局的两个座位连着跑。写成 `g % 开局数` 时它和 `g % 2` 同周期（开局数是偶数），六条开局各有且只有一个座位 ⇒ 相同引擎读到 0.1667。`main()` 里现在还会在 `games` 不是 `2×开局数` 的整数倍时打一行警告。分片也按「对」切（`pair % shards`），否则每片只看到一个座位，单片报告自成像偏。
+- 作废局**不计入分数**，只计数并单独报「对面拒收 Invalid move」的条数：一次负载抖动既不是胜负也不是和棋，而规则分歧必须和抖动分开看，否则「新树赢了多少」里混着「旧树违规了几次」。
+
+**读数（同一台机器空载时跑；除注明外都是 `--timeout-ms 500 --max-depth 8`）**
+
+- null 对照（同一棵树两个进程）：修排程前 12 局 **0.1667** [0.047, 0.448]（2 胜 10 负），修后 12 局 **0.5000** [0.254, 0.746]（6 胜 6 负、0 作废）。两台相同引擎逐字 6-6 ⇒ 这套夹具接近确定性，也说明**有效样本的单位是「开局×座位」这一对，不是「局」**：同一对反复跑不加信息。
+- 正控（同一棵树，只把每手节点帽差开 10 倍：`--a-max-nodes 60000 --b-max-nodes 6000`）：rich **0.9167** [0.646, 0.985]（11 胜 1 负、0 作废）。这一支是给赛具自己用的「它能不能测出差别」——第一遍它读到 0.9091 但**带一局作废**，而那局作废是赛具的缺陷（见下面第三条口径），修完才是现在这个数。赛具有力量，且力量量的是预算差。
+- 跨树首份：连跑两遍各 24 局，第一遍 20 局计入 17 胜 3 负 ⇒ 0.8500 [0.640, 0.948]，第二遍 21 局计入 16 胜 5 负 ⇒ 0.7619 [0.549, 0.894]；用 `--report` 合并 48 局 = **41 局计入、33 胜 8 负 ⇒ 0.8049，Wilson 95 % [0.6599, 0.8977]**。两遍之差就是这套按墙钟出价的赛的**跑动噪声**（0.85 对 0.76），必须报出来：跨树时两侧深度不再相等，钟一抖结论就抖。分座位（第一遍）新执黑 9 胜 3 负、新执白 8 胜 0 负 4 作废 ⇒ 两个座位都在赢，不是座位效应；合并后执黑一侧胜率 0.3902 (16/41)。每局均耗 新 5.00 s / 旧 4.94 s，行价 **9.4 s/局**（单表）⇒ 方案 C 预注册的 ≈384 局 ≈ 60 分钟，三表并行约 25 分钟。
+- 禁手分歧的取证：`/tmp/tm170/p24_forbidden.cpp` 同一份源码分别 `-I <新树>/src` 链新树 core 目标、`-I <旧树>/src` 链 `<旧树>/build/CMakeFiles/gomoku_server.dir/src/core/*.o`，答 `is_forbidden(BLACK,(3,2))` = 1 与 0；`awk` 抽两棵树的 `PatternRecognizer::is_forbidden` 函数体 diff 为空。（这台取证探针在 `/tmp`，主机清掉就没了——它不是本轮交付物；本轮交付的是赛具、正控、和这条被指认到点的分歧。）
+
+**第三条口径是赛具自己的缺陷，不是引擎的**：认输发生在 AI 自己那一手**之后**——服务器先发 `ai_move` 再发 `game_over`，而夹具读到 `ai_move` 就换去读对面，输家的 `game_over` 从此躺在原 socket 里；下一子递回去时它只回「Invalid move」。所以正控第一遍那局被记成了作废。修法是在任何一次失败之路上，**先把两边的缓冲各排空 3 s 找那条迟到的局终帧**，找到就按真正的胜负记账（`drain_end()`）。修后正控 12/12 全部计入。这条也改变跨树读数的解释口径：修完仍在的 7 局作废才是**真的**规则分歧，全部指得出点——旧树执黑落在 (3,2) 与 (4,5)，两遍各两次。
+
+**这条分歧要人拍板**：跨树赛里「一边认为合法、一边认为非法」的点，现在按作废处理（48 局里 7 局，全部落在旧树执黑的那 24 局上，点是 (3,2) 与 (4,5) 两个各被重复指认到）。另一种口径是判「下出对面规则不允许之点的一方负」——那是仲裁口径而不是技术口径，而且它会直接改变 0.8049 这个数，所以大批跑之前必须先定。
+
+**门禁**：`node tests/readme_anchor_check.js` = 122 引用 0 问题；`node tests/web_frontend_check.js` = 113/113；`ctest --test-dir build` = **9/9 通过**：改赛具前两次 913.52 s / 919.33 s，**最终状态整树重建后再跑一遍 905.01 s**（`test_pinned` 247 s、`test_training` 95 s、`test_server` 69 s）。`memcheck test_server` **本轮未跑**（没有动 `src/`，赛具是纯客户端，也不在 ctest 里）。锚点文件行数不变：README 765 / 指导书 849 / `src/server/server.h` 278 / `web/index.html` 138，`CMakeLists.txt` 424 → 441（本轮的赛具目标；轮次169 的探针目标再 +17 ⇒ 458，两条都只在末尾追加）。
+
+**`:555` 到哪一步**：那一格从「**没有整树赛**」推进到「有赛具 + null 对照读平 + 正控读得出预算差 + 首份 41 局跨树读数」，但方案 C 的预注册判据（合并区间下界 ≥ 45 % 记「没有退化」）说的是 **≈384 个有效样本**，而有效样本按「开局×座位」这一对计 ⇒ 下一轮的两件事是**扩开局集**（`docs/ENGINE_REDESIGN.md` 保障 1 自己写的是「模板 + 若干中盘快照」，现集只有 6 条）与**定下禁手分歧的仲裁口径**，然后才是批跑。
+
+
+## 轮次169 「新根降一层」探针：省 3.4–29× 节点是**真的**，但那不是复用——是把棋走浅一层，而浅了的那手在唯一改变着法的盘面上**弱 77,859 点**；同一份节省不用付这一层的买法是预搜（`--ponder`，线上默认 0），量到 **168 节点拿到与全深度逐字相同的答案**。判**不落地**（不改产品代码），交付的是仪器 `tools/new_root_depth_probe.cpp` + `new_root_depth_probe` 目标 + 三份读数 — the "drop a layer at the new root" probe: the 3.4–29× node saving is real but it is *not* reuse — it is playing one ply shallower, and on the one pose where the move actually changes, the shallower move prices **77,859 points weaker** under a deeper reference; the same saving without paying that ply is what the idle pre-search (`--ponder`, shipped but default 0) buys — measured at **168 nodes for a byte-identical full-depth answer**. Judged NOT-TO-LAND: no product code changes; the deliverable is the instrument plus three readings.
+
+**那个说法指的是什么**：一次 d6 的思考把「我方落子 + 对手应手」之后的那个局面当成**第 2 层节点**来搜，所以给它写的置换表记录是 depth 4；下一次思考的根正是那个局面，而要的是 depth 6 —— `src/search/alphabeta.cpp:372` 的门是 `entry.depth >= depth`，4 ≥ 6 不成立，记录只拿去排序、不拿去截断。「降一层」= 下一次只要求 D−1（严格说要 D−2 才够到根自己那条记录）。这不是新机制的猜测：`src/server/game_manager.cpp:552` 那段注释写的就是这笔深度账，它给出的解法是预搜。
+
+**仪器**：`tools/new_root_depth_probe.cpp`（`build/new_root_depth_probe`，只链 `${GOMOKU_CORE_SOURCES}`，不改任何产品行为）。盘面 = `tests/test_pinned.cpp` 的四条钉臂 × 两色，每格再加一个「对手自选应手」变体；每条热臂都从头重放一遍上一手，重放的节点数逐字等于门禁的 221774 / 156428 / 300347 / 175088（重放不一致会当场打印「重放不确定」并作废该格）。全部按节点定价（帽 8,000,000），墙不参与判定。两次整跑逐字节相同、无一条不确定。
+
+**读数 1 —— 纯热表在新根上几乎买不到东西**（同一个新根，热表 vs 空表，都要 d6）：73,552/86,656 = −15.1 %、137,730/149,601 = −8.0 %、383,420/394,894 = −2.9 %、531,931/532,160 = −0.04 %、160,936/174,082 = −7.6 %、**277,287/269,335 = +2.9 %**（热臂比冷臂还贵），中位 ≈ −7.6 %。这与轮次140 的「ordering only」是同一件事；而轮次167 那次 10375→144 是**同一个局面换个走法重来**，跟新根不是一回事。
+
+**读数 2 —— 降一层买到的是浅一层的棋**：节点确实塌（quiet B 73,552→21,184→4,174，pos24 W 160,936→38,442→6,095，3.4×–29×），但六组里 **`热·要 d5` 与 `冷·要 d5`、`热·要 d4` 与 `冷·要 d4` 的着法和分值逐字相同** ⇒ 热表在浅深度上没有多给任何知识，只是让浅搜便宜。唯一改变着法的那组（quiet WHITE）：d6 走 (5,6) 报 99,999，d5/d4 都改走 (10,10) 报 97,044；用 `exact_root_score` 在 d8 给两个着法定价 ⇒ **(5,6) → 99,999、(10,10) → 22,140，弱 77,859 点**。副读数：着法不变时**分值**也会变 —— quiet BLACK 的 `热·要 d4` 报 71,992（那是父局面存下来的界），`冷·要 d4` 报 79,840，而复盘面板 / aspiration 中心 / 认输阈值读的都是这个数。
+
+**读数 3 —— 同样的节省、不付那一层 = 预搜**：预 50 % 之后仍要求 d6 ⇒ 168 / 56,903 / 234,085 / 465 节点，四臂答案都是全深度那个（quiet WHITE 保住的正是 99,999 的 (5,6)），合计 CPU 与不预搜持平（73,720 对 73,552；135,117 对 137,730；384,258 对 383,420）；预 25 % 时预搜自己被帽截（停=`nodes`、层=5），等待仍降到 29,057 / 94,012 / 308,408 / 117,783。猜错应手的两组（pos24 B (8,5)、pos24 W (9,8)）里 `热·要 d6` 与「预+要 d6」**逐字相同**（531,931 / 277,287）⇒ 白花的只是空闲预算，等待没变。轮次141 记的 saved÷spent ≈ 0.98–1.27 是同一个结论的另一面：**它把同一份 CPU 从等待里搬出来，不是少花钱**。
+
+**判定**：「新根降一层」不落地 —— 它是一个穿着性能标签的强度决定，而且它省的那部分本来就由迭代加深在超时时代劳。用户的直觉（每次只有一个点变化，不必搜很多）是对的，兑现它的旋钮是 `--ponder`（默认 0 是要不要抬的**用户决定**，与轮次141 同一句话）。
+
+**门禁**：`src/`、`tests/` 一字未动（变异臂规则本轮不适用：没有新增 ctest 用例，仪器的自检是「重放一致性 + 热/冷双臂同表」）。`readme_anchor_check` = 122 引用 0 问题；`web_frontend_check` = 113/113；`ctest --test-dir build` = **9/9 通过 919.33 s**；`memcheck` **未跑**（无产品代码改动）。锚点文件行数：README 765 / 指导书 849 / `src/server/server.h` 278 / `web/index.html` 138 不变，`CMakeLists.txt` 424 → 458（两条目标都只在末尾追加）。
+
 ## 轮次168 `memcheck test_server` 恢复可用：那条 hint 用例的前提不再拿墙钟当代理——改成悔棋之前先把已回的帧收干净并**亲眼确认里面没有 `hint_result`**，并把位置换成快路径接不住的 8 子中局（开局库/强制手都不答它，`request_hint` 必然进 alphabeta）；`sleep(100ms)` + `assert(delivery_ms > 500)` 一起删掉，因为它「过了 500 ms」在 memcheck 下很可能是悔棋自己花掉的，那时答案早已合法送达，于是 `hint_results == 0` 就成了在怪产品丢掉一个合法推荐 — the `memcheck test_server` gate runs to the bottom again: the hint case's premise is no longer a wall-clock proxy — before the takeback the test drains whatever has already arrived and asserts no `hint_result` is among it, and the position is an 8-stone midgame no fast path can answer (book and forced-move both stay silent, so `request_hint` must enter alphabeta). The `sleep(100 ms)` + `assert(delivery_ms > 500)` pair is gone: under memcheck those 500 ms could easily be the undo's own cost, in which case the answer had legitimately arrived before the takeback and `hint_results == 0` was blaming the product for discarding a valid hint.
 
 **这是兑现一条既存待办，不是新发现。** 轮次148 登记（REVIEW_LOG `:3414`）：「跟进项（下一轮单独做）：把这条用例改成不依赖时间差的判定」，同一根断言更早还红过两次（轮次122 与轮次123 的 memcheck 读数，REVIEW_LOG `:6982`、`:6727`，当时它在 1710 行）；轮次167 的 `memcheck` 门禁三次都在 23–26 s 中止于 `tests/test_server.cpp:1737 assert(hint_results == 0)`，**把 `tests/test_server.cpp` 换回 HEAD 重编重跑是同一行、同一断言、同一 rc=134** ⇒ 与那一轮的三条新用例无关，是这条既有时间假设。记忆里那条 [[test-server-memcheck-hint-case-is-timing-fragile]] 的「怎么修」写的也正是这个方向（「不要靠睡，用显式状态去观测」）。

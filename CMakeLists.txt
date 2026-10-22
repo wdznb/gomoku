@@ -422,3 +422,37 @@ if(MSVC)
 else()
     target_compile_options(think_latency_probe PRIVATE -Wall -Wextra -O2 -Wno-template-body -Wno-template-id-cdtor)
 endif()
+
+# 整树赛夹具（v2 §每阶段回归保障 第 2 条 / ENGINE_REDESIGN :555 的方案 C）：
+# 两个 gomoku_server 进程经 WS 对打，换坐、固定开局集、作废局不计分。
+# 纯客户端，不链引擎 —— 它要量的正是「两个各自跑完整生命周期引擎的进程」，
+# 链进来就成了进程内近似。继续追加在文件末尾（上面那些目标行被 REVIEW_LOG 按行号指认）。
+add_executable(gomoku_tree_match
+    tools/tree_match.cpp
+)
+target_link_libraries(gomoku_tree_match PRIVATE Threads::Threads nlohmann_json::nlohmann_json)
+if(UNIX)
+    target_link_libraries(gomoku_tree_match PRIVATE pthread)
+endif()
+if(MSVC)
+    target_compile_options(gomoku_tree_match PRIVATE /W4)
+else()
+    target_compile_options(gomoku_tree_match PRIVATE -Wall -Wextra -O2 -Wno-template-body -Wno-template-id-cdtor)
+endif()
+
+# 「新根降一层」探针（轮次169 的读数出处）：读的是引擎已有的旋钮，不改任何产品代码，
+# 所以它只链 core 源集，跟 think_latency_probe 一个形状。继续追加在文件末尾。
+add_executable(new_root_depth_probe
+    tools/new_root_depth_probe.cpp
+    ${GOMOKU_CORE_SOURCES}
+)
+target_include_directories(new_root_depth_probe PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/tests)
+target_link_libraries(new_root_depth_probe PRIVATE Threads::Threads nlohmann_json::nlohmann_json)
+if(UNIX)
+    target_link_libraries(new_root_depth_probe PRIVATE pthread)
+endif()
+if(MSVC)
+    target_compile_options(new_root_depth_probe PRIVATE /W4)
+else()
+    target_compile_options(new_root_depth_probe PRIVATE -Wall -Wextra -O2 -Wno-template-body -Wno-template-id-cdtor)
+endif()
