@@ -1994,6 +1994,8 @@ no existing assertion was edited.
 
 **门禁**：`memcheck test_server` **clean / 2038 s**，reports=0 · invalid_read=0 · invalid_write=0 · uninitialised=0 · **definite_leak=0**（轮次167 记为 not-run 的那个子门，本轮拿到）· `ctest -R "test_server|test_session"` 2/2（70.61 s，`test_server` 70.57）· `readme_anchor_check.js` 122/0 · `web_frontend_check.js` 113/113。全量 `ctest` 9/9 / 890.31 s 是轮次167 在同一棵 `src/` 上跑的，本轮只改了一个测试文件 ⇒ 重跑受影响的两套。
 
+**行号对照（更正一条）**：本轮重写的是 1689–1775 那一段，**它之后的 3067–3297 那批 戊-2 钉点因此整体下移 +32** —— 3112→3144（`entry.contains(field)`）、3160→3192（`越界必须回 config_reject`）、3190→3222（`reboot.find("重启")`）、3209→3241（`合法的值要回 config_ack`）、3267→3301（预览深度不敏感那条）、3297→3329（思考中不许预览那条）；本轮自己的 `hint_results == 0` 从 1737 移到 1767。**轮次168 的提交信息里写「被按行号指认的 test_server 行全部原位」是错的，以本表为准。** 好消息是下移打断不了任何长期指针：`grep` 遍 `docs/`、`README.md`、`src/` 里**没有一处**指向 `test_server.cpp` 的行号引用，被移到的只是本日志里轮次165/166 留下的历史臂证据行号——那正是这条对照表存在的理由（与轮次156 留 old→new 表同一处理）。
+
 **变异臂一条，rc=134**：N1 拆掉产品里「位置已被取代就丢答案」那道门（`game_manager.cpp` 的 `if (move_count_now != snapshot_move_count) { … }` → `if (false)`）⇒ 被取代的 hint 照常交付 `hint_result` ⇒ 死在 `test_server.cpp:1767` 的 `hint_results == 0 && "被取代的 hint 不许交付 hint_result（前提已在悔棋前亲眼查过）"`。这条臂同时回答了两件怕被问的事：前提改成直接观测之后用例**仍然在测那个分支**（不是把断言挪了个位置），以及新的失败信息确实带得出现场。
 
 **没做的一条，记着**：N2 本想演示「把位置换回一手石时，新的前提检查会自己报『前提没成立』」，但那要同时改 `armed_at == 8` 等前置断言，一臂变成三处改动；轮次167 的 M3（`undo` 只退一子 ⇒ 死在 `moved == 0`）已经覆盖了「盘面没真的变化」这一半，所以不做了。
