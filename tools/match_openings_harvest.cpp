@@ -9,6 +9,8 @@
 // 取出来的开局只收「偶数子、黑先行、盘面还活着」的三件条件，全部不满足的记录逐条计数并报出来 ——
 // 赛具那边（tools/tree_match.cpp 的 load_openings）对奇数子开局是直接拒不收的，两头口径要一致。
 #include "core/board.h"
+#include "core/pattern.h"
+#include "core/position_setup.h"
 #include "core/types.h"
 
 #include <nlohmann/json.hpp>
@@ -66,6 +68,8 @@ unsigned long long mix(const std::string& s) {
 
 struct Stats {
     long records = 0, games_bad = 0, ply_hits = 0, dead = 0, parity = 0, dup = 0, kept = 0;
+    long no_install = 0;   // 赛具的 set_position 装不进去（position_from_moves 回了 error）
+    std::string first_no_install;
 };
 
 // 把 moves 数组按顺序摆到盘上；返回 false 表示这条记录本身摆不出合法盘面。
@@ -96,6 +100,31 @@ std::string doc_of(const std::vector<std::pair<int, int>>& prefix) {
     return doc.dump();
 }
 
+// 反过来用同一道筛：把一份**已经写好**的开局档过一遍装载契约，报出装不进去的行。
+// 采集时筛过一次，档就永远安全了吗 —— 记录会换、棋型识别会改版、档也会手工编辑。
+// 所以把判据留成一条能重复跑的命令，而不是留成「当时采出来是干净的」这句话。
+// 退出码 0 = 全部可装载，1 = 有装不进的（这样它能直接当门禁）。
+int check_openings(const std::string& path) {
+    std::ifstream in(path);
+    if (!in) { std::fprintf(stderr, "读不到 %s\n", path.c_str()); return 2; }
+    std::string line;
+    long idx = 0, bad = 0;
+    while (std::getline(in, line)) {
+        if (line.empty()) continue;
+        const long row = idx++;
+        json j = json::parse(line, nullptr, false);
+        if (j.is_discarded()) { std::printf("%ld 非 JSON\n", row); ++bad; continue; }
+        if (!j.contains("moves") || !j["moves"].is_array() || j["moves"].empty()) continue;
+        std::vector<Position> mv;
+        for (const auto& p : j["moves"]) mv.emplace_back(p[0].get<int>(), p[1].get<int>());
+        const SetupResult r = position_from_moves(mv, BLACK);
+        if (!r.ok()) { std::printf("%ld %s\n", row, r.error.c_str()); ++bad; continue; }
+        if (r.side_to_move != BLACK) { std::printf("%ld 轮到白（%zu 子）\n", row, mv.size()); ++bad; }
+    }
+    std::printf("开局档 %s：行=%ld 不可装=%ld\n", path.c_str(), idx, bad);
+    return bad == 0 ? 0 : 1;
+}
+
 void harvest_path(const std::string& path, const Options& opt, std::vector<Candidate>& out,
                   std::set<std::string>& seen, Stats& st) {
     std::ifstream in(path);
@@ -121,15 +150,29 @@ void harvest_path(const std::string& path, const Options& opt, std::vector<Candi
             if (ply > static_cast<int>(order.size())) continue;
             ++st.ply_hits;
             if (ply % 2 != 0) { ++st.parity; continue; }
-            // 黑先行的第 ply 手之后，最后一子是白 ⇒ 现在轮到黑。盘面上已经有人成五就别收：
-            // 那种位置一 set_position 就局终，赛具会把它读成「一步都没下就结束」。
-            const Board snapshot = [&] {
-                Board b;
-                for (int i = 0; i < ply; ++i)
-                    b.place_stone(order[i].first, order[i].second, colors[i] == "black" ? BLACK : WHITE);
-                return b;
-            }();
-            if (snapshot.check_winner() != EMPTY || snapshot.move_count() != ply) { ++st.dead; continue; }
+            // 黑先行的第 ply 手之后，最后一子是白 ⇒ 现在轮到黑。
+            //
+            // 这道筛直接用**赛具装机的那条路**（`position_from_moves`），不自己复刻棋规：
+            // 快照文档写的是 `{"first":"black","moves":[[r,c]…]}`，服务器收到 set_position 就
+            // 是把这份 moves 交给它。轮次177 的 null 里 211 对有 2 对整对作废，报错是
+            // 「黑子 (5,6) 落点为禁手（三三 / 四四 / 长连）」，出自 `position_setup.cpp:538-551`
+            // —— 它把每颗已落的黑子**拿掉、用剩下的全盘**问一次禁手，比「落子当时」严：
+            // (5,6) 在前 18 子上合法，在这张 36 子快照上就不合法了。所以按当时的棋规筛会漏，
+            // 按装载契约筛才和服务器判的是同一件事（判定只有一份真源）。
+            std::vector<Position> install_moves;
+            install_moves.reserve(static_cast<size_t>(ply));
+            for (int i = 0; i < ply; ++i) install_moves.emplace_back(order[i].first, order[i].second);
+            const SetupResult install = position_from_moves(install_moves, BLACK);
+            if (!install.ok()) {
+                ++st.no_install;
+                if (st.first_no_install.empty()) st.first_no_install = install.error;
+                continue;
+            }
+            // 轮次必须是黑 —— 赛具的循环固定从执黑那一侧读第一帧，轮到白会让它等一帧永远不来的 ai_move。
+            if (install.side_to_move != BLACK || install.board.check_winner() != EMPTY) {
+                ++st.dead;
+                continue;
+            }
 
             std::vector<std::string> cells;
             for (int i = 0; i < ply; ++i) {
@@ -170,10 +213,15 @@ int main(int argc, char** argv) {
         else if (arg == "--plies" && value(&v)) opt.plies = parse_plies(v);
         else if (arg == "--per-band") { if (!value(&v)) return 1; opt.per_band = std::atoi(v.c_str()); }
         else if (arg == "--verbose") opt.verbose = true;
+        else if (arg == "--check" && value(&v)) {
+            PatternRecognizer::init();
+            return check_openings(v);
+        }
         else if (arg == "--help" || arg == "-h") {
             std::printf("用法: %s --records FILE.jsonl [--records FILE.jsonl ...]\n"
-                        "        [--plies 4,6,8,...] [--per-band N] [--out FILE.jsonl] [--verbose]\n",
-                        argv[0]);
+                        "        [--plies 4,6,8,...] [--per-band N] [--out FILE.jsonl] [--verbose]\n"
+                        "   或: %s --check 开局档.jsonl   （把装载契约当门禁跑：不可装 ⇒ 退出码 1）\n",
+                        argv[0], argv[0]);
             return 0;
         } else {
             std::fprintf(stderr, "不认识的参数: %s\n", arg.c_str());
@@ -182,6 +230,8 @@ int main(int argc, char** argv) {
     }
     if (opt.records_paths.empty()) { std::fprintf(stderr, "至少要一份 --records\n"); return 1; }
     if (opt.plies.empty()) opt.plies = parse_plies("4,6,8,10,12,14,16,18,20,24,28");
+    // is_forbidden 靠这张表活着；不 init 就是「什么都不禁」，那这道筛就成了摆设。
+    PatternRecognizer::init();
 
     std::vector<Candidate> all;
     std::set<std::string> seen;
@@ -207,7 +257,9 @@ int main(int argc, char** argv) {
     std::ofstream out(opt.out_path);
     if (!out) { std::fprintf(stderr, "写不出 %s\n", opt.out_path.c_str()); return 2; }
     for (const auto& c : kept) out << c.doc << "\n";
-    std::printf("记录=%ld 摆不出的局=%ld 命中档=%ld 奇数子拒收=%ld 已死盘=%ld 重复盘面=%ld ⇒ 开局=%ld 条\n",
-                st.records, st.games_bad, st.ply_hits, st.parity, st.dead, st.dup, st.kept);
+    std::printf("记录=%ld 摆不出的局=%ld 命中档=%ld 奇数子拒收=%ld 装不进=%ld 已死盘=%ld 重复盘面=%ld ⇒ 开局=%ld 条\n",
+                st.records, st.games_bad, st.ply_hits, st.parity, st.no_install, st.dead, st.dup, st.kept);
+    if (opt.verbose && !st.first_no_install.empty())
+        std::fprintf(stderr, "  第一条装不进的报错：%s\n", st.first_no_install.c_str());
     return 0;
 }

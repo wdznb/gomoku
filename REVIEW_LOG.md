@@ -1980,6 +1980,46 @@ additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cp
 no existing assertion was edited.
 
 
+## 轮次177 开局集 45 → 209 条并把夹具地板确认到 0：两台服务器都带 `--no-book` 跑两遍同配置 422 局，读数逐字 0.5000、**逐手零分岔**、209/211 对完美座位平 ⇒ 轮次174 那句「赛具噪声地板 ≈10 % 的局」正式关掉；正控（60000 vs 6000 节点/手）在 209 条上读 **0.7536 [0.7101, 0.7925]**、配对 106 : 0 : 103 ⇒ 有信息的对从 27 涨到 106（同一个 10 倍差的点估计从 0.8090 掉到 0.7536，灵敏度是拿效应量换的）；第 3 步的训练档 vs 默认档读 **0.4844 [0.4369, 0.5323]**、配对 **15 : 21 : 172** ⇒ 36 对有信息、训练档只占 0.4167，两跑配对结构逐字相同 ⇒ 判「这一档不值一次晋升」（理由从「泡在噪声里」换成「有信息的对数不够」），并顺带指认出一条与引擎无关的赛具抖动 — the opening set went 45 → 209 from the *same* 272 records by widening the sampling (bands and per-band), which also corrects 轮次171's premature "self-play boards are 98 % duplicate so the set can't be widened": three degrees of freedom existed and only one had been moved. The fixture is now proven to have a **zero** floor in the node-priced regime: two identical 422-game null passes (`--no-book`) read 0.5000 byte-for-byte with zero per-ply divergence. The 10× positive control reads 0.7536 [0.7101, 0.7925] with 106 informative pairs (up from 27), at the cost of a lower point estimate than the 45-opening run — resolution bought with diluted effect size. The trained-vs-default match reads 0.4844 [0.4369, 0.5323] with pair structure 15 : 21 : 172 (36 informative, trained share 0.4167), identical across two passes ⇒ not worth a promotion, and for a different reason than 轮次173: not noise, but sample count.
+
+**先纠正我自己写下的一条「扩不动」**：轮次171 记的是「168 局 ⇒ 2184 次档命中 ⇒ 2145 个重复 ⇒ 39 条，自对弈的盘高度同源，所以开局集不能只靠多跑几局来扩」。数字没错，结论下早了。同一批记录（`recA` 96 + `recB` 48 + `train_rec` 128 = **272 局**），只把采集口径从「11 个手数档 × 每档取 6」换成「17 个档（4..36，步长 2）× 每档取 20」，**不重复开局 = 205 条**。三个自由度（记录数、档数、每档上限）轮次171 只动了第一个。
+
+**夹具自证（`--no-book`，开局 211 条时跑的，含后来剔掉的 2 条）**
+
+| 跑 | 读数 |
+|---|---|
+| null1（A=B，各 12000 节点/手，422 局） | **0.5000 [0.4523, 0.5477]**，211 对里 209 对座位完美打平、0 对有信息、4 局作废（= 2 对，同一支坏 lineage）|
+| null2（同配置再一遍） | 得分、配对结构、每对座位**逐字相同**；`diff_moves` 读 **翻局 0、逐手分岔 0** |
+
+⇒ 地板是 0，不是 10 %。#77 的样本量口径因此重写成一句更便宜的话：**一跑就是一个确定读数**，重复跑不再压噪声，只压「有信息的对数」。
+
+**采集器补了一道筛，而我的第一版筛是错的**（这条比开局集本身值钱）：null 里那 2 对作废报的是「黑子 (5,6) 落点为禁手（三三 / 四四 / 长连）」，出自 `src/core/position_setup.cpp:538-551` —— 装载时它把每颗**已落**的黑子拿掉、用**剩下的全盘**问一次禁手。我第一版按「落子当时」筛（前缀合法才收），重采报 `历史禁手=0`，一条都没抓到：(5,6) 在前 18 子上合法，在这张 36 子快照上才不合法。改成**直接调装载那条路**（`position_from_moves`）之后 `装不进=12`，重采得 203 条；再拿同一个筛过旧档，剔掉 2 条 ⇒ 定稿 **209 条、209/209 可装载**，且轮次171 的 45 条**一条没丢**（逐行 `grep -xF` 验证，缺失=0）。一句话的教训：**赛具输入的合法性由赛具装它的那段代码定义，不由我以为的棋规定义。**
+
+**训练档 vs 默认档（第 3 步；两侧都 `--params` 带档、只换内容 —— 轮次174 立的规矩）**
+
+| 跑 | 得分 | 配对（训练通吃 : 默认通吃 : 座位平） | 有信息的对里训练占 |
+|---|---|---|---|
+| pass1（418 局，0 作废，1 和） | **0.4844 [0.4369, 0.5323]** | **15 : 21 : 172** | 0.4167 ± 0.163 |
+| pass2（418 局，1 作废） | 0.4832 [0.4356, 0.5311] | **15 : 21 : 171**（+1 不可用） | 0.4167 ± 0.163（逐字同） |
+
+- 判定：这份档**没有带来可测增益**，点估计还偏负；但 36 对的区间 [0.254, 0.579] 横跨一半 ⇒ 既不能判「变强」也不能判「变弱」，能判的是「**不值一次晋升**」。**理由换了**：轮次173 那次是「12 对泡在 10 % 噪声里」，这次是「地板已经是 0，缺的是有信息的对数」。要把 36 推到 ~100，要么开局集再翻一倍多，要么找更分家的档。
+- 训练档是**活的**：同口径的 null 读 0 对有信息，这一档读 36 对 ⇒ 它改的 `black.distance_to_stones 1→2`、`white.cand_width_root 24→15`、`white.double_three 30000→38400` 确实进了着法层（轮次174 证明的黑侧 `double_three/double_four` 那两格死基因之外的那些）。
+
+**新指认出一条与引擎无关的赛具抖动**：game 247（开局号 123，B 执黑）在 pass1 里 default 落 (4,2) 被 trained **收**、pass2 里同一张盘同一颗子被 **拒**，报 `Invalid move`。分岔点之前 13 手逐字相同 ⇒ 不是着法分歧，是握手：`src/server/game_manager.cpp:215`（`ai_thinking_` 还在响）或 `:235`（回合守卫）二选一 —— 赛具把子递给服务器的那一刻，接收侧的回合状态还没倒过来。**本轮没修**，登记为下一条要量的数：relay 抵达时接收侧仍在 thinking 的比例，以及它在真实对局里会不会把玩家的落子吞掉。实测代价 1/418 局，分数与配对结构都没被动到。
+
+**没跑 / 未得的账**
+- 那 2 条坏开局来自**记录本身**（记录是当时那套禁手口径跑出来的）；没去追生成侧为什么允许它，那是另一条线。
+- 「拿掉黑子、用全盘问禁手」比「落子当时」严，这在**棋规**上是有争议的（禁手判的是着法，不是最终形状）。本轮只按现有契约筛，没动契约。
+- null 两遍是在 211 条上跑的（含后来剔掉的 2 条）；209 条定稿后没再重跑 null —— 但两遍 null 的 209 个可用对与定稿集完全重合，作废那 2 对本来就不进账。
+- 正控在 209 条上只跑了一遍。
+- game 247 的握手没有复现脚本，只有两跑差集这一份证据。
+
+**下一步（顺序有因）**：① 修/量 game 247 那条握手（它现在会吃局，且真玩家可能受影响）；② 别再拿探针浪费在黑方那两格死基因上（优化器标不可达，#77 剩下的部分）；③ 要判系数级增益，先把「有信息的对」做起来：要么开局集到 ~600 条，要么改从「真分家的档」取（训练冠军里挑着法差异最大的局面）。
+
+**这道筛留成了一条能重复跑的命令**：`match_openings_harvest --check 开局档.jsonl` 把同一套装载契约当门禁跑，不可装 ⇒ 退出码 1。两个方向都验过 —— `--check tools/match_openings.jsonl` 读 `行=209 不可装=0`（exit 0），`--check /tmp/tm177/match_openings.211.bak`（剔之前那份）读 `98/99 黑子 (5,6) 落点为禁手…不可装=2`（exit 1）。为什么不只留在采集时：记录会换、棋型识别会改版、档也会有人手工动 —— 「当时采出来是干净的」不是一条可复查的陈述。
+
+**门禁**：`ctest --test-dir build` = **9/9 通过 784.91 s**（0 失败）；整树重建 0 error、0 warning（`-Wall -Wextra`）；`node tests/readme_anchor_check.js` = **122 引用 0 问题**；`node tests/web_frontend_check.js` = **113/113**。`memcheck` **未跑** —— `src/`、`tests/` 一字未动，本轮只改 `tools/`（采集器 + 开局档），没有任何测试引用 `tools/match_openings.jsonl` 或 `match_openings_harvest.cpp`（`grep -rn match_openings tests/ src/` 为空）。锚点文件行数：README 765 / 指导书 849 / `src/server/server.h` 278 / `web/index.html` 138 / `CMakeLists.txt` 512 全部不变（没加新目标，`--check` 挂在既有采集器目标上）。
+
 ## 轮次176 战术层按节点出价落地，顺手把赛具的噪声地板从「负载」改判成「开局库的每进程抽签」：`--max-nodes` 今天管到整手棋 —— VCF 拿 `min(1,000,000, 帽×20 %)`、VCT 拿 `min(500,000, 帽×30 %)`、认输探针拿 `min(resign_node_limit_, 帽×20 %)`，且命名了帽就不给这三处挂墙钟 deadline（只收紧不放宽 ⇒ 定深那一档上战术层的帽还是它自己的默认值，六个既有 pin 全部照过 —— 本轮 ctest 里 test_pinned 271.09 s 通过）；而这条改动**没有**改变赛具地板，地板是另一样东西：同一棵树同一套配置、两台服务器都带 `--no-book` 之后，两次 90 局赛读**逐字 0.5000、翻局 0、逐手分岔 0**（库开着是 9/90，其中 6 局在第 0 手就分岔），因为 `src/optimization/opening_book.h:57` 的 `mutable std::mt19937 rng_{std::random_device{}()}` 每进程重播种，第 0/1 手是库在替引擎回答 — the tactical phases now price by nodes when the caller named a node budget (VCF min(1M, 20 %), VCT min(500K, 30 %), the resign probe min(its own limit, 20 %), and none of the three carries a wall-clock deadline in that regime; the min() only ever tightens, so the deep-budget arm is untouched and the six existing pins still pass). What this round actually killed is a mis-attribution: the fixture's noise floor is not load. Two 90-game passes of the *same* tree and the *same* config on servers started with `--no-book` both read exactly **0.5000 with 0 flipped games and 0 divergent plies**; with the book loaded the same null flips 9/90 and 6 of those diverge on ply 0, because the book's weighted draw is re-seeded per process (`opening_book.h`'s `rng_{std::random_device{}()}`) and the book answers the first moves instead of the engine.
 
 **为什么这条值得单独一轮**：轮次174 把 9/90 记成了「战术层不受节点帽管」的后果，并据此定了验收口径「任何 A/B 都要按 ≥10 % 的翻动率配样本量」。那句话要是留着，#77 会被一句错误的样本量要求拖长好几倍。本轮把它证伪了。
