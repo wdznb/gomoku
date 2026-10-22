@@ -1980,6 +1980,34 @@ additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cp
 no existing assertion was edited.
 
 
+## 轮次171 赛具改成同版 A/B，并把开局集从 6 条扩到 45 条：用户拍的口径是「不要用旧代码跑，两边都同一版新树」——代价是 `docs/ENGINE_REDESIGN.md:555` 保障 2 那句「新引擎 vs 旧引擎」从此不由这条赛满足，轮次170 那份 0.8049 [0.6599, 0.8977] 连同 7 局禁手口径分歧一起留在档里当**小样本读数**而不是验收；收益是赛具落到它能长期用的那一面（两套配置、按节点出价）。新增采集器 `tools/match_openings_harvest.cpp`：从 `gomoku_train --records` 的对局记录里按手数档取中盘快照，只收「偶数子、黑先行、盘面还活着」，按 (行,列,色) 排序键去重，每档按 FNV 哈希取前 6 条（确定性的抽样，不手工挑局面）。**168 局记录 ⇒ 2184 次档命中 ⇒ 2145 个重复盘面 ⇒ 39 条不重复**，加 6 条手工模板 ⇒ `tools/match_openings.jsonl` 从 6 行换成 45 行 —— 顺带一条事实：自对弈的盘**高度同源（98 % 重复）**，所以开局集不能只靠多跑几局来扩。三条对照读数：null（同配置、双方各 12000 节点/手、90 局 = 45 开局 × 2 座位）三跑里有两跑读 **45/45 对全部座位打平、0 作废、得分逐字 0.5000**，第三跑 44 平 + 1 对作废 ⇒ **零误报**；正控（同版、rich 60000 对 poor 6000 节点/手）89 局计入读 **0.8090 [0.7152, 0.8772]**，配对统计 = **27 对 rich 双坐通吃、0 对 poor 双坐通吃、17 对座位打平**；同一个 10 倍差在 6 条开局上读的是 0.9167 [0.646, 0.985] ⇒ **点估计掉了 0.11、区间从 ±0.17 收到 ±0.08**，这就是「有效样本的单位是开局×座位这一对」的实证，也是「想量更小的差要的是开局数不是局数」的算法依据 — the match is retargeted (per the user's ruling) to same-tree A/B instead of new-vs-old, at the cost that acceptance row `:555` ("new engine vs old engine") is no longer served by this fixture; the new opening harvester turns 168 self-play records into 39 unique midgame snapshots (2145 of 2184 candidates were duplicate boards — self-play converges hard), giving a 45-opening set. Three controls: two of three null runs (identical configs, 12000 nodes/move each, 90 games = 45 openings × 2 seats) split **every** pair by seat with zero exclusions and score exactly 0.5000, the third loses one pair to an exclusion — zero false positives; the positive control (same tree, 60000 vs 6000 nodes) reads **0.8090 [0.7152, 0.8772]** with 27 pairs won on both seats, 0 reversed, 17 seat-split. The same 10× gap had read 0.9167 [0.646, 0.985] on the 6-opening set: the point estimate fell by 0.11 and the interval tightened from ±17 pp to ±8 pp, which is exactly what "the sample unit is the (opening, seat) pair" predicts.
+
+**残留噪声指认到行**：按节点出价只锁住 AlphaBeta —— `src/search/search_engine.h:118-121` 明写 `set_max_nodes` 是 "Only AlphaBeta reads it; the tactical phases and the resign probe still slice the wall clock"，所以 VCF / VCT / 认输探针仍吃 `--timeout-ms` 的毫秒片。观测到的后果：同配置两跑 180 局里有 1 局的胜者换了、270 局里有 1 局作废。两条出路摆在那：**给战术层也按节点定价**（产品改动，要授权），或者把「同配置两跑之差 ≤1/180」当成夹具的噪声上界写进判据。
+
+**赛具自己的两个坑，本轮堵掉了**：`--out` 过去无条件追加，我先把两跑串进了同一个 180 行文件，而日志只报最后一跑 ⇒ 那份读数当时是错的（切回三段重算才有上面的账）；现在默认拒绝写进非空文件，要续写得显式 `--append`。另外 `--report` 之前不吃文件名参数。
+
+**怎么复现**：两台 `build/gomoku_server --port 8081/8082 --no-sessions --web-dir web`，然后：
+
+    # null 对照（同版同参数，两侧每手都是 12000 节点）
+    ./build/gomoku_tree_match --a 127.0.0.1:8081 --b 127.0.0.1:8082 --names A=B \
+        --openings tools/match_openings.jsonl --games 90 --max-depth 8 --timeout-ms 3000 \
+        --a-max-nodes 12000 --b-max-nodes 12000 --out eq.jsonl
+    # 正控（同版，只把每手节点帽差开 10 倍）
+    ./build/gomoku_tree_match --a 127.0.0.1:8081 --b 127.0.0.1:8082 --names rich=poor \
+        --openings tools/match_openings.jsonl --games 90 --max-depth 8 --timeout-ms 3000 \
+        --a-max-nodes 60000 --b-max-nodes 6000 --out pos.jsonl
+    ./build/gomoku_tree_match --report pos.jsonl      # 事后复算 / 合并多跑
+    ./build/match_openings_harvest --records recA.jsonl --records recB.jsonl \
+        --plies 4,6,8,...,28 --per-band 6 --out harvested.jsonl   # 开局集就是从记录里这么来的
+
+配对统计用的一段 awk 记在这里，省得下次再推导：`"game"` 除以 2 是对号，一对两局的 A 得分之和
+`==1` 就是「座位打平（零信息）」、`==2` 或 `==0` 才是有信息的一对。
+
+**门禁**：`node tests/readme_anchor_check.js` = 122 引用 0 问题；`node tests/web_frontend_check.js` = 113/113；`ctest --test-dir build` = **9/9 通过 901.13 s**（这一跑覆盖扩集后的开局档与采集器目标；`--append` 守卫是它之后单独重编的一支 TU，`gomoku_tree_match` 建干净）。`memcheck` **未跑** —— `src/`、`tests/` 一字未动，赛具与采集器都不在 ctest 里。锚点文件行数：README 765 / 指导书 849 / `src/server/server.h` 278 / `web/index.html` 138 不变；`CMakeLists.txt` 458 → 476（第三条目标仍只在末尾追加）。`tools/match_openings.jsonl` 6 → 45 行。
+
+**下一步**（顺序是有条件的）：① 若要量「训练系数 vs 默认」，先决定要不要把战术层也按节点定价——不定的话 45 条开局上 ≤1/180 的同配置抖动会混进小差值；② 真训练（系数至今是硬编码默认值，`data/training/best_params.json` 与 `src/core/evaluator.h:10-30` 逐字相同）；③ 开局集继续按同一台采集器扩——10 倍节点差在 45 条上只有 27/45 对有信息，小差值需要更多开局而不是更多局。
+
+
 ## 轮次170 整树赛夹具落地（`:555` 方案 C 的前半）：两个 `gomoku_server` 进程经 WS 对打的赛具写出来了，而 null 对照先抓到夹具自己在偏——排程用 `g % 开局数` 定开局、`g % 2` 定座位，开局数是偶数时这两条同周期，**六条开局每条只被一个座位跑到**，于是两台**完全相同**的引擎打 12 局读到 0.1667（2 胜 10 负）；改成「同一开局连跑两个座位」的按对排程后，同一条 null 读到 **0.5000（6 胜 6 负、0 作废）**。首份跨树读数（新树 vs `v0.5.0-phase4`，500 ms/手、深度 8，连跑两遍共 48 局）：41 局计入 33 胜 8 负 ⇒ **0.8049，Wilson 95 % 区间 [0.660, 0.898]**，且新树两个座位都在赢（执黑 9/12、执白 8/8）⇒ 不是座位效应；同一口径两遍分别读 0.8500 与 0.7619，那 0.09 就是按墙钟出价的跑动噪声。正控一支（同一棵树、只把每手节点帽差开 10 倍）读 **0.9167** [0.646, 0.985] ⇒ 赛具量得出差别。作废的 7 局指向一条新事实而不是机器抖动：旧树执黑落下的点被新树 `make_move` 判「Invalid move」——同一个问题分别链到两棵树的 core 目标文件，`is_forbidden(BLACK,(3,2))` 新树 1 / 旧树 0，而两棵树的 `PatternRecognizer::is_forbidden` 源码 diff 为空 ⇒ 分歧在**棋型识别**（`src/core/pattern.cpp` 605 行 vs 555 行）不在禁手规则；盘面上那一点确实同时成两条两端皆空的活三（竖 3-2/4-2/5-2 与副对角 2-3/3-2/4-1），新树判三三禁手是判对了 — the whole-tree match fixture `:555` asked for now exists: two `gomoku_server` processes play over WS, one side per colour, seats paired per opening, aborted games excluded. The null control caught the harness itself biased — with the opening count even, `g % openings` and `g % 2` share a period, so each opening was only ever played from one seat, and two *identical* engines scored 0.1667 (2-10) over 12 games; pairing the two seats per opening takes that same null control to exactly **0.5000 (6-6, 0 aborted)**. The first cross-tree reading (HEAD vs tag `v0.5.0-phase4`, 500 ms/move, depth 8, two 24-game passes pooled = 48 games) is **0.8049, Wilson 95 % [0.6599, 0.8977]** over 41 decided games (33-8) — 9/12 as Black and 8/8 as White, so not a seat effect — while the two passes individually read 0.8500 and 0.7619, which is the run-to-run noise of a clock-priced match and gets reported as such. A positive control (same tree, only the per-move node cap differing by 10x) reads **0.9167 [0.646, 0.985]**, so the fixture can measure a difference. The 7 excluded games are a finding, not load noise: the old tree's Black lands on points the new tree refuses as "Invalid move", and the same probe linked against each tree's own objects answers `is_forbidden(BLACK,(3,2))` = 1 (new) vs 0 (old) while the two trees' `is_forbidden` source diffs empty — the divergence is in **pattern recognition**, not in the forbidden rule, and on that board the point really does make two open threes at once, so the new tree is the one reading the rules correctly.
 
 **改了什么**（`src/` 一字未动）

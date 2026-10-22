@@ -456,3 +456,21 @@ if(MSVC)
 else()
     target_compile_options(new_root_depth_probe PRIVATE -Wall -Wextra -O2 -Wno-template-body -Wno-template-id-cdtor)
 endif()
+
+# 整树赛开局集的采集器（轮次171）：从 gomoku_train --records 写的对局记录里按固定手数取中盘快照，
+# 因为赛具的有效样本单位是「开局×座位」这一对，开局集不宽 ⇒ 力量就上不去。
+# 继续追加在文件末尾（上面那些目标行被 REVIEW_LOG 按行号指认）。
+add_executable(match_openings_harvest
+    tools/match_openings_harvest.cpp
+    ${GOMOKU_CORE_SOURCES}
+)
+target_include_directories(match_openings_harvest PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/tests)
+target_link_libraries(match_openings_harvest PRIVATE Threads::Threads nlohmann_json::nlohmann_json)
+if(UNIX)
+    target_link_libraries(match_openings_harvest PRIVATE pthread)
+endif()
+if(MSVC)
+    target_compile_options(match_openings_harvest PRIVATE /W4)
+else()
+    target_compile_options(match_openings_harvest PRIVATE -Wall -Wextra -O2 -Wno-template-body -Wno-template-id-cdtor)
+endif()

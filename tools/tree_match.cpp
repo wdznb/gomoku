@@ -222,6 +222,7 @@ struct Options {
     int games = 2, timeout_ms = 1000, max_depth = 8;
     int a_max_nodes = 0, b_max_nodes = 0;
     int shard = 0, shards = 1;
+    bool append = false;
 };
 
 // 开局集：一行一个 position 文档（{"moves":[[r,c]...],"first":"black"}）。
@@ -529,13 +530,15 @@ int main(int argc, char** argv) {
         } else if (arg == "--max-depth") { if (!next(&opt.max_depth)) return 1;
         } else if (arg == "--a-max-nodes") { if (!next(&opt.a_max_nodes)) return 1;
         } else if (arg == "--b-max-nodes") { if (!next(&opt.b_max_nodes)) return 1;
+        } else if (arg == "--append") {
+            opt.append = true;
         } else if (arg == "--shard") { if (!next(&opt.shard)) return 1;
         } else if (arg == "--shards") { if (!next(&opt.shards)) return 1;
         } else if (arg == "--help" || arg == "-h") {
             std::printf("用法: %s --a HOST:PORT --b HOST:PORT [--names new=old]\n"
                         "        [--openings FILE.jsonl] [--games N] [--shard K --shards M]\n"
                         "        [--timeout-ms N] [--max-depth N] [--a-max-nodes N --b-max-nodes N]\n"
-                        "        [--out FILE.jsonl | --report FILE.jsonl]\n", argv[0]);
+                        "        [--out FILE.jsonl [--append] | --report FILE.jsonl]\n", argv[0]);
             return 0;
         } else {
             std::fprintf(stderr, "不认识的参数: %s\n", arg.c_str());
@@ -558,7 +561,20 @@ int main(int argc, char** argv) {
         if (openings.empty()) { std::fprintf(stderr, "开局集是空的\n"); return 2; }
     }
     // 游戏 i 的座位由 i 的奇偶定，分片只取属于自己的那几号 ⇒ 合并后两座位各跑满。
-    std::ofstream out(opt.out_path, std::ios::app);
+    // 追加模式会把两跑串进同一个文件（轮次171 就被自己这么绊了一次：180 行里混着两次 90 局，
+    // 而日志只报最后一跑的读数）。所以默认要求目标文件不存在或为空。
+    {
+        std::ifstream probe(opt.out_path);
+        std::string scratch;
+        if (probe && std::getline(probe, scratch) && !scratch.empty() && !opt.append) {
+            std::fprintf(stderr,
+                         "%s 已经有内容（%zu 字节起头）。两跑串在一档会把读数算错 —— "
+                         "要么换个 --out，要么明确加 --append\n", opt.out_path.c_str(),
+                         scratch.size());
+            return 2;
+        }
+    }
+    std::ofstream out(opt.out_path, opt.append ? std::ios::app : std::ios::trunc);
     if (!out) { std::fprintf(stderr, "写不出 %s\n", opt.out_path.c_str()); return 2; }
 
     std::vector<std::pair<json, GameResult>> rows;
