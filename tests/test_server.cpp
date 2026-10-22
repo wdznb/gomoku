@@ -1686,26 +1686,58 @@ void test_resume_takeover_notifies_the_loser() {
 // exists. The delivery slot then carries an invalid Move, which is exactly the
 // shape server.cpp turns into the error frame instead of a hint_result the client
 // would highlight on a stale board.
+// 一个快路径接不住的中局：8 子、分散、双方都还没成活三。开局库与强制手都不会
+// 替它答，所以 `request_hint` 必然进 alphabeta —— 这是这条用例的前提能被构造出来、
+// 而不是靠「睡 100 ms 赌它还没答完」的原因。
+GameRestore hint_pose_restore() {
+    GameRestore restore;
+    restore.player_color = BLACK;
+    restore.status = GameStatus::PLAYING;
+    const Position cells[8] = {{3, 3}, {11, 4}, {4, 10}, {13, 12},
+                               {7, 2}, {2, 12}, {12, 7}, {8, 9}};
+    for (int i = 0; i < 8; ++i) {
+        MoveAnalysis analysis;
+        analysis.move = Move(cells[i].row, cells[i].col, i % 2 == 0 ? BLACK : WHITE);
+        analysis.method = "human";
+        restore.moves.push_back(analysis);
+    }
+    return restore;
+}
+
 void test_hint_answer_for_a_superseded_position() {
     const auto dir = scratch("stale_hint_sessions");
     const auto records = scratch("stale_hint_records.jsonl");
     {
         Harness h(dir, records);
         GameManager& game = *h.entry->game;
-        assert(game.restore_game(playing_restore(1)));  // one black stone, WHITE to move
-        assert(game.current_turn() == WHITE);
-        assert(game.board().move_count() == 1);
+        assert(game.restore_game(hint_pose_restore()));   // 8 子，BLACK 应手
+        assert(game.current_turn() == BLACK);
+        const int armed_at = game.board().move_count();
+        assert(armed_at == 8);
 
         size_t seen = 0;
-        const auto requested = std::chrono::steady_clock::now();
         h.server.handle_request_hint(h.socket, json{{"timeout_ms", 3000}, {"max_depth", 8}});
         assert(game.hint_active_.load());
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        // **前提要直接看，不能拿墙钟当代理。**以前这里是「睡 100 ms → 悔棋 → 断言
+        // 总耗时 > 500 ms」，而 memcheck 下那 500 ms 很可能是悔棋自己花掉的：答案早在
+        // 悔棋之前就合法送达了，于是后面那条 `hint_results == 0` 就成了在怪产品「丢了
+        // 一个合法推荐」。现在改成：悔棋之前先把已经回来的帧收干净，亲眼确认里面没有
+        // hint_result —— 有，就是**前提没成立**，报这一条，而不是让不变量去背锅。
+        int early_results = 0;
+        for (const std::string& frame : drain_frames(h.server, h.socket, seen)) {
+            const json parsed = json::parse(frame, nullptr, false);
+            if (!parsed.is_discarded() && parsed.contains("type") &&
+                parsed["type"] == "hint_result") ++early_results;
+        }
+        assert(early_results == 0 &&
+               "前提没成立：悔棋之前 hint_result 就已合法送达，这条用例测不到「被取代」");
+
         int undone_count = -1;
         GameStatus undone_status = GameStatus::WAITING;
         assert(game.undo(undone_count, undone_status));
-        assert(undone_count == 0);
+        assert(undone_count == armed_at - 2 &&
+               "悔棋要退两子，快照的 move_count 才不再等于盘面");
         // The undo must not have armed an AI worker either, or the answer would
         // be dropped at the discard gate rather than at the stale-position check.
         assert(!game.is_ai_thinking());
@@ -1714,11 +1746,9 @@ void test_hint_answer_for_a_superseded_position() {
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
         assert(!game.hint_active_.load());
-        const long long delivery_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - requested).count();
-        // The premise of this case: the stone was given back while the search was
-        // still running, not after it had already answered.
-        assert(delivery_ms > 500);
+        // 只作参考，不参与判定：这一手到底跑了多久不是前提，前提已经在上面看过了。
+        std::cout << "  [r168] 被取代的 hint：悔棋后仍在跑的这段搜索交付前盘面 = "
+                  << armed_at << "，悔棋后 = " << undone_count << std::endl;
 
         int hint_results = 0;
         std::string answer_type;
@@ -1734,11 +1764,13 @@ void test_hint_answer_for_a_superseded_position() {
                 answer_message = parsed["message"].get<std::string>();
             }
         }
-        assert(hint_results == 0);
+        assert(hint_results == 0 &&
+               "被取代的 hint 不许交付 hint_result（前提已在悔棋前亲眼查过）");
         assert(answer_type == "error");
         assert(answer_message == "No hint available");
-        std::cout << "  stale hint: " << answer_type << " / " << answer_message
-                  << " after " << delivery_ms << " ms" << std::endl;
+        std::cout << "  [r168] stale hint: " << answer_type << " / " << answer_message
+                  << "（盘面从 " << armed_at << " 子退到 " << undone_count
+                  << " 子之后才有答案）" << std::endl;
 
         // Anti-overreach: with nothing touching the board the next hint is still a
         // hint_result on a legal point.

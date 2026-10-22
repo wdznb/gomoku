@@ -1980,6 +1980,24 @@ additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cp
 no existing assertion was edited.
 
 
+## 轮次168 `memcheck test_server` 恢复可用：那条 hint 用例的前提不再拿墙钟当代理——改成悔棋之前先把已回的帧收干净并**亲眼确认里面没有 `hint_result`**，并把位置换成快路径接不住的 8 子中局（开局库/强制手都不答它，`request_hint` 必然进 alphabeta）；`sleep(100ms)` + `assert(delivery_ms > 500)` 一起删掉，因为它「过了 500 ms」在 memcheck 下很可能是悔棋自己花掉的，那时答案早已合法送达，于是 `hint_results == 0` 就成了在怪产品丢掉一个合法推荐 — the `memcheck test_server` gate runs to the bottom again: the hint case's premise is no longer a wall-clock proxy — before the takeback the test drains whatever has already arrived and asserts no `hint_result` is among it, and the position is an 8-stone midgame no fast path can answer (book and forced-move both stay silent, so `request_hint` must enter alphabeta). The `sleep(100 ms)` + `assert(delivery_ms > 500)` pair is gone: under memcheck those 500 ms could easily be the undo's own cost, in which case the answer had legitimately arrived before the takeback and `hint_results == 0` was blaming the product for discarding a valid hint.
+
+**这是兑现一条既存待办，不是新发现。** 轮次148 登记（REVIEW_LOG `:3414`）：「跟进项（下一轮单独做）：把这条用例改成不依赖时间差的判定」，同一根断言更早还红过两次（轮次122 与轮次123 的 memcheck 读数，REVIEW_LOG `:6982`、`:6727`，当时它在 1710 行）；轮次167 的 `memcheck` 门禁三次都在 23–26 s 中止于 `tests/test_server.cpp:1737 assert(hint_results == 0)`，**把 `tests/test_server.cpp` 换回 HEAD 重编重跑是同一行、同一断言、同一 rc=134** ⇒ 与那一轮的三条新用例无关，是这条既有时间假设。记忆里那条 [[test-server-memcheck-hint-case-is-timing-fragile]] 的「怎么修」写的也正是这个方向（「不要靠睡，用显式状态去观测」）。
+
+**改了什么**（只动 `tests/test_server.cpp`；`src/` 一字未动，变异臂跑完 `ALL_RESTORED`）
+
+- 新 `hint_pose_restore()`：8 子分散中局（(3,3) (11,4) (4,10) (13,12) (7,2) (2,12) (12,7) (8,9)，黑白交替），**开局库与强制手都不答**，所以提示一定是一次真 alphabeta。
+- 删掉 `sleep(100 ms)`：悔棋现在紧跟在武装之后几微秒发生，「搜索还在飞」由构造成立而不是由运气成立；原来那个 100 ms 恰恰是把窗口让给快路径。
+- 前提**直接观测**：悔棋之前 `drain_frames` 一次，数里面有没有 `hint_result`；有就报「前提没成立」，而不是让后面的不变量背锅。
+- `assert(undone_count == armed_at - 2)`：把 `undo` 的出参按**契约**读（它是「退回之后盘上剩几子」，不是「退掉几子」），并断言快照与盘面确实分开了。
+- `delivery_ms` 那条墙钟断言删除；耗时只留一行打印，不参与判定。
+
+**门禁**：`memcheck test_server` **clean / 2038 s**，reports=0 · invalid_read=0 · invalid_write=0 · uninitialised=0 · **definite_leak=0**（轮次167 记为 not-run 的那个子门，本轮拿到）· `ctest -R "test_server|test_session"` 2/2（70.61 s，`test_server` 70.57）· `readme_anchor_check.js` 122/0 · `web_frontend_check.js` 113/113。全量 `ctest` 9/9 / 890.31 s 是轮次167 在同一棵 `src/` 上跑的，本轮只改了一个测试文件 ⇒ 重跑受影响的两套。
+
+**变异臂一条，rc=134**：N1 拆掉产品里「位置已被取代就丢答案」那道门（`game_manager.cpp` 的 `if (move_count_now != snapshot_move_count) { … }` → `if (false)`）⇒ 被取代的 hint 照常交付 `hint_result` ⇒ 死在 `test_server.cpp:1767` 的 `hint_results == 0 && "被取代的 hint 不许交付 hint_result（前提已在悔棋前亲眼查过）"`。这条臂同时回答了两件怕被问的事：前提改成直接观测之后用例**仍然在测那个分支**（不是把断言挪了个位置），以及新的失败信息确实带得出现场。
+
+**没做的一条，记着**：N2 本想演示「把位置换回一手石时，新的前提检查会自己报『前提没成立』」，但那要同时改 `armed_at == 8` 等前置断言，一臂变成三处改动；轮次167 的 M3（`undo` 只退一子 ⇒ 死在 `moved == 0`）已经覆盖了「盘面没真的变化」这一半，所以不做了。
+
 ## 轮次167 悔棋重下同一手要不要重新思考：预期成立，但机制不是「结果缓存」而是**置换表跨悔棋存活**——一手就悔 4312 → 1268 节点，下了两回合再悔 10375 → **144 节点（第一次的 1.4 %）**，答案（着法/分值/深度/method）逐字不变；控制臂钉住归因：同一张热表、悔棋之后**换一手**下立刻回到 7167 节点，所以那个 144 不是「搜索没跑」；`src/` 一字未动，三条 `test_server` 用例 + 三条变异臂全部 rc=134 — the user's expectation holds, but the mechanism is transposition-table survival across a takeback, not a result cache: replaying the same stone costs 1268 of 4312 nodes one move into the game and 144 of 10375 two rounds in, with a byte-identical answer, while a *different* stone on the equally warm table jumps straight back to 7167 nodes, which is what makes the saving attributable to position identity rather than to a search that never ran. `src/` untouched: three `test_server` cases and three mutation arms, all rc=134.
 
 **问题**（用户提出）：悔棋再重下相同位置，是否需要重新思考？预期是「不应该」。
