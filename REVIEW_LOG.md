@@ -1980,6 +1980,58 @@ additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cp
 no existing assertion was edited.
 
 
+## 轮次176 战术层按节点出价落地，顺手把赛具的噪声地板从「负载」改判成「开局库的每进程抽签」：`--max-nodes` 今天管到整手棋 —— VCF 拿 `min(1,000,000, 帽×20 %)`、VCT 拿 `min(500,000, 帽×30 %)`、认输探针拿 `min(resign_node_limit_, 帽×20 %)`，且命名了帽就不给这三处挂墙钟 deadline（只收紧不放宽 ⇒ 定深那一档上战术层的帽还是它自己的默认值，六个既有 pin 全部照过 —— 本轮 ctest 里 test_pinned 271.09 s 通过）；而这条改动**没有**改变赛具地板，地板是另一样东西：同一棵树同一套配置、两台服务器都带 `--no-book` 之后，两次 90 局赛读**逐字 0.5000、翻局 0、逐手分岔 0**（库开着是 9/90，其中 6 局在第 0 手就分岔），因为 `src/optimization/opening_book.h:57` 的 `mutable std::mt19937 rng_{std::random_device{}()}` 每进程重播种，第 0/1 手是库在替引擎回答 — the tactical phases now price by nodes when the caller named a node budget (VCF min(1M, 20 %), VCT min(500K, 30 %), the resign probe min(its own limit, 20 %), and none of the three carries a wall-clock deadline in that regime; the min() only ever tightens, so the deep-budget arm is untouched and the six existing pins still pass). What this round actually killed is a mis-attribution: the fixture's noise floor is not load. Two 90-game passes of the *same* tree and the *same* config on servers started with `--no-book` both read exactly **0.5000 with 0 flipped games and 0 divergent plies**; with the book loaded the same null flips 9/90 and 6 of those diverge on ply 0, because the book's weighted draw is re-seeded per process (`opening_book.h`'s `rng_{std::random_device{}()}`) and the book answers the first moves instead of the engine.
+
+**为什么这条值得单独一轮**：轮次174 把 9/90 记成了「战术层不受节点帽管」的后果，并据此定了验收口径「任何 A/B 都要按 ≥10 % 的翻动率配样本量」。那句话要是留着，#77 会被一句错误的样本量要求拖长好几倍。本轮把它证伪了。
+
+**证据链（六支探针，每支都能重跑）**
+
+| # | 量什么 | 读数 | 当时怎么想 |
+|---|---|---|---|
+| ① `lat_sweep` 新旧树各一遍 | 战术层帽生效没有 | 格 rows=2、WHITE、cap=40：改前 `vct/90000`，改后 `alphabeta/0/40 节点`；cap≥200 两树同读 vct | 机制活着（但 pin 臂一个没变 ⇒ 只收紧确实没伤到定深臂） |
+| ② `inproc_det` 进程内 3 轮 ×44 局 | 引擎在 cap=12000/墙 3000 下确不确定 | 逐局 FNV 指纹 **0 处不同** | 一度误判成「引擎确定 ⇒ 翻局在服务侧」 |
+| ③ `mv1/mv2` 带逐手记录两跑（库开） | 分岔出现在第几手 | 0.5222 / 0.4889，**9 局翻，6 局在第 0 手**，首个分歧手数均值 0.3、最大 1 | 第 0 手就翻 ⇒ 不可能是负载（那时一手才 12000 节点，墙钟 3000 ms 差一个数量级） |
+| ④ `inproc_onepass` 两个**独立进程**各一轮 | 不确定性是不是每进程的 | 逐局指纹全同 | 排除「指针键容器」那类每进程自由度，嫌疑收到库 |
+| ⑤ `nb1/nb2` 两台 `--no-book` 两跑 | 关掉库地板到不到 0 | **两跑都 0.5000，翻局 0，分岔 0** | 地板 = 库的抽签，结案 |
+| ⑥ 对照 `nb1` vs `mv1`（同树同配置，只差库） | 关库是不是无操作 | 差 **12/90 局，9 局在第 0 手** | 关库改的就是棋 ⇒ 开局的变化必须由开局集承担，不能留给抽签 |
+
+探针 ②/④ 覆盖 **44 条**开局而不是 45：`tools/match_openings.jsonl` 第 1 行是 `{}`（空盘开局，没有 `moves` 字段），两支探针都按「没有 moves 就跳过」处理。这条要记着，别把「44」读成开局集少了。
+
+**夹具改了什么**：`tools/tree_match.cpp` 每条记录新增 `moves` 数组（`[row, col, 落子方, 该手思考毫秒]`）。之前只有 `plies/winner`，两跑一比只能得出「这局翻了」，得不出「从第几手开始翻、翻的是着法还是记账」——③ 那个「6 局在第 0 手」就是靠它读出来的。逐手比对器留在 `/tmp/tm176/diff_moves.cpp`（比 `moves[0..2]`，故意不比 `think_ms`，那个字段本来就是负载）。
+
+**新增用例**：`tests/test_search.cpp` 的 `test_named_node_budget_prices_the_tactical_phases`，五条臂 —— ① cap=40（VCT 份额 12 节点）吃不住证明 ⇒ `alphabeta` 且 `nodes_searched == 40`；② cap=200（份额 60）⇒ `vct (3,4) 90000`；③ 只收紧不放宽：cap=8,000,000 / 40,000,000 / 不命名帽（墙钟放到 600 s）三支**同解**；④ VCF 侧份额 8 与 40,000 同解 `(5,4)`；⑤ **比例本身**被夹住：`share_edge` 扫 cap 100→320 找到这份 VCT 证明要 46–48 个节点，于是 cap=150（份额 45）交不出、cap=160（份额 48）交得出 ⇒ 份额被钉在 `[30 %, 32 %)`，抬高或砍低都会在这里红。
+
+**变异臂（`/tmp/tm176/mutation_arms.sh`，每条都在 copy 的树上改，且先 diff 证明「变异真的落上了」再跑）**
+
+| 臂 | 破坏什么 | 结果 |
+|---|---|---|
+| M0 | 好树对照 | 红臂 0 ✅ |
+| M2 | 两支战术层的按节点出价整个退回旧行为 | 红臂 2（①⑤）✅ |
+| M5 | 只退 VCT 那一支 | 红臂 2（①⑤）✅ |
+| M3 | VCT 份额 30 % → 100 % | 红臂 1（⑤）✅ |
+| M1 | 撤掉 `min(默认帽, 份额)`，允许放宽 | **红臂 0 ❌ 没咬住** |
+| M4 | 认输探针的 `priced_cap` 退回纯毫秒预算 | **红臂 0 ❌ 没咬住** |
+
+M1 咬不住的原因是可解释的：默认帽本来就够高，把它抬到 12,000,000 在这份夹具上不改任何答案 —— 要钉住「不放宽」得找一个 500,000 节点交不出、12,000,000 交得得出的局面，那是另一件事（本轮没做，记成缺口）。M4 更直接：本轮**没有**给认输探针那条按节点出价的分支加任何用例。
+
+**没跑 / 未得的账**：
+- 认输探针的按节点分支没有单元臂（上一条）。
+- 赛具的两跑对照只在 `cap=12000 / timeout=3000 ms / depth=8` 这一套工作点上量过 0 地板；换工作点要重量。
+- **AlphaBeta 自己的墙钟 deadline 在命名节点帽时仍然挂着**（`search_engine.cpp:296` `if (has_deadline) ab.set_deadline(search_deadline)`）。这是轮次132 写死的契约（「the hard deadline stays exactly where it was，`--timeout-ms` still a fallback」），本轮**没有**动它，理由是它量起来根本不在赛具的工作点上 binding：`wall_leak` 扫下来，cap=12000 时墙钟 3000 / 1000 / 300 ms 三档答案逐字相同，只有压到 30 / 5 ms 才变（那需要吞吐掉到 4000 节点/秒以下，实测高一个数量级）；cap=90000 才有 300 ms 那档变（22 支里）。⑤ 的 0 翻局也侧面证明它没参与。要收这条得先推翻轮次132 那句契约，那是个要问的决定，不是我该顺手改的。
+- `docs/ENGINE_REDESIGN.md:72` 那行引用的 `search_engine.cpp:12-13, 194-218` 是**改版前问题的陈述**，本轮的改动让行号更旧了；它不属于 `readme_anchor_check.js` 的门禁范围（那个只查 README 的 122 条），所以没跟着挪，留着当历史行号。
+
+**下一步（顺序有因）**：
+① 地板归零改写了 #77 的口径：不再需要「按 ≥10 % 翻动率配样本量」这条，同版 A/B 里**任何**一对有信息就读得出非零差。真正的限制回到**有信息的对数**（10 倍节点差也只有 27/45 对分得出胜负）⇒ 扩开局集（目标 ~190 条）仍然是第一步，但它现在买的是**灵敏度**，不是**可信度**。
+② 轮次173 那份训练档的 A/B 要带 `--no-book` **重量**：当时的 0.5444 / 0.4556 是泡在库的抽签噪声里的读数，判「量不出」的依据已经换了。
+③ 认输探针的按节点分支补用例（M4 那条缺口，今天零臂）。
+④ 「只收紧不放宽」要能量到：需要一个 500,000 节点交不出、12,000,000 交得出的局面（M1 那条缺口）。
+⑤ 库的每进程抽签**不改**：线上要的就是开局变化（现在的行为是对的），赛具要确定 —— 已经有 `--no-book` 这条路，不必为夹具去加一个「可命名种子」的产品开关。
+
+**门禁**：`ctest --test-dir build` = **9/9 通过 801.55 s**（0 失败）；`node tests/readme_anchor_check.js` = **122 引用 0 问题**；`node tests/web_frontend_check.js` = **113/113**；`bash tools/valgrind_check.sh memcheck test_server` = **clean**（reports=0，invalid_read=0，invalid_write=0，uninitialised=0，definite_leak=0，**1362 s**）。跑的顺序记一条诚实的账：第一遍 ctest（882.97 s，9/9）和 memcheck 都跑在 `src/search/search_engine.h` 那条注释改动**之前**的文本上 —— 那条改动 `git diff` 过滤掉注释行后是 0 行非注释变化，但既然要按「只有测试通过的功能才能提交」交，就把整树重编、全量 ctest 在最终文本上**重跑了一遍**（就是上面那 801.55 s）。memcheck 没有重跑，它覆盖的是同一份行为的二进制。
+
+**锚点文件行数**：README 765 / 指导书 849 / `src/server/server.h` 278 / `web/index.html` 138 / `CMakeLists.txt` 512 全部不变 —— 本轮没新增 CMake 目标（战术层出价改的是既有的 `gomoku_server` / 测试目标，赛具 `gomoku_tree_match` 也已在档）。
+
+
 ## 轮次175 认输审计第一次尝试：口径不成立，读数不采信，工具不入库。想量的数是「训练对局 65 % 以认输收场，里面有没有假认输」；做法是把 `reason=resign` 的终局位置用大 5 倍预算（`--cap 500000`，VCF 深度 20 与 24）重判一遍 `VCFSearch::find_defense`，再把 VCF 给的那步防守**真的落下去**问第二遍。这台仪器答不了这个问题，原因有两条，都是可复用的：
 
 1. **`find_defense` 的 `has_decisive_tempo` 分支在这类局面里必然报「能活」**（[src/search/vcf.cpp:404-414](file:///home/wdz/Desktop/workspace/gomoku/src/search/vcf.cpp#L404)，注释自己写着「宁可放过一次认输，也不肯认错一次」）。而抽到的 6 局恰恰全是**双方抢先手的冲四赛跑**：终局前两手是 `(9,11)white/vcf/100000` ← `(9,12)black/must_block/99000` 这种形状，防守方永远有一个「决定性先手」可下，于是判决从两侧都不可信 —— 第一版打印的「6/6 真假认输」是仪器的保守分支在替它说话，不是证据。
@@ -2014,6 +2066,8 @@ no existing assertion was edited.
 **顺带钉住一条我一直没记的约束**：两侧的**威胁阶梯**被「同带」规则限制在 ±20 %（`LADDER_MATCH_PERCENT = 20`，`src/training/params.cpp:121-159` 与 `:368-386`）——**从文件加载时违反就直接拒启**（只有优化器自己的 sanitize 才修），例如白 30000 / 黑 48000 会被拒；轮次173 那份冠军之所以能加载，是因为它把白侧一起抬到 38400（正好 20 %）。位置类基因不受这条带管（白 `position_weight_scale` 8→13 = +63 % 加载通过）。⇒ 这直接框住了「黑白侧重」在今天能表达的**最大幅度**：想让用户设想的那种「黑主攻、白主守」差得更远，要么动带内允许的范围（设计决策），要么走那条需要破 `eval(W) == -eval(B)` 的路线。
 
 **下一步（顺序有因）**：① 把 #76 提级——战术层按节点定价，噪声地板从 10 % 回到 0，否则任何系数级 A/B 都要拿几百个有信息的配对才敢判；② 优化器里把这两格对黑标成不可达（别再拿探针浪费在死基因上），这是 #77 的一部分；③ 开局集继续扩（12 对有信息撑不起判定）。
+
+**轮次176 改账**：这一轮写下的「噪声地板 ≈10 % 的局，成因就是战术层不受节点帽管」**是错的**，9/90 这个数字本身是对的，归因错了。战术层按节点出价之后（轮次176 的改动）再量，地板**还是 9/90**；把战术层与主搜索整个搬进进程内、cap=12000/墙钟 3000 ms 连打三轮 ×44 局，逐局指纹**零差异**；两个独立进程各打一轮，也零差异。逐手记录（本轮给赛具加的）显示这 9 局里 **6 局在第 0 手就分岔** —— 那不是负载，是**开局库**：`src/optimization/opening_book.h:57` 的 `mutable std::mt19937 rng_{std::random_device{}()}` 每进程重新播种，库在第 0/1 手替引擎回答。两台服务器都带 `--no-book` 重跑两次 90 局：**两跑都读逐字 0.5000，翻局 0、逐手分岔 0**。⇒ 赛具的地板是 **0**（关库前提下），不是 10 %；这一条把「任何 A/B 都要按 ≥10 % 翻动率配样本量」的验收口径作废，替它的是一句更简单的规矩：**起服务器必须 `--no-book`**。同轮另一支对照记着：库开 vs 库关（同树同配置）差 12/90 局、其中 9 局在第 0 手 —— 关库不是无操作，它改的就是棋，所以开局的不确定性必须由开局集承担，不能留给抽签。战术层那处改动按它自己的理由留下（一手按节点出价的思考，代价从此只是局面的函数），但它**不是**为了这条地板做的，别再这么引用它。
 
 
 
@@ -2070,9 +2124,13 @@ no existing assertion was edited.
 
 **残留噪声指认到行**：按节点出价只锁住 AlphaBeta —— `src/search/search_engine.h:118-121` 明写 `set_max_nodes` 是 "Only AlphaBeta reads it; the tactical phases and the resign probe still slice the wall clock"，所以 VCF / VCT / 认输探针仍吃 `--timeout-ms` 的毫秒片。观测到的后果：同配置两跑 180 局里有 1 局的胜者换了、270 局里有 1 局作废。两条出路摆在那：**给战术层也按节点定价**（产品改动，要授权），或者把「同配置两跑之差 ≤1/180」当成夹具的噪声上界写进判据。
 
+> **轮次176 的收尾**：第一条出路已做（战术层与认输探针现在都读节点帽，那句 `search_engine.h` 注释也改了），但**它没有改变地板** —— 第二条出路里那句「≤1/180 当噪声上界」和这里的归因一起作废：地板是开局库的每进程抽签，关库后 null 读 0 翻局。详见轮次176 与轮次174 末尾的改账段。
+
 **赛具自己的两个坑，本轮堵掉了**：`--out` 过去无条件追加，我先把两跑串进了同一个 180 行文件，而日志只报最后一跑 ⇒ 那份读数当时是错的（切回三段重算才有上面的账）；现在默认拒绝写进非空文件，要续写得显式 `--append`。另外 `--report` 之前不吃文件名参数。
 
 **怎么复现**：两台 `build/gomoku_server --port 8081/8082 --no-sessions --web-dir web`，然后：
+
+> **轮次176 起这条要加 `--no-book`**：开局库的加权抽签按进程重新播种，库开着时同配置两跑会在第 0/1 手就各抽各的（实测 9/90 局翻胜者）。两台都带 `--no-book` 之后 null 读逐字 0.5000、逐手零分岔。上面那台命令照原样留着当历史账，复现请按下面的口径。
 
     # null 对照（同版同参数，两侧每手都是 12000 节点）
     ./build/gomoku_tree_match --a 127.0.0.1:8081 --b 127.0.0.1:8082 --names A=B \

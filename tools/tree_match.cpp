@@ -1,13 +1,19 @@
 // gomoku_tree_match —— 方案 C（docs/ENGINE_REDESIGN.md :555「棋力回归」那一格）的整树赛夹具。
 //
 // 两个 gomoku_server 进程各持一个引擎（旧树 vs 新树，或同一棵树的两套配置），经 WS 对打。
-// 每侧走的都是线上那条正常会话（自己的 TT / 开局库 / 战术层 / 时间预算），夹具只扮演「玩家」，
-// 把一侧的 ai_move 原样递给另一侧 ⇒ 不是进程内的近似。
+// 每侧走的都是线上那条正常会话（自己的 TT / 战术层 / 时间预算；开局库按下面「起服务器时必须带
+// `--no-book`」那条规矩关掉），夹具只扮演「玩家」，把一侧的 ai_move 原样递给另一侧 ⇒ 不是进程内的近似。
 //
 // 计价口径：跨树只能用墙钟（v0.5.0-phase4 的 set_config 只认 timeout_ms/max_depth，
 // max_nodes 会被旧树忽略）；同一棵树的两套配置可以按节点出价，那条才是负载无关的尺子。
 // 座位：相邻两局换坐，开局集固定，两个座位各跑满 —— 轮次131 立的规矩（先量夹具自己）。
 // 作废局（连不上 / 等帧超时 / 对侧 error）**不计入分数**，只计数：一次负载抖动既不是胜负也不是和棋。
+//
+// 起服务器时必须带 `--no-book`（轮次176 的探针 ⑤/⑥ 量出来的）：开局库的加权抽签用
+// `std::random_device` 每进程播种（src/optimization/opening_book.h:57），所以库一开，同一套配置
+// 两跑在第 0 手就可能各抽各的 —— 实测 90 局翻 9 局，其中 6 局在第 0 手分岔。库一关，同配置两跑
+// 逐手零分岔、双方都读 0.5000。这不是负载，也不是战术层的预算口径（那条同轮按自己的理由改了，
+// 但它动不了这个地板）。开局的不确定性留在库里，就该由开局集来定，不该由抽签来定。
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -263,6 +269,10 @@ struct GameResult {
     std::string reason;
     int plies = 0;
     long long ms_a = 0, ms_b = 0;
+    // 逐手记录 [row, col, 落子方, 该手思考毫秒]。同配置两跑比的是「第一个分歧出现在第几手」，
+    // 只有手数与胜负的赛具答不出这个问题（轮次176：新树与旧树各读 9/90 翻局，而进程内 3 轮
+    // ×44 局指纹零差异 ⇒ 分歧不在引擎，但赛具量不到它落在哪一手）。
+    json moves = json::array();
 };
 
 // 读到某一侧出现 want 里的帧类型为止；error 帧、断开、超时都算这局作废。
@@ -388,6 +398,7 @@ GameResult play_game(const Options& opt, const json& opening, bool a_is_black) {
         last_row = row;
         last_col = col;
         last_by = mover == &A ? opt.a_name : opt.b_name;
+        res.moves.push_back(json::array({row, col, last_by, think}));
         if (!other->send_text({{"type", "make_move"}, {"row", row}, {"col", col}})) {
             res.winner = "abort";
             res.reason = "递给对手失败";
@@ -600,7 +611,8 @@ int main(int argc, char** argv) {
                     {"reason", r.reason}, {"plies", r.plies}, {"ms_a", r.ms_a},
                     {"ms_b", r.ms_b}, {"timeout_ms", opt.timeout_ms},
                     {"max_depth", opt.max_depth}, {"a_max_nodes", opt.a_max_nodes},
-                    {"b_max_nodes", opt.b_max_nodes}, {"a", opt.a_name}, {"b", opt.b_name}};
+                    {"b_max_nodes", opt.b_max_nodes}, {"a", opt.a_name}, {"b", opt.b_name},
+                    {"moves", r.moves}};
         out << rec.dump() << "\n" << std::flush;
         rows.emplace_back(std::move(rec), r);
         std::printf("  第 %d 局 座位%s 手数=%d 结果=%s%s 用时=%lldms\n", g,

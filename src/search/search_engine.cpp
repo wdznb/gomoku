@@ -18,6 +18,14 @@ namespace {
 constexpr int kVcfBudgetPercent = 20;
 constexpr int kVctBudgetPercent = 30;
 
+// 战术层自己的默认节点帽（vcf.cpp:8 与 vct.cpp:8 的构造值，这里重述是为了比较）。
+// 调用方命名了节点预算时，战术层的份额取「比例」与「这个默认值」的较小者：只允许
+// 收紧、不允许放宽 ⇒ 定深臂（`--max-nodes 8000000`）那一档上战术层的帽仍是这两个默认
+// 值本身，钉值不动；而小帽的那一手不再让战术层比主搜索多花几十倍的钱 —— 那正是
+// 轮次174 量到的 9/90 同配置翻局的来源（战术层带墙钟 deadline，截断时机跟着负载走）。
+constexpr int kVcfDefaultNodeLimit = 1000000;
+constexpr int kVctDefaultNodeLimit = 500000;
+
 }
 
 SearchEngine::SearchEngine()
@@ -234,7 +242,12 @@ SearchResult SearchEngine::search(const Board& board, int color,
 
     if (vcf_enabled_ && probe.own_four && !stop_flag.load()) {
         VCFSearch vcf(evaluator_, *tt_alphabeta_);
-        if (has_deadline) {
+        if (max_nodes_ > 0) {
+            // 按节点出价的这一手：战术层只花自己那份份额，且不挂墙钟 deadline —— 它的
+            // 结局从此只是局面的函数，与机器当时多忙无关。
+            vcf.set_node_limit(std::min(kVcfDefaultNodeLimit,
+                                        max_nodes_ * kVcfBudgetPercent / 100));
+        } else if (has_deadline) {
             vcf.set_deadline(search_start + std::chrono::milliseconds(
                 static_cast<long long>(time_limit_ms) * kVcfBudgetPercent / 100));
         }
@@ -256,7 +269,10 @@ SearchResult SearchEngine::search(const Board& board, int color,
 
     if (vct_enabled_ && probe.own_three && !stop_flag.load()) {
         VCTSearch vct(evaluator_, *tt_alphabeta_);
-        if (has_deadline) {
+        if (max_nodes_ > 0) {
+            vct.set_node_limit(std::min(kVctDefaultNodeLimit,
+                                        max_nodes_ * kVctBudgetPercent / 100));
+        } else if (has_deadline) {
             vct.set_deadline(search_start + std::chrono::milliseconds(
                 static_cast<long long>(time_limit_ms) * kVctBudgetPercent / 100));
         }
@@ -434,12 +450,22 @@ SearchResult SearchEngine::search(const Board& board, int color,
                 // disabled resignation. resign_node_limit_ is the hard ceiling.
                 long long time_scaled_nodes =
                     static_cast<long long>(usable_ms) * 400LL;
-                int probe_nodes = static_cast<int>(
-                    std::min<long long>(resign_node_limit_, time_scaled_nodes));
+                // 命名了节点帽的那一手：认输探针也只花自己那份份额。今天这条预算是
+                // `usable_ms × 400`（一个吞吐估计），它把「这台机器此刻多快」带进了判决 ——
+                // 轮次174 量到的 9/90 同配置翻局就出在这类毫秒预算上。
+                // 上面那道 `probe_budget_ms > 500` 门保留：按节点出价的这一手，前面的阶段
+                // 总共只有几万量级的节点，正常时限下它恒为真，只有把时限压到几百毫秒的
+                // 调用方才会被它拦住，而那正是它要拦的东西。
+                const long long priced_cap =
+                    static_cast<long long>(max_nodes_) * kVcfBudgetPercent / 100;
+                int probe_nodes = max_nodes_ > 0
+                    ? static_cast<int>(std::min<long long>(resign_node_limit_, priced_cap))
+                    : static_cast<int>(std::min<long long>(resign_node_limit_, time_scaled_nodes));
 
                 VCFSearch loss_probe(evaluator_, *tt_alphabeta_);
                 loss_probe.set_node_limit(probe_nodes);
-                if (has_deadline) loss_probe.set_deadline(search_deadline);
+                // 按节点出价时不再挂墙钟 deadline：探针的结局从此只是局面的函数。
+                if (max_nodes_ == 0 && has_deadline) loss_probe.set_deadline(search_deadline);
 
                 Move defense;
                 DefenseResult dr = loss_probe.find_defense(board, color, vcf_max_depth_,

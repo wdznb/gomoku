@@ -9343,6 +9343,132 @@ void test_a_coefficient_change_empties_the_transposition_table() {
     std::cout << "test_a_coefficient_change_empties_the_transposition_table passed" << std::endl;
 }
 
+// 轮次176：调用方命名了节点预算时，战术层也按节点出价。
+//
+// 在此之前 `--max-nodes` 只管得住 AlphaBeta：VCF/VCT 各自带着 1,000,000 / 500,000 的
+// 构造默认帽（vcf.cpp:8、vct.cpp:8），外加一条墙钟切片（时限的 20 % / 30 %）。于是一手
+// 「按节点出价」的思考，实际代价 = 主搜索的份额（确定的）+ 战术层花掉多少毫秒（跟着负载走），
+// 而且战术层能比主搜索本身多花几十倍的钱。现在命名了预算就把份额收到
+// min(自己的默认帽, 预算 × 份额) —— 只收紧、不放宽，所以定深那一档（预算远大于默认帽）
+// 的战术层行为一字不动，六个既有线上 pin 仍然成立。
+//
+// 夹具那 9/90 同配置翻局最后查明与这条无关（是开局库每进程的加权随机抽签，见轮次176 的
+// 探针 ⑤/⑥：关库后两跑逐手零分岔）。这条改动按自己的口径记账：一手棋的代价从此是局面的
+// 函数，而不是「局面 × 机器此刻多忙」。
+void test_named_node_budget_prices_the_tactical_phases() {
+    // 既有夹具（test_engine_stamps_elapsed_on_tactical_wins）：rows=2 只有 VCT 证明，
+    // rows=3 是 VCF 证明。VCT 份额 30 %，VCF 份额 20 %。
+    const auto lattice = [](int rows) {
+        Board board;
+        for (int i = 0; i < rows; ++i) {
+            const int r = 2 + i * 2;
+            board.place_stone(r, 2, BLACK);
+            board.place_stone(r, 3, WHITE);
+            board.place_stone(r, 4, WHITE);
+            board.place_stone(r, 5, WHITE);
+        }
+        return board;
+    };
+    std::atomic<bool> stop(false);
+    const int wall_ms = 3000;   // 与赛具同口径；命名了预算时战术层不再看这条墙
+
+    // ① 份额吃不住证明 ⇒ 战术层交不出答案，主搜索接手，并把手上的节点预算花满。
+    //    改动前同一手读 vct：那时无 VCT 只有 500,000 节点的默认帽和 900 ms 的墙。
+    {
+        SearchEngine engine;
+        engine.set_max_nodes(40);                       // VCT 份额 = 40 × 30 % = 12 节点
+        const SearchResult r = engine.search(lattice(2), WHITE, 8, wall_ms, stop);
+        assert(r.method == "alphabeta");
+        assert(r.nodes_searched == 40);                 // 主搜索被自己的帽掐住，一分不差
+        std::cout << "  [轮176] cap 40 -> " << r.method << " nodes=" << r.nodes_searched
+                  << " (改动前读 vct)" << std::endl;
+    }
+
+    // ② 份额够 ⇒ 战术层照旧交答案，且交的是同一个点：这条改的是「最多花多少」，
+    //    不是「必须花多少」。
+    {
+        SearchEngine engine;
+        engine.set_max_nodes(200);                      // 份额 60 节点，证明装得下
+        const SearchResult r = engine.search(lattice(2), WHITE, 8, wall_ms, stop);
+        assert(r.method == "vct");
+        assert(r.score == 90000);
+        assert(r.best_move.pos.row == 3 && r.best_move.pos.col == 4);
+        std::cout << "  [轮176] cap 200 -> " << r.method << " (" << r.best_move.pos.row
+                  << "," << r.best_move.pos.col << ")" << std::endl;
+    }
+
+    // ③ 只收紧不放宽：份额一旦高过战术层自己的默认帽（VCT 500,000），min() 就把它按回
+    //    默认值 ⇒ 40,000,000 的预算和 8,000,000 的预算、以及根本不命名预算（墙钟放到
+    //    600 s，切片永远够）的旧行为，三者必须交出同一个点。这一条是「定深臂不动」的证明。
+    {
+        struct Identity {
+            std::string method;
+            int score = 0, row = -1, col = -1;
+        } identity;
+        for (int cap : {8000000, 40000000}) {
+            SearchEngine engine;
+            engine.set_max_nodes(cap);                  // 份额 2.4M / 12M > 默认 500,000
+            const SearchResult r = engine.search(lattice(2), WHITE, 8, wall_ms, stop);
+            identity.method = r.method;
+            identity.score = r.score;
+            identity.row = r.best_move.pos.row;
+            identity.col = r.best_move.pos.col;
+            assert(r.method == "vct");
+            assert(r.score == 90000);
+            assert(r.best_move.pos.row == 3 && r.best_move.pos.col == 4);
+        }
+        SearchEngine unnamed;                             // 未命名预算 = 走老路（墙钟切片）
+        const SearchResult r = unnamed.search(lattice(2), WHITE, 8, 600000, stop);
+        assert(r.method == identity.method);
+        assert(r.score == identity.score);
+        assert(r.best_move.pos.row == identity.row && r.best_move.pos.col == identity.col);
+        std::cout << "  [轮176] 8M / 40M / 未命名 三支同解：" << identity.method << " ("
+                  << identity.row << "," << identity.col << ")" << std::endl;
+    }
+
+    // ④ VCF 那一侧：份额是上限而不是下限，小帽也交得出证明（rows=3 的证明只要几个节点），
+    //    大帽与小帽同解 —— 收份额不会把一个本来赢得下的局面改判成别的。
+    {
+        SearchResult small_move;
+        {
+            SearchEngine engine;
+            engine.set_max_nodes(40);                   // VCF 份额 = 8 节点
+            small_move = engine.search(lattice(3), WHITE, 8, wall_ms, stop);
+            assert(small_move.method == "vcf");
+            assert(small_move.score == 100000);
+        }
+        SearchEngine engine;
+        engine.set_max_nodes(200000);                    // 份额 40,000 节点
+        const SearchResult big = engine.search(lattice(3), WHITE, 8, wall_ms, stop);
+        assert(big.method == "vcf" && big.score == 100000);
+        assert(big.best_move.pos.row == small_move.best_move.pos.row);
+        assert(big.best_move.pos.col == small_move.best_move.pos.col);
+        std::cout << "  [轮176] vcf 份额 8 vs 40000 同解 (" << big.best_move.pos.row << ","
+                  << big.best_move.pos.col << ")" << std::endl;
+    }
+
+    // ⑤ 份额比例本身：上面四条只钉住「有份额」，没钉住「份额是 30 %」。这份 VCT 证明要
+    //    46–48 个节点，30 % 之下 cap 150 只分到 45（交不出，主搜索接手），cap 160 分到 48
+    //    （交得出）⇒ 比例被夹在 [30 %, 32 %) 里，抬比例或砍比例都会在这里红。
+    {
+        SearchEngine starved;
+        starved.set_max_nodes(150);                     // 份额 45 节点
+        const SearchResult tight = starved.search(lattice(2), WHITE, 8, wall_ms, stop);
+        assert(tight.method == "alphabeta");
+        assert(tight.nodes_searched == 150);
+
+        SearchEngine enough;
+        enough.set_max_nodes(160);                      // 份额 48 节点
+        const SearchResult loose = enough.search(lattice(2), WHITE, 8, wall_ms, stop);
+        assert(loose.method == "vct");
+        assert(loose.score == 90000);
+        std::cout << "  [轮176] 150（份额 45）交不出 / 160（份额 48）交得出 ⇒ 30 % 被夹住"
+                  << std::endl;
+    }
+
+    std::cout << "test_named_node_budget_prices_the_tactical_phases passed" << std::endl;
+}
+
 int main() {
     std::cout << "Running search tests..." << std::endl;
 
@@ -9544,6 +9670,9 @@ int main() {
     test_a_pondering_session_arms_a_pre_search_that_commits_nothing();
     test_the_board_sum_cache_answers_every_cell_of_the_census_and_keeps_the_cap_outside();
     test_a_coefficient_change_empties_the_transposition_table();
+
+    // 轮次176：命名了节点预算的那一手，战术层只花自己那份份额（且只收紧、不放宽）。
+    test_named_node_budget_prices_the_tactical_phases();
 
     std::cout << "All search tests passed!" << std::endl;
     return 0;
