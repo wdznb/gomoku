@@ -1980,6 +1980,19 @@ additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cp
 no existing assertion was edited.
 
 
+## 轮次175 认输审计第一次尝试：口径不成立，读数不采信，工具不入库。想量的数是「训练对局 65 % 以认输收场，里面有没有假认输」；做法是把 `reason=resign` 的终局位置用大 5 倍预算（`--cap 500000`，VCF 深度 20 与 24）重判一遍 `VCFSearch::find_defense`，再把 VCF 给的那步防守**真的落下去**问第二遍。这台仪器答不了这个问题，原因有两条，都是可复用的：
+
+1. **`find_defense` 的 `has_decisive_tempo` 分支在这类局面里必然报「能活」**（[src/search/vcf.cpp:404-414](file:///home/wdz/Desktop/workspace/gomoku/src/search/vcf.cpp#L404)，注释自己写着「宁可放过一次认输，也不肯认错一次」）。而抽到的 6 局恰恰全是**双方抢先手的冲四赛跑**：终局前两手是 `(9,11)white/vcf/100000` ← `(9,12)black/must_block/99000` 这种形状，防守方永远有一个「决定性先手」可下，于是判决从两侧都不可信 —— 第一版打印的「6/6 真假认输」是仪器的保守分支在替它说话，不是证据。
+2. **快路径的分值是哨兵，不是评价**：那 6 局的 `深搜分=99000 层=0` 就是 must_block 的记号（`SearchResult.depth` 在 AlphaBeta 之外恒为 0），把它读成「认输方其实大优」是错的。这条与轮次173 的「战术层不受节点帽管」是同一族坑。
+
+**我自己差点又误读一次**：看到打印里出现「连续两手同色」就断定记录格式不是严格交替。加了一道**交替检查**再跑，`对不上手数奇偶=0` 且连续同色告警一次没出 ⇒ 记录是干净交替的，是我把自己 `最后两手：X ← Y` 的顺序看反了 ⇒ 这条也记下来：**仪器自己的输出字段顺序也得设计成不容易看反**（下次写成 `倒数第二手=Y；最后一手=X`）。
+
+**下一次该怎么判**（省得再走一遍死路）：问题不是「防守枚举能否存活」，而是**谁先成五**。可用的三条路，任选其一都能给出判决：① 从认输位置跑 AlphaBeta，但**关掉 VCF/VCT 快路径**（`set_vcf_enabled(false)` / `set_vct_enabled(false)`），让 `score`/`depth` 是真数值而不是哨兵；② 用 **VCT**（容纳非强迫防守）而不是 VCF 的强迫树；③ 直接量 race-to-five：双方各自「到成五的最短手数」，谁短谁赢 —— 这条最贴这个场景，也最好解释。工具草稿在 `/tmp/tm170/resign_audit_v1.cpp.save`（主机会清 `/tmp`，所以设计已写在这里，按上面任一条重写即可）。
+
+**本轮仓库改动为零**：`git status` 干净，HEAD 仍是 `b57d180`；因此没有新门禁可跑（`readme_anchor_check` 122 引用 0 问题与 `web_frontend_check` 113/113 是在轮次174 那份状态下过的）。登记这条纯粹是为了让「认输是否有假」这个问题**带着否决理由**留在账上，而不是留下一个看起来像答案的数。
+
+
+
 ## 轮次174 轮次173 那次晋升的是**两格死基因**，顺带量出赛具真正的噪声地板：黑侧的 `double_three` 与 `double_four` 在评估里没有任何出账点（改到 1 或 200000，45 个盘面 × 全空格 × 两色的评估总分**逐字不动**，基线 4,718,908），因为 `pattern_score` 只有两个调用点（`src/core/evaluator.cpp:267` += 自己、`:270` -= 对手）且都在禁手门内，而 `has_three_three` / `has_four_four` 恰恰就是 `is_forbidden_from_pattern` 判黑违规所看的那两个字段（`src/core/pattern.cpp:558,594`）；同一支探针里三个正控都动得了（白 `double_three` → 差 −419,986；黑 `four_three` → 差 −159,992；四三是合法形状）⇒ **「内建验证赛 0.625 通过、外部赛具 0 增益」不是巧合：那一轮抬的是一个不可能改变任何着法的数**。而端到端追这条时量到的第二件事更要紧：**同一份配置两跑，90 局里有 9 局的胜者会换**（开局库加载着跑），且**只加载一份与默认值逐字相同的参数档也会换 10/90** ⇒ 赛具的噪声地板不是 0 而是 ≈10 % 的局，成因就是轮次173 记下的「战术层不受节点帽管」 — round 173's promotion moved two dead genes: Black's `double_three` and `double_four` have no place to be paid at all (setting them to 1 or 200000 leaves the evaluator totals byte-identical across 45 boards × every empty square × both colours), because `pattern_score` has exactly two call sites and both sit behind the forbidden gate, while `has_three_three`/`has_four_four` are the very fields that gate uses. Three positive controls in the same probe do move. Chasing this end-to-end also measured the fixture's real noise floor: two runs of the *same* configuration flip 9 of 90 games once the opening book is loaded, and merely loading a params file whose values are byte-identical to the defaults flips 10 of 90 — so the floor is ≈10 % of games, not zero, caused by the wall-clock-sliced tactical phases recorded in 轮次173.
 
 **先更正轮次171 写下的半句话**：当时说「两台相同引擎两跑，除 ms 字段外逐字相同」。那是 **12 局样本的运气**（12 局里一次都没翻的概率约 28 %，并不稀奇）。90 局尺度上的实测地板是 **9/90 ⇒ 10 %**。这条改写了验收口径：**任何 A/B 都必须按 ≥10 % 的局翻动率配样本量**，而轮次173 那份读数的 12 个有信息的配对本身就泡在噪声里 —— 结论（量不出）不变，但它的理由现在更硬。
