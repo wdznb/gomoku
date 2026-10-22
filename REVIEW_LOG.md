@@ -1980,6 +1980,39 @@ additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cp
 no existing assertion was edited.
 
 
+## 轮次172 色别不对称探针：三个数把「黑攻白守」这个设想从**直觉**变成了**定位问题**——禁手对黑的实际挤压是 **0.07 %–0.27 %**（开局根 0.07 %，实战黑方行棋的 4587 个局面 0.15 %，手数越深越高），**「黑候选全被禁手吃掉」的局面 0 个**，同一盘面上搜索真正拿到的分支宽度黑/白 = **0.978–1.010**（等宽）；而 168 局自对弈按色别的胜负是**黑 128 / 白 35 / 和 5 ⇒ 黑胜率 0.785**，65 % 的局以认输结束。⇒ 结论跟直觉的方向一致但成因不同：两侧**机会均等**（等宽），差的是**后果**——白方用同一套代码同一套评估要输掉 79 % 的局。所以对症且最便宜的一步是**把两侧系数真正分开训练**（`CoefficientPair` 的 2×14 基因组、`pair_from_vector` 的 `PAIR_GENE_COUNT` 都在，从没喂过数据），让白方的系数自己学出「封锁值钱」、黑方学出「进攻值钱」，而不需要动 `eval(W) == -eval(B)` 这条地基 — the side-asymmetry probe turns the "black attacks, white defends" intuition into a located problem: forbidden moves cost Black only 0.07-0.27 % of candidates, Black is never left with zero legal candidates, and Black and White get equal branching (0.978-1.010) on the same board — yet across 168 self-play games **Black wins 128 / White 35 / 5 draws = 0.785**, with 65 % of games ending in resignation. So the two colours have equal *opportunity* and unequal *outcomes*: the cheapest matched fix is to actually train the per-colour coefficient pair (the 2×14 genome already exists and has never been fed data) rather than to break the `eval(W) == -eval(B)` foundation that the draw-floor idea would require.
+
+**先更正轮次171 的一句话**：当时拿 null 对照的「执黑一侧胜率 0.4889」说「黑没有先手优势」。**那个统计量在恒等引擎下是退化的，不能这么用**：同一台引擎对打时，一条开局的两个座位必然一边赢一局（这正是 A 的得分恒等于 0.5000 的原因），所以配对里的「谁执黑谁赢」只反映这批开局本身偏向哪个座位，不反映先手优势。先手优势要问的是**自由生长的自对弈**，那一读是 **0.785**。这条已经写进仪器注释与下面的判据，避免下次再拿它当证据。
+
+**仪器**：`tools/side_asymmetry_probe.cpp` + `side_asymmetry_probe` 目标（只链 `${GOMOKU_CORE_SOURCES}`，不跑搜索 ⇒ 全量 9046 个黑先行局面 + 8 千个白先行局面秒级出数）。它量三件事：
+
+- 候选域（`Board::get_candidate_moves()`）里被 `PatternRecognizer::is_forbidden(..., BLACK)` 吃掉的个数，以及**行棋方自己**被吃掉的个数——白侧这一格恒为 0（`is_forbidden` 第一行就 `color != BLACK` 返回 false），那是「规则确实单边」的控制，不是发现。
+- 搜索真正拿到的宽度：走真的 `MoveGenerator::generate_moves(board, colour, 0, false)`，两侧都在同一张盘面上各问一遍。
+- 记录侧：按色别数胜负与 `reason`，并数「白胜且该局出现过黑无路」的局数。
+
+**读数**（`rec.jsonl` + `recA.jsonl` + `recB.jsonl` = 168 局；开局集 = `tools/match_openings.jsonl` 的 45 条）
+
+| 问的数 | 开局根（45 个黑先行盘面） | 实战黑方行棋（4587 个） | 实战白方行棋（4459 个） |
+|---|---|---|---|
+| 候选域均值 | 66.73 | 87.72 | 80.66 |
+| 黑被禁手吃掉 | 0.04（0.07 %） | 0.13（0.15 %） | 0.15（0.18 %，行棋方自己 0.00 %） |
+| 黑无路可走 | 0 | 0 | 0 |
+| 搜索宽度 黑/白 | 31.42 / 31.58 = **0.995** | 32.45 / 33.18 = **0.978** | 33.75 / 33.40 = **1.010** |
+
+分档看禁手挤压率随手数上升：4-9 子 0.00 % → 10-19 子 0.11 % → 30-39 子 0.19 % → 40+ 子 **0.27 %**；`白胜且出现过黑无路 = 0 局`。结束原因：成五 54 / 认输 109 / 和 0 / 其它 5。
+
+**这三条各自关掉一个设想**：
+
+1. 「黑被禁手逼得只能进攻」——**不成立**：禁手平均只吃掉黑 0.15 % 的候选，从没把黑锁死过。跨树赛里那 7 局作废是**旧树识别不出三三/四四而新树能**（轮次170 的取证），是旧树漏判，不是规则在削黑。
+2. 「白的分支更少所以守不住」——**不成立**：等宽（0.978–1.010）。
+3. 「黑白后果不对等」——**成立且巨大**：0.785 的黑胜率、65 % 认输收场。⇒ 差距在**评估与规则后果**这一层，正好是 `CoefficientPair` 分侧训练能动的地方，也正是 `eval(W)==-eval(B)` 这条地基**允许**动的地方（同一零点下各自定价）。
+
+**顺带一条要盯的**：自对弈里白方 79 % 的局要输，而白方的认输发生在「VCF 证明必败」上——65 % 的局以认输结束，其中多少是**误认输**（像轮次169 量到的那种 99,999 饱和分附近判负）本轮没量，登记为下一步的第一个数。
+
+**判定**：本轮不改 `src/`，只交付仪器与这三个数。它们把下一步钉成**任务 #77（两侧各自训练 + 用轮次171 的同版赛具验收「共享系数 vs 分套系数」）**；「白以和棋为底线」仍然排在它之后，因为那要破反对称性（TT 单符号约定、negamax、根层比较三处同改）。
+
+**门禁**：`src/`、`tests/` 一字未动（仪器是 `tools/` 里的只读探针，不进 ctest）。`readme_anchor_check` = 122 引用 0 问题；`web_frontend_check` = 113/113；`ctest --test-dir build` = **9/9 通过 900.97 s**（整树重建无 error、`side_asymmetry_probe.cpp` 在 `-Wall -Wextra` 下无 warning）；`memcheck` **未跑**（无产品代码改动）。锚点文件行数：README 765 / 指导书 849 / `src/server/server.h` 278 / `web/index.html` 138 不变；`CMakeLists.txt` 476 → 494（第四条目标仍只在末尾追加）。
+
 ## 轮次171 赛具改成同版 A/B，并把开局集从 6 条扩到 45 条：用户拍的口径是「不要用旧代码跑，两边都同一版新树」——代价是 `docs/ENGINE_REDESIGN.md:555` 保障 2 那句「新引擎 vs 旧引擎」从此不由这条赛满足，轮次170 那份 0.8049 [0.6599, 0.8977] 连同 7 局禁手口径分歧一起留在档里当**小样本读数**而不是验收；收益是赛具落到它能长期用的那一面（两套配置、按节点出价）。新增采集器 `tools/match_openings_harvest.cpp`：从 `gomoku_train --records` 的对局记录里按手数档取中盘快照，只收「偶数子、黑先行、盘面还活着」，按 (行,列,色) 排序键去重，每档按 FNV 哈希取前 6 条（确定性的抽样，不手工挑局面）。**168 局记录 ⇒ 2184 次档命中 ⇒ 2145 个重复盘面 ⇒ 39 条不重复**，加 6 条手工模板 ⇒ `tools/match_openings.jsonl` 从 6 行换成 45 行 —— 顺带一条事实：自对弈的盘**高度同源（98 % 重复）**，所以开局集不能只靠多跑几局来扩。三条对照读数：null（同配置、双方各 12000 节点/手、90 局 = 45 开局 × 2 座位）三跑里有两跑读 **45/45 对全部座位打平、0 作废、得分逐字 0.5000**，第三跑 44 平 + 1 对作废 ⇒ **零误报**；正控（同版、rich 60000 对 poor 6000 节点/手）89 局计入读 **0.8090 [0.7152, 0.8772]**，配对统计 = **27 对 rich 双坐通吃、0 对 poor 双坐通吃、17 对座位打平**；同一个 10 倍差在 6 条开局上读的是 0.9167 [0.646, 0.985] ⇒ **点估计掉了 0.11、区间从 ±0.17 收到 ±0.08**，这就是「有效样本的单位是开局×座位这一对」的实证，也是「想量更小的差要的是开局数不是局数」的算法依据 — the match is retargeted (per the user's ruling) to same-tree A/B instead of new-vs-old, at the cost that acceptance row `:555` ("new engine vs old engine") is no longer served by this fixture; the new opening harvester turns 168 self-play records into 39 unique midgame snapshots (2145 of 2184 candidates were duplicate boards — self-play converges hard), giving a 45-opening set. Three controls: two of three null runs (identical configs, 12000 nodes/move each, 90 games = 45 openings × 2 seats) split **every** pair by seat with zero exclusions and score exactly 0.5000, the third loses one pair to an exclusion — zero false positives; the positive control (same tree, 60000 vs 6000 nodes) reads **0.8090 [0.7152, 0.8772]** with 27 pairs won on both seats, 0 reversed, 17 seat-split. The same 10× gap had read 0.9167 [0.646, 0.985] on the 6-opening set: the point estimate fell by 0.11 and the interval tightened from ±17 pp to ±8 pp, which is exactly what "the sample unit is the (opening, seat) pair" predicts.
 
 **残留噪声指认到行**：按节点出价只锁住 AlphaBeta —— `src/search/search_engine.h:118-121` 明写 `set_max_nodes` 是 "Only AlphaBeta reads it; the tactical phases and the resign probe still slice the wall clock"，所以 VCF / VCT / 认输探针仍吃 `--timeout-ms` 的毫秒片。观测到的后果：同配置两跑 180 局里有 1 局的胜者换了、270 局里有 1 局作废。两条出路摆在那：**给战术层也按节点定价**（产品改动，要授权），或者把「同配置两跑之差 ≤1/180」当成夹具的噪声上界写进判据。

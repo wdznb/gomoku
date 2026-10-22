@@ -474,3 +474,21 @@ if(MSVC)
 else()
     target_compile_options(match_openings_harvest PRIVATE -Wall -Wextra -O2 -Wno-template-body -Wno-template-id-cdtor)
 endif()
+
+# 色别不对称探针（轮次172 的读数出处）：量禁手对黑方候选的实际挤压、黑白在同一盘面上的
+# 真实分支宽度、以及自对弈记录按色别的胜负构成。只读，走真的 MoveGenerator，不跑搜索。
+# 继续追加在文件末尾（上面那些目标行被 REVIEW_LOG 按行号指认）。
+add_executable(side_asymmetry_probe
+    tools/side_asymmetry_probe.cpp
+    ${GOMOKU_CORE_SOURCES}
+)
+target_include_directories(side_asymmetry_probe PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/tests)
+target_link_libraries(side_asymmetry_probe PRIVATE Threads::Threads nlohmann_json::nlohmann_json)
+if(UNIX)
+    target_link_libraries(side_asymmetry_probe PRIVATE pthread)
+endif()
+if(MSVC)
+    target_compile_options(side_asymmetry_probe PRIVATE /W4)
+else()
+    target_compile_options(side_asymmetry_probe PRIVATE -Wall -Wextra -O2 -Wno-template-body -Wno-template-id-cdtor)
+endif()
