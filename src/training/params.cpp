@@ -612,4 +612,27 @@ bool CoefficientVector::save(const std::string& path, const CoefficientPair& pai
     return true;
 }
 
+bool CoefficientVector::gene_is_perturbable(int gene) {
+    if (gene < 0 || gene >= PAIR_GENE_COUNT) return true;
+    // to_vector(CoefficientPair) 先排黑那一侧的 14 个，所以 side = gene / 14。
+    if (gene / TUNABLE_COUNT != 0) return true;
+    const int field = gene % TUNABLE_COUNT;
+    return field != static_cast<int>(TunableParam::DOUBLE_FOUR) &&
+           field != static_cast<int>(TunableParam::DOUBLE_THREE);
+}
+
+size_t CoefficientVector::perturbable_slot(size_t draw, size_t genome_width) {
+    const size_t slot = genome_width == 0 ? 0 : draw % genome_width;
+    // 老的一套（14 宽）系数同时喂两侧，白侧要读这两个值 ⇒ 原样返回。
+    if (genome_width != static_cast<size_t>(PAIR_GENE_COUNT) || slot >= genome_width) {
+        return slot;
+    }
+    // 往后找第一个活的基因（0 号就是活的，所以这个循环必然在 genome_width 步内返回）。
+    for (size_t step = 0; step < genome_width; ++step) {
+        const size_t candidate = (slot + step) % genome_width;
+        if (gene_is_perturbable(static_cast<int>(candidate))) return candidate;
+    }
+    return slot;
+}
+
 }

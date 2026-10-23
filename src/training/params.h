@@ -80,6 +80,27 @@ public:
     // vector, so the bound lookup has to follow the same indexing.
     static ParamBound bound_for_gene(int gene);
 
+    // Is this pair gene worth probing? BLACK's double_four / double_three have no
+    // payout point: both pattern_score call sites for BLACK sit behind
+    // is_forbidden_from_pattern (evaluator.cpp:192, :267/:270) and that gate is
+    // exactly what reads has_three_three / has_four_four (pattern.cpp:594), so a
+    // black pattern carrying either field is scored as nothing - with one exception
+    // the gate itself shows: is_forbidden returns false the moment the pattern holds
+    // an exact five (pattern.cpp:592), so a square where BLACK makes five *and* a
+    // double-four at once does read the gene. Such a square wins the game outright,
+    // which is why 轮次174 still measured the two as dead: measured gene-by-gene with
+    // tools/gene_reach_probe (45 盘面 × 全空格 × 两色, 基线 4,718,908 逐字不动).
+    // The optimizers therefore stop drawing them; they stay loadable, savable and
+    // ladder-repaired (sanitize still raises them to live_four, and white is still
+    // banded against black's value as the reference).
+    static bool gene_is_perturbable(int gene);
+
+    // Map an arbitrary draw onto a perturbable gene of a genome this wide, so a
+    // picker keeps its draw count identical while never landing on a dead gene.
+    // A genome that is not pair-wide (a shared 14-gene set feeds both colours, where
+    // these two values *do* pay out for WHITE) is returned unchanged.
+    static size_t perturbable_slot(size_t draw, size_t genome_width);
+
     static ParamBound bound_for(TunableParam param);
 
     // JSON text form, so a coefficient set can be embedded in checkpoints as well

@@ -1194,12 +1194,12 @@ void test_genetic_seed_covers_the_whole_box() {
         }
     }
     for (int g = 0; g < TUNABLE_COUNT; ++g) {
-        if (!low_seen[g] || !high_seen[g]) {
+        if ((!low_seen[g] || !high_seen[g]) && CoefficientVector::gene_is_perturbable(g)) {
             std::cout << "[r87r] gene " << g << " missed low=" << low_seen[g]
                       << " high=" << high_seen[g] << std::endl;
         }
-        assert(low_seen[g]);
-        assert(high_seen[g]);
+        assert(low_seen[g] || !CoefficientVector::gene_is_perturbable(g));  // 黑 6/7 是故意不扰动的死基因
+        assert(high_seen[g] || !CoefficientVector::gene_is_perturbable(g));
     }
 
     std::cout << "test_genetic_seed_covers_the_whole_box passed" << std::endl;
@@ -7974,6 +7974,179 @@ void test_k1_the_balance_phase_has_no_controller_class_in_the_tree() {
               << std::endl;
 }
 
+// 轮次182 #80：黑侧的 double_four / double_three 是「没有出账点」的死基因 —— pattern_score
+// 对 BLACK 的两个调用点（evaluator.cpp:192、:267）都坐在 is_forbidden_from_pattern 后面，
+// 而那道门读的正是 has_four_four / has_three_three 这两个字段本身（pattern.cpp:594）。
+// 轮次174 用 tools/gene_reach_probe 逐格差分量过（45 个盘面 × 全空格 × 两色，基线
+// 4,718,908 逐字不动），这一条把它钉成两半：
+//   A 分数与着法读不到它们：黑侧这两格从 1 改到 90000，盘上每个空格的黑侧分、成对分与
+//     一次按节点定价的搜索答案都逐字不变；同一颗子在白侧**必须**会变（正控 —— 不然
+//     「不变」只证明我把系数装错了地方）。
+//   B 优化器不再拿它们做扰动：hill 与 GA 各跑一遍，把所有被评估过的个体都收下来 —— 黑侧
+//     这两格在一个取值上都没动过（基线把 double_three 抬到 90000、double_four 本来就是
+//     50000，都高于 live_four 的上限 40000 ⇒ sanitize 那根「组合分不低于 live_four」的棘轮
+//     碰不到它们，于是「只许一个取值」这条断言是干净的）；而黑侧的 live_four 与紧挨着的
+//     four_three 照旧到处跑（正控：冻的是这两格，不是黑那一半，也不是「组合分」这一类）。
+void test_black_dead_threat_genes_are_never_probed() {
+    // ---- 先钉判据本身 ----
+    assert(!CoefficientVector::gene_is_perturbable(static_cast<int>(
+        black_gene(TunableParam::DOUBLE_FOUR))));
+    assert(!CoefficientVector::gene_is_perturbable(static_cast<int>(
+        black_gene(TunableParam::DOUBLE_THREE))));
+    // 黑侧四三不是禁手 ⇒ 它照旧出账，不能一起冻（冻错就是一次无声的棋力改动）。
+    assert(CoefficientVector::gene_is_perturbable(static_cast<int>(
+        black_gene(TunableParam::FOUR_THREE))));
+    assert(CoefficientVector::gene_is_perturbable(static_cast<int>(
+        white_gene(TunableParam::DOUBLE_FOUR))));
+    assert(CoefficientVector::gene_is_perturbable(static_cast<int>(
+        white_gene(TunableParam::DOUBLE_THREE))));
+    // 老的一套（14 宽）系数同时喂两侧，白侧要读这两个值 ⇒ 一个都不许冻。
+    for (size_t draw = 0; draw < 14; ++draw) {
+        assert(CoefficientVector::perturbable_slot(draw, 14) == draw);
+    }
+    assert(CoefficientVector::perturbable_slot(6, 28) == 8);
+    assert(CoefficientVector::perturbable_slot(7, 28) == 8);
+    assert(CoefficientVector::perturbable_slot(20, 28) == 20);
+    assert(CoefficientVector::perturbable_slot(27, 28) == 27);
+
+    // ---- A：出账点 ----
+    // 白在 (7,7) 落子同时成两条活四 ⇒ has_four_four；黑在 (10,10) 同样。黑那一格是禁手，
+    // 于是黑侧那一支永远走不到 pattern_score，改系数不改分。
+    Board pose;
+    const std::array<std::array<int, 3>, 12> stones = {{
+        {{7, 5, WHITE}}, {{7, 6, WHITE}}, {{7, 8, WHITE}},
+        {{5, 7, WHITE}}, {{6, 7, WHITE}}, {{8, 7, WHITE}},
+        {{10, 8, BLACK}}, {{10, 9, BLACK}}, {{10, 11, BLACK}},
+        {{8, 10, BLACK}}, {{9, 10, BLACK}}, {{11, 10, BLACK}},
+    }};
+    for (const auto& s : stones) pose.place_stone(s[0], s[1], s[2]);
+    assert(pose.check_winner() == EMPTY);
+
+    ThreatCoefficients defaults;
+    CoefficientPair base = CoefficientPair::shared(defaults);
+    CoefficientVector::sanitize(base);
+    CoefficientPair black_low = base, black_high = base, white_low = base, white_high = base;
+    black_low.black.double_four = 1;
+    black_low.black.double_three = 1;
+    black_high.black.double_four = 90000;
+    black_high.black.double_three = 90000;
+    white_low.white.double_four = 1;
+    white_low.white.double_three = 1;
+    white_high.white.double_four = 90000;
+    white_high.white.double_three = 90000;
+
+    const Evaluator eval_black_low(black_low), eval_black_high(black_high);
+    const Evaluator eval_white_low(white_low), eval_white_high(white_high);
+
+    long long single_low = 0, single_high = 0, pair_low = 0, pair_high = 0;
+    for (int r = 0; r < BOARD_SIZE; ++r) {
+        for (int c = 0; c < BOARD_SIZE; ++c) {
+            if (!pose.is_empty(r, c)) continue;
+            single_low += eval_black_low.evaluate_position(pose, r, c, BLACK);
+            single_high += eval_black_high.evaluate_position(pose, r, c, BLACK);
+            pair_low += eval_black_low.evaluate_position_pair(pose, r, c, BLACK);
+            pair_high += eval_black_high.evaluate_position_pair(pose, r, c, BLACK);
+        }
+    }
+    assert(single_low == single_high);
+    assert(pair_low == pair_high);
+    assert(eval_black_low.evaluate_board(pose, BLACK) ==
+           eval_black_high.evaluate_board(pose, BLACK));
+
+    // 正控：同一颗子换到白侧，分数必须跟着这两格动。
+    const int w_df_lo = eval_white_low.evaluate_position(pose, 7, 7, WHITE);
+    const int w_df_hi = eval_white_high.evaluate_position(pose, 7, 7, WHITE);
+    assert(w_df_hi > w_df_lo);
+
+    // 着法层：按节点定价的一手棋（无墙钟 ⇒ 确定），两侧系数不同不该换子。
+    std::atomic<bool> stop{false};
+    SearchEngine engine_low(base), engine_high(base);
+    engine_low.set_coefficients(black_low);
+    engine_high.set_coefficients(black_high);
+    engine_low.set_max_nodes(20000);
+    engine_high.set_max_nodes(20000);
+    engine_low.set_book_enabled(false);
+    engine_high.set_book_enabled(false);
+    const SearchResult move_low = engine_low.search(pose, BLACK, 6, 0, stop);
+    const SearchResult move_high = engine_high.search(pose, BLACK, 6, 0, stop);
+    assert(move_low.best_move.pos.row == move_high.best_move.pos.row &&
+           move_low.best_move.pos.col == move_high.best_move.pos.col);
+    assert(move_low.score == move_high.score);
+
+    // ---- B：优化器不再扰动它们 ----
+    // 基线里把黑侧 double_three 抬到 90000：sanitize 的阶梯是「组合分不低于 live_four」，
+    // 而 live_four 的上限只有 40000 ⇒ 抬起来之后这根棘轮碰不到这两格，于是「一个取值都不许
+    // 变」这条断言是干净的（默认那版 30000 会随个体的 live_four 被合法地抬上去，那不是扰动）。
+    CoefficientPair probe_base = base;
+    probe_base.black.double_three = 90000;
+    probe_base.black.double_four = 50000;
+    CoefficientVector::sanitize(probe_base);
+
+    struct Seen {
+        std::vector<int> black_four, black_three, black_live_four, black_four_three;
+        std::vector<int> white_four, white_three;
+    };
+    // 适应度只看白侧两根不相干的格子：黑侧怎么动都不加分，于是被评估过的每个个体都收进
+    // 来看得见 —— 记录的是**扰动落点**，不只是最后被接受的那几步。
+    auto record = [](const CoefficientPair& p, Seen* seen) {
+        seen->black_four.push_back(p.black.double_four);
+        seen->black_three.push_back(p.black.double_three);
+        seen->black_live_four.push_back(p.black.live_four);
+        seen->black_four_three.push_back(p.black.four_three);
+        seen->white_four.push_back(p.white.double_four);
+        seen->white_three.push_back(p.white.double_three);
+        return static_cast<double>(p.white.rush_four) + static_cast<double>(p.white.live_two);
+    };
+
+    auto distinct_count = [](std::vector<int> values) {
+        std::sort(values.begin(), values.end());
+        return static_cast<int>(std::unique(values.begin(), values.end()) - values.begin());
+    };
+    auto check_seen = [&](const Seen& seen, const char* who) {
+        assert(!seen.black_four.empty());
+        // 两格死基因：所有被评估过的个体上取值都只有基线那一个。
+        assert(distinct_count(seen.black_four) == 1);
+        assert(seen.black_four.front() == probe_base.black.double_four);
+        assert(distinct_count(seen.black_three) == 1);
+        assert(seen.black_three.front() == probe_base.black.double_three);
+        // 正控一：黑侧 live_four 照旧到处跑 ⇒ 我没有把黑那一半冻住。
+        assert(distinct_count(seen.black_live_four) >= 2);
+        // 正控二：紧挨着的黑侧 four_three（会出账的那一格）也照旧被试探 ⇒ 冻的确实是这两格，
+        // 不是「黑侧组合分」这一类。
+        assert(distinct_count(seen.black_four_three) >= 2);
+        (void)who;
+    };
+
+    {
+        Seen seen;
+        HillClimbingConfig settings;
+        settings.max_iterations = 120;
+        HillClimbingOptimizer optimizer(
+            [&seen, &record](const CoefficientPair& p) { return record(p, &seen); }, settings, 4242);
+        double unused_best = 0.0;
+        int unused_iterations = 0;
+        optimizer.run(probe_base, unused_iterations, unused_best);
+        check_seen(seen, "hill");
+    }
+    {
+        Seen seen;
+        GeneticConfig settings;
+        settings.population_size = 10;
+        settings.max_generations = 4;
+        settings.stagnation_generations = 4;
+        GeneticOptimizer optimizer(
+            [&seen, &record](const CoefficientPair& p) { return record(p, &seen); }, settings, 8123);
+        int generations_run = 0;
+        double best_fitness = 0.0;
+        const CoefficientPair champion = optimizer.run(probe_base, generations_run, best_fitness);
+        check_seen(seen, "genetic");
+        assert(champion.black.double_four == probe_base.black.double_four);
+        assert(champion.black.double_three == probe_base.black.double_three);
+    }
+
+    std::cout << "test_black_dead_threat_genes_are_never_probed passed" << std::endl;
+}
+
 int main() {
     std::cout << "Running training tests..." << std::endl;
 
@@ -8125,6 +8298,7 @@ int main() {
     test_k1_same_seed_two_runs_write_the_same_checkpoint_bytes();
     test_k1_pause_at_round_boundary_then_resume_gives_the_same_checkpoint();
     test_k1_the_balance_phase_has_no_controller_class_in_the_tree();
+    test_black_dead_threat_genes_are_never_probed();
 
     std::cout << "All training tests passed" << std::endl;
     return 0;

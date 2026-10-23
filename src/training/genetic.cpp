@@ -45,9 +45,9 @@ void GeneticOptimizer::seed_population(const CoefficientPair& base) {
             // Half the members keep the human shape and get one randomly placed
             // nudge per gene, the rest are redrawn across the whole box.
             if (i % 2 == 0) {
-                const size_t target = rng_() % genes.size();
+                const size_t target = CoefficientVector::perturbable_slot(rng_(), genes.size());
                 genes[target] += static_cast<int>(noise(rng_) * span * 0.25);
-            } else {
+            } else if (CoefficientVector::gene_is_perturbable(g)) {
                 genes[g] = static_cast<int>(bound.min_value + uniform(rng_) * span);
             }
         }
@@ -109,7 +109,7 @@ std::vector<int> GeneticOptimizer::mutate(const std::vector<int>& genes) const {
 
     std::vector<int> result = genes;
     for (size_t g = 0; g < result.size(); ++g) {
-        if (unit(rng_) >= 0.5) continue;
+        if (unit(rng_) >= 0.5 || !CoefficientVector::gene_is_perturbable(static_cast<int>(g))) continue;
         const double perturbed = result[g] * (1.0 + gaussian(rng_));
         result[g] = static_cast<int>(std::llround(perturbed));
     }

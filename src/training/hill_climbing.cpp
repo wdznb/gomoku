@@ -54,7 +54,7 @@ CoefficientPair HillClimbingOptimizer::run(const CoefficientPair& base,
     int steps = 0;
 
     for (int iteration = 1; iteration <= config_.max_iterations; ++iteration) {
-        const size_t index = pick_index(rng_);
+        const size_t index = CoefficientVector::perturbable_slot(pick_index(rng_), current.size());
         const size_t slot = rng_() % config_.multipliers.size();
         const std::vector<int> candidate = neighbor(current, index, config_.multipliers[slot]);
         // A rescale can round back to the same integer, and a step that changed
