@@ -1980,6 +1980,45 @@ additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cp
 no existing assertion was edited.
 
 
+## 轮次178 #79 握手定性：赛具装上「两侧对账」，服务端给六个拒绝分支起名，窗口在进程内 100 % 复现——被吞的那一手走的是 `ai_thinking` 分支；发生率 4/3326 局 ≈ 0.12 %，一次作废把 trained-vs-default 的读数从逐字可复现的 0.4844 挪到 0.4832 或 0.4856
+
+**这一轮只问一个问题**：轮次177 记下「同一颗子一跑被收、一跑被 `make_move` 拒，报一句笼统的 `Invalid move`」。拒它的六个条件里，「已占」「轮到谁」「禁手」只看盘面，「AI 在响」「已结束」只看状态 —— 所以第一个要切开的问题是**「两侧的盘到那一刻一不一样」**，而旧夹具答不出这句话。
+
+**仪器 ①（进仓库）：`tools/tree_match.cpp` 的 `drift` 字段**。任何一局作废，夹具就向**两侧**各发一次 `request_replay`，把「手摆 base 子 + 本局 moves 子」拼成各自的 stone 序列做比对，结果既写进记录的新字段 `drift`，也附进 `reason`：一致 ⇒「两侧盘面一致（N 子）⇒ 拒子与盘无关」；不一致 ⇒「第几子起不同、两边各是什么、各多少子」。判据来自 `src/server/game_manager.cpp:214-248` 那六个 `return false`。
+
+**仪器 ②（不进仓库，跑完就还原）：给六个分支起名**。临时在当前树上给每个分支加一行 `[reject] <tag> cell=… stones=… thinking=… status=… player=… ai=…` 的 stderr，编 `gomoku_server` 再跑三场全场；跑完 `cp` 回原文件、`git diff --stat src/` 为空、强制重建。**两次采到的样本都是同一条分支**：
+
+    [reject] ai_thinking cell=(5,10) stones=68 thinking=1 status=1 player=1 ai=2
+    [reject] ai_thinking cell=(3,5) stones=38 thinking=1 status=1 player=1 ai=2
+
+配上对账，两条事件的签名一模一样：**接收方比对面少的那一子，正是它刚拒掉的那一子**（`39/38`、`69/68`，前 N−1 子逐字一致）⇒ 不是累积漂移，是**瞬态拒绝**。
+
+**窗口在进程内是 100 % 可复现的**（`/tmp/tm178/window_probe.cpp`，在 `move_callback_` 里直接读标志并试一次递子）：
+
+    回调内：ai_thinking_=1
+    同一刻递进来的子：被拒（reject 分支 = ai_thinking）
+    回调之后 200 ms：ai_thinking_=0
+
+机制就写在代码里：`ai_move` 帧在 `game_manager.cpp:590` 发出（`send_message` 就在回调里同步走），而标志要到 `:631` 才清。中间这段就是被吞的那一手所在的窗口；`make_move` **不拿** `thinking_mutex_`，所以 `ai_thinking_` 是唯一挡着并发写盘的那道闸。顺带一条自证：先试图在回调**里**自旋等标志落下，永远等不到——这正说明清标志严格发生在回调返回之后。
+
+**发生率（八批）**：pass1 0/418、pass2 **1**/418、单开局重放 0/400、hunt1 0/418、hunt2 **1**/418、dg1 **1**/418、dg2 0/418、dg3 **1**/418 ⇒ **4/3326 ≈ 0.12 %**。单开局重放 400 局一次都不出（那局棋两套配置着法完全相同，读逐字 0.5000）⇒ 它不是某条开局的性质，是**时序**：对面用快路径在亚毫秒内回子时才会撞进窗口。
+
+**为什么要管它**：trained vs default 这个读数在**零作废**的三场里逐字相同（0.4844 [0.4369, 0.5323]，配对 15 : 21 : 172），而每多吞一局就变成 0.4832 或 0.4856 —— **±0.0012 量级的扰动，正好和 #77 要找的系数级增益同量级**。它不是「少一局数据」那么轻。
+
+**为什么本轮没修**：修法是**语义选择**，且两个方向都要动并发或帧序契约——
+- **A**：保住「AI 在响时不落子」这条守卫，但在 WS 处理侧对刚发出的那一手做**极短等待后重试**（几毫秒级），让玩家/夹具的子落定而不是被吞。改动局限在 `handle_make_move`，不动锁的嵌套。
+- **B**：让 `make_move` 在 AI 思考中先 `stop_thinking` 再接收（玩家落子永远有效）。这要把 `ai_thinking_` 的清除提前到发帧之前，而 `check_game_over()` 与预搜仍要读完盘面 ⇒ 必须把发帧挪到所有板面工作之后，同时用**已有的** deferred-end 机制保住「`ai_move` 早于 `game_over`」这条帧序（`server.cpp:984-990` 那段注释说的就是它）。
+- **C**：只修赛具——收到 `Invalid move` 且对账显示缺的是自己刚递的那一子时，重递一次。零产品风险，立刻把 0.12 % 的读数扰动关掉，但玩家侧那一手仍会被吞。
+
+**没跑 / 未得的账**
+- **窗口宽度没量出来**：观察者线程用 5 ms 粒度睡，抓不到微秒级边界；换成自旋后它在 AI 想完之前就把 4×10⁸ 次迭代耗尽了，算出来的差值是无意义的天文数字（那次运行的数不采信，也不写进结论）。所以现在只有「窗口存在」（进程内 100 % 可复现）与「发生率 0.12 %」两个数，中间那个宽度是缺口。
+- 归因样本 2 个（另外 2 次事件发生在没带日志的批次里，无从归因）。
+- 归因构建不入库；`drift` 只在**作废**路径上取，正常局不多两次往返。
+- 真实玩家点得比 0.12 % 慢得多，所以「玩家的落子会不会被吞」这条**没有**被本轮证实或证伪——它只是同一段代码的推论。
+
+**门禁**：全量重建 0 error / 0 warning；`readme_anchor_check` = 122 引用 0 问题；`web_frontend_check` = 113/113；`ctest` **未跑** —— 本轮进仓库的只有 `tools/tree_match.cpp`（不在 ctest 里，也没有任何测试引用它：`grep -rn tree_match tests/ src/` 为空），`src/` 已还原到提交状态（`git diff --stat src/` 为空）。它的验证是**跑出来的**：八批共 3326 局真实赛局，其中 4 次作废全部由新字段解释清楚了。
+
+
 ## 轮次177 开局集 45 → 209 条并把夹具地板确认到 0：两台服务器都带 `--no-book` 跑两遍同配置 422 局，读数逐字 0.5000、**逐手零分岔**、209/211 对完美座位平 ⇒ 轮次174 那句「赛具噪声地板 ≈10 % 的局」正式关掉；正控（60000 vs 6000 节点/手）在 209 条上读 **0.7536 [0.7101, 0.7925]**、配对 106 : 0 : 103 ⇒ 有信息的对从 27 涨到 106（同一个 10 倍差的点估计从 0.8090 掉到 0.7536，灵敏度是拿效应量换的）；第 3 步的训练档 vs 默认档读 **0.4844 [0.4369, 0.5323]**、配对 **15 : 21 : 172** ⇒ 36 对有信息、训练档只占 0.4167，两跑配对结构逐字相同 ⇒ 判「这一档不值一次晋升」（理由从「泡在噪声里」换成「有信息的对数不够」），并顺带指认出一条与引擎无关的赛具抖动 — the opening set went 45 → 209 from the *same* 272 records by widening the sampling (bands and per-band), which also corrects 轮次171's premature "self-play boards are 98 % duplicate so the set can't be widened": three degrees of freedom existed and only one had been moved. The fixture is now proven to have a **zero** floor in the node-priced regime: two identical 422-game null passes (`--no-book`) read 0.5000 byte-for-byte with zero per-ply divergence. The 10× positive control reads 0.7536 [0.7101, 0.7925] with 106 informative pairs (up from 27), at the cost of a lower point estimate than the 45-opening run — resolution bought with diluted effect size. The trained-vs-default match reads 0.4844 [0.4369, 0.5323] with pair structure 15 : 21 : 172 (36 informative, trained share 0.4167), identical across two passes ⇒ not worth a promotion, and for a different reason than 轮次173: not noise, but sample count.
 
 **先纠正我自己写下的一条「扩不动」**：轮次171 记的是「168 局 ⇒ 2184 次档命中 ⇒ 2145 个重复 ⇒ 39 条，自对弈的盘高度同源，所以开局集不能只靠多跑几局来扩」。数字没错，结论下早了。同一批记录（`recA` 96 + `recB` 48 + `train_rec` 128 = **272 局**），只把采集口径从「11 个手数档 × 每档取 6」换成「17 个档（4..36，步长 2）× 每档取 20」，**不重复开局 = 205 条**。三个自由度（记录数、档数、每档上限）轮次171 只动了第一个。

@@ -273,6 +273,9 @@ struct GameResult {
     // 只有手数与胜负的赛具答不出这个问题（轮次176：新树与旧树各读 9/90 翻局，而进程内 3 轮
     // ×44 局指纹零差异 ⇒ 分歧不在引擎，但赛具量不到它落在哪一手）。
     json moves = json::array();
+    // 作废那一刻从两侧各取一份 replay 比对出来的话（「两侧盘面一致」或「第 N 子起不同」）。
+    // 空串 = 这局没作废，或作废在取不到 replay 的分支上。
+    std::string drift;
 };
 
 // 读到某一侧出现 want 里的帧类型为止；error 帧、断开、超时都算这局作废。
@@ -307,6 +310,49 @@ std::string winner_side(const json& msg, bool a_is_black) {
     if (w == "black") return a_is_black ? "a" : "b";
     if (w == "white") return a_is_black ? "b" : "a";
     return "abort";
+}
+
+// 作废的那一刻，向两侧各要一份 replay —— 把「谁的盘和谁的不一样」变成记录里的一个字段，
+// 而不是留给下一轮猜。轮次177 的 game 247 就是猜不出来的那种：两跑前 13 手逐字相同，
+// 同一颗黑子 (4,2) 一跑被收、一跑被 `make_move` 拒；`make_move` 的六个拒绝条件里
+// 「盘面已占」和「轮到谁」都只取决于盘与状态，所以真正要分的不是「谁拒的」，是
+// 「两侧的盘到那一刻为止是不是一样的」（src/server/game_manager.cpp:214-248 的六个拒绝条件）。
+bool query_replay(Ws& ws, int budget_ms, json* out) {
+    if (!ws.send_text({{"type", "request_replay"}})) return false;
+    const long long deadline = now_ms() + budget_ms;
+    for (int tries = 0; tries < 32; ++tries) {
+        std::string frame;
+        bool closed = false;
+        const int left = static_cast<int>(deadline - now_ms());
+        if (left <= 0 || !ws.recv_message(&frame, left, &closed)) return false;
+        json msg = json::parse(frame, nullptr, false);
+        if (msg.is_discarded()) continue;
+        if (msg.value("type", std::string("")) == "replay") { *out = std::move(msg); return true; }
+    }
+    return false;
+}
+
+// 一侧的「盘」= 手摆局面摆下的 base 子 + 这局落的 moves 子，按顺序取 (行,列,色)。
+std::vector<std::string> stones_of(const json& replay) {
+    std::vector<std::string> stones;
+    const auto push = [&stones](const json& entry) {
+        stones.push_back(std::to_string(entry.value("row", -1)) + "," +
+                         std::to_string(entry.value("col", -1)) + "," +
+                         entry.value("color", std::string("?")));
+    };
+    if (replay.contains("base")) for (const auto& s : replay["base"]) push(s);
+    if (replay.contains("moves")) for (const auto& m : replay["moves"]) push(m);
+    return stones;
+}
+
+std::string drift_note(const json& ra, const json& rb) {
+    const std::vector<std::string> a = stones_of(ra), b = stones_of(rb);
+    if (a == b) return "两侧盘面一致（" + std::to_string(a.size()) + " 子）⇒ 拒子与盘无关，是回合/状态那一类";
+    size_t k = 0;
+    while (k < a.size() && k < b.size() && a[k] == b[k]) ++k;
+    return "两侧盘面第 " + std::to_string(k + 1) + " 子起不同（A=" +
+           (k < a.size() ? a[k] : std::string("(无)")) + " B=" + (k < b.size() ? b[k] : std::string("(无)")) +
+           "，共 " + std::to_string(a.size()) + "/" + std::to_string(b.size()) + " 子）";
 }
 
 // 某一侧不再说话了：先看对面是不是早就把「结束」那一帧压在缓冲里。
@@ -377,6 +423,15 @@ GameResult play_game(const Options& opt, const json& opening, bool a_is_black) {
                     res.reason += "（" + last_by + " 落 (" + std::to_string(last_row) + "," +
                         std::to_string(last_col) + ") 之后）";
                 }
+                // 再问一层：两侧到这一刻的盘到底一不一样。取不到就如实写取不到。
+                json ra, rb;
+                const bool ok_a = query_replay(A, 4000, &ra);
+                const bool ok_b = query_replay(B, 4000, &rb);
+                res.drift = (ok_a && ok_b) ? drift_note(ra, rb)
+                                           : std::string("(replay 没取到：") +
+                                                 (ok_a ? std::string() : "A ") +
+                                                 (ok_b ? std::string() : "B ") + ")";
+                res.reason += " ｜" + res.drift;
             } else {
                 res.reason = failed + " 已不回话，" + res.reason;
             }
@@ -612,7 +667,7 @@ int main(int argc, char** argv) {
                     {"ms_b", r.ms_b}, {"timeout_ms", opt.timeout_ms},
                     {"max_depth", opt.max_depth}, {"a_max_nodes", opt.a_max_nodes},
                     {"b_max_nodes", opt.b_max_nodes}, {"a", opt.a_name}, {"b", opt.b_name},
-                    {"moves", r.moves}};
+                    {"moves", r.moves}, {"drift", r.drift}};
         out << rec.dump() << "\n" << std::flush;
         rows.emplace_back(std::move(rec), r);
         std::printf("  第 %d 局 座位%s 手数=%d 结果=%s%s 用时=%lldms\n", g,
