@@ -34,6 +34,10 @@ public:
 
     void set_node_limit(int limit) { node_limit_ = limit; }
 
+    // Nodes actually examined by the last search() - the readout tools/vct_slice_probe.cpp
+    // prices VCT with. Observability only; nothing in the engine branches on it.
+    int nodes_searched() const { return nodes_searched_; }
+
     // Optional absolute wall-clock deadline. VCT otherwise bounds work only by
     // node_limit_, so it can overrun the caller's timeout_ms by seconds; the
     // search engine sets this once so VCT/VCF/AlphaBeta share a single budget.

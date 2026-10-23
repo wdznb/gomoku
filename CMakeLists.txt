@@ -510,3 +510,20 @@ if(MSVC)
 else()
     target_compile_options(gene_reach_probe PRIVATE -Wall -Wextra -O2 -Wno-template-body -Wno-template-id-cdtor)
 endif()
+
+# VCT 的切片烧法探针（轮次181 的读数出处）：线上墙钟档里 VCT 实际花掉多少、
+# 先撞哪个限、以及它那句「我赢」独立复核成不成立。继续追加在文件末尾。
+add_executable(vct_slice_probe
+    tools/vct_slice_probe.cpp
+    ${GOMOKU_CORE_SOURCES}
+)
+target_include_directories(vct_slice_probe PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/tests)
+target_link_libraries(vct_slice_probe PRIVATE Threads::Threads nlohmann_json::nlohmann_json)
+if(UNIX)
+    target_link_libraries(vct_slice_probe PRIVATE pthread)
+endif()
+if(MSVC)
+    target_compile_options(vct_slice_probe PRIVATE /W4)
+else()
+    target_compile_options(vct_slice_probe PRIVATE -Wall -Wextra -O2 -Wno-template-body -Wno-template-id-cdtor)
+endif()
