@@ -1809,11 +1809,11 @@ void GameServer::setup_game_callbacks(std::shared_ptr<WebSocketSession> session,
     game.set_think_finished_callback([this, session] {
         // 在 worker 线程上被调用：这里只许做一次 post。取队列的那一步必须在 io 线程上跑
         // ——它要调 make_move，而 make_move 会点下一手思考，那一步开头 join 上一个 worker。
-        unsigned long long stamp = 0;
-        {
-            std::lock_guard<std::mutex> lock(games_mutex_);
-            stamp = pending_seq_;
-        }
+        // 取号这一步同样不许碰 games_mutex_：io 线程正可能抱着它在 detach_socket 的
+        // halt_search（:1422）里 join 我，而我就是它等的那条线程 —— 轮次187 的夹具把这一条
+        // 撞成了整台服务器连 ping 都不回。号与队列仍然一起在 games_mutex_ 下写，这里只读
+        // 一个原子量：它只用来判「这张取件单是不是迟到了」。
+        const unsigned long long stamp = pending_seq_.load(std::memory_order_acquire);
         net::post(ioc_, [this, key = session.get(), stamp] { apply_pending_move(key, stamp); });
     });
     game.set_move_callback([this, session](const Move& move, int score, int thinking_time_ms) {

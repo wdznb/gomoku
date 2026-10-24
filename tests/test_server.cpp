@@ -3785,6 +3785,77 @@ void test_a_detached_session_over_the_cap_is_settled_and_shelved() {
     std::cout << "test_a_detached_session_over_the_cap_is_settled_and_shelved passed" << std::endl;
 }
 
+namespace {
+// 轮次187 的挂死探针留下的三件东西故意不释放，见下面那段注释。
+Harness* g_wedge_probe = nullptr;
+std::thread* g_wedge_joiner = nullptr;
+std::atomic<bool> g_wedge_returned{false};
+}  // namespace
+
+// 断开一条**正在思考**的链接，会不会把整台服务器钉死。
+//
+// 形状：on_disconnect（server.cpp:695）先拿 games_mutex_，detach_socket 在它里面 halt_search
+// （:1422）—— 那一步是「join 掉正在跑的那条 worker」。而 worker 交回思考标志的最后一步
+// （setup_game_callbacks 装的 think-finished，:1809）也要拿同一把 games_mutex_。两边各等对方，
+// 谁都不会先撒手；而 io 线程是这台服务器唯一的反应器，所以挂住的不是这一局，是整个进程：
+// 夹具上实测到 SIGINT 之后 7 分钟不退出、ping 也不回，/proc 里 io 线程与 worker 都停在
+// futex_do_wait，那条 worker 的 utime=0 —— 它一睁眼就撞在锁上。
+//
+// 判法只能在「真挂住也出得来」的形状里做：拿锁那一端放到一根临时线程上，主线程只等**有界的工作量**；
+// 一旦没回来，这两条卡住的线程连同 Harness 一起留在文件域指针里**不析构** —— 析构它会走到第二次
+// 挂死（~GameManager 也要 join 那条卡住的 worker），而留在 static 里 valgrind 记 still reachable，
+// 不是 definite leak。用例通过的那一支（修好之后）三件都是正常收尾的。
+//
+// 等待上界按「一整次有界搜索」计时来定，不写死秒数：memcheck 下整进程慢 ~20 倍、TSan ~3 倍，任何按
+// 秒画的界线都会变成假失败（轮次168 被这条坑过一次）。收口那条路要做的工作不可能超过一手完整搜索 ——
+// 停止旗一置，worker 在下一个节点就撒手 —— 所以 8 个单位是余量。
+void test_a_socket_that_closes_while_the_ai_is_thinking_does_not_wedge_the_io_thread() {
+    // 对照臂先跑，它有两个用处：证明「思考已经跑完的断开」本来就一直是对的，以及给出上面那个单位。
+    Harness settled(scratch("r187_disconnect_settled"), std::string());
+    GameManager& calm = *settled.entry->game;
+    calm.set_config(120000, 6, -1, 40000);
+    const auto unit_t0 = std::chrono::steady_clock::now();
+    assert(calm.make_move(7, 7));
+    join_think(calm);
+    const long long unit_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                  std::chrono::steady_clock::now() - unit_t0).count();
+    settled.server.on_disconnect(settled.socket.get());
+    CHECK_MESSAGE(settled.entry->attached == nullptr, "没在飞的断开同样要收干净（对照臂）");
+    const int ticks = static_cast<int>(std::max<long long>(2000, unit_ms * 8) / 10) + 1;
+
+    auto* h = new Harness(scratch("r187_disconnect_while_thinking"), std::string());
+    g_wedge_probe = h;
+    GameManager& game = *h->entry->game;
+    game.set_config(1200000, 8, -1, 400000);   // 一次思考要跑一阵，断开才赶得上它
+    assert(game.make_move(7, 7));               // 人落一子：make_move 自己把 AI 那一手点起来
+    CHECK_MESSAGE(game.is_ai_thinking(), "断开之前那条 worker 必须还在飞");
+
+    g_wedge_returned.store(false);
+    g_wedge_joiner = new std::thread([h] {
+        h->server.on_disconnect(h->socket.get());   // io 线程在那一刻做的事：拿锁 + join worker
+        g_wedge_returned.store(true);
+    });
+    for (int tick = 0; tick < ticks && !g_wedge_returned.load(); ++tick) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    const bool came_back = g_wedge_returned.load();
+    if (!came_back) {
+        std::printf("  [r187] 断开挂住：io 线程抱着 games_mutex_ 等 worker，worker 等那把锁\n");
+    }
+    CHECK_MESSAGE(came_back,
+                  "断开一条正在思考的会话必须自己收回来 —— 否则整台服务器连 ping 都不回");
+
+    // 「收回来」不许是靠少做事换来的：这一条要变成 detach、标志要交回、盘要落进会话文件。
+    CHECK_MESSAGE(h->entry->attached == nullptr, "断开之后这一条要挂成 detach");
+    CHECK_MESSAGE(!game.is_ai_thinking(), "思考标志要交回来");
+    CHECK_MESSAGE(std::filesystem::exists(h->session_file()), "断开那一刻的盘要落进会话文件");
+
+    std::cout << "  [r187] 断开一条在飞的思考：join 回来了、detach 落盘了、标志交回了（单位 = 一手完整搜索 "
+              << unit_ms << " ms，上界 " << ticks * 10 << " ms）" << std::endl;
+    std::cout << "test_a_socket_that_closes_while_the_ai_is_thinking_does_not_wedge_the_io_thread passed"
+              << std::endl;
+}
+
 int main() {
     std::cout << "Running server tests..." << std::endl;
 
@@ -3840,6 +3911,7 @@ int main() {
     test_the_takeback_lands_on_the_same_position_and_a_repeat_stays_stable();
     test_a_stone_that_arrived_in_the_tail_window_is_held_and_then_applied();
     test_a_detached_session_over_the_cap_is_settled_and_shelved();
+    test_a_socket_that_closes_while_the_ai_is_thinking_does_not_wedge_the_io_thread();
 
     test_analyze_progress_then_exactly_one_result_per_ply();
     test_analyze_is_refused_while_the_ai_is_thinking();

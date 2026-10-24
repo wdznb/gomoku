@@ -287,7 +287,7 @@ private:
         unsigned long long stamp = 0;
     };
     std::map<WebSocketSession*, PendingMove> pending_moves_;
-    unsigned long long pending_seq_ = 0;
+    std::atomic<unsigned long long> pending_seq_{0};   // worker 只原子读它，不拿 games_mutex_（轮次187 的挂死）
     // 今天 handle_make_move 的主体（拒因、帧序、`side_chosen` 落账）。自己拿 `games_mutex_`，
     // 所以调用它的两条路（当场执行 / 稍后被取出）都不得抱着那把锁。
     void do_make_move(std::shared_ptr<WebSocketSession> session, int row, int col);
