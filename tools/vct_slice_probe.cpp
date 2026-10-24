@@ -60,6 +60,7 @@ struct Options {
     int time_limit_ms = 16000;  // 线上默认 timeout_ms（param_schema.cpp:23）
     bool engine_order = false;
     bool verbose = false;
+    int rebuild_plies = 0;    // >0 ⇒ 对非 0 节点的 WIN 重建一条 forcing 线（#84 gap②）
 };
 
 struct Arm {
@@ -76,12 +77,61 @@ struct Arm {
     char win_tag = '-';
     int win_blocks = -1;
     int win_row = -1, win_col = -1;
+    // 这一句「我赢」是从根扫描哪一条分支回来的（见 root_branch）；'X' = 认不出且节点>0
+    char win_branch = '-';
+    std::string win_pv;
+    // 重放这条开局用的子序列与先手（#84 gap② 的 forcing 线重建要用，不能等 run_arm 之后再摆）
+    std::vector<Position> stones;
+    int first_color = BLACK;
+    // VCT 声称的着法**落下之前**，对面已经攥着几个成五点（见 five_points_of）
+    int race_before = 0;
     // 按真实次序（快路径 → VCF → VCT，AlphaBeta 关掉）走一遍完整思考的归属
     std::string eng_method;
     long long eng_ms = 0;
     int eng_score = 0;
     int eng_row = -1, eng_col = -1;
 };
+
+// #84 欠的那一格归因：VCT 的根扫描有四条分支会当场交出 WIN，判据逐字照 `src/search/vct.cpp`
+// 里那条次序摆：本手成五 'F' → 摆完之后自己有一条活四 'L' → four_count>=2 'D' → 防守表为空 'N'。
+// 第四条只能排除法得到：`VCTSearch::generate_defenses` 是私有的，探针调不到它。
+// 「0 节点 ⇔ 根扫描答的」这条**捷径是错的**，一次带标签的实验把它证伪了（六条白侧臂里三条被标成
+// 递归的其实是根上的 'L' —— 根扫描会先把前面的候选着法送进递归，节点数于是先涨了，走到后面某一
+// 手才命中 'L' 并返回）。所以 F/L/D 三条按判据直接认，认不出来的（本应 'N'）在节点>0 时**与真递归
+// 分不开**，标成 'X'；只有节点=0 的才敢写死 'N'。要精确到那一层得给 vct.cpp 加一个归因出口，
+// 本轮不加（它没有任何读者，而这一层的分辨力对本次的结论不是必需的）。
+char root_branch(const Board& board, int color, int row, int col) {
+    if (row < 0 || col < 0 || !board.is_empty(row, col)) return '?';
+    Board scratch = board;
+    if (!scratch.place_stone(row, col, color)) return '?';
+    const bool five = scratch.has_five_in_a_row(row, col, color);
+    const PositionPattern p =
+        PatternRecognizer::recognize_position(scratch, row, col, color);
+    scratch.undo_last_move();
+    if (five) return 'F';
+    for (int d = 0; d < 4; ++d) {
+        if (p.directions[d].type == PatternType::LIVE_FOUR) return 'L';
+    }
+    if (p.four_count >= 2) return 'D';
+    return 'N';
+}
+
+// 此刻这张盘上，`who` 一方还有几个「下一手成五」的点。audit_win 是在 VCT 声称的着法**之后**
+// 数这个数的；这里要在它落子**之前**数一次，因为递归证明（'V' 那一支）根本不经过根的四条分支，
+// 拿「之后」那个数没法问「对面本来是不是已经攥着胜着」。
+int five_points_of(const Board& board, int who) {
+    Board scratch = board;
+    int count = 0;
+    for (int r = 0; r < BOARD_SIZE; ++r) {
+        for (int c = 0; c < BOARD_SIZE; ++c) {
+            if (!scratch.is_empty(r, c)) continue;
+            if (!scratch.place_stone(r, c, who)) continue;
+            if (scratch.has_five_in_a_row(r, c, who)) ++count;
+            scratch.undo_last_move();
+        }
+    }
+    return count;
+}
 
 // 独立复核 VCT 的一句「我赢」：把它给的着法摆上，只看两个硬事实 ——
 //   1) 摆完之后进攻方还剩几个「下一手成五」的点 S；
@@ -154,7 +204,10 @@ void report_audit(const std::string& name, const std::vector<Arm>& arms) {
             ++recursive;
             deep.push_back(a.opening + (a.color == BLACK ? " B" : " W") + " (" +
                 std::to_string(a.win_row) + "," + std::to_string(a.win_col) +
-                ") 节点=" + std::to_string(a.nodes) + " 本手后可成五点=" + std::to_string(a.win_blocks));
+                ") 节点=" + std::to_string(a.nodes) + " 支=" + a.win_branch +
+                " 本手后可成五点=" + std::to_string(a.win_blocks) +
+                " 落子前对面已有成五点=" + std::to_string(a.race_before) +
+                " 变例=" + (a.win_pv.empty() ? std::string("(空)") : a.win_pv));
         }
     }
     std::printf("\n-- %s 的 WIN 复核 --\n", name.c_str());
@@ -166,10 +219,33 @@ void report_audit(const std::string& name, const std::vector<Arm>& arms) {
                 sound_multi, blocked_one, lost_race, five_now);
     std::printf("  根扫描里「对面一子就挡得住」的（=VCT 判 WIN 是防守枚举漏了）：%d/%d\n",
                 fabricated, zero_node);
+    // 分支归因（#84 欠的那一格）：哪一支交回的 WIN，各支的复核结论怎么分布。
+    struct BranchRow { int total = 0; int five = 0; int sound = 0; int blocked = 0; int race = 0;
+                       int held_before = 0; };
+    std::map<char, BranchRow> by_branch;
+    for (const Arm& a : arms) {
+        if (std::string(a.result) != "WIN") continue;
+        BranchRow& row = by_branch[a.win_branch];
+        ++row.total;
+        if (a.race_before > 0) ++row.held_before;
+        if (a.win_tag == 'F') ++row.five;
+        else if (a.win_blocks < 0) ++row.race;
+        else if (a.win_blocks >= 2) ++row.sound;
+        else ++row.blocked;
+    }
+    std::printf("  分支归因（F=本手成五 L=活四 D=双四 N=防守表空(0 节点) X=认不出 F/L/D 且节点>0：防守表空或递归证明，两者分不开）\n");
+    std::printf("    支    合计   本手成五   >=2成五点且对面没有   对面一子挡住   对面先把五做成   落子前对面已有成五点\n");
+    for (const char k : {'F', 'L', 'D', 'N', 'X', '?'}) {
+        const auto it = by_branch.find(k);
+        if (it == by_branch.end()) continue;
+        const BranchRow& r = it->second;
+        std::printf("    %c  %6d %10d %18d %13d %14d %14d\n",
+                    k, r.total, r.five, r.sound, r.blocked, r.race, r.held_before);
+    }
     for (size_t i = 0; i < suspect.size() && i < 12; ++i)
         std::printf("    %s\n", suspect[i].c_str());
-    std::printf("  递归证明的 WIN（本判据只能确认它「不是立即可见」，真伪要逐手复验）：%zu\n", deep.size());
-    for (size_t i = 0; i < deep.size() && i < 8; ++i)
+    std::printf("  非 0 节点交回的 WIN（递归证明，或后面的候选才命中根分支 —— 见分支列）：%zu\n", deep.size());
+    for (size_t i = 0; i < deep.size() && i < 24; ++i)
         std::printf("    %s\n", deep[i].c_str());
 }
 
@@ -308,6 +384,15 @@ void run_arm(Arm& arm, const Board& board, const Evaluator& ev, TranspositionTab
         arm.win_col = r.best_move.pos.col;
         Board scratch = board;
         arm.win_tag = audit_win(scratch, arm.color, arm.win_row, arm.win_col, &arm.win_blocks);
+        const char pred = root_branch(board, arm.color, arm.win_row, arm.win_col);
+        arm.win_branch = pred != 'N' ? pred : (arm.nodes == 0 ? 'N' : 'X');
+        arm.race_before = five_points_of(board, arm.color == BLACK ? WHITE : BLACK);
+        for (const Move& m : r.variation) {
+            if (!m.pos.is_valid()) continue;
+            // 分隔符不能用逗号：这一列直接写进 CSV。
+            arm.win_pv += "(" + std::to_string(m.pos.row) + ":" + std::to_string(m.pos.col) +
+                          (m.color == BLACK ? "B)" : "W)");
+        }
     }
 }
 
@@ -335,6 +420,120 @@ std::vector<Position> moves_of(const json& rec) {
     return out;
 }
 
+// #84 的 gap②：递归证明交回来的 WIN 在树里**不带变例**（`vct.cpp` 那条 `best_score >= 100000`
+// 的出口只填 best_move），所以「逐手复验」在库里没有可依之物。这一台重建器不读 VCT 的任何内部
+// 状态，只把开局序列摆回去、按局面自己找一条**forcing 线**：进攻方只走「落子后自己的成五点比
+// 落子前多 ⇒ 这一手是把四做出来」的着法；防守方要么挡住刚露出的那个点，要么自己成五；两边都查
+// 黑侧禁手。找得到一条真的胜线 ⇒ VCT 那句「我赢」成立；找不到 ⇒ 这个 WIN 至少不是forcing的，
+// 判不出真赢。「找不到」不等于「证伪」（真正的forcing线可能第一步不当令），那一行要照实写。
+struct ForcingLine {
+    bool found = false;
+    std::string line;
+    std::string stall;
+};
+
+int five_points_into(const Board& board, int color, Position* out, int cap) {
+    int n = 0;
+    for (const Position& p : board.active_empty()) {
+        Board scratch = board;
+        if (!scratch.place_stone(p.row, p.col, color)) continue;
+        if (!scratch.has_five_in_a_row(p.row, p.col, color)) continue;
+        if (out && n < cap) out[n] = p;
+        ++n;
+    }
+    return n;
+}
+
+bool forcing_search(Board& board, int attacker, int ply, int max_plies, std::string& line) {
+    if (ply > max_plies) return false;
+    const int defender = attacker == BLACK ? WHITE : BLACK;
+
+    Position before[8];
+    const int before_count = five_points_into(board, attacker, before, 8);
+
+    for (const Position& p : board.active_empty()) {
+        if (!board.place_stone(p.row, p.col, attacker)) continue;
+        if (board.check_winner() == attacker) {
+            line += "(" + std::to_string(p.row) + ":" + std::to_string(p.col) +
+                    (attacker == BLACK ? "B 成五)" : "W 成五)");
+            board.undo_last_move();
+            return true;
+        }
+        Position after[8];
+        const int after_count = five_points_into(board, attacker, after, 8);
+        if (after_count <= before_count) {  // 这一手没做出新的四，不是 forcing 的
+            board.undo_last_move();
+            continue;
+        }
+        if (ply + 1 > max_plies) {
+            board.undo_last_move();
+            continue;
+        }
+        bool all_blocks_lose = true;
+        std::string this_line;
+        for (int i = 0; i < after_count && all_blocks_lose; ++i) {
+            Board next = board;
+            if (!next.place_stone(after[i].row, after[i].col, defender)) continue;
+            std::string tail;
+            if (next.check_winner() == defender ||
+                !forcing_search(next, attacker, ply + 1, max_plies, tail)) {
+                all_blocks_lose = false;
+            } else {
+                this_line += "(" + std::to_string(p.row) + ":" + std::to_string(p.col) +
+                             (attacker == BLACK ? "B)" : "W)") +
+                             "(" + std::to_string(after[i].row) + ":" +
+                             std::to_string(after[i].col) +
+                             (defender == BLACK ? "B)" : "W)") + tail;
+            }
+        }
+        if (all_blocks_lose) {
+            line = this_line;
+            board.undo_last_move();
+            return true;
+        }
+        board.undo_last_move();
+    }
+    return false;
+}
+
+ForcingLine rebuild_forcing_line(const std::vector<Position>& stones, int first_color,
+                                 int attacker, int max_plies) {
+    ForcingLine out;
+    Board board;
+    int side = first_color;
+    for (const Position& p : stones) {
+        if (!board.place_stone(p.row, p.col, side)) {
+            out.stall = "开局序列装不下";
+            return out;
+        }
+        side = side == BLACK ? WHITE : BLACK;
+    }
+    std::string line;
+    out.found = forcing_search(board, attacker, 0, max_plies, line);
+    out.line = line;
+    return out;
+}
+
+// 非 0 节点交回来的那几条 WIN 的真伪重建（#84 gap②）。库不给变例，这里用只读重建顶上去。
+void report_rebuild(const std::string& name, const std::vector<Arm>& arms, int max_plies) {
+    int checked = 0, found = 0;
+    for (const Arm& a : arms) {
+        if (std::string(a.result) != "WIN" || a.nodes == 0) continue;
+        ++checked;
+        const ForcingLine line =
+            rebuild_forcing_line(a.stones, a.first_color, a.color, max_plies);
+        if (line.found) ++found;
+        const std::string detail = line.found ? (" 线=" + line.line)
+                                              : std::string("（不等于证伪，见 rebuild 上的说明）");
+        std::printf("  %s %c (%d,%d) 节点=%d 我方成五点=%d ⇒ forcing 重建：%s%s\n",
+                    a.opening.c_str(), a.color == BLACK ? 'B' : 'W',
+                    a.win_row, a.win_col, a.nodes, a.win_blocks,
+                    line.found ? "找得到一条真的胜线" : "找不到", detail.c_str());
+    }
+    std::printf("-- %s 的 WIN 逐手重建：查 %d 条（只查非 0 节点那批），找到 %d，进攻深度上限 %d 手 --\n",
+                name.c_str(), checked, found, max_plies);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -352,9 +551,11 @@ int main(int argc, char** argv) {
         else if (a == "--engine-order") opt.engine_order = true;
         else if (a == "--out") opt.out = next("");
         else if (a == "--verbose") opt.verbose = true;
+        else if (a == "--rebuild-forcing") opt.rebuild_plies = std::atoi(next("4").c_str());
         else {
             std::printf("用法: %s [--openings F] [--slice-ms N] [--node-limit N] [--depth N]"
-                        " [--time-limit-ms N] [--engine-order] [--out F] [--verbose]\n", argv[0]);
+                        " [--time-limit-ms N] [--engine-order] [--rebuild-forcing N] [--out F]"
+                        " [--verbose]\n", argv[0]);
             return 2;
         }
     }
@@ -409,6 +610,8 @@ int main(int argc, char** argv) {
             arm.opening = "#" + std::to_string(idx);
             arm.color = color;
             arm.legal_side = (color == side);
+            arm.first_color = first;
+            arm.stones = mv;
             arm.gated = threat_probe(board, color).own_three;
             run_arm(arm, board, ev, tt, opt);
             if (opt.engine_order) run_engine_order(arm, board, eng, opt);
@@ -429,6 +632,10 @@ int main(int argc, char** argv) {
     report("执白侧（同一盘面换个轮次问 —— 只为采样白侧的烧法，不是合法臂）", white_mirror, opt.slice_ms, opt.node_limit);
     report_audit("执黑侧", black_legal);
     report_audit("执白侧", white_mirror);
+    if (opt.rebuild_plies > 0) {
+        report_rebuild("执黑侧", black_legal, opt.rebuild_plies);
+        report_rebuild("执白侧", white_mirror, opt.rebuild_plies);
+    }
     if (opt.engine_order) {
         report_engine_order("执黑侧", black_legal);
         report_engine_order("执白侧", white_mirror);
@@ -437,12 +644,13 @@ int main(int argc, char** argv) {
     if (!opt.out.empty()) {
         std::ofstream o(opt.out);
         o << "opening,color,gated,ms,nodes,result,hit_cap,hit_deadline,win_tag,win_blocks,win_row,win_col,"
-             "eng_method,eng_ms,eng_score,eng_row,eng_col\n";
+             "win_branch,win_pv,race_before,eng_method,eng_ms,eng_score,eng_row,eng_col\n";
         for (const Arm& a : all) {
             o << a.opening << ',' << (a.color == BLACK ? 'B' : 'W') << ',' << (a.gated ? 1 : 0)
               << ',' << a.ms << ',' << a.nodes << ',' << a.result << ','
               << (a.hit_node_cap ? 1 : 0) << ',' << (a.hit_deadline ? 1 : 0) << ','
               << a.win_tag << ',' << a.win_blocks << ',' << a.win_row << ',' << a.win_col << ','
+              << a.win_branch << ',' << a.win_pv << ',' << a.race_before << ','
               << a.eng_method << ',' << a.eng_ms << ',' << a.eng_score << ','
               << a.eng_row << ',' << a.eng_col << '\n';
         }

@@ -67,6 +67,14 @@ private:
 
     std::vector<Move> generate_attacks(const Board& board, int color);
     std::vector<Move> generate_defenses(const Board& board, int color, int attack_row, int attack_col);
+
+    // #84：对面此刻有没有「下一手成五」的点。一条威胁主张（活四/双四/无防守点）只有在答案
+    // 是「没有」时才成立 —— 否则防守方不必来挡，先落那一子棋就结束了。根扫描与递归两层原来
+    // 都不看这一项：`generate_defenses` 只枚举「挡我这条威胁」的点，对面在别处已经能成五它
+    // 不知道（实测 209 条开局 × 执黑侧 43 个根扫描 WIN 里 28 个属于这一类，轮次184）。
+    // 只在三条进攻候选循环里调用（根扫描与 vct_attack/vct_defend 各一处），每条候选一次；扫描走
+    // active_empty()（任何成五点都挨着子），不是全 225 格。
+    bool defender_can_make_five(Board& board, int attacker) const;
 };
 
 }

@@ -151,6 +151,13 @@ int VCTSearch::vct_defend(Board& board, int color, int depth, int alpha, int bet
             return 100000 + depth;
         }
 
+        // #84：见 search() 里那条同形的判断 —— 这一层也只看「挡我」的点，不看对面此刻能不能
+        // 直接把五做成。丢掉这条候选，不是丢掉整个节点（别的候选可能先把那个点填上）。
+        if (defender_can_make_five(board, color)) {
+            board.undo_last_move();
+            continue;
+        }
+
         PositionPattern pattern = PatternRecognizer::recognize_position(
             board, move.pos.row, move.pos.col, color);
         bool has_live_four = false;
@@ -249,6 +256,12 @@ int VCTSearch::vct_attack(Board& board, int color, int depth, int alpha, int bet
         if (board.has_five_in_a_row(move.pos.row, move.pos.col, color)) {
             board.undo_last_move();
             return 100000 + depth;
+        }
+
+        // #84：同 search()/vct_defend 那条 —— 对面此刻就能把五做成，这条候选不是胜着。
+        if (defender_can_make_five(board, color)) {
+            board.undo_last_move();
+            continue;
         }
 
         PositionPattern pattern = PatternRecognizer::recognize_position(
@@ -355,6 +368,13 @@ VCTMove VCTSearch::search(const Board& board, int color, int max_depth,
             return result;
         }
 
+        // #84：这一手没把对面的成五点填掉，就不是胜着 —— 它不必来挡，先落那一子棋就结束了。
+        // 下面三条威胁分支和那条防守循环都只算「挡我这条威胁」的点，看不出这一层。
+        if (defender_can_make_five(mutable_board, color)) {
+            mutable_board.undo_last_move();
+            continue;
+        }
+
         PositionPattern pattern = PatternRecognizer::recognize_position(
             mutable_board, move.pos.row, move.pos.col, color);
         bool has_live_four = false;
@@ -442,6 +462,30 @@ VCTMove VCTSearch::search(const Board& board, int color, int max_depth,
     }
 
     return result;
+}
+
+namespace {
+// #84 的门用的是「对面此刻有几个成五点」这个硬事实。扫描走 active_empty() —— 任何成五点
+// 都挨着自己的子，而 active_empty() 是「离任何子 Chebyshev<=2」的空格集合，是它的超集。
+// place/undo 会改 active_empty_ 本身，所以先把格子抄进这块小缓冲，不能边遍历边落子。
+constexpr int kMaxActiveCells = BOARD_SIZE * BOARD_SIZE;
+}  // namespace
+
+bool VCTSearch::defender_can_make_five(Board& board, int attacker) const {
+    const int defender = attacker == BLACK ? WHITE : BLACK;
+    Position cells[kMaxActiveCells];
+    int count = 0;
+    for (const Position& pos : board.active_empty()) {
+        if (count == kMaxActiveCells) break;
+        cells[count++] = pos;
+    }
+    for (int i = 0; i < count; ++i) {
+        if (!board.place_stone(cells[i].row, cells[i].col, defender)) continue;
+        const bool wins = board.has_five_in_a_row(cells[i].row, cells[i].col, defender);
+        board.undo_last_move();
+        if (wins) return true;
+    }
+    return false;
 }
 
 }

@@ -9469,6 +9469,62 @@ void test_named_node_budget_prices_the_tactical_phases() {
     std::cout << "test_named_node_budget_prices_the_tactical_phases passed" << std::endl;
 }
 
+// #84：根扫描的三条威胁分支（活四 / 双四 / 没有防守点）以前只看「挡我这条威胁」的点，不看
+// 对面此刻能不能直接把五做成。实测这一类占执黑侧 43 个根扫描 WIN 里的 28 个（轮次184；轮次181
+// 只数出「28 个伪报」，这一轮把它归到活四那一条支上，四条分支里其余三条 418 臂一次都没交回过）。
+// 三臂：
+//   ① 黑落一子成活四，而白在同一刻攥着唯一的成五点 ⇒ 这不是胜着（门装上之前这里是 WIN）。
+//   ② 把白那串四缩成三（成五点消失）⇒ 同一颗黑子必须是胜着 —— 正控，防止我把门装到别处去。
+//   ③ 黑这一手正好把白的成五点填掉，同时自己成活四 ⇒ 门不许挡住它（被拒的是这条候选，不是整个节点）。
+void test_vct_root_threat_loses_the_race_when_the_defender_holds_a_five() {
+    Evaluator evaluator;
+    TranspositionTable tt;
+    std::atomic<bool> stop(false);
+
+    // ① 白的成五点 (0,4) 空着；黑的 (10,4) 成活四（两端 (10,3)/(10,8) 都空）。
+    {
+        Board board;
+        for (int c = 0; c < 4; ++c) assert(board.place_stone(0, c, WHITE));
+        for (int c = 5; c <= 7; ++c) assert(board.place_stone(10, c, BLACK));
+        assert(board.is_empty(0, 4));
+
+        VCTSearch vct(evaluator, tt);
+        const VCTMove raced = vct.search(board, BLACK, 6, stop);
+        assert(raced.result != VCTResult::WIN);
+    }
+
+    // ② 同一副黑的子，白只剩三连 ⇒ 白的成五点不存在 ⇒ 同一个判据必须交出胜着。
+    {
+        Board board;
+        for (int c = 0; c < 3; ++c) assert(board.place_stone(0, c, WHITE));
+        for (int c = 5; c <= 7; ++c) assert(board.place_stone(10, c, BLACK));
+
+        VCTSearch vct(evaluator, tt);
+        const VCTMove wins = vct.search(board, BLACK, 6, stop);
+        assert(wins.result == VCTResult::WIN);
+        assert(wins.best_move.pos.row == 10 &&
+               (wins.best_move.pos.col == 4 || wins.best_move.pos.col == 8));
+    }
+
+    // ③ 白那串四改在对角线上，唯一的成五点 (4,4) 同时是黑第四行那条活的左端 ⇒ 黑落那里既挡住
+    // 对面又成活四：门放它过去。
+    {
+        Board board;
+        for (int i = 0; i < 4; ++i) assert(board.place_stone(i, i, WHITE));
+        for (int c = 5; c <= 7; ++c) assert(board.place_stone(4, c, BLACK));
+        assert(board.is_empty(4, 4));
+
+        VCTSearch vct(evaluator, tt);
+        const VCTMove blocks_and_wins = vct.search(board, BLACK, 6, stop);
+        assert(blocks_and_wins.result == VCTResult::WIN);
+        assert(blocks_and_wins.best_move.pos.row == 4 &&
+               blocks_and_wins.best_move.pos.col == 4);
+    }
+
+    std::cout << "test_vct_root_threat_loses_the_race_when_the_defender_holds_a_five passed"
+              << std::endl;
+}
+
 int main() {
     std::cout << "Running search tests..." << std::endl;
 
@@ -9673,6 +9729,7 @@ int main() {
 
     // 轮次176：命名了节点预算的那一手，战术层只花自己那份份额（且只收紧、不放宽）。
     test_named_node_budget_prices_the_tactical_phases();
+    test_vct_root_threat_loses_the_race_when_the_defender_holds_a_five();
 
     std::cout << "All search tests passed!" << std::endl;
     return 0;
