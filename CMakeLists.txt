@@ -527,3 +527,8 @@ if(MSVC)
 else()
     target_compile_options(vct_slice_probe PRIVATE -Wall -Wextra -O2 -Wno-template-body -Wno-template-id-cdtor)
 endif()
+
+# 轮次188：赛具的配对报表（判定用它算 n_inf 与 SE）自己的钉值用例。它跑工具本体、不连服务器，
+# 所以要挂在 ctest 里 —— 一把没人测过的尺子，早晚量出假数。（放在文件末尾：前面的行号被账引用着。）
+add_test(NAME tree_match_pairs COMMAND gomoku_tree_match --selfcheck-pairs)
+set_tests_properties(tree_match_pairs PROPERTIES TIMEOUT 60)

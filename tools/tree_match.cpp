@@ -23,6 +23,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <map>
 #include <random>
 #include <string>
 #include <utility>
@@ -532,6 +533,130 @@ void print_report(const Tally& t, const Options& opt, const char* title) {
     }
 }
 
+// ── 配对报表：同一开局的两个座位合起来算一对 ─────────────────────────────────
+// 上面那个分数把「A 执黑赢 + A 执白输」也记成 0.5 —— 这一对没有说出谁更强，它只是噪声的均值。
+// 只有两座位同胜的对（rich = A 两胜，reversed = B 两胜）才真的把差值指出来，而判定要的分辨率是
+// SE = 0.5/√n_inf，n_inf 正是这两种对的只数。这一格以前由临时脚本在 CSV 外面算，脚本自己错过三次
+// （轮次171 的 `--append` 撞号、轮次124 的空日志、轮次129 的锚点脚本），所以挪进仪器里。
+struct Pairing {
+    long complete = 0;          // 两个座位都跑到的对
+    long rich = 0, split = 0, reversed = 0;
+    long split_with_draw = 0;   // split 里「有一手是和棋」那一子类
+    long incomplete = 0;        // 任一手作废，或只跑到一个座位
+    long collisions = 0;        // 同一个 (对, 座位) 出现两次 ⇒ 这份档不止拼了一遍读数
+};
+
+Pairing pairing_of(const std::vector<std::pair<json, GameResult>>& rows) {
+    Pairing p;
+    std::map<long, std::map<bool, long>> seen;      // 对 → 座位 → 只数
+    std::map<long, std::map<bool, double>> points;  // 对 → 座位 → A 拿到的分（作废记 -1）
+    for (const auto& row : rows) {
+        const long pair = row.first.value("game", 0LL) / 2;
+        const bool a_black = row.first.value("a_black", true);
+        if (++seen[pair][a_black] > 1) ++p.collisions;
+        const std::string& w = row.second.winner;
+        points[pair][a_black] = w == "abort" ? -1.0 : (w == "a" ? 1.0 : (w == "b" ? 0.0 : 0.5));
+    }
+    for (const auto& kv : seen) {
+        const std::map<bool, long>& seats = kv.second;
+        if (!seats.count(true) || !seats.count(false)) {
+            ++p.incomplete;   // 只看到一个座位：这一对不能算进任何一边
+            continue;
+        }
+        const double x = points.at(kv.first).at(true);
+        const double y = points.at(kv.first).at(false);
+        if (x < 0.0 || y < 0.0) {
+            ++p.incomplete;
+            continue;
+        }
+        ++p.complete;
+        const double a = x + y;   // A 在这一对里拿到的总分
+        if (a == 2.0) ++p.rich;
+        else if (a == 0.0) ++p.reversed;
+        else {
+            ++p.split;
+            if (x == 0.5 || y == 0.5) ++p.split_with_draw;
+        }
+    }
+    return p;
+}
+
+void print_pairs(const Pairing& p) {
+    if (p.collisions) {
+        std::printf("  配对报表拒绝出数：同一个（开局对，座位）出现了不止一次（撞号 %ld 处）⇒ 这份档里拼了"
+                    "不止一遍读数（`--append` 或分片编号会撞），先把它拆开\n", p.collisions);
+        return;
+    }
+    const long n_inf = p.rich + p.reversed;
+    const double phat = n_inf > 0 ? static_cast<double>(p.rich) / n_inf : 0.0;
+    const double se_inf = n_inf > 0 ? 0.5 / std::sqrt(static_cast<double>(n_inf)) : 0.0;
+    const double cmp = p.complete > 0
+                           ? (p.rich + 0.5 * p.split) / static_cast<double>(p.complete) : 0.0;
+    const double se_cmp = p.complete > 0 ? 0.5 / std::sqrt(static_cast<double>(p.complete)) : 0.0;
+    std::printf("  配对（两座位同开局算一对）：完整=%ld 不完整(作废/缺一座位)=%ld   "
+                "A 两胜=%ld 各胜一座位=%ld（其中含和=%ld） B 两胜=%ld\n",
+                p.complete, p.incomplete, p.rich, p.split, p.split_with_draw, p.reversed);
+    std::printf("  有信息对 n_inf=%ld ⇒ p̂(A 两胜 | 有信息)=%.4f SE=%.4f 95%%≈[%.4f, %.4f]；"
+                "完整对得分=%.4f SE=%.4f（分数按 0.5 为中性，差过 1.96 SE 才谈方向）\n",
+                n_inf, phat, se_inf, phat - 1.96 * se_inf, phat + 1.96 * se_inf, cmp, se_cmp);
+}
+
+// 仪器自己的用例：喂一份合成棋谱，钉住四类计数与撞号那一臂。判定要用这把尺子，它自己不能没测过。
+// 这里**不用** assert()：`gomoku_tree_match` 不在 CMakeLists:339-348 那个「每个套件都加 -UNDEBUG」的
+// 名单里，一旦有人把树配成 Release，assert 版自检会变成永远通过的空过场。
+int selfcheck_pairs() {
+    int failures = 0;
+    auto expect = [&failures](bool ok, const char* what) {
+        if (!ok) {
+            std::printf("  [selfcheck] 不自洽：%s\n", what);
+            ++failures;
+        }
+    };
+
+    std::vector<std::pair<json, GameResult>> rows;
+    auto add = [&rows](long game, bool a_black, const std::string& winner) {
+        json rec = {{"game", game}, {"a_black", a_black}};
+        GameResult g;
+        g.winner = winner;
+        rows.emplace_back(rec, g);
+    };
+    add(0, true, "a");    add(1, false, "a");      // A 两个座位都赢 ⇒ rich
+    add(2, true, "b");    add(3, false, "b");      // B 两个座位都赢 ⇒ reversed
+    add(4, true, "a");    add(5, false, "b");      // 各胜一座位 ⇒ split
+    add(6, true, "draw"); add(7, false, "a");      // 半分 + 一胜 ⇒ split（含和那一子类）
+    add(8, true, "a");    add(9, false, "abort");  // 一手作废 ⇒ incomplete
+    add(10, true, "a");                            // 只跑到一个座位 ⇒ incomplete 的另一条路
+    // winner 记的是**哪一侧**赢（"a"/"b"/"draw"），座位由 a_black 记；一对里两条的座位必须一真一假，
+    // 否则那不是「同一开局的两个座位」。上面第一版把 rich 写成了「一条 a 一条 b」，被这条自检当场抓住
+    // —— 尺子自己有牙，这正是把它放进 ctest 的理由。
+
+    const Pairing p = pairing_of(rows);
+    expect(p.complete == 4, "完整对要 4");
+    expect(p.incomplete == 2, "不完整对要 2（一手作废的那对 + 只跑到一个座位的那对）");
+    expect(p.rich == 1, "rich 要 1");
+    expect(p.reversed == 1, "reversed 要 1");
+    expect(p.split == 2, "split 要 2");
+    expect(p.split_with_draw == 1, "split 里含和的子类要 1");
+    expect(p.collisions == 0, "干净档不许报撞号");
+
+    std::vector<std::pair<json, GameResult>> dup = rows;
+    dup.push_back(rows[0]);   // 同一个 (对 0, 执黑座位) 再出现一次
+    const Pairing d = pairing_of(dup);
+    expect(d.collisions == 1, "撞号那一臂要报 1 处");
+
+    std::printf("[selfcheck] 配对报表\n");
+    print_pairs(p);
+    std::printf("  钉值：完整 4 / 不完整 2（作废一对 + 缺一座位一对）/ rich 1 / split 2(含和 1) / "
+                "reversed 1 / n_inf 2\n");
+    std::printf("  撞号那一臂：collisions=%ld（报表已拒绝出数）\n", d.collisions);
+    if (failures) {
+        std::printf("  [selfcheck] 失败 %d 条\n", failures);
+        return 1;
+    }
+    std::printf("  [selfcheck] 全部自洽\n");
+    return 0;
+}
+
 bool parse_endpoint(const std::string& spec, std::string* host, int* port) {
     const size_t colon = spec.rfind(':');
     if (colon == std::string::npos) return false;
@@ -558,6 +683,7 @@ int run_report(const Options& opt) {
         rows.emplace_back(rec, g);
     }
     print_report(tally_of(rows), opt, "整树赛读数（来自档）");
+    print_pairs(pairing_of(rows));
     return 0;
 }
 
@@ -600,11 +726,16 @@ int main(int argc, char** argv) {
             opt.append = true;
         } else if (arg == "--shard") { if (!next(&opt.shard)) return 1;
         } else if (arg == "--shards") { if (!next(&opt.shards)) return 1;
+        } else if (arg == "--selfcheck-pairs") {
+            // 不需要服务器：仪器自己的钉值（进 ctest，见 CMakeLists 末尾那条 add_test）
+            return selfcheck_pairs();
         } else if (arg == "--help" || arg == "-h") {
             std::printf("用法: %s --a HOST:PORT --b HOST:PORT [--names new=old]\n"
                         "        [--openings FILE.jsonl] [--games N] [--shard K --shards M]\n"
                         "        [--timeout-ms N] [--max-depth N] [--a-max-nodes N --b-max-nodes N]\n"
-                        "        [--out FILE.jsonl [--append] | --report FILE.jsonl]\n", argv[0]);
+                        "        [--out FILE.jsonl [--append] | --report FILE.jsonl]\n"
+                        "        %s --selfcheck-pairs   （跑配对报表的钉值用例，不连服务器）\n",
+                        argv[0], argv[0]);
             return 0;
         } else {
             std::fprintf(stderr, "不认识的参数: %s\n", arg.c_str());
@@ -681,6 +812,7 @@ int main(int argc, char** argv) {
     std::snprintf(title, sizeof title, "整树赛（分片 %d/%d，%zu 条开局，预算 %d ms/手，深度 %d）",
                   opt.shard, opt.shards, openings.size(), opt.timeout_ms, opt.max_depth);
     print_report(t, opt, title);
+    print_pairs(pairing_of(rows));
     std::printf("  本分片墙钟=%lld ms（%.1f ms/局）\n", spent,
                 rows.empty() ? 0.0 : static_cast<double>(spent) / rows.size());
     return 0;
