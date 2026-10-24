@@ -297,6 +297,21 @@ private:
     // 玩家改主意了（悔棋 / 重开 / 认输 / 终止 / 摆棋 / 断开）就别再落下那一手：它是替
     // 上一个局面许下的。**调用方必须已持 games_mutex_**（上面那几个 handler 都持着）。
     void drop_pending_move_locked(WebSocketSession* key);
+
+  public:
+    // #91：那面内存墙不在「重开/摆棋」那条路上，而在「detach 下来的会话要留满 30 分钟」这条设计上：
+    // 每局两条新链接 ⇒ 每局两个会话，实测 +14 MB/局（轮次185），约 250 个会话/台就开始握手超时。
+    // 这个名额把「窗口」变成「名额」：越过就把最老的 detach 会话照 overdue 的同一条路走 —— 先结算
+    // 落盘，再上架成 cold（token 仍可续，只是从文件重建，引擎丢掉）。
+    // 缺省 0 = 不限 = 今天的行为；只有显式 `--max-sessions` 会改它，负数按 0 收。
+    void set_max_sessions(int limit) { max_sessions_ = limit < 0 ? 0 : limit; }
+
+  private:
+    // 把一条已经**落盘结算好**的会话从内存里摘掉：要么放上冷架（token 之后从文件重建），要么在
+    // 「这一局什么都没下过」时直接删掉。调用方负责先 flush —— 没结算成功的不许走到这里。
+    // **调用方必须已持 games_mutex_**（on_flush_tick 持着）。
+    void shelve_locked(const std::shared_ptr<TrackedGame>& entry);
+    int max_sessions_ = 0;
 };
 
 }

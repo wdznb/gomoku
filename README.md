@@ -164,7 +164,7 @@ cd build
 
 每局一个文件 `data/sessions/<token>.json`，内容见「会话与断线续局」。目录建不出来时服务器打印
 原因并关闭落盘继续运行——端口能服务、棋能下，比一个写不进去的目录重要；写盘失败同样只报在
-stdout，不会打断对局。`data/sessions/` 与 `data/training/` 都在 `.gitignore` 里。
+stdout，不会打断对局。`data/sessions/` 与 `data/training/` 都在 `.gitignore` 里。`--max-sessions N`（缺省 0 = 不限）把「detach 的会话留满 30 分钟」换成「最多留 N 个」：越过就把最老的先结算落盘、再放上冷架，token 仍可续（只是从文件重建，丢的是那一局的引擎与其置换表）——一场 120 局的整树赛因此从 1695 MB 回到峰值一百多 MB（轮次186）。
 
 路径类选项（`--web-dir`、`--book`、`--sessions`、`--records`、`--params`）**给空串就是启动即报错退出**
 （退出码 1，错误信息点名是哪个 flag）：空路径多半是 shell 变量没展开，而不是「不要这个功能」，

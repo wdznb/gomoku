@@ -1708,26 +1708,57 @@ void GameServer::on_flush_tick() {
             ++it;
             continue;
         }
-        const SessionSnapshot shelved = snapshot_of(entry);
-        if (shelved.base.empty() && shelved.record.moves.empty() &&
-            shelved.player_color.empty()) {
-            // Nothing was ever played here, and flush_entry's empty-content branch
-            // already deleted this token's file. Shelving the snapshot would only let
-            // the old token come back at resume as a resumed:false frame naming the
-            // SAME token, while README:487 asks for a new game with a new token;
-            // dropping the entry leaves the token unknown both on disk and in memory,
-            // so the next resume falls through to open_session(nullptr).
-            stop_analyze(entry);
-            it = sessions_.erase(it);
-            continue;
-        }
-        // Back onto the shelf. The file is current (flush_entry just settled
-        // it), so what is dropped is the engine, not the game: the token still
-        // resumes, by rebuilding from that file.
-        stop_analyze(entry);
-        cold_sessions_[entry.token] = shelved;
-        it = sessions_.erase(it);
+        const auto next = std::next(it);
+        shelve_locked(it->second);
+        it = next;
     }
+    if (max_sessions_ <= 0) return;
+    // #91：名额只管**已 detach** 的那些（还在被 socket 用的那些不归内存管，它们是活的局）。
+    // 最老的先下架 —— 与 overdue 同一条路、同一个语义，只是把「等满 30 分钟」换成「名额用完」。
+    std::vector<std::shared_ptr<TrackedGame>> detached;
+    for (auto& kv : sessions_) {
+        TrackedGame& entry = *kv.second;
+        if (entry.attached || entry.detached_ms <= 0) continue;
+        detached.push_back(kv.second);
+    }
+    std::sort(detached.begin(), detached.end(),
+              [](const std::shared_ptr<TrackedGame>& lhs,
+                 const std::shared_ptr<TrackedGame>& rhs) {
+                  return lhs->detached_ms < rhs->detached_ms;
+              });
+    int over = static_cast<int>(detached.size()) - max_sessions_;
+    for (size_t i = 0; i < detached.size() && over > 0; ++i) {
+        // 和 overdue 一样：文件还欠着写就不许上架，否则那几手会在下一次 resume 时从冷文件里消失。
+        // 这种时候不是「整轮停住」而是跳过这一条、把名额让给下一条 —— 否则一条写不下去的会话
+        // 会把整个名额机制钉死（它的文件永远不新，永远轮不到后面那些）。
+        if (!flush_entry(detached[i])) continue;
+        shelve_locked(detached[i]);
+        --over;
+    }
+}
+
+// 调用方必须已经确认这一条**落盘成功**（上面两条路都是先 flush_entry 才走到这里）。
+void GameServer::shelve_locked(const std::shared_ptr<TrackedGame>& entry) {
+    if (!entry) return;
+    const SessionSnapshot shelved = snapshot_of(*entry);
+    if (shelved.base.empty() && shelved.record.moves.empty() &&
+        shelved.player_color.empty()) {
+        // Nothing was ever played here, and flush_entry's empty-content branch
+        // already deleted this token's file. Shelving the snapshot would only let
+        // the old token come back at resume as a resumed:false frame naming the
+        // SAME token, while README:487 asks for a new game with a new token;
+        // dropping the entry leaves the token unknown both on disk and in memory,
+        // so the next resume falls through to open_session(nullptr).
+        stop_analyze(*entry);
+        sessions_.erase(entry->token);
+        return;
+    }
+    // Back onto the shelf. The file is current (the caller's flush_entry just
+    // settled it), so what is dropped is the engine, not the game: the token still
+    // resumes, by rebuilding from that file.
+    stop_analyze(*entry);
+    cold_sessions_[entry->token] = shelved;
+    sessions_.erase(entry->token);
 }
 
 json GameServer::board_to_json(const Board& board) {

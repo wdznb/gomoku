@@ -12,6 +12,7 @@ int main(int argc, char* argv[]) {
     std::string records_path = "data/training/records.jsonl";
     std::string params_path;
     int ponder_percent = 0;
+    int max_sessions = 0;   // #91：0 = 不限（今天的行为）
     bool no_sessions = false;
     // Which of the two persistence paths the caller actually wrote down, as
     // opposed to the defaults above - --no-sessions needs to tell them apart.
@@ -84,6 +85,20 @@ int main(int argc, char* argv[]) {
                     return 1;
                 }
                 ponder_percent = parsed;
+            } else if (arg == "--max-sessions" && i + 1 < argc) {
+                // #91：detach 下来的会话原本要留满 30 分钟才下架（断线续局要的就是这段时间）。
+                // 跑一整场赛具 = 每局两个新会话，实测 +14 MB/局，约 250 个会话/台就开始握手超时。
+                // 给了这个名额就改成「最老的先结算并上架」：token 仍然能续，只是从文件重建。
+                // 不给（0）就是今天的行为，一点不变。
+                const std::string text = argv[++i];
+                std::size_t used = 0;
+                const int parsed = std::stoi(text, &used);
+                if (used != text.size() || parsed < 0) {
+                    std::cerr << "Invalid --max-sessions " << text
+                              << " (must be a whole number >= 0)" << std::endl;
+                    return 1;
+                }
+                max_sessions = parsed;
             } else {
                 std::cerr << "Unknown or valueless option: " << arg << std::endl;
                 return 1;
@@ -147,6 +162,8 @@ int main(int argc, char* argv[]) {
         gomoku::GameServer server(port, web_dir, book_path,
                                   params_path.empty() ? nullptr : &coefficients,
                                   sessions_dir, records_path, ponder_percent);
+        // 在 start() 之前设：之后就是 io 线程在读它了。
+        server.set_max_sessions(max_sessions);
         server.start();
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;

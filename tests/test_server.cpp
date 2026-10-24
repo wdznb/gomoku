@@ -3663,6 +3663,128 @@ void test_a_stone_that_arrived_in_the_tail_window_is_held_and_then_applied() {
 }
 
 
+// #91：detach 下来的会话原本要留满 30 分钟才下架（断线续局要的就是这段时间）。一场赛具每局开两条
+// 新链接 ⇒ 每局堆两个会话，实测 +14 MB/局，约 250 个/台就开始握手超时（轮次185 量的）。名额把
+// 「窗口」换成「名额」：越过就把**最老的 detach 会话**照 overdue 那条路走 —— 先结算落盘，再上架成
+// cold。丢的是引擎，不是局：token 仍可续，只是从文件重建。六臂：
+//   ① 越过名额：老的那条被结算并下架，新的留下；
+//   ② 被下架的 token 仍可 resume（resumed:true，且带回了那一局的子）；
+//   ③ 没超名额 ⇒ 一条都不动；
+//   ④ 缺省（0 = 不限）⇒ 今天的行为，两条都还热；
+//   ⑤ 名额只管 detach 的：还在被 socket 用的那条不许被动；
+//   ⑥ 文件还欠着写 ⇒ 这条不许上架，但它也不许把名额机制钉死 —— 跳过它，名额让给下一条文件本来就新的。
+void test_a_detached_session_over_the_cap_is_settled_and_shelved() {
+    const auto dir = scratch("r186_session_cap");
+    const auto records = scratch("r186_cap_records.jsonl");
+    const auto wall_ms = [] {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::system_clock::now().time_since_epoch()).count();
+    };
+    // 一条会话：开局、落 n 子、然后断开（detach 会把 detached_ms 盖上戳）。
+    GameServer server(0, std::string(), std::string(), nullptr, dir.string(), records.string());
+    std::vector<std::shared_ptr<WebSocketSession>> held;
+    auto make_detached = [&server, &held](int stones) {
+        auto socket = std::make_shared<WebSocketSession>(tcp::socket(server.ioc_), std::string());
+        auto entry = server.open_session(nullptr);
+        server.attach_socket(socket, entry);
+        assert(entry->game->restore_game(playing_restore(stones)));
+        server.detach_socket(socket.get());
+        held.push_back(socket);
+        return entry;
+    };
+
+    // ④ 缺省 = 不限：两条 detach 的会话都没过期，tick 之后都还热。
+    {
+        auto first = make_detached(1);
+        auto second = make_detached(1);
+        server.set_max_sessions(0);
+        server.on_flush_tick();
+        assert(server.sessions_.count(first->token) == 1);
+        assert(server.sessions_.count(second->token) == 1);
+        assert(server.cold_sessions_.empty());
+    }
+
+    // ③ 有名额但没超：cap=2、正好两条 ⇒ 仍然都不动。
+    {
+        server.set_max_sessions(2);
+        server.on_flush_tick();
+        assert(server.sessions_.size() == 2);
+        assert(server.cold_sessions_.empty());
+    }
+
+    // ⑤ 名额只管 detach 的：再来一条挂在 socket 上的（活的），它不该是受害者。
+    auto live_socket = std::make_shared<WebSocketSession>(tcp::socket(server.ioc_), std::string());
+    auto live = server.open_session(nullptr);
+    server.attach_socket(live_socket, live);
+    assert(live->game->restore_game(playing_restore(2)));
+
+    // ① 超名额：此刻有两条 detach + 一条活的，cap=1 ⇒ 最老的那条 detach 先下架，而且它是
+    //    **先结算落盘**才走的。受害者按内容挑（map 的序是 token 序，不是插入序，begin() 可能就是
+    //    那条活的）；「最老」用显式盖戳定死 —— 同一毫秒里两条谁先谁后不可判。
+    std::shared_ptr<GameServer::TrackedGame> victim = nullptr;
+    for (auto& kv : server.sessions_) {
+        if (kv.first == live->token) continue;
+        if (!victim || kv.second->detached_ms < victim->detached_ms) victim = kv.second;
+    }
+    assert(victim);
+    const std::string victim_token = victim->token;
+    victim->detached_ms = wall_ms() - 60LL * 1000LL;
+    server.set_max_sessions(1);
+    server.on_flush_tick();
+
+    assert(server.sessions_.count(victim_token) == 0);
+    assert(server.cold_sessions_.count(victim_token) == 1);
+    assert(server.sessions_.count(live->token) == 1);   // ⑤ 活着的那条没被动
+    // 落下的那一条已经不在内存里了 —— 被丢掉的是它的引擎（那张置换表），不是那局棋：② 会用旧 token 续回来。
+    // 文件必须是它最后一次结算的样子：一局 1 子。
+    std::string error;
+    SessionSnapshot on_disk;
+    assert(load_session(dir, victim_token, on_disk, error));
+    assert(on_disk.record.moves.size() == 1);
+    assert(server.sessions_.size() == 2);               // live + 剩下那条 detach
+
+    // ⑥ 欠写的会话不许上架，但它**不该把名额机制钉死**：再造一条 detach 的，让它成为「最老的那条」
+    //    并且带着没落盘的改动（文件里还是 1 子，盘上已经 2 子）。目录换成不可写之后 tick 应当
+    //    跳过它（不许上架）、把名额让给下一条文件本来就是新的会话。
+    auto third = make_detached(1);
+    assert(third->game->restore_game(playing_restore(2)));
+    third->detached_ms = wall_ms() - 120LL * 1000LL;
+    const std::string third_token = third->token;
+    const auto blocker = scratch("r186_blocker");
+    { std::ofstream file(blocker); file << "not a directory"; }
+    const std::string good_dir = server.sessions_dir_;
+    server.sessions_dir_ = (blocker / "sub").string();
+    const size_t cold_before = server.cold_sessions_.size();
+    server.on_flush_tick();
+    assert(server.sessions_.count(third_token) == 1);           // 欠写的这条没被搬走
+    assert(server.cold_sessions_.count(third_token) == 0);
+    assert(server.cold_sessions_.size() == cold_before + 1);    // 名额由另一条兑现了
+    server.sessions_dir_ = good_dir;
+    std::string dirty_error;
+    SessionSnapshot dirty_file;
+    assert(load_session(good_dir, third_token, dirty_file, dirty_error));
+    assert(dirty_file.record.moves.size() == 1);                // 那第二手没有进文件
+    std::error_code cleanup;
+    std::filesystem::remove(blocker, cleanup);
+
+    // ② 被下架的那条仍可续：新 socket 拿旧 token resume ⇒ resumed:true 且那一局的子回来了。
+    auto second_socket = std::make_shared<WebSocketSession>(tcp::socket(server.ioc_), std::string());
+    size_t seen = 0;
+    server.handle_resume(second_socket, json{{"token", victim_token}});
+    json frame;
+    for (const std::string& text : drain_frames(server, second_socket, seen)) {
+        const json parsed = json::parse(text, nullptr, false);
+        if (!parsed.is_discarded() && parsed.value("type", "") == "session") frame = parsed;
+    }
+    assert(frame.is_object());
+    assert(frame["resumed"] == true);
+    assert(frame.contains("board"));
+
+    std::cout << "  [r186] 名额 1：最老的 detach 会话被结算并上架，token 仍可续；live 与欠写的都没动"
+              << std::endl;
+    std::cout << "test_a_detached_session_over_the_cap_is_settled_and_shelved passed" << std::endl;
+}
+
 int main() {
     std::cout << "Running server tests..." << std::endl;
 
@@ -3717,6 +3839,7 @@ int main() {
     test_a_different_stone_after_the_takeback_pays_a_fresh_think_again();
     test_the_takeback_lands_on_the_same_position_and_a_repeat_stays_stable();
     test_a_stone_that_arrived_in_the_tail_window_is_held_and_then_applied();
+    test_a_detached_session_over_the_cap_is_settled_and_shelved();
 
     test_analyze_progress_then_exactly_one_result_per_ply();
     test_analyze_is_refused_while_the_ai_is_thinking();
