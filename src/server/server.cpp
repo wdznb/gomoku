@@ -693,6 +693,8 @@ void GameServer::on_open(std::shared_ptr<WebSocketSession> session) {
 // the table so `resume` with the same token can hand it to a new socket.
 void GameServer::on_disconnect(WebSocketSession* session) {
     std::lock_guard<std::mutex> lock(games_mutex_);
+    // 槽位按裸指针索引；这一句不清，下一个复用了同一块地址的 socket 会替上一个把子落下。
+    drop_pending_move_locked(session);
     detach_socket(session);
 }
 
@@ -967,18 +969,80 @@ void GameServer::handle_set_position(std::shared_ptr<WebSocketSession> session, 
 }
 
 void GameServer::handle_make_move(std::shared_ptr<WebSocketSession> session, const json& msg) {
-    std::lock_guard<std::mutex> lock(games_mutex_);
-    auto it = games_.find(session.get());
-    if (it == games_.end()) return;
-    
-    auto& game = it->second;
-    int row = get_int(msg, "row", -1);
-    int col = get_int(msg, "col", -1);
-    
+    const int row = get_int(msg, "row", -1);
+    const int col = get_int(msg, "col", -1);
+
+    // #81 尾窗：AI 的子已经交出（`ai_move` 就在前面几行发出去了）、但 `ai_thinking_` 还没
+    // 交回 —— 这一段里到达的合法子今天被 make_move 的守卫一拒就再无机会。这里把它存一手，
+    // 等 worker 交回标志之后由 io 线程取走。
+    //
+    // 判「要不要存货」的这一段不能抱着 games_mutex_ 走出函数：当场执行那条路要进
+    // do_make_move，而它自己拿那把锁。
+    bool kept = false;   // 已经进队列，回帧由执行的那一刻补
+    bool full = false;   // 队列里已经有一手，第二手是真拒绝
+    unsigned long long drain_now = 0;   // 非 0 ⇒ 入队正赶上标志交回，当场自己补一次取件
+    {
+        std::lock_guard<std::mutex> lock(games_mutex_);
+        auto it = games_.find(session.get());
+        if (it == games_.end()) return;
+        if (row >= 0 && row < 15 && col >= 0 && col < 15 &&
+            it->second->is_ai_thinking() && it->second->answer_delivered()) {
+            if (pending_moves_.count(session.get())) {
+                full = true;
+            } else {
+                pending_moves_[session.get()] = PendingMove{
+                    [this, session, row, col]() { do_make_move(session, row, col); },
+                    ++pending_seq_};
+                kept = true;
+                // 交回标志可能正好落在「我读标志」与「我入队」之间 —— 那一次的取件单已经跑完，
+                // 不自己补一次取件就再没人来取。锁下重读一次标志，真错过了就当场补。
+                if (!it->second->is_ai_thinking()) drain_now = ++pending_seq_;
+            }
+        }
+    }
+
     if (row < 0 || row >= 15 || col < 0 || col >= 15) {
         send_error(session, "Invalid move position");
         return;
     }
+    if (full) {
+        send_error(session, "Invalid move");
+        return;
+    }
+    if (drain_now) {
+        apply_pending_move(session.get(), drain_now);
+        return;
+    }
+    if (kept) return;
+    do_make_move(session, row, col);
+}
+
+void GameServer::apply_pending_move(WebSocketSession* key, unsigned long long stamp) {
+    std::function<void()> intent;
+    {
+        std::lock_guard<std::mutex> lock(games_mutex_);
+        auto pending = pending_moves_.find(key);
+        if (pending == pending_moves_.end()) return;
+        // 迟到的取件单：这一手是它之后才存进来的，交给下一次的取件单。
+        if (pending->second.stamp > stamp) return;
+        intent = std::move(pending->second.intent);
+        pending_moves_.erase(pending);
+    }
+    // io 线程，锁已放下：这一句会走到 make_move，而 make_move 自己就点下一手思考。
+    intent();
+}
+
+void GameServer::drop_pending_move_locked(WebSocketSession* key) {
+    pending_moves_.erase(key);
+}
+
+void GameServer::do_make_move(std::shared_ptr<WebSocketSession> session, int row, int col) {
+    std::lock_guard<std::mutex> lock(games_mutex_);
+    auto it = games_.find(session.get());
+    // 排队期间这一局可能已经被拿走（断开、重开）；没有局就没有欠帧。
+    if (it == games_.end()) return;
+    
+    auto& game = it->second;
 
     // make_move only ever commits a stone for player_color_ (it rejects any call
     // when current_turn() != player_color_), and on a pending position that call
@@ -1032,6 +1096,7 @@ void GameServer::handle_undo(std::shared_ptr<WebSocketSession> session) {
     std::lock_guard<std::mutex> lock(games_mutex_);
     auto it = games_.find(session.get());
     if (it == games_.end()) return;
+    drop_pending_move_locked(session.get());   // 悔棋之后这一手的对象已经不存在了
     
     auto& game = it->second;
     int undo_move_count = 0;
@@ -1127,6 +1192,7 @@ void GameServer::handle_resign(std::shared_ptr<WebSocketSession> session) {
     std::lock_guard<std::mutex> lock(games_mutex_);
     auto it = games_.find(session.get());
     if (it == games_.end()) return;
+    drop_pending_move_locked(session.get());
 
     // A game that was never started has no side to resign: the opening actions
     // are choosing a colour or playing the first stone, and settling an untouched
@@ -1150,6 +1216,7 @@ void GameServer::handle_stop_thinking(std::shared_ptr<WebSocketSession> session)
     auto it = games_.find(session.get());
     if (it == games_.end()) return;
     
+    drop_pending_move_locked(session.get());   // 终止 = 这一手不必再落了
     it->second->stop_thinking();
 }
 
@@ -1173,6 +1240,7 @@ void GameServer::handle_restart(std::shared_ptr<WebSocketSession> session) {
     std::shared_ptr<TrackedGame> fresh;
     {
         std::lock_guard<std::mutex> lock(games_mutex_);
+        drop_pending_move_locked(session.get());   // 新局不欠旧局那一手
         const std::shared_ptr<TrackedGame> previous = entry_locked(session.get());
         const ReplaySnapshot replay =
             previous ? previous->game->replay_snapshot() : ReplaySnapshot();
@@ -1682,6 +1750,8 @@ void GameServer::clear_game_callbacks(GameManager& game) {
     game.set_move_callback(nullptr);
     game.set_hint_callback(nullptr);
     game.set_game_over_callback(nullptr);
+    // 一起清：留着它，一个已经交还出去的 socket 会被别人的思考结果 post 醒一次。
+    game.set_think_finished_callback(nullptr);
 }
 
 void GameServer::setup_game_callbacks(std::shared_ptr<WebSocketSession> session, GameManager& game) {
@@ -1705,6 +1775,16 @@ void GameServer::setup_game_callbacks(std::shared_ptr<WebSocketSession> session,
         send_message(session, msg);
     });
     
+    game.set_think_finished_callback([this, session] {
+        // 在 worker 线程上被调用：这里只许做一次 post。取队列的那一步必须在 io 线程上跑
+        // ——它要调 make_move，而 make_move 会点下一手思考，那一步开头 join 上一个 worker。
+        unsigned long long stamp = 0;
+        {
+            std::lock_guard<std::mutex> lock(games_mutex_);
+            stamp = pending_seq_;
+        }
+        net::post(ioc_, [this, key = session.get(), stamp] { apply_pending_move(key, stamp); });
+    });
     game.set_move_callback([this, session](const Move& move, int score, int thinking_time_ms) {
         json msg;
         msg["type"] = "ai_move";

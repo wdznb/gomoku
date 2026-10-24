@@ -495,6 +495,7 @@ void GameManager::start_ai_thinking(int timeout_ms, int max_depth) {
     stop_flag_.store(false);
     discard_pending_.store(false);
     ai_thinking_.store(true);
+    ai_answer_delivered_.store(false);
     timeout_ms_ = timeout_ms;
     max_depth_ = max_depth;
     
@@ -544,6 +545,7 @@ void GameManager::ai_thinking_worker(int timeout_ms, int max_depth, Reuse reuse,
             resign_now(ai_color_);
         }
         ai_thinking_.store(false);
+        if (think_finished_callback_) think_finished_callback_();
         return;
     }
 
@@ -587,6 +589,9 @@ void GameManager::ai_thinking_worker(int timeout_ms, int max_depth, Reuse reuse,
             hint_score_ = result.score;
             hint_color_ = ai_color_;
             has_hint_ = (result.method == "alphabeta");
+            // 交出子之前立这个记号：从这一刻起对面就被告知「轮到你了」，而 `ai_thinking_`
+            // 还要到本函数最后一行才清。服务端拿它区分「被窗口吞掉的一手」与「提前点的一手」。
+            ai_answer_delivered_.store(true);
             move_callback_(result.best_move, result.score, result.elapsed_ms);
 
             check_game_over();
@@ -629,6 +634,8 @@ void GameManager::ai_thinking_worker(int timeout_ms, int max_depth, Reuse reuse,
     }
 
     ai_thinking_.store(false);
+    // 标志已经交回：这一刻起服务端可以把它替这一手攒着的意图取走了。
+    if (think_finished_callback_) think_finished_callback_();
 }
 
 void GameManager::check_game_over() {

@@ -271,6 +271,32 @@ private:
     void detach_socket(WebSocketSession* session);
     void schedule_flush();
     void on_flush_tick();
+
+    // #81：AI 已经把子交出、但还没把 `ai_thinking_` 交回 —— 这段尾窗里到达的合法子，今天
+    // 被 game_manager 的守卫一拒就不再有机会（轮次178 量到 4/3326 局）。这一张表把它存住，
+    // 等 worker 交回标志之后**由 io 线程**取走执行。
+    //
+    // 为什么必须是 io 线程：被取出的闭包会调 `make_move`，而 `make_move` 自己就会点下一手
+    // 思考，`start_ai_thinking` 的开头又是 join 上一个 worker —— 让 worker 自己取队列，它就
+    // 在 join 自己（轮次183 实测挂死在这里）。放在 io 线程上还顺手把「只有 io 线程动这局棋」
+    // 这条老不变量还了回来：这张表因此只需要 `games_mutex_`，不需要第二把锁。
+    struct PendingMove {
+        std::function<void()> intent;
+        // 入队时的代号。取队列的那次 post 带着**它自己**看到的代号来：号比存货老的 post
+        // 不许动这一手（那是上一思考留下的、迟到的取件单，此刻盘面还轮到 AI 收尾）。
+        unsigned long long stamp = 0;
+    };
+    std::map<WebSocketSession*, PendingMove> pending_moves_;
+    unsigned long long pending_seq_ = 0;
+    // 今天 handle_make_move 的主体（拒因、帧序、`side_chosen` 落账）。自己拿 `games_mutex_`，
+    // 所以调用它的两条路（当场执行 / 稍后被取出）都不得抱着那把锁。
+    void do_make_move(std::shared_ptr<WebSocketSession> session, int row, int col);
+    // worker 交回标志后 post 到 io 线程上跑的那一步：取出一手（最多一手）并执行。
+    // `stamp` 是 post 那一刻的代号；比存货老的取件单什么都不做。
+    void apply_pending_move(WebSocketSession* key, unsigned long long stamp);
+    // 玩家改主意了（悔棋 / 重开 / 认输 / 终止 / 摆棋 / 断开）就别再落下那一手：它是替
+    // 上一个局面许下的。**调用方必须已持 games_mutex_**（上面那几个 handler 都持着）。
+    void drop_pending_move_locked(WebSocketSession* key);
 };
 
 }

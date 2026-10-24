@@ -301,6 +301,28 @@ private:
     // Sets game-over state without joining the search threads, so it is safe to
     // call from ai_thinking_worker itself.
     void resign_now(int color);
+
+  public:
+    // #81 的接口，加在类的最后：`game_manager.h:142/188-196/204-208/239-247` 按行号被指认过。
+    //
+    // 这一次思考的子有没有已经交出去。`ai_move` 是在提交段里发出去的（`thinking_mutex_` 之内），
+    // 而 `ai_thinking_` 要到 worker 的最后一行才清 —— 这两件事之间到达的合法子，今天被 :215
+    // 一拒就不再有第二次的机会（轮次178 量到 4/3326 局）。这个记号就是「已经被应承过」与
+    // 「人在 AI 想完之前提前点了一手」的分界：前者该等，后者照旧拒。
+    bool answer_delivered() const { return ai_answer_delivered_.load(); }
+
+    // 思考彻底结束（标志已交回）时的通知。由服务端装上，内容只有一个：把「可以取队列了」
+    // post 回 io 线程。**不在 worker 线程上做这件事** —— 被取出的那手棋会调 make_move，
+    // 而 make_move 自己就会点下一手思考，`start_ai_thinking` 开头又去 join 上一个 worker，
+    // 在 worker 线程上跑它等于让线程 join 自己（轮次183 就是挂死在这里）。
+    using ThinkFinishedCallback = std::function<void()>;
+    void set_think_finished_callback(ThinkFinishedCallback cb) {
+        think_finished_callback_ = std::move(cb);
+    }
+
+  private:
+    std::atomic<bool> ai_answer_delivered_{false};
+    ThinkFinishedCallback think_finished_callback_;
 };
 
 }
