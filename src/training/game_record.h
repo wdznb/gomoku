@@ -35,7 +35,7 @@ struct MoveRecord {
     int seldepth = 0;
     std::string stopped = "none";
     // Appended, not inserted: `MoveRecord` is written and read by name through JSON, but
-    // the session's bridge (server.cpp:189/:205) copies it field by field, and design doc
+    // the session's bridge (server.cpp:181-196/:198-213) copies it field by field, and design doc
     // 2.9 :443's table-read count has to survive a save/restore to be worth reporting.
     int tt_hits = 0;
     // 丁-2（v2 §3.4 S4）：同一局面「一个更贵的老师」给的答案，与上面那一手分开记。

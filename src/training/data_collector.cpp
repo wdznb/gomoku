@@ -35,7 +35,7 @@ float centre_control(const Board& board, int color) {
 std::vector<float> DataCollector::extract_features(const Board& board, int side_to_move) const {
     std::vector<float> features(FEATURE_COUNT, 0.0f);
     fill_invariants(board, side_to_move, features);
-    fill_orientation(board, side_to_move, features);
+    fill_orientation(board, features);
     return features;
 }
 
@@ -92,8 +92,7 @@ void DataCollector::fill_invariants(const Board& board, int side_to_move,
     out[FEATURE_SIDE] = side_to_move == BLACK ? 1.0f : 0.0f;
 }
 
-void DataCollector::fill_orientation(const Board& board, int side_to_move,
-                                     std::vector<float>& out) const {
+void DataCollector::fill_orientation(const Board& board, std::vector<float>& out) const {
     if (board.move_count() > 0) {
         const Move last = board.last_move();
         out[FEATURE_LAST_ROW] = static_cast<float>(last.pos.row - BOARD_SIZE / 2) / 7.0f;
@@ -160,7 +159,7 @@ std::vector<TrainingSample> DataCollector::collect(const GameRecord& record, int
 
                     TrainingSample sample;
                     sample.features = invariants;
-                    fill_orientation(oriented, side, sample.features);
+                    fill_orientation(oriented, sample.features);
                     sample.value = value;
                     sample.move = oriented_move;
                     sample.search_score = entry.score;

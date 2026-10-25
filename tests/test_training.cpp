@@ -475,7 +475,7 @@ void test_elo_system() {
 
 // Round 101 FF1: the bracket behind the rating table disagreed with the promotion
 // rule it sits next to. README:198 makes a verification match 8 games, so a 5-3
-// candidate scores 0.625, which trainer.cpp:408 promotes (>= the 0.56 bar, open match)
+// candidate scores 0.625, which trainer.cpp:551-553 promotes (>= the 0.56 bar, open match)
 // while the old `>= 0.75 / <= 0.25` test booked *both* sides a draw - the table
 // printed a match somebody had clearly taken as nobody winning. The bracket now
 // follows what a match score means: above half is a win, below half a loss, exactly
@@ -1891,8 +1891,8 @@ void test_sample_refuses_unreadable_identity_keys() {
 // counting as a half. An INVALID record cannot be produced deterministically
 // through this door: play_game passes an empty prefix and a null stop flag
 // (trainer.cpp:69), SelfPlay::run only reports INVALID for an illegal prefix
-// (self_play.cpp:38-48), an external stop (:137-143) or an engine illegal move
-// (:77-88), and every move generator filters forbidden points. So the out-
+// (self_play.cpp:53-57), an external stop (:175-180) or an engine illegal move
+// (:95-99), and every move generator filters forbidden points. So the out-
 // parameter is pinned on the valid side here and through the denominator
 // identity below; the negative proof for the exclusion is at compile level.
 void test_play_game_counts_only_valid_games() {
@@ -2171,7 +2171,7 @@ void test_data_game_ids_unique_across_batches() {
 }
 
 // Round 112 PP1: the id a data game got used to be games_played_ + 1 + t * 1000, i.e. a
-// fixed offset off a counter every round advances (trainer.cpp:74 and :318 add each
+// fixed offset off a counter every round advances (trainer.cpp:89 and :457 add each
 // merged record, plus the fitness and verification games). A long run therefore
 // re-reaches the offset legitimately: on the round where games_played_ is 1000, worker
 // 0's base is exactly the base worker 1 used on the games_played_ = 0 round, so two
@@ -2642,7 +2642,7 @@ void test_params_rejects_broken_rule_constants() {
 }
 
 // Round 100 EE1: the guard behind that boundary stopped one step short. Evaluator
-// clamps the aggregate at five - 1 (evaluator.cpp:175-177), so five == 1 is not a
+// clamps the aggregate at five - 1 (evaluator.cpp:296-298), so five == 1 is not a
 // smaller scale but a cap of zero - evaluate_board answers 0 for every board, the
 // engine plays blind, and the server still prints the file as loaded. The other
 // side of the boundary (five == 2) must stay legal, and a rejected file must leave
@@ -3471,7 +3471,7 @@ void test_trainer_refuses_an_empty_flag_value() {
 // Round 99 DD6, labelled as what it is: a help-text assert. Only the usage
 // entries for --stagnation and --hill-iterations were rewritten, and the two
 // claims they now make are the code's existing behaviour - the 3x probe budget is
-// trainer.cpp:374 and the N+1 ceiling is hill_climbing.cpp skipping a step whose
+// trainer.cpp:513 and the N+1 ceiling is hill_climbing.cpp skipping a step whose
 // neighbour is identical. No call path changes, so there is nothing else to pin.
 void test_trainer_help_states_the_probe_budget() {
 #ifndef _WIN32
@@ -3573,8 +3573,8 @@ void test_server_refuses_no_sessions_with_a_stated_path() {
 }
 
 // Round 101 FF2: `--resume CK --seed N` used to start, parse N, and then let the
-// resume overwrite it (trainer.cpp:628 assigns the seed the checkpoint recorded, and
-// trainer.cpp:486 always writes one), so the reproducibility the caller asked for was
+// resume overwrite it (trainer.cpp:771 assigns the seed the checkpoint recorded, and
+// trainer.cpp:629 always writes one), so the reproducibility the caller asked for was
 // not the run that actually happened. The parser now refuses the pair, the same class
 // as the --params/--resume contradiction it sits next to.
 //
@@ -3644,7 +3644,7 @@ void test_trainer_refuses_a_seed_that_a_resume_would_drop() {
 
     // Both given, in either order: refused, naming both flags.
     const std::string quoted_ck = "'" + ck.string() + "'";
-    for (const std::string arguments : {"--resume " + quoted_ck + " --seed 7",
+    for (const std::string& arguments : {"--resume " + quoted_ck + " --seed 7",
                                         "--seed 7 --resume " + quoted_ck}) {
         const int status = run(arguments);
         std::cout << "  [r101ff2] " << arguments << " => exit " << status << ": "
@@ -3770,14 +3770,14 @@ void test_trainer_refuses_one_file_for_both_out_and_checkpoint() {
 
 // Round 107 KK1: run() clears everything that describes *this* run - generations_run,
 // converged_, best_history_ - and it did not clear the stagnation counter
-// `generations_since_improvement_`. genetic.h:39-41 states the contract as "evolves until
+// `generations_since_improvement_`. genetic.h:44-46 states the contract as "evolves until
 // the best result stops improving", i.e. this run's own improvement history, so a second run
 // on the same object inherited the first one's count and, with fitness that cannot improve,
 // hit `generations_since_improvement_ >= stagnation_generations` inside generation 1 and
 // reported generations_run == 1. The trainer builds one optimizer per round loop, so every
 // round after the first of a stagnating search was billed as a single generation.
 //
-// `evaluations_` is intentionally left alone (genetic.h:50-51 - it is the caller's cumulative
+// `evaluations_` is intentionally left alone (genetic.h:55-56 - it is the caller's cumulative
 // cost counter), which is why the accumulation is pinned in the same test: a future sweep
 // that zeroed it too would silently under-report the training budget. A constant fitness
 // makes the outcome independent of the RNG draws - no generation can beat the incumbent, so
@@ -7975,7 +7975,7 @@ void test_k1_the_balance_phase_has_no_controller_class_in_the_tree() {
 }
 
 // 轮次182 #80：黑侧的 double_four / double_three 是「没有出账点」的死基因 —— pattern_score
-// 对 BLACK 的两个调用点（evaluator.cpp:192、:267）都坐在 is_forbidden_from_pattern 后面，
+// 对 BLACK 的两个调用点（evaluator.cpp:193、:267）都坐在 is_forbidden_from_pattern 后面，
 // 而那道门读的正是 has_four_four / has_three_three 这两个字段本身（pattern.cpp:594）。
 // 轮次174 用 tools/gene_reach_probe 逐格差分量过（45 个盘面 × 全空格 × 两色，基线
 // 4,718,908 逐字不动），这一条把它钉成两半：
@@ -8186,7 +8186,7 @@ void test_a_copy_of_the_champion_scores_exactly_half_at_the_training_regime() {
     assert(copy.verdict == SprtVerdict::OPEN);
     // llr 在这里不是独立信息：`add_game` 按场累加 `s·ln(p1/0.5) + (1-s)·ln((1-p1)/0.5)`，
     // 于是它只由 (score, games) 决定 ⇒ 0.5 的 4 场恒等于 -1.33598（每对 -0.668；和棋场与
-    // 一对一胜一负给同一个数，`tests/test_training.cpp:4675-4686` 那批字面值）。钉这个字面值
+    // 一对一胜一负给同一个数，`tests/test_training.cpp:4682` 的逐对漂移与 `:4785-4792` 的 0.5 臂那批字面值）。钉这个字面值
     // 管的是 SPRT 那两项的系数别被人挪走，**不**管这一档里每对是不是真的各胜一场。
     assert(std::abs(copy.llr + 1.335976974) < 1e-6);
 

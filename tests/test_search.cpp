@@ -4313,7 +4313,7 @@ Evaluator b1_evaluator(int root, int deep) {
     return Evaluator(coeffs);
 }
 
-// A generator holds its evaluator by reference (move_generator.h:82), so the two
+// A generator holds its evaluator by reference (move_generator.h:139), so the two
 // have to be owned together. Writing `MoveGenerator gen(b1_evaluator(24, 8))` binds
 // the generator to a temporary that dies at the end of that statement, and the
 // generator then reads a width off freed stack - which is how this file's own case 3
@@ -5754,7 +5754,7 @@ void test_killers_are_recorded_by_the_tree_not_by_the_root_or_quiescence() {
 //
 // Production is alphabeta.cpp's `search_child_pvs()`, the `pv_` writes in
 // `alphabeta()` / `search_root_layer()`, the one commit-point `copy_out` in the
-// `layer_complete && layer.sound` branch, and `search_engine.cpp:357`'s
+// `layer_complete && layer.sound` branch, and `search_engine.cpp:422`'s
 // `result.principal_variation = info.principal_variation;`.
 //
 // PROVENANCE OF EVERY NUMBER PINED BELOW - and what this block deliberately does
@@ -6211,7 +6211,7 @@ void test_pv_table_refuses_every_ply_and_index_outside_its_slots() {
 // The quiet pose (four stones, no threat, widths 24/8, fresh table, no budget of
 // any kind) is the pose the cost pin in test_three_stage_ordering... runs on, so
 // the same think answers the same 8,7 / 71992 here and the line that goes with
-// it. The depth-4 arm is the SearchEngine field half: search_engine.cpp:357 is
+// it. The depth-4 arm is the SearchEngine field half: search_engine.cpp:422 is
 // the writer the design doc's 2.4.4 asks for, and a field only AlphaBetaSearch
 // could read would not be a deliverable.
 void test_committed_layer_reports_its_principal_variation() {
@@ -8009,10 +8009,10 @@ void test_one_set_of_records_answers_the_sum_for_either_colour() {
 }
 
 // The branch every aborted node of a cut think takes. `alphabeta()`
-// (src/search/alphabeta.cpp:308) returns this node's own static score from its stop test
-// (:334) *without* consulting the table: the hash and the reuse would both have to move
+// (src/search/alphabeta.cpp:320) returns this node's own static score from its stop test
+// (:346) *without* consulting the table: the hash and the reuse would both have to move
 // above that test, and a cut think's frames are the reason they must not - the comment at
-// `:327-333` states the choice and what step 3 gave this branch instead. What that read
+// `:337-345` states the choice and what step 3 gave this branch instead. What that read
 // costs is the claim this case pins: the sum comes out of the same records, so the nodes a
 // budget kills stopped each paying a whole-board pass. The pin is a think that really is
 // cut, by node budget only, so nothing here depends on a wall clock.
@@ -8081,7 +8081,7 @@ void test_the_nodes_a_cut_kills_pay_the_sum_out_of_the_records() {
 //
 // Half the row was already shipped, and the shipped half is what makes the other half a
 // fact rather than a coincidence. The accounting is stage A's: SearchInfo::seldepth
-// (alphabeta.h:34), SearchStats::seldepth, the frame that carries it (server.cpp:1674)
+// (alphabeta.h:37), SearchStats::seldepth, the frame that carries it (server.cpp:1738)
 // and the case that pins them (:3172). What feeds it - ctx_.note_quiescence_depth(qdepth)
 // - is armed one line after the node counter and *before* the cap test, so a think reports
 // the depth a node was entered at, not the depth it expanded to. That ordering is why

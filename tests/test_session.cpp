@@ -510,7 +510,7 @@ void test_delete_session_is_idempotent() {
     std::cout << "test_delete_session_is_idempotent passed" << std::endl;
 }
 
-// Defect 1: Unvalidated timeout_ms/max_depth in session restore (session_store.cpp:121-122)
+// Defect 1: Unvalidated timeout_ms/max_depth in session restore (session_store.cpp:146-152 read, :188-196 range)
 // A corrupted session file with negative or extreme values should be rejected
 // rather than loaded without validation.
 void test_session_config_validation() {

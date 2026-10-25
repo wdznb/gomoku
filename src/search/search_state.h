@@ -230,7 +230,7 @@ public:
     // a WHITE node alike, and the record needs no colour field:
     // `evaluate_position_pair(board, r, c, colour)` is `value_black + value_white`
     // whichever colour asks, because the two terms of that sum merely swap places
-    // (evaluator.cpp:192 - the fact test_evaluator.cpp:388 already pins).
+    // (evaluator.cpp:199-213 - the fact test_evaluator.cpp:400-401 already pins).
     struct Cell {
         PositionPattern black;
         PositionPattern white;

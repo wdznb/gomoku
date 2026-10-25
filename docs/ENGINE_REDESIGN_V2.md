@@ -147,7 +147,7 @@ v2.0 与本版初稿的头表都写过「v1.0 的 A/B/C/D 四阶段已全部落�
 
 **现状**：占 14.45 % Ir，做的是棋盘走线。但它读的内容是有界的：
 
-- 黑棋特判的三个分支（`pattern.cpp:417` LIVE_FOUR/RUSH_FOUR 的 `five_points`、`:446` LIVE_THREE 的 `live`、`:383` FIVE 的 `run_length() >= 6`）只沿 `dir` 一条线、以 `(row, col)` 为中心 ±6 格内做判断；
+- 黑棋特判的三个分支（`pattern.cpp:417` LIVE_FOUR/RUSH_FOUR 的 `five_points`、`:446` LIVE_THREE 的 `live`、`:383-384` FIVE 的 `run_length() >= 6`）只沿 `dir` 一条线、以 `(row, col)` 为中心 ±6 格内做判断；
 - 输入是这条线上 13 个格子的三态串（EMPTY / BLACK / WHITE）＋ 一个由中央 9 格窗口给出的基础 `PatternType`，而基础类型**已经**是现有 2^18 窗口 LUT 的输出；
 - 输出只是「修正后的 `PatternType`」，白棋分支的 `LONG_FIVE → FIVE` 降级也是纯函数。
 
@@ -164,7 +164,7 @@ v2.0 与本版初稿的头表都写过「v1.0 的 A/B/C/D 四阶段已全部落�
 
 #### O2｜已占子的线字键缓存（`StoneCache`，打 `pattern_score` 那一半）
 
-**现状**：`pattern_score` 占 20.85 %，在 `evaluate_board` 里对每颗已占子调用（`evaluator.cpp:245-248`），一子四方向全重算。`CandidateCache`（`search_state.h:226`）已经用「四 uint64 线字键」把**候选空格**的分数缓存做成「条目自带过期判据」的形状（轮次137），这是本树既有先例。
+**现状**：`pattern_score` 占 20.85 %，在 `evaluate_board` 里对每颗已占子调用（`evaluator.cpp:245-248`；轮次194 复核：`evaluate_board` 现在是 `:304-319`，而这一段只对**空候选格**调 `board_pair_value`，树里并没有「对每颗已占子调 `pattern_score`」的循环——前提的更正见指导书 §2.2 O2），一子四方向全重算。`CandidateCache`（`search_state.h:226`）已经用「四 uint64 线字键」把**候选空格**的分数缓存做成「条目自带过期判据」的形状（轮次137），这是本树既有先例。
 
 **改什么**：同一形状搬到已占子上。
 
@@ -278,7 +278,7 @@ VCF 的树形不是宽树，是**窄而深的强制链**：每一层的冲四点
 
 ### 2.6 `:124` 的默认值：ponder 该不该出厂就开（本版替文档补的那笔定价）
 
-`:124` 那一格现在是「带开关达标」：`--ponder 25` 读到 30.75 %、`--ponder 50` 读到 45.80 %，但**出厂默认是 0**（`src/main.cpp:14`、`src/server/server.h:94`），理由是「它吃 CPU」。文档从没为这笔 CPU 定价，尤其是用户指出的那一项：**每个等待中的会话会多一条引擎线程**。本节把它算完，再给默认值。
+`:124` 那一格现在是「带开关达标」：`--ponder 25` 读到 30.75 %、`--ponder 50` 读到 45.80 %，但**出厂默认是 0**（`src/main.cpp:14`、`src/server/server.h:94-98`），理由是「它吃 CPU」。文档从没为这笔 CPU 定价，尤其是用户指出的那一项：**每个等待中的会话会多一条引擎线程**。本节把它算完，再给默认值。
 
 #### 2.6.1 成本形状（三项实测 ＋ 一项折算）
 
@@ -319,7 +319,7 @@ VCF 的树形不是宽树，是**窄而深的强制链**：每一层的冲四点
 
 - 全局 `ponder_slots_`，默认 **1**：拿不到槽就**不 arm**（不排队、不发帧、不重试），下一手再说；
 - 训练 `train_quota > 0` 时槽数置 **0**（与 §4.4 的让位规则同一口径，避免两套优先级打架）；
-- 槽在 `cancel_ponder()` 的 join 之后释放（含 `make_move` / `undo` / `request_hint` / `halt_search` 四条异常路径，`game_manager.cpp:223/277/387/475`）；
+- 槽在 `cancel_ponder()` 的 join 之后释放（含 `make_move` / `undo` / `request_hint` / `halt_search` 四条异常路径，`game_manager.cpp:227/285/396/486`，`cancel_ponder` 本体在 `:110-121`）；
 - **验收仪器**：12 个并发会话同时等待，`ponder_arms()` 的并发峰值必须 ≤ 1；且每会话 think 的 p99 与单会话档差 ≤ 5 %。这条仪器是 P-1 唯一的存在理由——没有它，槽就是个摆设。
 
 #### 2.6.4 默认值：建议抬到 25 %，不抬到 50 %
@@ -385,7 +385,7 @@ README `:213` 与轮次129 的实测（深度 4 / 400 ms，同一套系数走镜
 
 #### S4｜深搜蒸馏样本：把深搜的着法当教材，而不是只数输赢
 
-- 现状：`data_collector` 已在产 JSONL 样本，但样本只覆盖 alphabeta 决策的 ply——`min_search_depth_ = 1`（`data_collector.h:74`，`trainer.cpp:207` 从未改写过）把所有 vcf/must_block 的 ply 丢掉了；轮次125 实测 14/28/62 → 112/224/496 条样本，差的就是这几类 ply。
+- 现状：`data_collector` 已在产 JSONL 样本，但样本只覆盖 alphabeta 决策的 ply——`min_search_depth_ = 1`（`data_collector.h:78`，`trainer.cpp:343` 的 `DataCollector collector;` 从未改写过它）把所有 vcf/must_block 的 ply 丢掉了；轮次125 实测 14/28/62 → 112/224/496 条样本，差的就是这几类 ply。
 - 改什么：训练信号从「这一局的胜负」改为「这一手与一次更贵的参考搜索给出的着法差多少」。d6 的搜索直接当 d4 的老师，**深搜的优势第一次变成训练动力，而不是把对局抹平**。
 - 形态：`min_search_depth_` 提升 ＋ 每样本加一份 `teacher_move`（由一次更贵/定深更大的参考搜索产生，与实际执行的那一手分开记，不许互相污染）；训练目标是一个就地可算的距离量。
 - **验收仪器**：报「样本数」与「teacher 与实际一致的比例」随轮次的变化；一致率上升 = 队伍在学；同时确认样本覆盖 vcf/must_block 的 ply（断言的正是今天缺的那部分）。
@@ -808,7 +808,7 @@ budgets = {1k, 2k, 4k, 8k, 16k, 32k, 64k, 128k, 256k}
 命中即停（所以期望只跑 3–5 档，不是 9 档）
 ```
 
-- 预算固定、时钟不参与（轮次121 B5 量到 `time_limit_ms = 0` 不是确定性配置，`search_engine.cpp:256-260` 会把 `remaining_time` 兜到 100 ms；所以这里必须显式 `set_max_nodes` ＋ 一个不 binding 的时限）；
+- 预算固定、时钟不参与（轮次121 B5 量到 `time_limit_ms = 0` 不是确定性配置，`search_engine.cpp:297-300` 会把 `remaining_time` 兜到 100 ms；所以这里必须显式 `set_max_nodes` ＋ 一个不 binding 的时限）；
 - **难度分层**（写进卡片的 `layer`）：`solve_budget <= 8k` → `easy`；`8k < x <= 64k` → `normal`；`> 64k` 或解不出 → `hard`；
 - **杀线**：若某层在**生成它的那棵树上**的 `solve_rate` 就是 100 %（生成器自己能秒解）→ 该层无区分度，降级为 `easy` 或丢弃。**题库不能由「已经会做的题」组成。**
 

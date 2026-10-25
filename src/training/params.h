@@ -82,7 +82,7 @@ public:
 
     // Is this pair gene worth probing? BLACK's double_four / double_three have no
     // payout point: both pattern_score call sites for BLACK sit behind
-    // is_forbidden_from_pattern (evaluator.cpp:192, :267/:270) and that gate is
+    // is_forbidden_from_pattern (evaluator.cpp:193, :267/:270) and that gate is
     // exactly what reads has_three_three / has_four_four (pattern.cpp:594), so a
     // black pattern carrying either field is scored as nothing - with one exception
     // the gate itself shows: is_forbidden returns false the moment the pattern holds

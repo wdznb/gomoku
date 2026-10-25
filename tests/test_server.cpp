@@ -719,7 +719,7 @@ void test_shutdown_flush_keeps_a_zero_stone_resign_out_of_the_records() {
 }
 
 // Round 104 II, the `--no-sessions` shape of the reordered sweep: with both paths
-// cleared (main.cpp:100-103), flush_all now reaches export_game_record without
+// cleared (main.cpp:129-132), flush_all now reaches export_game_record without
 // passing flush_entry's first-line short-circuit. The helper's own path test is
 // what keeps that harmless - a decided game in the table at Ctrl+C must not create
 // a record file, a session file or anything else on disk.
@@ -1349,7 +1349,7 @@ void test_a_shelved_played_session_keeps_its_token() {
 
 // Round 81, C1: handle_resign's "started" guard must count played plies, not
 // stones on the board. A hand-set position installs its base stones as the board
-// itself (game_manager.cpp:90), so replay_snapshot().move_count is non-zero while
+// itself (game_manager.cpp:159), so replay_snapshot().move_count is non-zero while
 // analyses_ is still empty - and undo already refuses to give those stones back
 // for the same reason. Settling such a position handed the opponent 白棋胜（认输）
 // over zero moves on the default player_color_(BLACK).
@@ -1970,7 +1970,7 @@ void test_check_position_reads_a_bom_prefixed_document() {
 // the way in while handle_make_move queued move_made only afterwards. The client
 // paints the winning stone from move_made, so 终局 landed on a board one stone
 // short of the five. The AI path already sends its stone before the end
-// (game_manager.cpp:424-426); the human path now holds the end frame back until
+// (game_manager.cpp:624/:694-695); the human path now holds the end frame back until
 // the stone has gone out.
 void test_human_move_answers_the_stone_before_the_end() {
     json matrix = json::array();
@@ -2080,9 +2080,9 @@ void test_human_move_answers_the_stone_before_the_end() {
 // there. That ending reached neither this session - its own stone was refused, so
 // no success path ever drained the slot - nor anybody else, until the NEXT
 // session played a legal stone and was handed a game_over for a game it is not
-// part of. The window is real: server.cpp:941-944 arms the slot, and an AI worker
+// part of. The window is real: server.cpp:992 arms the slot, and an AI worker
 // committing a finishing stone under it fires the callback that parks the frame
-// (game_manager.cpp:424-426, server.cpp:1626-1634). Two statements cannot be hit
+// (game_manager.cpp:624/:694-695, server.cpp:1799-1800). Two statements cannot be hit
 // by timing in a test, so the slot is armed exactly the way that block arms it
 // and the worker is then run to completion: the state entering the reject branch
 // is the state the race produces, and the parked frame is the server's own
@@ -2166,7 +2166,7 @@ void test_a_rejected_stone_delivers_the_end_a_worker_parked() {
         assert(parked);
 
         // (13,13) is empty; the stone is refused by the game-over guard at
-        // game_manager.cpp:148, which is what the worker's five leaves behind.
+        // game_manager.cpp:221, which is what the worker's five leaves behind.
         h.server.handle_make_move(h.socket, json{{"row", 13}, {"col", 13}});
         const std::vector<std::string> refused_stone = drain_frames(h.server, h.socket, seen);
 
@@ -2495,7 +2495,7 @@ void test_http_answers_a_read_with_the_file_and_a_write_with_a_refusal() {
 // same request: `..` asks for a file outside web_dir_ (README:139 is the directory being
 // rooted in), and `.` asks for this one - `/./index.html` *is* index.html. HEAD's tree
 // answers that with a 404. The guard now refuses only `..` by name and lets
-// weakly_canonical plus the root-prefix check at server.cpp:450-459 decide, which is what
+// weakly_canonical plus the root-prefix check at server.cpp:455-463 decide, which is what
 // actually holds the line: every control below was red-proof before and stays green now.
 void test_resolve_file_reads_a_single_dot_segment_and_still_refuses_every_escape() {
     const auto dir = scratch("r111_oo2_web");
@@ -2989,7 +2989,7 @@ void test_analyze_progress_then_exactly_one_result_per_ply() {
         if (item["ply"] < 6) assert(kind == "none");   // 开局六手之内是剔除区，不贴标记
         if (item["ply"] == 8) {
             // 钉的是「段 B 对快路径的手没话说」这一条（§6.3.1 的根表规则，轮次145 落进
-            // replay_analyzer.cpp:216 那句 return）：第 8 手黑棋盘上就有成五的着法，
+            // replay_analyzer.cpp:228-231 那个 root_scores 为空的 return）：第 8 手黑棋盘上就有成五的着法，
             // SearchEngine 的快路径直接答，root_scores 是空的，所以判定不许是俗手，
             // layer 也不许是难度层——它俩都只能是「没说过话」的那一个值。
             assert(kind == "none");
@@ -3808,10 +3808,11 @@ std::atomic<bool> g_wedge_returned{false};
 
 // 断开一条**正在思考**的链接，会不会把整台服务器钉死。
 //
-// 形状：on_disconnect（server.cpp:695）先拿 games_mutex_，detach_socket 在它里面 halt_search
-// （:1422）—— 那一步是「join 掉正在跑的那条 worker」。而 worker 交回思考标志的最后一步
-// （setup_game_callbacks 装的 think-finished，:1809）也要拿同一把 games_mutex_。两边各等对方，
-// 谁都不会先撒手；而 io 线程是这台服务器唯一的反应器，所以挂住的不是这一局，是整个进程：
+// 形状：on_disconnect（server.cpp:683）先拿 games_mutex_，detach_socket 在它里面 halt_search
+// （:1352）—— 那一步是「join 掉正在跑的那条 worker」。而 worker 交回思考结果的那一步
+// （setup_game_callbacks 装的 owner_notify，:1755-1759）只做一次原子 exchange ＋ 一次 post，
+// 不拿 games_mutex_ —— 轮次193 之后这条回路里没有第二把锁可等。改之前那一步是
+// think-finished 回调，它要拿同一把 games_mutex_，于是两边各等对方、谁都不先撒手；而 io 线程是这台服务器唯一的反应器，所以挂住的不是这一局，是整个进程：
 // 夹具上实测到 SIGINT 之后 7 分钟不退出、ping 也不回，/proc 里 io 线程与 worker 都停在
 // futex_do_wait，那条 worker 的 utime=0 —— 它一睁眼就撞在锁上。
 //
@@ -3938,7 +3939,7 @@ void test_the_board_epoch_distinguishes_a_refilled_position_from_the_snapsotted_
 // 轮次190 的**测量**用例，登记为 #106。轮次193 修完之后它变成「改后应当无声」的取证：
 // 跑法 `GOMOKU_R190_MEASURE=1 ./build-tsan/test_server`，TSan 应报 0 条 race。
 // 循环里「拷贝整盘」与「跑掉已 post 的提交任务」都在同一根线程上 —— 这正是产品里 io 线程
-// 做 `state_sync`（`server.cpp:825` 的形状）与 `commit_pending` 的形状；worker 已经不再写
+// 做 `state_sync`（`server.cpp:811` 的形状）与 `commit_pending` 的形状；worker 已经不再写
 // `board_`。改前（轮次193 开工时的 HEAD）同一跑法实测 7 条：全是主线程
 // `Board(const Board&)` 读 vs worker 持 `thinking_mutex_` 的写 —— `board.cpp:64` ×2、
 // `:145` ×2、`:65` ×1，另两条报在 `board.h:45` 的拷贝上。
@@ -3972,7 +3973,7 @@ void test_the_io_thread_board_copy_overlaps_the_ai_commit() {
 // 轮次191 #103：未完局不进 records。这条把轮次188 那两次同版 null「418 个会话文件、records 各只有 1 行」的成因钉住：
 // 418 个会话里只有 2 个是空 base（开局集第 1 行那条 `{}` ⇒ 夹具不发 set_position），其中一局（CSV 第 0 局）本台执黑赢下、
 // 31 手之后认输的是对面那台 —— `resign` 只出现在轮到落子那一侧的链接上（`tree_match.cpp:409-445`）⇒ 本台会话停在
-// `status:"playing"` + `reason:"invalid"`，非决定性、按 `export_game_record`（`server.cpp:1594-1606`）本来就不该落；
+// `status:"playing"` + `reason:"invalid"`，非决定性、按 `export_game_record`（`server.cpp:1523-1535`）本来就不该落；
 // 另一局本台执白认输 ⇒ 落 1 行。⇒ 代码与实测自洽，188 记的「两局都是空 base + 决定性结束」是错的（B 段改判）。
 void test_an_unfinished_game_stays_out_of_the_record_stream_until_it_ends() {
     const auto dir = scratch("r191_unfinished_sessions");

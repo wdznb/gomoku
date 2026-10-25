@@ -178,17 +178,6 @@ GameEndReason end_reason_of(const std::string& reason) {
     return GameEndReason::INVALID;
 }
 
-const char* server_reason_of(GameEndReason reason) {
-    switch (reason) {
-        case GameEndReason::FIVE: return "five";
-        case GameEndReason::RESIGN: return "resign";
-        case GameEndReason::BOARD_FULL: return "draw";
-        case GameEndReason::FORBIDDEN: return "forbidden";
-        default: break;
-    }
-    return "";
-}
-
 MoveRecord record_of(const MoveAnalysis& analysis) {
     MoveRecord entry;
     entry.move = analysis.move;

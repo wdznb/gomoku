@@ -109,13 +109,13 @@ git push origin master                # 然后核对 git log --oneline -1 origin
 1. **协议（服务端）**
    - `src/server/server.h` 的 handler 声明区（约 `:184` 之后）加：
      `void handle_analyze_request(std::shared_ptr<WebSocketSession> session, const json& msg);`
-   - `src/server/server.cpp` 的 `handle_message` 分发链（`:715-743`）加一个 `else if (type == "analyze_request")`。**它是会话级帧，所以不要动 `:705` 那个白名单**（白名单只管 `ping`/`check_position` 这类不需要会话的帧）。
+   - `src/server/server.cpp` 的 `handle_message` 分发链（`:714-762`）加一个 `else if (type == "analyze_request")`。**它是会话级帧，所以不要动 `:705` 那个白名单**（白名单只管 `ping`/`check_position` 这类不需要会话的帧）。
    - 新 handler 里：
-     - 用 `get_int_or(msg, "depth", 8)` / `get_int_or(msg, "budget", 20000)` 读参数（`server.cpp:25-40` 的两个 helper 已防 `{"row":"7"}` 这类异常）；
+     - 用 `get_int_or(msg, "depth", 8)` / `get_int_or(msg, "budget", 20000)` 读参数（`server.cpp:27-43` 的两个 helper 已防 `{"row":"7"}` 这类异常）；
      - 从 `GameManager::replay_snapshot()`（`game_manager.cpp:343-358`，`thinking_mutex_` 下拷贝）取整局；把 `MoveAnalysis` 逐字段转成 `GameRecord::moves`（`row/col/color/score/depth/nodes/method/...` 一一对应）；
      - **起一个后台线程**跑 `ReplayAnalyzer` ＋ `ReplayReviewer`（都在 `src/training/replay_analyzer.h`），每完成一手 `send_message(session, analyze_progress)`，最后发一帧 `analyze_result`；
      - 玩家正在思考（`ai_thinking()`）时**直接拒绝**，回一帧 `error` 说明「AI 正在思考，复盘会偷走它的时钟」，不排队。
-   - 线程安全：`WebSocketSession::send` 内部走 `net::post`（`server.cpp:352-370`），**后台线程可以直接调**；但 socket 关闭后不能再写，所以要么在 `clear_game_callbacks`（`:1660`）里 join/置停，要么用 `weak_ptr` ＋ `expired()` 检查。
+   - 线程安全：`WebSocketSession::send` 内部走 `net::post`（`server.cpp:344-362`），**后台线程可以直接调**；但 socket 关闭后不能再写，所以要么在 `clear_game_callbacks`（`:1709`）里 join/置停，要么用 `weak_ptr` ＋ `expired()` 检查。
 
 2. **协议（帧形状）**
 
@@ -137,9 +137,9 @@ git push origin master                # 然后核对 git log --oneline -1 origin
 
 1. **`drawEvalGraph` 的几何一位都不能动**：`limit = 2000`、`x = width * (i + 0.5) / n`、`y = height / 2 - (clamped / limit) * (height / 2 - 6)`、`|score| >= 99999` 才画点。`tests/web_frontend_check.js` 有两条用例逐点校验（约 `:1138-1195` 与 `:1679-1721`）。**加标记只能新增绘制**。
 2. 前端测试桩**没有 `clientWidth/clientHeight`**，走 `200×64` 回退分支；新画的任何东西都要能在回退尺寸下算出来。
-3. `resumeApplied` 为真时不会自动进回放视角（`app.js:739-742`），面板要「开局即复盘」就必须显式调 `showReplayMove(0)`。
+3. `resumeApplied` 为真时不会自动进回放视角（`app.js:813-814`），面板要「开局即复盘」就必须显式调 `showReplayMove(0)`。
 4. `web_frontend_check.js` 的 105 项**全是行为断言**（元素桩属性、实际发出的帧、canvas 调用坐标），不是源码字符串匹配。新用例**只许追加到文件末尾**，并且不要依赖用例之间的全局元素状态（元素桩是单例，需要先显式清空，参考 `:3733-3735` 的注释）。
-5. `tt_hits` 服务端已经下发（`server.cpp:1068`）但前端丢弃了，做面板时可以直接消费，**不需要改协议**。
+5. `tt_hits` 服务端已经下发（`server.cpp:1081`）但前端丢弃了，做面板时可以直接消费，**不需要改协议**。
 6. 不要为复盘新开端口。仓库有过一次压测把临时端口池打满导致机器硬重启的记录（`docs/PROMPT_STRESS_TEST.md`）。
 
 **验收**
@@ -191,7 +191,7 @@ git push origin master                # 然后核对 git log --oneline -1 origin
 
 **注意**
 
-- `position_term` / `edge_penalty_term` 是 `Evaluator` 的 **private** 成员函数（`evaluator.h:117-118`）。仓库既有先例是用 `#define private public` 在测试 TU 里打开（`tests/test_search.cpp` 就这么做），工具里也可以，但**只能在工具/测试里用**，不要污染 `src/`。
+- `position_term` / `edge_penalty_term` 是 `Evaluator` 的 **private** 成员函数（`evaluator.h:174-175`）。仓库既有先例是用 `#define private public` 在测试 TU 里打开（`tests/test_search.cpp` 就这么做），工具里也可以，但**只能在工具/测试里用**，不要污染 `src/`。
 - 这一项**不改任何生产代码**，它只是把已有的实现钉住。所以它不会让任何读数变好——它的价值是「以后改评估器时有一张表能比对」。
 - 输出文件放 `data/diff/`，不要让 `build` 每次生成（会污染工作区）；用命令行参数指定输出路径。
 
@@ -216,7 +216,7 @@ git push origin master                # 然后核对 git log --oneline -1 origin
 
 **注意**
 
-- 这些读数来自 `REVIEW_LOG` 轮次137–141，**搜索前必须 `set_max_nodes` ＋ 给一个不 binding 的时限**。`time_limit_ms = 0` 会被 `search_engine.cpp:256-260` 兜到 100 ms，层切割点跟着机器忙闲走，读数就不可比了（轮次121 B5 踩过）。
+- 这些读数来自 `REVIEW_LOG` 轮次137–141，**搜索前必须 `set_max_nodes` ＋ 给一个不 binding 的时限**。`time_limit_ms = 0` 会被 `search_engine.cpp:297-300` 兜到 100 ms，层切割点跟着机器忙闲走，读数就不可比了（轮次121 B5 踩过）。
 - `test_pinned` 要加进 `CMakeLists.txt` 末尾那个 `foreach(... -UNDEBUG)` 列表，否则 Release 构建下 `assert` 会被编译掉。
 
 **验收**
@@ -246,7 +246,7 @@ git push origin master                # 然后核对 git log --oneline -1 origin
 
 **注意**
 
-- **命中必须返回 `±(100000 + dist)`**，不能返回 `±100000`：`search_engine.cpp:349` 的认输判定与 `transposition.h:98` 的距离还原都依赖这个约定。
+- **命中必须返回 `±(100000 + dist)`**，不能返回 `±100000`：`search_engine.cpp:432-433` 的认输判定与 `transposition.h:99-101` 的距离还原都依赖这个约定。
 - **任何一臂出现着法或分值变化 → 立即回滚**。证明表的语义是「同一个答案换一条路径」，出现新答案就是 bug，不是收益。
 - `ProofTable` 每会话一张，跟着 `SearchEngine` 走；训练侧每 worker 一张（与 TT 同生命周期）。
 - 这张表**不进 `SearchResult`、不进帧**。
@@ -261,15 +261,15 @@ git push origin master                # 然后核对 git log --oneline -1 origin
 
 ### 丙-2 O2：`BoardValueCache`（**文档原文写错了，按这里做**）
 
-**状态**：未做。**注意：`ENGINE_REDESIGN_V2.md` §2.2 O2 的前提是错的**——它说「`pattern_score` 对每颗已占子调用」，实际 `pattern_score` 是对**空候选格**调的（`evaluator.cpp:279/289`），已占子只进 `position_term` / `edge_penalty_term`（`:208-233`，那里不调 `pattern_score`）。所以「已占子键缓存」打不到那 20.85 %。**轮次153 实测：这一半已经在树里**——`CandidateCache::board_score`（§2.6 Step 2/3，轮次122-123）就是这份每格棋盘和价缓存，键是四条线字、失效判据是线字键比对，命中由 `test_search` 的 C2-4 钉着（quiet BLACK d6：8,755,599 probes／4,949,934 命中 = 56.5 %）；状态应为**已做**，本轮交的是点名而树里缺的两张验收（18,900 组逐格差分 ＋ cap 不进缓存）。
+**状态**：未做。**注意：`ENGINE_REDESIGN_V2.md` §2.2 O2 的前提是错的**——它说「`pattern_score` 对每颗已占子调用」，实际 `pattern_score` 是对**空候选格**调的（`evaluator.cpp:193` 与 `:267/:270`），已占子只进 `position_term` / `edge_penalty_term`（`:224-248`，那里不调 `pattern_score`）。所以「已占子键缓存」打不到那 20.85 %。**轮次153 实测：这一半已经在树里**——`CandidateCache::board_score`（§2.6 Step 2/3，轮次122-123）就是这份每格棋盘和价缓存，键是四条线字、失效判据是线字键比对，命中由 `test_search` 的 C2-4 钉着（quiet BLACK d6：8,755,599 probes／4,949,934 命中 = 56.5 %）；状态应为**已做**，本轮交的是点名而树里缺的两张验收（18,900 组逐格差分 ＋ cap 不进缓存）。
 
 **目标效果**：把 `evaluate_board` 里每个空候选格的**棋盘和价**（`board_pair_value`）缓存起来，键不变就复用，把 20.85 % 的 `pattern_score` 大部分省掉。
 
 **实现思路**
 
-1. 照 `CandidateCache` 的形状（`src/search/search_state.h:226-350`）：每格一份记录，键是**四族线字**（`uint64_t key[4]`，黑白各 32 位拼成一个字，见 `line_key` `:339-345`）＋ `valid`。
+1. 照 `CandidateCache` 的形状（`src/search/search_state.h:226-350`）：每格一份记录，键是**四族线字**（`uint64_t key[4]`，黑白各 32 位拼成一个字，见 `line_key` `:341-350`）＋ `valid`。
 2. 缓存的是 `board_pair_value(my_pattern, opp_pattern, row, col, black_is_mine)` 的返回值——**注意它与 `candidate_pair_value` 是两个数**：前者不含中心权重、含禁手判定、会被 cap；后者是排序价。
-3. `evaluate_board`（`evaluator.cpp:276-293`）改成读穿缓存：键相同用旧值，键不同重算并更新。
+3. `evaluate_board`（`evaluator.cpp:304-319`）改成读穿缓存：键相同用旧值，键不同重算并更新。
 4. 缓存挂在 `SearchContext` / `SearchState` 上，**跟着一次思考生死**，不要放进 `Board`。
 
 **注意**
@@ -347,7 +347,7 @@ git push origin master                # 然后核对 git log --oneline -1 origin
 
 **实现思路**
 
-1. 改 `Trainer::measure_fitness`（`trainer.cpp:38-49`）：现在它返回 `play_match(...)` 的胜负对分数；改成「胜负对 × (1-w) ＋ 连续分量 × w」。
+1. 改 `Trainer::measure_fitness`（`trainer.cpp:41-57`）：现在它返回 `play_match(...)` 的胜负对分数；改成「胜负对 × (1-w) ＋ 连续分量 × w」。
 2. 三个分量全部从**现有产物**取，不加新基础设施：
    - 终局静态分差：终局局面 `Evaluator::evaluate_board` 的两色差，归一化到 [0,1]；
    - 先成五一方用了多少手：`GameRecord::moves.size()` 归一化；
@@ -376,15 +376,15 @@ git push origin master                # 然后核对 git log --oneline -1 origin
 **实现思路**
 
 1. `src/training/game_record.h` 的 `MoveRecord` 加 `Move teacher_move` / `int teacher_depth` / `int teacher_score`（只增字段，放在 `tt_hits` 之后），`game_record.cpp` 的 `to_json` / `from_json` 各加三个可选键（旧记录读回为空 = 没有老师）。
-2. `SelfPlayConfig` 加 `teacher_depth` / `teacher_max_nodes`（0 = 关）；`SelfPlay::run` 在 `engine.search`（`self_play.cpp:76`）之后、`place_stone`（`:115`）之前，用**独立引擎 ＋ 独立 TT** 再搜一次，写进 `entry.teacher_*`。
-3. `DataCollector::collect`（`data_collector.cpp:155-166`）把 `entry.teacher_move` 搬进 `sample.teacher_move`，`teacher_source = "distill"`。
+2. `SelfPlayConfig` 加 `teacher_depth` / `teacher_max_nodes`（0 = 关）；`SelfPlay::run` 在 `engine.search`（`self_play.cpp:79`）之后、`place_stone`（`:139`）之前，用**独立引擎 ＋ 独立 TT** 再搜一次，写进 `entry.teacher_*`。
+3. `DataCollector::collect`（`data_collector.cpp:171-179`）把 `entry.teacher_move` 搬进 `sample.teacher_move`，`teacher_source = "distill"`。
 
 **注意**
 
-1. **教师必须用独立 TT**。worker 与 `shared_tt_` 共用一张表（`trainer.cpp:292`），教师若在同一张表上写 d6 条目，随后的 d4 搜索会直接切在 d6 条目上，`entry.depth` 与 `search_depth` 失真，样本口径被污染。
+1. **教师必须用独立 TT**。worker 与 `shared_tt_` 共用一张表（`trainer.cpp:388`），教师若在同一张表上写 d6 条目，随后的 d4 搜索会直接切在 d6 条目上，`entry.depth` 与 `search_depth` 失真，样本口径被污染。
 2. **教师必须在落子前搜**，否则局面已变。
-3. **vcf/vct/must_block 不回填 `depth`**（`search_engine.cpp:179/225-250`），教师深度要显式记 `config.teacher_depth`，不要指望 `result.depth`。
-4. **顺手修一个 bug**：`RetryExplorer::reset()`（`self_play.cpp:163-168`）会清掉 `set_start_line` 设的开局（`trainer.cpp:302` 只设一次），所以重试那一局是从空盘开始的。改成保留 start line。
+3. **vcf/vct/must_block 不回填 `depth`**（`search_engine.cpp:205/:258/:283` 三处 return 都不写 `result.depth`），教师深度要显式记 `config.teacher_depth`，不要指望 `result.depth`。
+4. **顺手修一个 bug**：`RetryExplorer::reset()`（`self_play.cpp:190-198`）会清掉 `set_start_line` 设的开局（`trainer.cpp:414` 只设一次），所以重试那一局是从空盘开始的。改成保留 start line。
 
 **验收**
 
@@ -423,7 +423,7 @@ git push origin master                # 然后核对 git log --oneline -1 origin
 **验收**
 
 - **等价臂先行**：`pair.black == pair.white` 时，整棵树的着法/分值/节点数与今天**逐字节相同**。
-- `eval(W) == -eval(B)` 在 42 副棋盘 × 225 格上成立（`tests/test_evaluator.cpp:549-554` 那条断言的加强版）。
+- `eval(W) == -eval(B)` 在 42 副棋盘 × 225 格上成立（`tests/test_evaluator.cpp:542-570` 那条断言的加强版）。
 - 旧参数文件 / 旧 checkpoint 能读进来，读成两侧同值。
 - **预期红灯（落地时已逐条改，未删一条断言）**：变红的是 `tests/test_evaluator.cpp` 的三个辅助函数与两处用例——`naive_board_total` 与 `black_forbidden_candidates` 改成按色调 `pattern_score` / `get_position_weight`，`clamp_board_diff` 的帽取两侧 `five` 的较小者，`test_evaluate_board_never_judges_white` 与 `test_edge_penalty_below_rush_four` 里共五处补上颜色实参。（旧版这里列的是改之前那份文件里的行号区间，行号随新用例漂移，改为按**函数名**指认。）
 
@@ -458,7 +458,7 @@ git push origin master                # 然后核对 git log --oneline -1 origin
 
 ### 丁-5 S1：开局规则参数化（swap / soosyrv）
 
-**状态**：轮次160 实测判**不落地**，机制一行未写（不加 `opening_rule` 字段、不发 `choose_swap` 帧、不动 `GameManager`）；**验收仪器进了树**：`tools/opening_rule_screen.cpp` + `CMakeLists.txt:352-369` 的目标 `opening_rule_screen`（追加在文件末尾，不去动上面被按行号指认的那些目标行）。四臂实测（48 条三面开局、异强度 24 条，depth 4、节点帽 1500/手）：`none`/同系数 座位通吃 **47/48 = 97.9 %**、玩家通吃 0 %；`swap`/同系数 **同样是 47/48 = 97.9 %**、要求交换 48/48、**两局判决不同 = 0**；异强度那一组 `none` 与 `swap` 也都是 18/24 座位通吃 + 6/24 玩家通吃。⇒ 杀线「`swap` 下仍 > 60 % 一方通吃」命中，而且与对照组**逐字相同**：交换判决只是局面的函数，而换色对本来就把同一局面在两色各下一遍，所以交换只换「谁拿好座位」，换不动整对局分的分布。文档「同一套系数下跑 48 条开局」这台仪器因此量不到它自己要证明的东西——要量的是**开局本身一面倒**，那是 S2（丁-6）：起跑线 97.9 %／75.0 %，验收要把筛后的集合压到 1/3 以下。另：`Trainer::random_opening_line` 的第 1 手本来钉在天元（`trainer.cpp:269`），所以 `soosyrv` 与 `swap` 在这一档是同一支，不必单独加臂。读数与复现命令见 REVIEW_LOG 轮次160。
+**状态**：轮次160 实测判**不落地**，机制一行未写（不加 `opening_rule` 字段、不发 `choose_swap` 帧、不动 `GameManager`）；**验收仪器进了树**：`tools/opening_rule_screen.cpp` + `CMakeLists.txt:352-369` 的目标 `opening_rule_screen`（追加在文件末尾，不去动上面被按行号指认的那些目标行）。四臂实测（48 条三面开局、异强度 24 条，depth 4、节点帽 1500/手）：`none`/同系数 座位通吃 **47/48 = 97.9 %**、玩家通吃 0 %；`swap`/同系数 **同样是 47/48 = 97.9 %**、要求交换 48/48、**两局判决不同 = 0**；异强度那一组 `none` 与 `swap` 也都是 18/24 座位通吃 + 6/24 玩家通吃。⇒ 杀线「`swap` 下仍 > 60 % 一方通吃」命中，而且与对照组**逐字相同**：交换判决只是局面的函数，而换色对本来就把同一局面在两色各下一遍，所以交换只换「谁拿好座位」，换不动整对局分的分布。文档「同一套系数下跑 48 条开局」这台仪器因此量不到它自己要证明的东西——要量的是**开局本身一面倒**，那是 S2（丁-6）：起跑线 97.9 %／75.0 %，验收要把筛后的集合压到 1/3 以下。另：`Trainer::random_opening_line` 的第 1 手本来钉在天元（`trainer.cpp:268`），所以 `soosyrv` 与 `swap` 在这一档是同一支，不必单独加臂。读数与复现命令见 REVIEW_LOG 轮次160。
 
 **目标效果**：`--opening-rule none|swap|soosyrv`，默认 `none`（与今天一致）。让先手优势有**规则级**补偿，而不是靠搜索补偿。
 
@@ -508,7 +508,7 @@ git push origin master                # 然后核对 git log --oneline -1 origin
 
 ### 戊-1 H：进程模型（`gomoku_broker` ＋ `gomoku_train --worker`）
 
-**状态**：**两段都落地了**——第一段（轮次163）= 成本仪器 + 吞吐实测 + IPC 核心（`tools/worker_nps_probe.cpp`、`src/training/run_spool.h/.cpp`）；第二段（轮次164）= `src/training/worker_mode.h/.cpp`（`gomoku_train --worker <task>`：自绑核 → 走**同一条**数据采集路 → 每行原样装进 spool 信封 → 落完成标记；带 `control_socket` 时每 200 ms 往那条 UDS 发一行心跳，连不上就当场拒活）、`tools/broker_main.cpp` → `gomoku_broker`（配额 `workers = max(1, 在线 CPU − reserved_cores)`，缺省 `reserved_cores` 按实测取 **3**；`posix_spawn` + `SETSID` 派活；一个 attempt **收尸之后**才判账——标记在、整份读干净、且行数与标记自己声明的条数逐条对上，才算入账，否则整批作废重排；看门：退出码非 0 / 没有标记 / 心跳超 5 s；控制面只有那条 UDS，`pause`/`resume`/`stop`/`quota`/`status`/`beat`，认下的回 ack、认不出的点名 reject；不新开 TCP）、`tools/think_latency_probe.cpp`（四档 think 墙钟）。**吞吐（42 副普查棋盘、depth 4、节点帽 20000，各行 `nodes`/`checksum` 逐字相同）**：单进程 16,395–21,914 nps，**2 份绑核 100.5/97.9 %、3 份 96.2/94.6/95.9 %、4 份 87.9/87.0/88.6 %**，4 份不绑核 89.0/88.8/89.2 %、缩表到 512 条仍 88.2 % ⇒ 掉的那 11 % 是这台 6 核虚机的共享物理核，不是绑核没生效也不是 cache；验收第 1 条于 ≤3 worker 达到、于 4 worker 达不到，故缺省配额取 3，§4.4 那句「超过说明绑核没生效」被控制臂证伪。**三档 think（验收第 3 条，`--pin 1` 把 think 钉在 reserved 之前、worker 只拿 3/4/5）**：饱和档（depth 6 / 1200 ms）全停 p50 1121.6 / p99 1204.0 ms，全训 1063.0/1203.7，半训 1023.8/1206.7，边下边训 1117.1/1205.4 ⇒ **p99 比 100.1 %**；把时间帽抬到 20 s 让分布不饱和再测一遍：全停 2323.9/10963.8，全训 2381.6/11689.7（106.6 %），半训 2403.7/11292.1（103.0 %），边下边训 2379.0/11089.3 ⇒ **101.1 %**，判据（≤ 120 %）两档都成立，绑核生效。**两个缺陷在本轮登记并已修**：(a) 判账时机——早先按目录扫完成标记，会在 worker 还活着时把它正在写的 spool 读成「截断」，于是把一个还在飞的 attempt 判脏、删标记、重排，同一个 seq 双跑（B2 臂抓到，表现为 `requeued=2` 与一次多余的 attempt）；现在只有收尸之后才判，且新增「标记声明的条数 == 数到的行数」这条正面账。(b) `accept4(…, SOCK_NONBLOCK)` 的 flag 只作用于返回的**新** socket，监听 socket 自身还阻塞的话第一次 accept 就把主循环卡在「等第一个连接」上（第一次冒烟一个任务文件都没写出去，进程睡在 socket 等待里）。**验收第 2 条 = 七条进程臂**（worker 与线程模式逐字等价、失败不留标记、`SIGKILL` 后账对齐、半行判脏整批作废、心跳超时被看门杀、让位是任务粒度且 `pause` 不是退出、心跳字节形状与连不上就拒活）。**仍未交**：Windows 那半（`CreateProcess` + Job Object + `SetProcessAffinityMask`）按 §4.2 的杀线取「POSIX-only ＋ Windows 保持线程模式」，worker 侧对绑核与心跳两条都**显式拒绝**而不是写一份没有仪器覆盖的回退；思路 1 那句「轮末跑 `BalanceController`」仍然落空（丁-4 判不落地，树里没有这个类），broker 因此不做轮末平衡步骤；线程模式仍然在原处（`trainer.cpp:274-333`）作为没有 broker 时的缺省路径。
+**状态**：**两段都落地了**——第一段（轮次163）= 成本仪器 + 吞吐实测 + IPC 核心（`tools/worker_nps_probe.cpp`、`src/training/run_spool.h/.cpp`）；第二段（轮次164）= `src/training/worker_mode.h/.cpp`（`gomoku_train --worker <task>`：自绑核 → 走**同一条**数据采集路 → 每行原样装进 spool 信封 → 落完成标记；带 `control_socket` 时每 200 ms 往那条 UDS 发一行心跳，连不上就当场拒活）、`tools/broker_main.cpp` → `gomoku_broker`（配额 `workers = max(1, 在线 CPU − reserved_cores)`，缺省 `reserved_cores` 按实测取 **3**；`posix_spawn` + `SETSID` 派活；一个 attempt **收尸之后**才判账——标记在、整份读干净、且行数与标记自己声明的条数逐条对上，才算入账，否则整批作废重排；看门：退出码非 0 / 没有标记 / 心跳超 5 s；控制面只有那条 UDS，`pause`/`resume`/`stop`/`quota`/`status`/`beat`，认下的回 ack、认不出的点名 reject；不新开 TCP）、`tools/think_latency_probe.cpp`（四档 think 墙钟）。**吞吐（42 副普查棋盘、depth 4、节点帽 20000，各行 `nodes`/`checksum` 逐字相同）**：单进程 16,395–21,914 nps，**2 份绑核 100.5/97.9 %、3 份 96.2/94.6/95.9 %、4 份 87.9/87.0/88.6 %**，4 份不绑核 89.0/88.8/89.2 %、缩表到 512 条仍 88.2 % ⇒ 掉的那 11 % 是这台 6 核虚机的共享物理核，不是绑核没生效也不是 cache；验收第 1 条于 ≤3 worker 达到、于 4 worker 达不到，故缺省配额取 3，§4.4 那句「超过说明绑核没生效」被控制臂证伪。**三档 think（验收第 3 条，`--pin 1` 把 think 钉在 reserved 之前、worker 只拿 3/4/5）**：饱和档（depth 6 / 1200 ms）全停 p50 1121.6 / p99 1204.0 ms，全训 1063.0/1203.7，半训 1023.8/1206.7，边下边训 1117.1/1205.4 ⇒ **p99 比 100.1 %**；把时间帽抬到 20 s 让分布不饱和再测一遍：全停 2323.9/10963.8，全训 2381.6/11689.7（106.6 %），半训 2403.7/11292.1（103.0 %），边下边训 2379.0/11089.3 ⇒ **101.1 %**，判据（≤ 120 %）两档都成立，绑核生效。**两个缺陷在本轮登记并已修**：(a) 判账时机——早先按目录扫完成标记，会在 worker 还活着时把它正在写的 spool 读成「截断」，于是把一个还在飞的 attempt 判脏、删标记、重排，同一个 seq 双跑（B2 臂抓到，表现为 `requeued=2` 与一次多余的 attempt）；现在只有收尸之后才判，且新增「标记声明的条数 == 数到的行数」这条正面账。(b) `accept4(…, SOCK_NONBLOCK)` 的 flag 只作用于返回的**新** socket，监听 socket 自身还阻塞的话第一次 accept 就把主循环卡在「等第一个连接」上（第一次冒烟一个任务文件都没写出去，进程睡在 socket 等待里）。**验收第 2 条 = 七条进程臂**（worker 与线程模式逐字等价、失败不留标记、`SIGKILL` 后账对齐、半行判脏整批作废、心跳超时被看门杀、让位是任务粒度且 `pause` 不是退出、心跳字节形状与连不上就拒活）。**仍未交**：Windows 那半（`CreateProcess` + Job Object + `SetProcessAffinityMask`）按 §4.2 的杀线取「POSIX-only ＋ Windows 保持线程模式」，worker 侧对绑核与心跳两条都**显式拒绝**而不是写一份没有仪器覆盖的回退；思路 1 那句「轮末跑 `BalanceController`」仍然落空（丁-4 判不落地，树里没有这个类），broker 因此不做轮末平衡步骤；线程模式仍然在原处（`trainer.cpp:312-478`）作为没有 broker 时的缺省路径。
 
 **目标效果**：supervisor 进程（broker）派活给 N 个 worker 进程，每个 worker 绑一个物理核；玩家下棋时 worker 让位；崩溃只死一个任务。
 
@@ -538,7 +538,7 @@ git push origin master                # 然后核对 git log --oneline -1 origin
 
 ### 戊-2 I：参数单一真源 ＋ 网页控制面 ＋ 预览
 
-**状态**：**已落地**（轮次165）。单一真源是 `src/server/param_schema.{h,cpp}` 的 `ParamSpec`（十二字段，指导书 §4 戊-2 思路 1 列的 12 项全在）＋ `ParamRegistry`（十条：`max_depth` / `timeout_ms` / `soft_time_ms` / `max_nodes` / `ponder_percent` / `analyze_depth` / `analyze_budget` / `analyze_max_candidates` / `reserved_cores` / `shared_tt_bits`）——**注册的是「代码真的读的那一行」**，`docs/ENGINE_REDESIGN_V2.md` §5 表里那些「代码里没读」的行（训练配额、日志级别…）不进注册表而是登记成文档漂移。三条帧 `config_schema` / `config_set` / `config_preview` 都从 `handle_config_frame`（`server.cpp:751` 那一行分派）走，`:941-944` 与 `:1626-1634` 两处被 `test_server` 按行号指认，所以本轮不动那些行号；范围越界**不截断**、要点名（`reject["why"]` 里带 `[2, 20]` 这一份区间），`restart` 那一档直接拒收（面板据此把它禁用），`unknown key` 报「代码里没有这条参数」而不是混报成越界（`test_config_set_refuses_out_of_range_without_touching_the_session`）。三类 `when_live` 都在清单里出现：`live` = {`timeout_ms`, `soft_time_ms`, `analyze_depth`, `analyze_budget`, `analyze_max_candidates`}、`next_think` = {`max_depth`, `max_nodes`}、`restart` = {`ponder_percent`, `reserved_cores`, `shared_tt_bits`}。预览跑 5 臂（`quiet × {黑,白}`、`scattered × {黑,白}`、`pos24 × 黑`，`src/server/preview_arms.h`），pos24 与 `tests/pinned_positions.h::pinned_pos24()` **逐子比对**（`test_preview_arms_are_the_pinned_poses`）——生产码不引测试头（那等于把夹具链进服务端），两份定义靠这条断言钉住；预览在 `game->is_ai_thinking()` 时拒收而不是排队，且**不改任何状态**（同一份参数两次预览校验和/节点/每臂深度·着法·分数逐字相同 —— `test_config_preview_is_repeatable_and_commits_nothing`；针臂按节点定价，所以时间不参与，与 §9.2 一致）。前端：`web/index.html:83,86` 的 `#depth`/`#timeout` **不再自带 min/max/step**，`app.js:applyParamSchema` 每次连新会话从服务端 `config_schema` 拉一次并驱动 `syncTimeoutBounds`；面板上「改参」/「预览」两条按钮各发一帧 `config_set`/`config_preview`，`handleConfigAck`/`handleConfigReject`/`handleConfigPreview` 都写到状态行；`web_frontend_check.js` 两条新臂把「面板由 schema 渲染」和「`app.js` 不含硬编码」钉住。**杀线**：「注册表缺省 ≠ 服务端此刻真正在用的那个数」——由 `test_config_schema_carries_the_fields_the_panel_needs` 直接查 `h.entry->game->max_depth() == depth->default_value` 与 `analyze_depth_default_ == ParamRegistry::find("analyze_depth")->default_value`，漂了就 rc=134。**变异矩阵六臂**（N1 关范围查 / N2 关 restart 拒收 / N3 schema 少一个字段 / N4 关思考中不预览 / N5 预览帽钉死 / N6 应用不 ack）全部 rc=134。**遗留登记三条**：(a) `solve_rate@8k`（指导书 §553 明列的一栏）本轮没跑，因为每条臂要额外一次定 8k 预算搜索（五臂 × 每次预览翻一倍），且这个字段本身在指导书里也标「参考」；(b) 预览**同步跑在 io 线程**上：节点帽 20k / 墙 5 min ⇒ 单条预览最坏 ~30 s（生产），会把同 `io_context` 里其他会话冻在这个窗口内 —— 与复盘那条 `analyze_thread` 相比是显式取舍，本轮按「先能改、能拒、能重放」这条主路先交，并线在 §4 戊-3 之后再补；(c) `docs/ENGINE_REDESIGN_V2.md` §5 列了但代码没读的字段（训练配额、日志级别…）不进注册表，作为**文档漂移**记在指导书 §7 而不是假装存在。旧 `set_config`（`app.js:646-651`）保留在原地，只是不再被面板调用，方便老前端仍然可用。
+**状态**：**已落地**（轮次165）。单一真源是 `src/server/param_schema.{h,cpp}` 的 `ParamSpec`（十二字段，指导书 §4 戊-2 思路 1 列的 12 项全在）＋ `ParamRegistry`（十条：`max_depth` / `timeout_ms` / `soft_time_ms` / `max_nodes` / `ponder_percent` / `analyze_depth` / `analyze_budget` / `analyze_max_candidates` / `reserved_cores` / `shared_tt_bits`）——**注册的是「代码真的读的那一行」**，`docs/ENGINE_REDESIGN_V2.md` §5 表里那些「代码里没读」的行（训练配额、日志级别…）不进注册表而是登记成文档漂移。三条帧 `config_schema` / `config_set` / `config_preview` 都从 `handle_config_frame`（`server.cpp:738` 那一行分派）走，`:992` 与 `:1799-1800` 两处被 `test_server` 按行号指认，所以本轮不动那些行号；范围越界**不截断**、要点名（`reject["why"]` 里带 `[2, 20]` 这一份区间），`restart` 那一档直接拒收（面板据此把它禁用），`unknown key` 报「代码里没有这条参数」而不是混报成越界（`test_config_set_refuses_out_of_range_without_touching_the_session`）。三类 `when_live` 都在清单里出现：`live` = {`timeout_ms`, `soft_time_ms`, `analyze_depth`, `analyze_budget`, `analyze_max_candidates`}、`next_think` = {`max_depth`, `max_nodes`}、`restart` = {`ponder_percent`, `reserved_cores`, `shared_tt_bits`}。预览跑 5 臂（`quiet × {黑,白}`、`scattered × {黑,白}`、`pos24 × 黑`，`src/server/preview_arms.h`），pos24 与 `tests/pinned_positions.h::pinned_pos24()` **逐子比对**（`test_preview_arms_are_the_pinned_poses`）——生产码不引测试头（那等于把夹具链进服务端），两份定义靠这条断言钉住；预览在 `game->is_ai_thinking()` 时拒收而不是排队，且**不改任何状态**（同一份参数两次预览校验和/节点/每臂深度·着法·分数逐字相同 —— `test_config_preview_is_repeatable_and_commits_nothing`；针臂按节点定价，所以时间不参与，与 §9.2 一致）。前端：`web/index.html:83,86` 的 `#depth`/`#timeout` **不再自带 min/max/step**，`app.js:applyParamSchema` 每次连新会话从服务端 `config_schema` 拉一次并驱动 `syncTimeoutBounds`；面板上「改参」/「预览」两条按钮各发一帧 `config_set`/`config_preview`，`handleConfigAck`/`handleConfigReject`/`handleConfigPreview` 都写到状态行；`web_frontend_check.js` 两条新臂把「面板由 schema 渲染」和「`app.js` 不含硬编码」钉住。**杀线**：「注册表缺省 ≠ 服务端此刻真正在用的那个数」——由 `test_config_schema_carries_the_fields_the_panel_needs` 直接查 `h.entry->game->max_depth() == depth->default_value` 与 `analyze_depth_default_ == ParamRegistry::find("analyze_depth")->default_value`，漂了就 rc=134。**变异矩阵六臂**（N1 关范围查 / N2 关 restart 拒收 / N3 schema 少一个字段 / N4 关思考中不预览 / N5 预览帽钉死 / N6 应用不 ack）全部 rc=134。**遗留登记三条**：(a) `solve_rate@8k`（指导书 §553 明列的一栏）本轮没跑，因为每条臂要额外一次定 8k 预算搜索（五臂 × 每次预览翻一倍），且这个字段本身在指导书里也标「参考」；(b) 预览**同步跑在 io 线程**上：节点帽 20k / 墙 5 min ⇒ 单条预览最坏 ~30 s（生产），会把同 `io_context` 里其他会话冻在这个窗口内 —— 与复盘那条 `analyze_thread` 相比是显式取舍，本轮按「先能改、能拒、能重放」这条主路先交，并线在 §4 戊-3 之后再补；(c) `docs/ENGINE_REDESIGN_V2.md` §5 列了但代码没读的字段（训练配额、日志级别…）不进注册表，作为**文档漂移**记在指导书 §7 而不是假装存在。旧 `set_config`（`app.js:661-666`）保留在原地，只是不再被面板调用，方便老前端仍然可用。
 
 **目标效果**：一份 `ParamSpec` 定义同时喂服务端、训练器、前端；前端零硬编码；面板能改、能预览、能解释。
 
@@ -700,7 +700,7 @@ git push origin master && git log --oneline -1 origin/master
 | 乙-2 | 期望值怎么来 | 硬编码读数（来自 `REVIEW_LOG`） | 透明、可 review、变了一眼看得出 | 臂数 > 50 时才考虑 golden 文件 |
 | 丙-1 | 证明存哪 | **独立 `ProofTable`**，不写进 TT | TT 的替换是 depth 优先、且每批 `clear()`——证明会被淘汰；证明必须比一次思考活得久 | 不换。若坚持写 TT，等于让「已证明」和「搜得深」抢同一个槽 |
 | 丙-1 | `UNKNOWN` 存不存 | **不存** | 「没证明」不是信息；存了就是把未证明当证明用 | 不换 |
-| 丙-1 | 命中返回什么 | `±(100000 + dist)` | 认输判定（`search_engine.cpp:349`）与 TT 距离还原都依赖这个约定 | 不换 |
+| 丙-1 | 命中返回什么 | `±(100000 + dist)` | 认输判定（`search_engine.cpp:432-433`）与 TT 距离还原都依赖这个约定 | 不换 |
 | 丙-2 | 缓存挂哪 | `SearchState`（跟一次思考生死） | `Board` 要可复制、要能跨思考复用，挂上去会带来失效地狱 | 不换 |
 | 丙-2 | 键用什么 | 四 `uint64` 线字 | 「±2 邻域」会漏：实测 (7,7) 会因 (7,12) 落子而变（轮次122） | 不换。键成本 > 收益时是**作废**，不是换键 |
 | 丙-3 | 威胁等级从哪来 | 复用 `MoveGenerator` 已有的一次 `recognize` | 那里已经为分 Tier 扫过一遍，再算就是第三次 | 不换。轮次154 补：布尔量**给得出**（等级 = 行棋方四方向 `PatternType` 最大档），分辨率**给不够**（每份被截的 tier 只有 3.6-4.0 档，宽度却要留 8-16 个），所以不存在「再写细一点」的第二方案 |

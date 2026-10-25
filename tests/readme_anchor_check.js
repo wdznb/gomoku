@@ -7,9 +7,16 @@
 //      on the lines it cites - printed as hints for a reader, never as a verdict;
 //   3. is the `replay` frame method enum written at README:529-531 (the paragraph
 //      this script reads, so the number here is deliberately hardcoded) the same
-//      set of labels the code can actually put into that frame.
-// Exit 1 on an out-of-range citation, a citation onto a blank line, or a documented
-// engine path that no source file emits.
+//      set of labels the code can actually put into that frame;
+//   4. the same completeness question for every `file.ext:NNN` citation of a source
+//      line - README.md, the two live design docs and every comment under src/,
+//      tests/, tools/ and web/ - resolved by path, else by unique basename. Those
+//      numbers are counted on the tree as checked in; docs/ENGINE_REDESIGN.md and
+//      REVIEW_LOG.md are read-only history and keep the numbers they were written
+//      with, so neither is scanned as a citer.
+// Exit 1 on an out-of-range citation, a citation onto a blank line, a citation that
+// resolves to no file or to more than one, or a documented engine path that no
+// source file emits.
 'use strict';
 
 const fs = require('fs');
@@ -158,6 +165,126 @@ console.log(`assigned but not in the list: ${undocumented.join(', ') || 'none'}`
 console.log(`in the list but never assigned: ${unemitted.join(', ') || 'none'}`);
 console.log(`fast paths the sentence calls 后三条: ${documented.slice(-3).join(', ')}`);
 for (const t of unemitted) problems.push(`README lists ${t} but src/search/search_engine.cpp never assigns it`);
+
+// ---- Source-line citations ------------------------------------------------
+// Round 194: `file.ext:NNN` and `file.ext:NNN-NNN` appear in the docs, in headers and
+// in test comments, and nothing used to check them - eleven deleted lines in
+// server.cpp were enough to make every later server.cpp number in the tree wrong.
+// A citation resolves against the repo root first; a bare basename is accepted only
+// when exactly one file in the tree carries it. Line numbers are counted on the files
+// as checked in, with the final trailing newline not counted as a line.
+const CITER_DIRS = ['src', 'tests', 'tools', 'web'];
+const CITER_DOCS = ['README.md', 'docs/IMPLEMENTATION_GUIDE.md', 'docs/ENGINE_REDESIGN_V2.md'];
+// Read-only history: their numbers were true when written and are line-pinned by
+// tests/test_training.cpp, so they are not re-counted here.
+const HISTORY_DOCS = new Set(['docs/ENGINE_REDESIGN.md', 'REVIEW_LOG.md']);
+const CITABLE_EXT = new Set(['.cpp', '.h', '.js', '.md', '.json', '.sh', '.py', '.txt', '.html', '.css']);
+const SOURCE_CITATION = /([A-Za-z0-9_./-]+\.(?:cpp|h|js|md|json|sh|py|txt|html|css)):(\d+)(?:\s*-\s*(\d+))?/g;
+const SKIP_DIRS = new Set(['.git', 'deps', 'node_modules', '.qoder']);
+
+function walk_all(dir, out) {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        if (entry.isDirectory()) {
+            if (SKIP_DIRS.has(entry.name) || entry.name.startsWith('build')) continue;
+            walk_all(path.join(dir, entry.name), out);
+        } else out.push(path.join(dir, entry.name));
+    }
+    return out;
+}
+
+const repo_files = walk_all(ROOT, []);
+const rel_of = (f) => path.relative(ROOT, f).split(path.sep).join('/');
+const by_basename = new Map();
+for (const f of repo_files) {
+    if (!CITABLE_EXT.has(path.extname(f))) continue;
+    const base = path.basename(f);
+    if (!by_basename.has(base)) by_basename.set(base, []);
+    by_basename.get(base).push(rel_of(f));
+}
+
+const cite_files = [];
+for (const dir of CITER_DIRS) walk(path.join(ROOT, dir), cite_files);
+const cite_set = new Set(cite_files
+    .filter((f) => ['.cpp', '.h', '.js'].includes(path.extname(f)))
+    .map(rel_of));
+for (const d of CITER_DOCS) cite_set.add(d);
+for (const d of HISTORY_DOCS) cite_set.delete(d);
+cite_set.delete(rel_of(self));
+
+const text_of = new Map();
+const target_lines = (rel) => {
+    if (!text_of.has(rel)) {
+        const t = fs.readFileSync(path.join(ROOT, rel), 'utf8').split('\n');
+        if (t.length && t[t.length - 1] === '') t.pop();
+        text_of.set(rel, t);
+    }
+    return text_of.get(rel);
+};
+const source_phrases = (block) => [...new Set([...block.matchAll(/`([^`\n]{2,60})`/g)]
+    .map((m) => norm(m[1])))].filter((p) => /[A-Za-z_]{3,}/.test(p) && !/^[\w./-]+\.(?:cpp|h|js|md|json|sh|py|txt|html|css)/.test(p));
+const needle_of = (p) => p.split('(')[0].split('{')[0].split('[')[0].split(':')[0].trim();
+
+const source_problems = [];
+const source_hints = [];
+let source_total = 0;
+let source_ok = 0;
+for (const rel of [...cite_set].sort()) {
+    const citer = text_of.has(rel) ? text_of.get(rel) : target_lines(rel);
+    const is_doc = rel === 'README.md' || rel.startsWith('docs/');
+    citer.forEach((raw, index) => {
+        for (const match of raw.matchAll(SOURCE_CITATION)) {
+            if (/https?:\/\//.test(raw.slice(Math.max(0, match.index - 12), match.index + match[1].length))) continue;
+            const where = `${rel}:${index + 1}`;
+            const from = Number(match[2]);
+            const to = match[3] ? Number(match[3]) : from;
+            let target = null;
+            const direct = path.join(ROOT, match[1]);
+            if (fs.existsSync(direct) && fs.statSync(direct).isFile()) target = rel_of(direct);
+            else {
+                const list = by_basename.get(path.basename(match[1])) || [];
+                if (list.length > 1) {
+                    source_problems.push(`${where} -> ${match[0]}: ambiguous basename (${list.join(', ')})`);
+                    continue;
+                }
+                if (list.length === 1) target = list[0];
+            }
+            if (target === null) {
+                source_problems.push(`${where} -> ${match[0]}: no such file`);
+                continue;
+            }
+            ++source_total;
+            const lines = target_lines(target);
+            if (from < 1 || to > lines.length || from > to) {
+                source_problems.push(`${where} -> ${match[0]}: range ${from}-${to} outside ${target} (${lines.length} lines)`);
+                continue;
+            }
+            if (lines[from - 1].trim() === '') {
+                let down = from;
+                while (down <= to && lines[down - 1].trim() === '') down++;
+                source_problems.push(`${where} -> ${match[0]}: blank anchor ${from} in ${target}` +
+                                     `${down <= to ? ` (first text at ${down})` : ''}`);
+                continue;
+            }
+            ++source_ok;
+            const block = is_doc ? raw : comment_block({ file: path.join(ROOT, rel), index });
+            const phrases = source_phrases(block);
+            if (phrases.length === 0) continue;
+            const cited = norm(lines.slice(from - 1, to).join(' '));
+            if (phrases.some((p) => cited.includes(needle_of(p)))) continue;
+            const elsewhere = phrases.map((p) => ({ p, n: lines.findIndex((l) => l.includes(needle_of(p))) }))
+                .find((h) => h.n >= 0);
+            source_hints.push(`${where} -> ${match[0]}${elsewhere
+                ? `: no phrase on the cited lines, first "${elsewhere.p}" at ${target}:${elsewhere.n + 1}`
+                : `: none of the cited phrases appears in ${target}`}`);
+        }
+    });
+}
+console.log('');
+console.log(`source citations resolved: ${source_total}, ok: ${source_ok}, ` +
+            `problems: ${source_problems.length + (source_total - source_ok)}`);
+for (const p of source_problems) problems.push('source ' + p);
+console.log(`source topic hints (review by hand, not enforced): ${source_hints.length}`);
+for (const h of source_hints) console.log('  HINT ' + h);
 
 if (problems.length) {
     console.log('');

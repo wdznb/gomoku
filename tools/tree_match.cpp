@@ -317,7 +317,7 @@ std::string winner_side(const json& msg, bool a_is_black) {
 // 而不是留给下一轮猜。轮次177 的 game 247 就是猜不出来的那种：两跑前 13 手逐字相同，
 // 同一颗黑子 (4,2) 一跑被收、一跑被 `make_move` 拒；`make_move` 的六个拒绝条件里
 // 「盘面已占」和「轮到谁」都只取决于盘与状态，所以真正要分的不是「谁拒的」，是
-// 「两侧的盘到那一刻为止是不是一样的」（src/server/game_manager.cpp:214-248 的六个拒绝条件）。
+// 「两侧的盘到那一刻为止是不是一样的」（src/server/game_manager.cpp:220-262 的六个拒绝条件）。
 bool query_replay(Ws& ws, int budget_ms, json* out) {
     if (!ws.send_text({{"type", "request_replay"}})) return false;
     const long long deadline = now_ms() + budget_ms;
