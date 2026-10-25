@@ -98,6 +98,10 @@ void GameManager::halt_search() {
     // last act, so a halt that arrived while it was still running has to take it off
     // too before anything reads the board or the table this session owns.
     cancel_ponder();
+    // 轮次193 #106：worker 也可能已经把结论停在槽里等属主线程来取。halt 的意思是
+    // 「这一手不要了」，所以在这里取走扔掉 —— 与 join 一起，这就是「迟到的通知什么
+    // 都不做」的保证（通知那边只有一次 exchange，取到空槽就返回）。
+    drop_pending_result();
 }
 
 // Stop and join the idle pre-search. Never called with thinking_mutex_ held: the
@@ -502,7 +506,6 @@ void GameManager::start_ai_thinking(int timeout_ms, int max_depth) {
     stop_flag_.store(false);
     discard_pending_.store(false);
     ai_thinking_.store(true);
-    ai_answer_delivered_.store(false);
     timeout_ms_ = timeout_ms;
     max_depth_ = max_depth;
     
@@ -543,6 +546,23 @@ void GameManager::ai_thinking_worker(int timeout_ms, int max_depth, Reuse reuse,
     SearchResult result = engine_.search(snapshot, ai_color_, max_depth, timeout_ms, stop_flag_);
     prev_think_elapsed_ms_.store(result.elapsed_ms);
 
+    // 轮次193 #106：这条线程不再改盘。结论停进槽里（一次 release exchange），通知只做
+    // 一次 post；落子、`analyses_`、`move_callback_` 与标志交回都在属主线程里做 —— 盘面
+    // 因此只有一个写者。回调不装（无头用法）时就地提交，与这一轮之前同一具身体、同一个线程。
+    if (owner_notify_) {
+        // 同一局同一刻只有一手思考，槽本来就该是空的；真留着上一份只能说明属主线程
+        // 没来取过，而那时新一手是点不起来的（make_move / undo 都挡在 ai_thinking_ 上）。
+        delete pending_result_.exchange(new SearchResult(std::move(result)),
+                                        std::memory_order_acq_rel);
+        owner_notify_();
+        return;
+    }
+    apply_search_result(std::move(result));
+}
+
+// 本函数就是原来 worker 的提交段：谁调它，谁就是这一局的属主线程。无头路径由 worker
+// 自己调；服务端由 io 线程在 commit_pending() 里调。
+void GameManager::apply_search_result(SearchResult result) {
     if (result.resigned) {
         std::lock_guard<std::mutex> lock(thinking_mutex_);
         // Interruption is not a refutation: the proven loss is the engine's own
@@ -552,7 +572,6 @@ void GameManager::ai_thinking_worker(int timeout_ms, int max_depth, Reuse reuse,
             resign_now(ai_color_);
         }
         ai_thinking_.store(false);
-        if (think_finished_callback_) think_finished_callback_();
         return;
     }
 
@@ -599,9 +618,9 @@ void GameManager::ai_thinking_worker(int timeout_ms, int max_depth, Reuse reuse,
             hint_score_ = result.score;
             hint_color_ = ai_color_;
             has_hint_ = (result.method == "alphabeta");
-            // 交出子之前立这个记号：从这一刻起对面就被告知「轮到你了」，而 `ai_thinking_`
-            // 还要到本函数最后一行才清。服务端拿它区分「被窗口吞掉的一手」与「提前点的一手」。
-            ai_answer_delivered_.store(true);
+            // ai_move 与标志交回之间不再有「窗口」：两件事同在本函数里，而本函数整段
+            // 在属主线程上跑 —— io 线程不可能在这中间读一条玩家消息（轮次178 的
+            // 4/3326 就是旧形状下那段尾巴；旧补丁按 io 线程排队取件，这里不需要了）。
             move_callback_(result.best_move, result.score, result.elapsed_ms);
 
             check_game_over();
@@ -634,18 +653,35 @@ void GameManager::ai_thinking_worker(int timeout_ms, int max_depth, Reuse reuse,
         // finish can read the arm without racing the ponder itself.
         ponder_arms_.fetch_add(1);
         const int ponder_color = ai_color_;
+        // 旧形状里这里捕的是 worker 那次思考的 `max_depth` 入参；搬进属主线程之后，
+        // 同一格读数就是此刻配置的那一档（这次思考正是按它起的）。
+        const int ponder_depth = max_depth();
         ponder_thread_ = std::make_unique<std::thread>(
-            [this, ponder_root, ponder_color, ponder_nodes, max_depth]() {
+            [this, ponder_root, ponder_color, ponder_nodes, ponder_depth]() {
                 const SearchResult pondered = engine_.ponder_search(
-                    ponder_root, ponder_color, max_depth, ponder_nodes, ponder_stop_);
+                    ponder_root, ponder_color, ponder_depth, ponder_nodes, ponder_stop_);
                 ponder_last_nodes_.store(pondered.nodes_searched);
                 ponder_active_.store(false);
             });
     }
 
     ai_thinking_.store(false);
-    // 标志已经交回：这一刻起服务端可以把它替这一手攒着的意图取走了。
-    if (think_finished_callback_) think_finished_callback_();
+}
+
+void GameManager::commit_pending() {
+    SearchResult* parked = pending_result_.exchange(nullptr, std::memory_order_acq_rel);
+    if (parked == nullptr) return;
+    std::unique_ptr<SearchResult> result(parked);
+    apply_search_result(std::move(*result));
+}
+
+void GameManager::drop_pending_result() {
+    SearchResult* parked = pending_result_.exchange(nullptr, std::memory_order_acq_rel);
+    if (parked == nullptr) return;
+    delete parked;
+    // 结论不要了，但 worker 替这一手攥着的标志必须交回 —— 旧形状里它是自己走到最后
+    // 一行清的，现在它停在 post 那一步就返回了。
+    ai_thinking_.store(false);
 }
 
 void GameManager::check_game_over() {

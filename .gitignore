@@ -54,5 +54,8 @@ vgcore.*
 # TSan build (tools/valgrind_check.sh tsan mode), kept separate from build/ and build-vg/
 build-tsan/
 
+# ASan build (the lifetime instrument for #105 / #106), same reason
+build-asan/
+
 # Stress client built by tools/stress/build_stress.sh (not a production artifact)
 tools/stress/ws_stress

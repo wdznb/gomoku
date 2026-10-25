@@ -2143,8 +2143,14 @@ void test_a_rejected_stone_delivers_the_end_a_worker_parked() {
         // assertion below is unchanged, a frame that never arrives is still a failure.
         bool parked = false;
         for (int spin = 0; spin < 12000 && !parked; ++spin) {
-            std::lock_guard<std::mutex> lock(h.server.end_frame_mutex_);
-            parked = !h.server.deferred_end_frame_.is_null();
+            // 轮次193 #106：worker 想完只 post 一句，落子与 game_over 都在属主（这里就是
+            // 测试自己充当的那条 io 线程）上跑 —— 不泵队列，那个回调永远不会发生。
+            h.server.ioc_.restart();
+            h.server.ioc_.poll();
+            {
+                std::lock_guard<std::mutex> lock(h.server.end_frame_mutex_);
+                parked = !h.server.deferred_end_frame_.is_null();
+            }
             if (!parked) std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
         if (!parked) {
@@ -3370,8 +3376,11 @@ namespace {
 
 // 等 make_move 自己起的那条 worker 跑完：join 而不是轮询——memcheck 下墙钟会放大
 // ~20 倍，任何「等 N 毫秒」的写法都会变成假失败，而 join 没有时限。
+// 轮次193 #106：worker 想完只把结论停进原子槽再 post 一句；盘要由属主线程落。测试里没有
+// 在跑的 io 线程，join 完之后由这一行充当属主（无头用法没装通知 ⇒ 槽本来就是空的，空操作）。
 void join_think(GameManager& game) {
     if (game.search_thread_ && game.search_thread_->joinable()) game.search_thread_->join();
+    game.commit_pending();
     assert(!game.is_ai_thinking());
 }
 
@@ -3524,142 +3533,147 @@ void test_the_takeback_lands_on_the_same_position_and_a_repeat_stays_stable() {
 }
 
 
-// 轮次184 #81：被窗口吞掉的那一手。量出来的事实是（同一条真实 WS 路径，A/B 同一份二进制）：
-// 自然状态下「交出 ai_move → 交回 ai_thinking_」这段尾巴均值 20 µs、最大 146 µs，418 局里
-// 一次都撞不上；把尾巴撑到 20 ms，**今天的行为一场比赛丢 90 颗合法子、作废 90 局**，而队列
-// 那一臂同样撑到 20 ms：0 丢 0 作废，122 颗存住的手全部被取出落下。
-// 本用例不靠撑尾巴：直接把 `move_callback_` 换成一道门 —— 它跑在提交段里，正是要卡住的那个位置，
-// 于是「窗口」变成测试里可以停靠的状态。钉四臂：
-//   ① 窗口里到达的一手：不入队前不落地、也不回 error；交回标志后由 **io 线程**取出并落下。
-//   ② 队列里已经有一手时到的第二手：明确拒（一次只存一手）。
-//   ③ 没人在想时到达：当场落，帧序与今天相同。
-//   ④ 终止思考之后：那颗存着的手不许再落 —— 玩家已经改了主意。
-void test_a_stone_that_arrived_in_the_tail_window_is_held_and_then_applied() {
-    const auto dir = scratch("r184_tail_window");
+// 轮次184 #81 那张「尾窗存手」表在轮次193 #106 里删掉了，连同它的用例：ai_move 与标志交回
+// 现在同在一个 io 任务里（`GameManager::commit_pending`），一收一放之间没有第二个 handler 能
+// 插进来 —— 尾巴不存在，所以「存手」和「取件单」都没有了存在的形状。轮次178 量到的 4/3326
+// 吞子窗口是**结构性消失**，下面第三条直接把「看到子就立刻回一手」钉住，不再靠撑宽尾巴。
+//
+// #106 搬家的三面各一条：
+//   ① 喊话那一刻盘还没动，提交段（move_callback）跑在喊话者之外的线程上；
+//   ② 属主决定不要这一手时（`halt_search`），槽里的结论被扔掉、标志交回，迟到的提交是空操作；
+//   ③ 服务端那条路上，读到 ai_move 的人一定读到已经交回的标志 ⇒ 回手不会被吞。
+void test_the_ai_commit_runs_on_the_owner_thread() {
+    GameManager game;
+    game.set_player_color(BLACK);
+    game.set_config(120000, 4, -1, 40000);
+
+    std::atomic<int> notified{0};
+    std::atomic<std::thread::id> notifier{std::thread::id()};
+    game.set_owner_notify([&notified, &notifier] {
+        notifier.store(std::this_thread::get_id());
+        notified.fetch_add(1);
+    });
+    std::atomic<std::thread::id> committed{std::thread::id()};
+    std::atomic<int> commit_calls{0};
+    game.set_move_callback([&committed, &commit_calls](const Move&, int, int) {
+        committed.store(std::this_thread::get_id());
+        commit_calls.fetch_add(1);
+    });
+    game.set_game_over_callback([](int, const std::string&) {});
+
+    const std::thread::id owner = std::this_thread::get_id();
+    assert(game.make_move(7, 7));       // 人落一子；make_move 自己把 AI 那一手点起来
+    for (int spin = 0; spin < 12000 && notified.load() == 0; ++spin) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    // 前提直接看，不拿墙钟当代理：worker 想完了，把结论停进了槽里。
+    CHECK_MESSAGE(notified.load() == 1, "worker 想完必须喊一声（而且只喊一次）");
+    CHECK_MESSAGE(notifier.load() != owner, "前提：喊话的是 worker，不是属主线程");
+    CHECK_MESSAGE(game.board().move_count() == 1, "喊话那一刻 AI 的子还不许落下");
+    CHECK_MESSAGE(commit_calls.load() == 0, "喊话那一刻不该已经有提交段跑过");
+    CHECK_MESSAGE(game.is_ai_thinking(), "标志要等属主提交才交回 —— worker 不再自己收尾");
+
+    game.commit_pending();              // 测试在替那条 io 线程做事
+    CHECK_MESSAGE(commit_calls.load() == 1, "提交段要跑，而且只跑一次");
+    CHECK_MESSAGE(committed.load() == owner, "提交段（move_callback）必须在属主线程跑");
+    CHECK_MESSAGE(game.board().move_count() == 2, "属主提交之后 AI 那子才上盘");
+    CHECK_MESSAGE(!game.is_ai_thinking(), "提交完标志要交回");
+    // 再提交一次什么都不许发生。注意这条断言**不单独钉 exchange**：把槽换成
+    // 「load + 拷贝、槽不清」的突变体（M4a）也照样绿，因为第二份结论会撞上
+    // `apply_search_result` 里的 `current_turn() == ai_color_` —— 轮到人的时候落子
+    // 直接被挡回。exchange 那一项的看门人是所有权语义（memcheck），不是这条。
+    game.commit_pending();
+    CHECK_MESSAGE(commit_calls.load() == 1 && game.board().move_count() == 2,
+                  "再提交一次什么都不许发生（槽已空；即便重放也被人那一手的轮次挡住）");
+    game.halt_search();
+    std::cout << "  [r193] 提交段线程 = 属主（与喊话者不同）；再提交一次不重复提交"
+              << std::endl;
+    std::cout << "test_the_ai_commit_runs_on_the_owner_thread passed" << std::endl;
+}
+
+void test_a_parked_result_is_dropped_when_thinking_is_stopped() {
+    GameManager game;
+    game.set_player_color(BLACK);
+    game.set_config(120000, 4, -1, 40000);
+
+    std::atomic<int> notified{0};
+    game.set_owner_notify([&notified] { notified.fetch_add(1); });
+    std::atomic<int> commit_calls{0};
+    game.set_move_callback([&commit_calls](const Move&, int, int) { commit_calls.fetch_add(1); });
+    game.set_game_over_callback([](int, const std::string&) {});
+
+    assert(game.make_move(7, 7));
+    for (int spin = 0; spin < 12000 && notified.load() == 0; ++spin) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    CHECK_MESSAGE(notified.load() == 1 && game.is_ai_thinking(),
+                  "前提：结论已停在槽里，等属主来取");
+    const int before = game.board().move_count();
+
+    // 认输 / 悔棋 / 断开走的那条路（#105 的 stale 判据是另一头）：这一手不要了。
+    game.halt_search();
+    CHECK_MESSAGE(!game.is_ai_thinking(),
+                  "停止之后标志必须交回 —— worker 停在 post 那一步，不再自己清它");
+    CHECK_MESSAGE(game.board().move_count() == before && commit_calls.load() == 0,
+                  "被丢弃的结论不许落子、也不许回调");
+    // 通知已经排进队列但没有属主去取：迟到的提交是空操作（槽早被 halt_search 换走了）。
+    game.commit_pending();
+    CHECK_MESSAGE(game.board().move_count() == before && commit_calls.load() == 0 &&
+                          !game.is_ai_thinking(),
+                  "迟到的提交不许把被丢弃的那一手落回来");
+    std::cout << "  [r193] 停在槽里的一手被 halt_search 丢掉：盘 " << before << " 子没变、"
+              << "回调 0 次、迟到的提交空操作" << std::endl;
+    std::cout << "test_a_parked_result_is_dropped_when_thinking_is_stopped passed" << std::endl;
+}
+
+void test_the_reply_after_ai_move_is_never_swallowed() {
+    const auto dir = scratch("r193_fast_reply");
     Harness h(dir, std::string());
     GameManager& game = *h.entry->game;
-    game.set_config(120000, 6, -1, 40000);      // 按节点帽定价：一次思考有界且可复现
+    game.set_config(120000, 4, -1, 40000);   // 按节点帽定价：一手上界可复现
     size_t seen = 0;
 
-    std::atomic<bool> block{true};
-    game.set_move_callback([&block](const Move&, int, int) {
-        // 门就立在提交段里：ai_move 正要发出去、ai_thinking_ 还没交回。
-        while (block.load()) std::this_thread::yield();
-    });
-
-    assert(game.make_move(7, 7));               // 人落一子；make_move 自己把 AI 那手点起来
-    for (int spin = 0; spin < 5000 && !game.answer_delivered(); ++spin) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-    CHECK_MESSAGE(game.answer_delivered(), "门要真的停在「子已交出」之后");
-    CHECK_MESSAGE(game.is_ai_thinking(), "并且标志还没交回 —— 这就是被量到的那段尾巴");
-
-    // 挑一个空位当「窗口里到达的那一手」，保证不是撞在子上的假拒。
-    int held_row = -1, held_col = -1;
-    for (int r = 0; r < 15 && held_row < 0; ++r) {
-        for (int c = 0; c < 15 && held_row < 0; ++c) {
-            if (game.board().is_empty(r, c)) { held_row = r; held_col = c; }
-        }
-    }
-    assert(held_row >= 0);
-
-    h.server.handle_make_move(h.socket, json{{"row", held_row}, {"col", held_col}});
-    CHECK_MESSAGE(game.board().is_empty(held_row, held_col),
-                  "存进队列的那一手不许在交回标志之前就落下");
-    // ② 第二手：一次只存一手，多的那手是明确的拒绝（不是被时间吞掉）。
-    int second_row = -1, second_col = -1;
-    for (int r = 0; r < 15 && second_row < 0; ++r) {
-        for (int c = 0; c < 15 && second_row < 0; ++c) {
-            if ((r != held_row || c != held_col) && game.board().is_empty(r, c)) {
-                second_row = r; second_col = c;
+    h.server.handle_make_move(h.socket, json{{"row", 7}, {"col", 7}});
+    bool saw_ai_move = false;
+    for (int spin = 0; spin < 12000 && !saw_ai_move; ++spin) {
+        for (const std::string& frame : drain_frames(h.server, h.socket, seen)) {
+            const json parsed = json::parse(frame, nullptr, false);
+            if (!parsed.is_discarded() && parsed.value("type", "") == "ai_move") {
+                saw_ai_move = true;
             }
         }
+        if (!saw_ai_move) std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
-    assert(second_row >= 0);
-    h.server.handle_make_move(h.socket, json{{"row", second_row}, {"col", second_col}});
-    std::vector<std::string> while_held = drain_frames(h.server, h.socket, seen);
-    int errors_while_held = 0;
-    for (const std::string& frame : while_held) {
-        const json parsed = json::parse(frame, nullptr, false);
-        if (!parsed.is_discarded() && parsed.value("type", "") == "error") ++errors_while_held;
-    }
-    CHECK_MESSAGE(errors_while_held == 1, "第二手被明确拒一次（一手存、一手拒），而不是两头都不吭声");
+    CHECK_MESSAGE(saw_ai_move, "前提：AI 那子要真的交付");
+    // 这条是结构性的：帧离开 socket 与标志交回在同一段提交里，所以读到帧的人一定读到已交回。
+    CHECK_MESSAGE(!game.is_ai_thinking(),
+                  "ai_move 已在手上时标志必须已经交回（这一段没有第二条尾巴）");
 
-    // ④ 的另一半先验一遍：终止思考 ⇒ 存着的那手作废。
-    h.server.handle_stop_thinking(h.socket);
-    // ④ 的取证顺序是有意为之：**不**取件。这一次思考交回标志时留下的取件单就滞住在 io 队列里，
-    // 变成一张下一臂要拿它来验的「迟到单」。
-    block.store(false);
-    join_think(game);
-    CHECK_MESSAGE(game.board().is_empty(held_row, held_col),
-                  "终止过思考的存手不许再落下");
-    const bool dropped_stone_stayed_off = game.board().is_empty(held_row, held_col);
-
-    // ① 同一扇窗口，这一次不终止：交回标志之后必须由 io 线程把它落下。
-    block.store(true);
-    assert(game.make_move(second_row, second_col));
-    for (int spin = 0; spin < 5000 && !game.answer_delivered(); ++spin) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-    CHECK_MESSAGE(game.answer_delivered(), "第二次交子同样要真的发生");
-    int third_row = -1, third_col = -1;
-    for (int r = 0; r < 15 && third_row < 0; ++r) {
-        for (int c = 0; c < 15 && third_row < 0; ++c) {
-            if (game.board().is_empty(r, c)) { third_row = r; third_col = c; }
+    int row = -1, col = -1;
+    for (int r = 0; r < BOARD_SIZE && row < 0; ++r) {
+        for (int c = 0; c < BOARD_SIZE && row < 0; ++c) {
+            if (game.board().is_empty(r, c)) { row = r; col = c; }
         }
     }
-    assert(third_row >= 0);
-    h.server.handle_make_move(h.socket, json{{"row", third_row}, {"col", third_col}});
-    // ⑤ 迟到的取件单在这一泵里跑：它手里是上一思考的代号，而这一手是之后才存的 ——
-    //    没有代号过滤就会被提前取走，而此刻 AI 还没交出子，落子必然被语义守卫拒成一条 error。
-    std::vector<std::string> stale_ticket = drain_frames(h.server, h.socket, seen);
-    int errors_from_stale = 0;
-    for (const std::string& frame : stale_ticket) {
-        const json parsed = json::parse(frame, nullptr, false);
-        if (!parsed.is_discarded() && parsed.value("type", "") == "error") ++errors_from_stale;
-    }
-    CHECK_MESSAGE(errors_from_stale == 0 && game.board().is_empty(third_row, third_col),
-                  "迟到的取件单不许取走还没到的那手棋");
-    block.store(false);
-    join_think(game);
-    std::vector<std::string> after_apply = drain_frames(h.server, h.socket, seen);
-    bool saw_move_made = false, saw_error = false;
-    for (const std::string& frame : after_apply) {
+    assert(row >= 0);
+    // 玩家看到子就立刻回一手 —— 轮次178 量到的尾巴里，这一手会被 `Invalid move` 吞掉。
+    h.server.handle_make_move(h.socket, json{{"row", row}, {"col", col}});
+    int errors = 0;
+    int stones = 0;
+    for (const std::string& frame : drain_frames(h.server, h.socket, seen)) {
         const json parsed = json::parse(frame, nullptr, false);
         if (parsed.is_discarded()) continue;
         const std::string type = parsed.value("type", "");
-        if (type == "move_made") saw_move_made = true;
-        if (type == "error") saw_error = true;
+        if (type == "error") ++errors;
+        if (type == "move_made") ++stones;
     }
-    CHECK_MESSAGE(saw_move_made && !saw_error,
-                  "补上的回帧是 move_made，不是一条 Invalid move");
-    CHECK_MESSAGE(!game.board().is_empty(third_row, third_col),
-                  "窗口里存下的那一手，交回标志之后必须落在盘上");
-
-    // ③ 没人在想：当场落，且不需要取件。先收掉上一手落子自己点起来的那次思考 ——
-    // 否则这一刻仍然是「AI 在想」，走的就不是当场那条路。换回调必须排在收思考**之后**：
-    // `move_callback_` 是个裸 std::function，worker 在读它（判空 :561、调用 :595），
-    // 交换与读并发就是 TSan 报的那条；产品里这段由「同一 io 线程 + 断开时先 clear」挡着，
-    // 测试这里没有任何东西挡，所以顺序本身就是那条纪律。
-    join_think(game);
-    game.set_move_callback([](const Move&, int, int) {});
-    CHECK_MESSAGE(!game.is_ai_thinking(), "③ 的前提是这一局暂时没有思考在飞");
-    int free_row = -1, free_col = -1;
-    for (int r = 0; r < 15 && free_row < 0; ++r) {
-        for (int c = 0; c < 15 && free_row < 0; ++c) {
-            if (game.board().is_empty(r, c)) { free_row = r; free_col = c; }
-        }
-    }
-    assert(free_row >= 0);
-    h.server.handle_make_move(h.socket, json{{"row", free_row}, {"col", free_col}});
-    CHECK_MESSAGE(!game.board().is_empty(free_row, free_col), "空闲时提交的一手当场就落");
+    CHECK_MESSAGE(errors == 0, "看到 ai_move 之后的回手不许被吞成 Invalid move");
+    CHECK_MESSAGE(stones == 1, "回手要落，而且只落一次");
+    CHECK_MESSAGE(!game.board().is_empty(row, col), "回手真的在盘上");
     game.halt_search();
-
-    std::cout << "  [r184] 窗口存手落下=" << (game.board().is_empty(third_row, third_col) ? "否" : "是")
-              << "，被终止的存手仍未落=" << (dropped_stone_stayed_off ? "是" : "否")
-              << std::endl;
-    std::cout << "test_a_stone_that_arrived_in_the_tail_window_is_held_and_then_applied passed"
-              << std::endl;
+    std::cout << "  [r193] 看到 ai_move 就回 ( " << row << "," << col << " )：error 0、"
+              << "move_made 1" << std::endl;
+    std::cout << "test_the_reply_after_ai_move_is_never_swallowed passed" << std::endl;
 }
 
 
@@ -3921,12 +3935,14 @@ void test_the_board_epoch_distinguishes_a_refilled_position_from_the_snapsotted_
               << std::endl;
 }
 
-// 轮次190 的**测量**用例，登记为 #106 —— 缺省不跑（`GOMOKU_R190_MEASURE=1` 才跑），因为它现在必然红：
-// io 线程那一记「把整张盘拷进 state_sync」（`server.cpp:825` 的形状）与 AI worker 的提交
-// （`game_manager.cpp` 里 `board_.place_stone` 那一格）之间没有任何同步，而 #105 只修了求招那一条。
-// 跑法：`GOMOKU_R190_MEASURE=1 ./build-tsan/test_server` ⇒ TSan 报 race（读=这条循环 / 写=AI 提交）；
-// 不带变量 ⇒ 缺省门禁盖不到这一对，`races=0` 是「没被摸到」而不是「不存在」。轮次190 实测：
-// 两跑各 8 条报告，思考在飞期间整盘拷贝 12 244 880 次。
+// 轮次190 的**测量**用例，登记为 #106。轮次193 修完之后它变成「改后应当无声」的取证：
+// 跑法 `GOMOKU_R190_MEASURE=1 ./build-tsan/test_server`，TSan 应报 0 条 race。
+// 循环里「拷贝整盘」与「跑掉已 post 的提交任务」都在同一根线程上 —— 这正是产品里 io 线程
+// 做 `state_sync`（`server.cpp:825` 的形状）与 `commit_pending` 的形状；worker 已经不再写
+// `board_`。改前（轮次193 开工时的 HEAD）同一跑法实测 7 条：全是主线程
+// `Board(const Board&)` 读 vs worker 持 `thinking_mutex_` 的写 —— `board.cpp:64` ×2、
+// `:145` ×2、`:65` ×1，另两条报在 `board.h:45` 的拷贝上。
+// 不带变量 ⇒ 缺省门禁不跑它（它是要开着 TSan 才读得出东西的仪器）。
 void test_the_io_thread_board_copy_overlaps_the_ai_commit() {
     if (std::getenv("GOMOKU_R190_MEASURE") == nullptr) {
         std::cout << "  [#106] 跳过（要跑它请给 GOMOKU_R190_MEASURE=1）" << std::endl;
@@ -3940,13 +3956,17 @@ void test_the_io_thread_board_copy_overlaps_the_ai_commit() {
     assert(game.is_ai_thinking());                 // 前提直接看，不拿墙钟当代理
     long reads = 0;
     while (game.is_ai_thinking()) {
+        // 属主那条路：这一泵跑的可能正是 worker 停下时 post 的那次提交。
+        h.server.ioc_.restart();
+        h.server.ioc_.poll();
         Board copy = game.board();                 // handle_state 读的就是这一格
         (void)copy.move_count();
         ++reads;
     }
     join_think(game);
     std::cout << "  [#106] 思考在飞期间的整盘拷贝 = " << reads
-              << " 次；这一对里 io 读 `board_`、worker 写 `board_`，中间没有东西" << std::endl;
+              << " 次；拷贝与提交都在同一根线程上，worker 不写 `board_`（TSan 应 0 条）"
+              << std::endl;
     std::cout << "test_the_io_thread_board_copy_overlaps_the_ai_commit passed" << std::endl;
 }
 // 轮次191 #103：未完局不进 records。这条把轮次188 那两次同版 null「418 个会话文件、records 各只有 1 行」的成因钉住：
@@ -4056,7 +4076,9 @@ int main() {
     test_undo_then_the_same_stone_reuses_the_table_across_the_takeback();
     test_a_different_stone_after_the_takeback_pays_a_fresh_think_again();
     test_the_takeback_lands_on_the_same_position_and_a_repeat_stays_stable();
-    test_a_stone_that_arrived_in_the_tail_window_is_held_and_then_applied();
+    test_the_ai_commit_runs_on_the_owner_thread();
+    test_a_parked_result_is_dropped_when_thinking_is_stopped();
+    test_the_reply_after_ai_move_is_never_swallowed();
     test_a_detached_session_over_the_cap_is_settled_and_shelved();
     test_a_socket_that_closes_while_the_ai_is_thinking_does_not_wedge_the_io_thread();
     test_the_board_epoch_distinguishes_a_refilled_position_from_the_snapsotted_one();

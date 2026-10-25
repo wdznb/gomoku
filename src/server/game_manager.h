@@ -303,22 +303,23 @@ private:
     void resign_now(int color);
 
   public:
-    // #81 的接口，加在类的最后：`game_manager.h:142/188-196/204-208/239-247` 按行号被指认过。
+    // 轮次193 #106：一局的盘面只有一个写者 —— 属主线程（服务端就是那条 io 线程）。
     //
-    // 这一次思考的子有没有已经交出去。`ai_move` 是在提交段里发出去的（`thinking_mutex_` 之内），
-    // 而 `ai_thinking_` 要到 worker 的最后一行才清 —— 这两件事之间到达的合法子，今天被 :215
-    // 一拒就不再有第二次的机会（轮次178 量到 4/3326 局）。这个记号就是「已经被应承过」与
-    // 「人在 AI 想完之前提前点了一手」的分界：前者该等，后者照旧拒。
-    bool answer_delivered() const { return ai_answer_delivered_.load(); }
-
-    // 思考彻底结束（标志已交回）时的通知。由服务端装上，内容只有一个：把「可以取队列了」
-    // post 回 io 线程。**不在 worker 线程上做这件事** —— 被取出的那手棋会调 make_move，
-    // 而 make_move 自己就会点下一手思考，`start_ai_thinking` 开头又去 join 上一个 worker，
-    // 在 worker 线程上跑它等于让线程 join 自己（轮次183 就是挂死在这里）。
-    using ThinkFinishedCallback = std::function<void()>;
-    void set_think_finished_callback(ThinkFinishedCallback cb) {
-        think_finished_callback_ = std::move(cb);
-    }
+    // worker 想完只把结论停进一个原子槽（一次 exchange，无锁），再调一次这个回调；回调
+    // **只许 post**，不许碰游戏状态、也不许拿 `games_mutex_`（轮次187 的挂死就是 worker
+    // 就地拿锁）。落子、`analyses_`、提示、`move_callback_` 与 `check_game_over()` 全在
+    // 属主线程的 `commit_pending()` 里做，于是 io 线程读整盘（`state_sync` /
+    // `replay_snapshot`）与提交之间不再有第二个写者 —— 轮次193 改前实测那一族 TSan race
+    // 共 7 条：主线程 `Board(const Board&)` 读 vs worker 持 `thinking_mutex_` 的写
+    // （`board.cpp:64` ×2、`:145` ×2、`:65` ×1，另两条报在 `board.h:45` 的拷贝上）。
+    //
+    // 不装回调时（单元测试与训练器的无头用法）worker 就地提交，与这一轮之前逐字同形：
+    // 那条路上属主线程在 join 之前不读盘，本来就没有第二个读者。
+    using OwnerNotify = std::function<void()>;
+    void set_owner_notify(OwnerNotify cb) { owner_notify_ = std::move(cb); }
+    // 属主线程：把 worker 停下（或被中止）的那份结论落盘。槽空就是空操作 —— 通知迟到
+    // 是正常形状（`halt_search` 会先把槽取走，`exchange` 让两边恰好有一个拿到它）。
+    void commit_pending();
 
     // 轮次190 #105：求招收尾那一句「这张盘还是不是我给它算的那张」抽成一个判据，让它可以
     // 被同步地钉住（并发那一面由 `test_hint_answer_for_a_superseded_position` 盖）。比的必须是
@@ -328,14 +329,21 @@ private:
     }
 
   private:
-    std::atomic<bool> ai_answer_delivered_{false};
-    ThinkFinishedCallback think_finished_callback_;
+    // 轮次193 #106：结论槽。同一局同一刻只有一手思考，生产者（worker）与消费者
+    // （`commit_pending`）从不同时在场，所以一个原子指针就是完整的队列。
+    std::atomic<SearchResult*> pending_result_{nullptr};
+    OwnerNotify owner_notify_;
+    // 两条提交路的同一具身体：无头路径由 worker 自己调，服务端由属主线程调。
+    void apply_search_result(SearchResult result);
+    // halt_search 用：这一手不要了 —— 槽里的结论扔掉，思考标志照旧交回（worker 以前
+    // 是自己走到最后一行清它的；现在它停在 post 那一步就返回了）。
+    void drop_pending_result();
     // 轮次190 #105，加在类的最后（上面 #81 那条规矩：这个头文件的 `:142/188-196/204-208/239-247`
     // 都被按行号指认过）。盘面版本号：每一个改 `board_` 的地方 +1，改盘的顺序也由它说话。
     // 求招 worker 判断「这张盘还是不是我给它算的那张」时**只 load 这个号**，不回读 `board_` ——
     // 玩家那两条路（`make_move` / `undo`）改盘不拿 `thinking_mutex_`，只挡
     // `ai_thinking_`，而它们都不挡 `hint_active_`，所以那记回读是一 pair 真 race（TSan 量到）。
-    // 与轮次187 的 `pending_seq_` 同形：worker 交回结论的那一步只看原子号，不碰锁、不碰活盘。
+    // 与轮次187 那条规矩同形：worker 交回结论/下判断的那一步只看原子号，不碰锁、不碰活盘。
     std::atomic<int> board_epoch_{0};
 };
 
