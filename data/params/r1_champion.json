@@ -1,0 +1,38 @@
+{
+  "coefficients": {
+    "cand_width_deep": 8,
+    "cand_width_root": 15,
+    "distance_to_stones": 2,
+    "double_four": 50000,
+    "double_three": 30000,
+    "edge_penalty": 100,
+    "five": 100000,
+    "forbidden_penalty": 50000,
+    "four_three": 32000,
+    "live_four": 10000,
+    "live_three": 500,
+    "live_two": 50,
+    "position_weight_scale": 8,
+    "rush_four": 1000,
+    "sleepy_three": 100,
+    "sleepy_two": 10,
+    "white": {
+      "cand_width_deep": 8,
+      "cand_width_root": 24,
+      "distance_to_stones": 1,
+      "double_four": 50000,
+      "double_three": 30000,
+      "edge_penalty": 100,
+      "five": 100000,
+      "forbidden_penalty": 50000,
+      "four_three": 25600,
+      "live_four": 10000,
+      "live_three": 500,
+      "live_two": 50,
+      "position_weight_scale": 13,
+      "rush_four": 1000,
+      "sleepy_three": 100,
+      "sleepy_two": 10
+    }
+  }
+}
