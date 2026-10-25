@@ -3949,6 +3949,60 @@ void test_the_io_thread_board_copy_overlaps_the_ai_commit() {
               << " 次；这一对里 io 读 `board_`、worker 写 `board_`，中间没有东西" << std::endl;
     std::cout << "test_the_io_thread_board_copy_overlaps_the_ai_commit passed" << std::endl;
 }
+// 轮次191 #103：未完局不进 records。这条把轮次188 那两次同版 null「418 个会话文件、records 各只有 1 行」的成因钉住：
+// 418 个会话里只有 2 个是空 base（开局集第 1 行那条 `{}` ⇒ 夹具不发 set_position），其中一局（CSV 第 0 局）本台执黑赢下、
+// 31 手之后认输的是对面那台 —— `resign` 只出现在轮到落子那一侧的链接上（`tree_match.cpp:409-445`）⇒ 本台会话停在
+// `status:"playing"` + `reason:"invalid"`，非决定性、按 `export_game_record`（`server.cpp:1594-1606`）本来就不该落；
+// 另一局本台执白认输 ⇒ 落 1 行。⇒ 代码与实测自洽，188 记的「两局都是空 base + 决定性结束」是错的（B 段改判）。
+void test_an_unfinished_game_stays_out_of_the_record_stream_until_it_ends() {
+    const auto dir = scratch("r191_unfinished_sessions");
+    const auto records = scratch("r191_unfinished_records.jsonl");
+    {
+        Harness h(dir, records);
+        // 黑四子 {7,3}..{7,6}、白四子交错，BLACK 应手：差一手成五，正是「跑了一阵还没完」的形状
+        GameRestore mid;
+        mid.player_color = BLACK;
+        mid.status = GameStatus::PLAYING;
+        const Position cells[8] = {{7, 3}, {0, 0}, {7, 4}, {0, 1},
+                                   {7, 5}, {0, 2}, {7, 6}, {0, 3}};
+        for (int i = 0; i < 8; ++i) {
+            MoveAnalysis analysis;
+            analysis.move = Move(cells[i].row, cells[i].col, i % 2 == 0 ? BLACK : WHITE);
+            analysis.method = "human";
+            mid.moves.push_back(analysis);
+        }
+        assert(h.entry->game->restore_game(mid));
+        assert(h.entry->game->status() == GameStatus::PLAYING);
+        assert(!h.entry->game->is_ai_thinking());
+
+        h.server.flush_entry(h.entry);
+        assert(records_lines(records) == 0);              // 未完局：records 一行都不许多
+        assert(!h.entry->exported);
+        assert(std::filesystem::exists(h.session_file()));   // 但会话文件要落：复盘与续局的料
+        std::ifstream in(h.session_file());
+        const json saved = json::parse(in, nullptr, false);
+        assert(!saved.is_discarded());
+        assert(saved["status"] == "playing");
+        assert(saved["record"]["reason"] == "invalid");   // 与 188 那份现场同一个读数
+        assert(saved["record"]["moves"].size() == 8);
+
+        // 把这局下完：黑补上 {7,7} 成五 —— 同一局到这一刻才有资格进 records
+        h.server.handle_make_move(h.socket, json{{"row", 7}, {"col", 7}});
+        assert(h.entry->game->status() == GameStatus::GAME_OVER);
+        assert(!h.entry->game->is_ai_thinking());
+        h.server.flush_entry(h.entry);
+        assert(records_lines(records) == 1);
+        assert(h.entry->exported);
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    std::filesystem::remove(records, ec);
+    std::cout << "  [r191] 未完局：records 0 行而会话文件写 playing/invalid；补上第五子之后同一局才落 1 行"
+              << std::endl;
+    std::cout << "test_an_unfinished_game_stays_out_of_the_record_stream_until_it_ends passed"
+              << std::endl;
+}
+
 int main() {
     std::cout << "Running server tests..." << std::endl;
 
@@ -4007,6 +4061,7 @@ int main() {
     test_a_socket_that_closes_while_the_ai_is_thinking_does_not_wedge_the_io_thread();
     test_the_board_epoch_distinguishes_a_refilled_position_from_the_snapsotted_one();
     test_the_io_thread_board_copy_overlaps_the_ai_commit();
+    test_an_unfinished_game_stays_out_of_the_record_stream_until_it_ends();
 
     test_analyze_progress_then_exactly_one_result_per_ply();
     test_analyze_is_refused_while_the_ai_is_thinking();
