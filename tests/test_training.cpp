@@ -8205,6 +8205,49 @@ void test_a_copy_of_the_champion_scores_exactly_half_at_the_training_regime() {
               << std::endl;
 }
 
+// 轮次192 #107：is_decisive() 的两个合取项各自没有一条按值断言的用例。实测四次跑（对照 /
+// 只删 winner 那半 / 只删 reason 那两项 / 恒真，各重编 7 个编译单元后跑整套 test_training）：
+// 前三次全绿，只有恒真红在 test_self_play_records_legal_game 的 `:610` —— 而那条断言上一行
+// 刚断言 winner == EMPTY ⇒ 光 winner 项就够判非决定性，reason 那两项在那里从不承重。所以这
+// 里把两半各钉一遍，顺带钉住下游 outcome_for 的 0 分语义。
+void test_a_decisive_record_needs_both_a_winner_and_a_replayable_ending() {
+    GameRecord record;
+    assert(record.winner == EMPTY);
+    assert(record.reason == GameEndReason::INVALID);
+
+    // 有真结局名、却没有 winner（和棋 / 只留下半份结果）⇒ 不是决定性，也不许给任何一方记分。
+    record.reason = GameEndReason::FIVE;
+    assert(record.winner == EMPTY);
+    assert(!record.is_decisive());
+    assert(record.outcome_for(BLACK) == 0.0f);
+    assert(record.outcome_for(WHITE) == 0.0f);
+
+    record.winner = BLACK;
+    assert(record.is_decisive());
+    assert(record.outcome_for(BLACK) == 1.0f);
+    assert(record.outcome_for(WHITE) == -1.0f);
+
+    // 反过来：留下 winner 也洗不白「被截断 / 无法重放」这两种结局。
+    const GameEndReason kCutOff[] = {GameEndReason::MOVE_LIMIT, GameEndReason::INVALID};
+    for (GameEndReason reason : kCutOff) {
+        record.reason = reason;
+        assert(!record.is_decisive());
+        assert(record.outcome_for(BLACK) == 0.0f);
+        assert(record.outcome_for(WHITE) == 0.0f);
+    }
+
+    // 四种真结局都必须算决定性 —— 否则一个恒 `return false` 的实现也能过上面每一句。
+    const GameEndReason kEnded[] = {GameEndReason::FIVE, GameEndReason::FORBIDDEN,
+                                    GameEndReason::RESIGN, GameEndReason::BOARD_FULL};
+    for (GameEndReason reason : kEnded) {
+        record.reason = reason;
+        assert(record.is_decisive());
+    }
+
+    std::cout << "test_a_decisive_record_needs_both_a_winner_and_a_replayable_ending passed"
+              << std::endl;
+}
+
 int main() {
     std::cout << "Running training tests..." << std::endl;
 
@@ -8358,6 +8401,7 @@ int main() {
     test_k1_the_balance_phase_has_no_controller_class_in_the_tree();
     test_black_dead_threat_genes_are_never_probed();
     test_a_copy_of_the_champion_scores_exactly_half_at_the_training_regime();
+    test_a_decisive_record_needs_both_a_winner_and_a_replayable_ending();
 
     std::cout << "All training tests passed" << std::endl;
     return 0;

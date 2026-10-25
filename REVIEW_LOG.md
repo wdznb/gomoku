@@ -1984,6 +1984,41 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次192 #107 关闭（is_decisive() 两半**各自**都没有牙 —— 191 记的「reason 那半由那条条件式断言钉着」不成立；三条无条件断言 + 一次枚举进树）
+
+**先量，再写**（`/tmp/r192/arms.sh`）：191 的 D 段把缺口只记在 `winner != EMPTY` 那一半，理由是 `tests/test_training.cpp:608-611` 的 `if (record.reason == GameEndReason::MOVE_LIMIT) { … }` 钉住「封顶局不算胜负」。四条臂各重编 7 个编译单元、跑整套 `test_training`（49–53 s），在**新用例进树之前**读：
+
+| 臂 | `is_decisive()` 改成 | 读数 |
+|---|---|---|
+| T0 | 不动（对照） | 绿，`All training tests passed` |
+| T_R1 | `return winner != EMPTY;`（删掉两项 reason） | **绿** |
+| T_R3 | `return reason != MOVE_LIMIT && reason != INVALID;`（删掉 winner 项） | **绿** |
+| T_R4 | `return true;` | 红：`test_self_play_records_legal_game` `:610 Assertion '!record.is_decisive()' failed` |
+
+两条绿合起来说明的是**两半各自都自由**，不是 #107 写的那一半。T_R4 那条红还纠正了 191 的因果：`:610` 会红 ⇒ 这一局**确实走的是 `MOVE_LIMIT` 分支**（`if` 的 body 执行了），可同族的 T_R1 依然绿 —— 因为 `:609` 刚断言 `winner == EMPTY`，光 winner 项就够判非决定性，`reason` 那两项在那条断言里**从不承重**。191 说「reason 那半在训练侧不是装饰」只对了一半：语义确实在用（`snapshot_of` 把 PLAYING 局的 reason 钳成 INVALID，`server.cpp:1586-1587`），但没有任何用例按值读过它。**跑之前先验了一条假设**：191/前一轮担心 `:5839-5845` 那条 `broken`（winner=BLACK + reason=INVALID，读 `Trainer::game_margin == 0.5`）会杀掉 T_R1 —— 不会，那一段根本不经过 `is_decisive()`（改动前的全仓调用点只有 `game_record.h:71` 的 `outcome_for`、`server.cpp:1340/:1596`，以及测试侧的九条既有断言 —— `test_server` 六条、`test_session` 一条、`test_training` 两条；没有 trainer）。
+
+**用例**（`tests/test_training.cpp:8213` `test_a_decisive_record_needs_both_a_winner_and_a_replayable_ending`，注册在 `main` 末尾 ⇒ README 按行号指认的 `:6239/:6271/:6397/:6399` 与 189 记的 `:8159` 全部不动；+44 行、0 删；`main` 里的注册数 **132 → 133**，整套打印的 ` passed` 行 **108 → 109** —— 189 记的「108 条全过」就是这个打印行口径，两种数都对：
+
+- `:8221` `winner==EMPTY && reason==FIVE` ⇒ 非决定性，`outcome_for(BLACK/WHITE)` 都是 0（钉 winner 半）；
+- `:8226` `winner==BLACK && reason==FIVE` ⇒ 决定性、±1（钉正向极性，否则恒 `return false` 也能过上面每句）；
+- `:8234` `winner==BLACK && reason∈{MOVE_LIMIT, INVALID}` ⇒ 非决定性、`outcome_for` 归 0（钉 reason 半）；
+- `:8244` `reason∈{FIVE, FORBIDDEN, RESIGN, BOARD_FULL}` ⇒ 决定性（钉枚举没被悄悄缩窄）。
+
+**变异台第二轮（隔离轮，`/tmp/r192/arms3.sh`）**：注册在末尾时两条臂会被既有用例抢先杀死（`return true` 死在 `:610`、`return false` 死在 `:279` 的 round-trip 断言）—— 191 记过的坑本轮重演两次 ⇒ 把注册行临时挪到 `main` 首部（定义体不动 ⇒ 断言行号不变），跑完逐字恢复（`test_training.cpp` md5 回核 `e3977d32`、`game_record.h` 回核 `9e537f23`）再重编：
+
+| 臂 | 变异 | 红在 |
+|---|---|---|
+| T0i | 不动（隔离版对照） | 绿，`All training tests passed` |
+| T_R4i | `return true;` | `:8221` |
+| T_R5i | `return false;` | `:8226` |
+| T_R6i | 再加 `&& reason != GameEndReason::BOARD_FULL` | `:8244` |
+
+配合第一轮的 T_R1 → `:8234`、T_R3 → `:8221`（arm2 那轮新用例已进树、注册在末尾，两条臂都死在新用例里，无需隔离），**四条断言各有臂杀死**。R6 第一次跑是 sed 写错（把 `&&` 拼到了分号后面 ⇒ 编译失败，`game_record.cpp` / `data_collector.cpp` 两个 TU 报错），改成插在分号前重跑才拿到 `:8244` —— 记一笔：变异臂要先确认改出来的代码能编译，否则「红/绿」都读不得。
+
+**门禁**（串行一段脚本 `/tmp/r192/gates.sh`；本轮只改 `tests/test_training.cpp`，`src/` 一字未动 —— 但 `game_record.h` 被变异台改过、已按快照回核 `9e537f23`，所以段 1 连它一起 touch，强制 **41** 个编译单元重编）：段 1 警告 **7** 条，逐条数过全是既有账、且是「一条缺陷 × 编译它的 target 数」（`data_collector.cpp:95` 未用参数 `side_to_move` ×4、`server.cpp:181` `server_reason_of` ×2、`test_training.cpp:3647` `-Wrange-loop-construct` ×1；前两条并进 D 段 #87）⇒ **无新增警告**（touch 集合与轮次191 同形，41 vs 44 个别横比）。段 2 ctest **10/10 通过，924.75 s**（`test_search 566.72 s`、`test_pinned 256.12`、`test_training 53.00`（含新用例）、`test_server 36.10`、`tree_match_pairs 0.00`）。段 3 锚点 **122 citations / 0 problems**、前端 **113/113**、README **765 行**、指导书 **849 行**（两者本轮一字未动）。段 4 TSan `test_server` **clean**（`races=0 deadlocks=0 thread_leaks=0 rc=0 68s`）。段 5 memcheck `test_server` **clean**（`reports=0 invalid_read=0 invalid_write=0 uninitialised=0 definite_leak=0`，`1866 s`）。段 6 最终文件再单跑一次 `test_training`：`rc=0`、`All training tests passed`、109 行 ` passed` ⇒ 上面那些「绿」覆盖的是最终文件（注释修正在门禁启动之前，之后没再动过任何构建输入）。
+
+**没做的**：#106（带复现命令）；本轮 `src/` 一字未动（断言读的是头文件里的内联谓词），没有性能/内存主张，callgrind 没跑；`GameRecord::is_decisive()` 的语义本身没改（改的是它的证据，不是它的定义）。
+
 ## 轮次191 #103 关闭（未完局留在会话文件、不进 records —— 代码与 188 那份现场本来就自洽，「不自洽」是 188 读错了）＋ 新用例自己有三条牙（HN1/HN4/HN5），另两臂由既有用例覆盖
 
 **先把现场重算一遍**（`/tmp/r188` 那批 null 跑的产物还在盘上，下面每个数都是一条 `jq` 命令复算出来的，命令写在末尾）。服务端两台 `sess_null209` / `sessB_null209` 各 **418** 个会话文件，`recA_null209.jsonl` / `recB_null209.jsonl` 各 **1** 行。按 `(.status, .base|length)` 分类，两台逐字相同：**209 `game_over` + 195 `playing` + 14 `waiting`**；base 长度全是偶数、范围 0..36，其中**只有 2 个文件是空 base**。这两个是：
@@ -11589,6 +11624,7 @@ while the numeric family is `0` on both trees (identical message). The tester's 
 | 「轮次189 门禁段 4 报『TSan 红：2 条 race』」 | 数错了。`tools/valgrind_check.sh` 用 `grep -c "ThreadSanitizer: data race"` 数报告，而 TSan 每条发现打两行（`WARNING:` + `SUMMARY:`）⇒ 一条被数成两条。真相：**1 条 race + 1 条 thread leak**（后者是轮次187 那条用例自己漏的 join）。「同一个二进制 187 clean、今天 3/3 复现」这条不变 —— 每跑都是那 1+1 | 189 → 190 仪器改数 |
 | 「门禁会把 race 的两条访问与两个函数打成明细」 | 那句 `grep -A24 "^==.*== WARNING: ThreadSanitizer: data race"` 与 TSan 的实际输出（`WARNING: ThreadSanitizer: data race (pid=…)`，行首没有 `==pid== ` 那个空格形状）**从不匹配** ⇒ 这个分支自写下起一句没打印过，红的时候只有一句计数。轮次190 修好，第一次读到 `Read of size 4 … by thread T13 (mutexes: write M0)` | 189 自查（190 修） |
 | 「轮次188 的 null 那跑『每台北都有两局空 base 且决定性结束，records 却各只有 1 行』⇒ 导出条件与实测不自洽（`#103` 的原始写法）」 | **只有一局是决定性结束**。418 个文件按 `(.status,.base|length)` 分类 = 209 `game_over` + 195 `playing` + 14 `waiting`，空 base 的只有 2 个：`4f3290…`（`game_over`/black/resign/31 手，就是那 1 行）与 `4d1a69…`（**`playing`** + `winner:"draw"`(EMPTY) + `reason:"invalid"`）⇒ `is_decisive()` 两半各自都挡住第二局，规则之外没有隐藏条件；代码与现场自洽。那条 `playing` 也不是脏数据：`null209.csv` 有 418 行 ⇒ 会话文件与局数 1:1，而 182 条棋线各出现 2 次是**换座的两局同一条线**（null 的零分岔），不是同一局的两个视图；status 的 `game_over 209` vs `playing 195 + waiting 14 = 209` 与报表「胜=209 负=209」严丝合缝 ⇒ 一台服务器只看到**自己这侧**的结束通知，本台赢下的局永远留在 `playing`（其中 14 场 `plies==0` 就赢的留成 `waiting`）。 | 轮次191 用 `/tmp/r188` 原产物重算（`jq`，命令在轮次191 那段）；A 段第 27 条 |
+| 「`is_decisive()` 的 reason 那半由 `tests/test_training.cpp:608-611` 那条条件式断言钉着」（轮次191 的 D 段 #107 这么写的） | **那半同样没有牙**。四臂实测（新用例进树之前）：删掉 winner 项 ⇒ 绿、删掉两项 reason ⇒ 绿、恒真 ⇒ 红在 `:610`。`:610` 为什么逮不住 reason 半也可读：同一条记录在上一行刚断言 `winner == EMPTY`，光 winner 项就够判非决定性；而且恒真那条会红正说明那个 `if` 的 body 本局**确实执行了**，所以 191 猜的「没走到截断就一句不核」也不是原因。轮次192 补了 `:8213` 那条用例把两半各钉一遍 | 191（记账）→ 192（实测改判并关闭） |
 
 ### C. 棋力提升路线（按「每单位成本的期望棋力」排）
 
@@ -11628,5 +11664,5 @@ while the numeric family is `0` on both trees (identical message). The tester's 
 - **`#106` io 线程整盘拷贝 vs AI 提交写盘：量到了，缺省门禁盖不到（轮次190）**：`test_the_io_thread_board_copy_overlaps_the_ai_commit`（`tests/test_server.cpp:3930`）默认 return，`GOMOKU_R190_MEASURE=1` 才跑。带变量 ⇒ TSan **7 条 race**：写 = `board.cpp:64/:65/:145`（`place_stone`/`set_stone_bits`，AI worker 在 `thinking_mutex_` 里），读 = main 线程 `Board::Board(const Board&)`（`server.cpp:825` 那记 `state_sync` 的形状），思考在飞期间拷贝 43 075 664 次；不带变量 ⇒ `clean races=0`。⇒ 「TSan 绿」= 「用例摸得到的部分没有 race」，不是「盘面没有跨线程共享」。修法比 #105 大一圈：让 `board_` 只剩一个写者（AI 提交与求招交付都回 io 线程，与 183/187 的「排队的玩家一手必须回 io 线程执行」同形），代价是要重排 `ai_answer_delivered_` / `move_callback_` / `think_finished_callback_` 的时序 —— 那块地已经踩过两次（worker 自 join、worker 就地拿 `games_mutex_`），所以它要自己一轮：先量「提交回 io 之后，178 那 4/3326 吞子窗口与 183 的一手队列各自会变成什么」，再动代码。
 
 - **`#104` 适配评估的逐次分数没有读数口**：`hill climbing ran N iterations, M evaluations, best fitness X` 只报最好那一次；24 次评估各自的分数、平局率、候选是否 ≡ 冠军，日志与 checkpoint 都没有（checkpoint 实测键 = `best_version/elo/games_played/rounds_completed/samples_collected/seed/versions`）⇒ 想判「内部选点有没有牙」只能靠版本比对这种外围办法。欠一个便宜的读数口（每评估一行 `fitness` + 是否复制体）。〔轮次189 又走了一次外围办法才拿到判据：把 checkpoint 里 `versions[]` 的规范化 JSON 串与日志里 `verification score … -> promoted/kept` 那几列正则拼起来重放晋级史，才得出「183 轮复制体 / 其中 179 轮读 1.000000」这张表（8 行 node 脚本，产品里没有这个读数，也没有留任何仪器）。顺带一条同源的没解释读数：修后那三轮都是 `kept champion`，而 `champion elo` 仍逐轮在动（1516.000 → 1515.264 → 1514.561）；验证局的逐场胜负与和棋**落不进任何地方**（records 只收数据局，见 A 段第 20 条），所以连「这一轮的 0.5 是 4 胜 4 负还是四场和棋」都读不出来 —— 分为什么掉更没有解释。这条也在 #104 的欠口里。〕
-- **`#107` `is_decisive()` 的 `winner != EMPTY` 那一半没有单独断言（轮次191 量出来的缺口）**：`src/training/game_record.h:64-67` 是 `winner != EMPTY && reason != MOVE_LIMIT && reason != INVALID` 三个条件两半。轮次191 的第三轮变异台各拆一半跑整套 `test_server`：只留 `winner` 一半 ⇒ **绿**；拆掉 `winner` 只留两个 reason ⇒ **绿**。⇒ 对「未完局不许进 records」这一路，两半是**冗余防护**（现场那份 `playing` 会话同时带着 `winner:"draw"`(EMPTY) 与 `reason:"invalid"`，见 A 段第 27 条），所以只有把两半一起拆掉才红（HN1）。但 reason 那半在训练侧**不是**装饰：`tests/test_training.cpp:608-611` 是 `if (record.reason == GameEndReason::MOVE_LIMIT) { assert(winner == EMPTY); assert(!is_decisive()); }` 的**条件式**断言 —— 那一局没走到 MOVE_LIMIT 就一句不核，所以「封顶局不算胜负」其实没有无条件钉住。欠的是两条便宜断言：一条钉 `MOVE_LIMIT`（把上面那个 `if` 变成直接构造一条 reason=MOVE_LIMIT 的记录来核），一条钉 `winner==EMPTY && reason==FIVE` 这种不该导出、也不该被 `outcome_for` 记分的组合。本轮不顺手做（#103 的交付物是钉住现场那个形状，不是给 `GameRecord` 补全表）。
+- **`#107` `is_decisive()` 两半都没有单独断言 —— 轮次192 关闭（两条无条件断言 + 一次枚举进树）**：`src/training/game_record.h:64-67` 是 `winner != EMPTY && reason != MOVE_LIMIT && reason != INVALID` 三个条件两半。191 只记了 winner 那一半，并且以为 reason 半由 `tests/test_training.cpp:608-611` 那条 `if` 钉着。192 在**新用例进树之前**用四条臂量（各重编 7 个编译单元、跑整套 `test_training`）：删掉 winner 项 ⇒ **绿**、删掉两项 reason ⇒ **绿**、恒真 ⇒ 红在 `:610` ⇒ **两半各自都自由**；`:610` 逮不住 reason 半的原因是同一记录上一行刚断言过 `winner == EMPTY`（恒真那条会红 ⇒ 那个 `if` 的 body 本局确实执行了，「没走到截断」不是原因）。对「未完局不许进 records」这一路，两半仍是**冗余防护**（现场那份 `playing` 会话同时带着 `winner:"draw"`(EMPTY) 与 `reason:"invalid"`，见 A 段第 27 条）⇒ 191 的 HN1 仍须两半一起拆才红；两条读数不矛盾：一条说「这一路有两个挡板」，一条说「每个挡板都没有用例单独核过」。落地：`tests/test_training.cpp:8213` `test_a_decisive_record_needs_both_a_winner_and_a_replayable_ending`（注册在 `main` 末尾，+44 行 / 0 删，注册数 132 → 133），四条断言 `:8221` / `:8226` / `:8234` / `:8244` 各有臂杀死（`:8221` ← T_R3 / T_R4i，`:8226` ← T_R5i，`:8234` ← T_R1，`:8244` ← T_R6i），隔离轮与逐字恢复见轮次192 那段。
 
