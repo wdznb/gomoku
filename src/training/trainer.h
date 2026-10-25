@@ -68,24 +68,28 @@ struct TrainingConfig {
     // once with each colour, which cancels that position's first-move advantage inside
     // the pair and lets different pairs probe different positions.
     //
-    // The shipped default is 0 - the mechanism is armed but off - because the doc's
-    // promise ("let the coefficients, not the first move, decide") measures backwards
-    // on this engine. Screened at depth 4 / 400 ms with both engines holding the same
-    // coefficients, 45 of the first 48 four-ply lines end with one colour winning every
-    // game: at that strength a four-stone position is usually already a forced win, so
-    // the colour swap does not turn the pair into a coefficient test, it turns the
-    // forced win into a pair that scores exactly 0.5 whoever is better. The full run
-    // agrees - plies 4 raised the share of fitness matches pinned at 0.5 from the
-    // control's 32.5 % to 38.8 % and the colour-decided pair share to 66.9 %. 0 is the
-    // pre-#4 contract and the arm those readings are compared against; a named count is
-    // the way to probe a position class the screen has not ruled out yet.
+    // The default is 3 (轮次196). 0 is not a short ruler on an empty board, it is a
+    // flat one: both games of a pair start from the same empty board, the engine is
+    // deterministic, so the pair is one game twice with the colours swapped and
+    // splits 1-1 by construction. At the batch regime (depth 8, 12k nodes) 24 of 24
+    // fitness rounds read exactly 0.5 that way and the hill climber returned its own
+    // start (轮次195). Replaying three plies put 17 of 24 rounds off 0.5, and the
+    // resulting champion scored 0.5518 +- 0.0254 against the defaults over 386
+    // external openings (pre-registered bar: complete-pair CI lower bound > 0.5; it
+    // read 0.5020). Three is also the smallest count that reaches all eight
+    // positions: legal_moves() walks only the cells near a stone, so the 2-ply
+    // vocabulary is the 24 replies folded into 5 classes and the eight set indices
+    // land on 4 of them, while three and four plies both reach 8 distinct ones
+    // (tests/test_training.cpp prints both readings).
     //
-    // When it is armed, four plies is the floor, not a guess: legal_moves() walks only
-    // the cells near a stone, so with BLACK on the centre the reply is 24 neighbourhood
-    // cells folded into 5 symmetry classes - the generator's whole 2-ply vocabulary -
-    // and the eight set indices in fact land on 4 of them. At four plies the eight
-    // indices give eight positions that stay distinct after folding the symmetries.
-    int match_opening_plies = 0;
+    // The depth-4 / 400 ms screen that kept this off is still the reason 0 stays a
+    // named arm: with both engines holding the same coefficients, 45 of the first 48
+    // four-ply lines ended with one colour winning every game, and plies 4 raised
+    // the share of fitness matches pinned at 0.5 from 32.5 % to 38.8 %. That was
+    // measured at four plies and a different regime; three plies has not been
+    // re-screened at depth 4, so 0 remains the pre-#4 contract rather than a
+    // disproven setting.
+    int match_opening_plies = 3;
 
     // Self-play games generated per round purely to collect training data.
     int data_games = 4;

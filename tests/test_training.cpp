@@ -5040,11 +5040,12 @@ void test_trainer_cli_sprt_probes() {
 // replay legally, because a line the replay refuses would leave the match with no
 // denominator rather than a smaller one.
 void test_match_opening_set_is_fixed_and_diverse() {
-    // The shipped default is OFF, and this is the door that keeps it off: the round's
-    // mirror screen found 47 of 48 four-ply lines already won by one colour, so a
-    // replayed opening pins its pair at 0.5 instead of testing the coefficients. The
-    // mechanism below is what a named count arms.
-    assert(TrainingConfig().match_opening_plies == 0);
+    // The shipped default is 3 plies (轮次196): an empty board is a flat ruler, not a
+    // short one, because a pair from it is the same game twice and splits 1-1 - at
+    // depth 8 the default-off arm read 0.5 in 24 of 24 fitness rounds. The round-129
+    // depth-4 screen is why 0 stays a named comparison arm: it measured four-ply
+    // lines, not three, and not at the regime the default is priced in.
+    assert(TrainingConfig().match_opening_plies == 3);
 
     // Plies 0 is the pre-#4 contract and the arm the readings compare against.
     assert(Trainer::match_opening_line(0, 0).empty());
@@ -5072,11 +5073,26 @@ void test_match_opening_set_is_fixed_and_diverse() {
               << SYMMETRY_COUNT << " symmetries" << std::endl;
     assert(keys.size() == static_cast<size_t>(Trainer::kMatchOpeningSet));
 
-    // Why four plies is the floor when the mechanism is armed and not a guess:
+    // 轮次196：缺省改成 3 手之后，这个数目就是缺省档真正的问题数。
+    std::set<std::string> three_ply_keys;
+    for (int i = 0; i < Trainer::kMatchOpeningSet; ++i) {
+        const std::vector<Move> line = Trainer::match_opening_line(i, 3);
+        assert(line.size() == 3);
+        assert_playable_line(line);
+        three_ply_keys.insert(symmetry_key_of(line));
+    }
+    std::cout << "  [r196] the same 8 indices at 3 plies reach " << three_ply_keys.size()
+              << " positions" << std::endl;
+    // Three is the smallest count that reaches the whole set, which is what makes it a
+    // default rather than a compromise: folding takes the 2-ply vocabulary down to four
+    // positions, and the third ply separates them again.
+    assert(three_ply_keys.size() == static_cast<size_t>(Trainer::kMatchOpeningSet));
+
+    // Why three plies is the smallest useful count and not a guess:
     // legal_moves() only walks the cells near a stone, so with one stone on the board
     // the reply is chosen from a handful of neighbourhood cells, and eight indices
     // cannot yield eight positions. The reading is printed, not asserted equal to the
-    // set size - the ceiling is the reason four is the smallest useful count.
+    // set size - the ceiling above is the reason the default sits at three.
     std::set<std::string> two_ply_keys;
     for (int i = 0; i < Trainer::kMatchOpeningSet; ++i) {
         const std::vector<Move> line = Trainer::match_opening_line(i, 2);
@@ -5085,7 +5101,8 @@ void test_match_opening_set_is_fixed_and_diverse() {
         two_ply_keys.insert(symmetry_key_of(line));
     }
     std::cout << "  [r129] the same 8 indices at 2 plies reach only " << two_ply_keys.size()
-              << " positions - four is the floor when the flag is armed" << std::endl;
+              << " positions - three is the floor now that the flag defaults on"
+              << std::endl;
     assert(two_ply_keys.size() < static_cast<size_t>(Trainer::kMatchOpeningSet));
 
     // Fixed means bounded: past the end of the set the rotation reuses the same lines
@@ -5223,7 +5240,7 @@ void test_trainer_cli_match_opening_probes() {
     }
     const std::string base =
         "--rounds 1 --method hill --hill-iterations 1 --depth 1 --timeout-ms 1 "
-        "--max-moves 2 --fitness-games 1 --verification-games 2 --no-data --quiet";
+        "--fitness-games 1 --verification-games 2 --no-data --quiet";
     const std::filesystem::path out_path = temp_path("r129_open_out.json");
     const std::filesystem::path ck = temp_path("r129_open_ck.json");
     const std::filesystem::path err = temp_path("r129_open_stderr.txt");
@@ -5233,8 +5250,9 @@ void test_trainer_cli_match_opening_probes() {
         text << in.rdbuf();
         return text.str();
     };
-    auto run = [&](const std::string& arguments) {
-        const std::string command = "./gomoku_train " + base + " --out '" + out_path.string() +
+    auto run = [&](int max_moves, const std::string& arguments) {
+        const std::string command = "./gomoku_train " + base + " --max-moves " +
+                                    std::to_string(max_moves) + " --out '" + out_path.string() +
                                     "' --checkpoint '" + ck.string() + "' " + arguments +
                                     " > /dev/null 2> '" + err.string() + "'";
         const int status = std::system(command.c_str());
@@ -5248,32 +5266,40 @@ void test_trainer_cli_match_opening_probes() {
 
     // One replayed ply under a two-ply cap is still a searched game: accepted. The
     // same request at the cap is refused, and 0 - no opening at all - is accepted.
-    const int one = run("--match-opening-plies 1");
-    const int at_cap = run("--match-opening-plies 2");
+    const int one = run(2, "--match-opening-plies 1");
+    const int at_cap = run(2, "--match-opening-plies 2");
     // Read the refusal before the next arm overwrites the log: the arm that exits 0
     // writes nothing to it.
     const std::string cap_err = read_all(err);
-    const int off = run("--match-opening-plies 0");
-    // Asking for nothing is the shipped default, and under --max-moves 2 the default
-    // has to clear the guard - which is only true because it is 0.
-    const int unnamed = run("");
+    const int off = run(2, "--match-opening-plies 0");
+    // The default is 3, so an unnamed run under a two-ply cap is refused by the same
+    // guard - the default is a count, not a special case that bypasses the check. The
+    // same unnamed run under a four-ply cap is accepted, which is what shows the
+    // default really is three rather than zero.
+    const int unnamed_at_two = run(2, "");
+    const std::string default_err = read_all(err);
+    const int unnamed_at_four = run(4, "");
     std::cout << "  [r129] --match-opening-plies 1 => exit " << one << ", 2 with "
                  "--max-moves 2 => exit "
-              << at_cap << ", 0 => exit " << off << ", unnamed => exit " << unnamed
+              << at_cap << ", 0 => exit " << off << ", unnamed with --max-moves 2 => exit "
+              << unnamed_at_two << ", unnamed with --max-moves 4 => exit " << unnamed_at_four
               << std::endl;
     assert(one == 0);
     assert(at_cap == 1);
     assert(off == 0);
-    assert(unnamed == 0);
+    assert(unnamed_at_two == 1);
+    assert(unnamed_at_four == 0);
     // The refusal names both flags: a run that dies on this combination has to be
     // told which of the two to move.
     assert(cap_err.find("--match-opening-plies") != std::string::npos);
     assert(cap_err.find("--max-moves") != std::string::npos);
+    assert(default_err.find("--match-opening-plies") != std::string::npos);
+    assert(default_err.find("--max-moves") != std::string::npos);
 
-    assert(run("--match-opening-plies -1") == 1);
-    assert(run("--match-opening-plies") == 1);
-    assert(run("--match-opening-plies 1e1") == 1);
-    assert(run("--match-opening-plies ''") == 1);
+    assert(run(2, "--match-opening-plies -1") == 1);
+    assert(run(2, "--match-opening-plies") == 1);
+    assert(run(2, "--match-opening-plies 1e1") == 1);
+    assert(run(2, "--match-opening-plies ''") == 1);
 
     const std::filesystem::path usage = temp_path("r129_open_usage.txt");
     assert(std::system(("./gomoku_train --help > '" + usage.string() + "' 2>&1").c_str()) != -1);
@@ -5922,6 +5948,10 @@ void test_a_margin_weight_blends_the_real_match_score_off_the_lattice() {
     config.timeout_ms = 5000;
     config.max_nodes = 800;
     config.max_moves = 14;
+    // 这条用例测的是 0.6·胜负 + 0.4·连续分量 的算术，需要一场里至少有一局分出胜负；
+    // 缺省 3 手开局下同系数的一对会被座位钉成 1-1，混合后的分数仍是 0.5，格点那句
+    // 就失去了前提。这里点名 0 手，把开局这个变量从实验里拿掉。
+    config.match_opening_plies = 0;
     config.fitness_games = 2;
     config.verification_games = 2;
     config.sprt_elo = 0;        // 不打断：两局都要真下完，格点判定才有意义
@@ -7164,7 +7194,7 @@ void test_h1_a_sigkilled_writer_leaves_at_most_one_partial_line() {
 }
 
 // 在这里 include 而不是在文件顶部：`tests/test_training.cpp` 顶部加一行会把 REVIEW_LOG 按行号
-// 指认的那几十处（`test_training.cpp:6239`…`:7033`）一起推走，而这两条用例用不到更早的位置。
+// 指认的那几十处一起推走（那些数字是写下时的树，例如 6239 与 7033），而这两条用例用不到更早的位置。
 #include "training/worker_mode.h"
 #include <nlohmann/json.hpp>
 
