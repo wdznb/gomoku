@@ -74,6 +74,12 @@ double Trainer::play_game(SearchEngine& black, SearchEngine& white, int black_ow
     settings.max_nodes = config_.max_nodes;
     settings.max_moves = config_.max_moves;
 
+    // 轮次189 #102：一场配对局从**空表**开始。镜像对的第二局要是带着第一局烘热的置换表，
+    // 「候选 ≡ 冠军」就不读 0.5 了：188 那批 190 轮里同版候选的验证赛 **179 次读 1.000000**
+    // （SPRT 6 局就 accept），把下面两行拆掉则本轮的用例当场红在 `copy.score == 0.5` 上。
+    // 上面 `score_match` 那对引擎是为「跨候选」才新建的，这两句管的是**跨局**。
+    black.transposition_table().clear();
+    white.transposition_table().clear();
     SelfPlay play(black, white, settings);
     GameRecord record = play.run(opening, nullptr, nullptr);
     const bool valid = record.reason != GameEndReason::INVALID;
@@ -768,7 +774,7 @@ bool Trainer::load_checkpoint(const std::string& path, std::string& error) {
 
 // `tactics_card.h:66` 的那个符号在这里重述一次声明，而不是往文件顶部加 `#include`：
 // 加一行 include 会把本文件被按行号指认的那几处（`measure_fitness` 41-57、`score_match`
-// 180-257、checkpoint 的 `versions[]` 626-629）整体推走。
+// 186-260、checkpoint 的 `versions[]` 632-635）整体推走。
 std::string coefficients_fingerprint(const ThreatCoefficients& coeffs);
 
 namespace {

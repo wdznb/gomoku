@@ -385,7 +385,7 @@ README `:213` 与轮次129 的实测（深度 4 / 400 ms，同一套系数走镜
 
 #### S4｜深搜蒸馏样本：把深搜的着法当教材，而不是只数输赢
 
-- 现状：`data_collector` 已在产 JSONL 样本，但样本只覆盖 alphabeta 决策的 ply——`min_search_depth_ = 1`（`data_collector.h:74`，`trainer.cpp:201` 从未改写过）把所有 vcf/must_block 的 ply 丢掉了；轮次125 实测 14/28/62 → 112/224/496 条样本，差的就是这几类 ply。
+- 现状：`data_collector` 已在产 JSONL 样本，但样本只覆盖 alphabeta 决策的 ply——`min_search_depth_ = 1`（`data_collector.h:74`，`trainer.cpp:207` 从未改写过）把所有 vcf/must_block 的 ply 丢掉了；轮次125 实测 14/28/62 → 112/224/496 条样本，差的就是这几类 ply。
 - 改什么：训练信号从「这一局的胜负」改为「这一手与一次更贵的参考搜索给出的着法差多少」。d6 的搜索直接当 d4 的老师，**深搜的优势第一次变成训练动力，而不是把对局抹平**。
 - 形态：`min_search_depth_` 提升 ＋ 每样本加一份 `teacher_move`（由一次更贵/定深更大的参考搜索产生，与实际执行的那一手分开记，不许互相污染）；训练目标是一个就地可算的距离量。
 - **验收仪器**：报「样本数」与「teacher 与实际一致的比例」随轮次的变化；一致率上升 = 队伍在学；同时确认样本覆盖 vcf/must_block 的 ply（断言的正是今天缺的那部分）。

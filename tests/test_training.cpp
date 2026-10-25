@@ -8147,6 +8147,64 @@ void test_black_dead_threat_genes_are_never_probed() {
     std::cout << "test_black_dead_threat_genes_are_never_probed passed" << std::endl;
 }
 
+// 轮次189 #102：一台引擎打它自己，内部验证赛必须读**逐字 0.5**，而且要在「训练真会用的那档
+// regime」下读 —— 深度 8 + 12 000 节点/手（时间只兜底）。旧形状里镜像对的第二局带着第一局烘热的
+// 置换表：188 那批 190 轮里 183 轮的候选与当轮冠军逐字相同，其中 **179 轮验证分读 1.000000**；本轮
+// 拿那颗 checkpoint 原状续 3 轮对照，修前三轮都是 `1.000000 (accept, 6 局) -> promoted`、修后三轮都是
+// `0.500000 (open, 8 局) -> kept champion`（读数与命令见 REVIEW_LOG 轮次189）。
+// 已有的那几条同版断言量不到这件事：`test_a_closed_sprt_ends_the_match_early`（:4831）跑在
+// `max_moves = 1`、`test_a_match_rotates_through_the_opening_set`（:5172）跑在深度 1 —— 一局只
+// 落一两子的形状里没有表可烘，它们的 0.5 是**规定出来的**（全是和棋）。这一条按 60 手的真实
+// 局长、深度 8 + 12 000 节点跑（每场到底分没分胜负读不出来：验证局不落 records，见 D 段 #104）。
+void test_a_copy_of_the_champion_scores_exactly_half_at_the_training_regime() {
+    TrainingConfig config = fast_training_config();
+    config.search_depth = 8;
+    config.timeout_ms = 3000;
+    config.max_nodes = 12000;
+    config.max_moves = 60;
+    config.sprt_elo = 300;
+    config.resign_enabled = true;
+    config.match_opening_plies = 0;
+    // 生产那档默认 8 场（`TrainingConfig::verification_games`，trainer.h:52），这里取 4：
+    // 本轮同一次会话里两次跑的差把价量出来了 —— 用例 4 场时套件墙钟 49.2 s，用例改跑 4+8 场
+    // 时 105.9 s ⇒ 8 场 ~57 s、~7.1 s/局；把这条留在 8 场，套件要 ~77 s，而它的 TIMEOUT 是
+    // 300 s（CMakeLists.txt:336），这台 VM 的墙钟一天里能飘一个量级，不留那点余量。8 场那档
+    // 本轮量过：逐字 0.5000 / llr -2.6720 / open / games=8 —— 和 `test_a_closed_sprt_ends_the_match_early`
+    // 在深度 1 强制和棋下钉的 -2.6719539 是同一个数（llr 只由 score 与场数决定，见下），所以
+    // 8 场这一档真正多出来的信息是「真实 60 手局长下也平」，不是那个字面值。
+    config.verification_games = 4;
+
+    Trainer trainer(ThreatCoefficients(), config);
+    const int before = trainer.games_played();
+    const MatchOutcome copy =
+        trainer.score_match(CoefficientPair(), CoefficientPair(), config.verification_games);
+    assert(trainer.games_played() - before == config.verification_games);
+    assert(copy.games == config.verification_games);   // 没被 SPRT 提前收掉
+    assert(copy.score == 0.5);
+    // 一台没改的引擎**不许有被读成方向**的形状：中性 ⇒ score 恰 0.5（低于 --accept-score 0.56），
+    // SPRT 停在 open。REJECT 也是这一条要挡住的：把复制体判负和判胜一样是量具在编方向。
+    assert(copy.verdict == SprtVerdict::OPEN);
+    // llr 在这里不是独立信息：`add_game` 按场累加 `s·ln(p1/0.5) + (1-s)·ln((1-p1)/0.5)`，
+    // 于是它只由 (score, games) 决定 ⇒ 0.5 的 4 场恒等于 -1.33598（每对 -0.668；和棋场与
+    // 一对一胜一负给同一个数，`tests/test_training.cpp:4675-4686` 那批字面值）。钉这个字面值
+    // 管的是 SPRT 那两项的系数别被人挪走，**不**管这一档里每对是不是真的各胜一场。
+    assert(std::abs(copy.llr + 1.335976974) < 1e-6);
+
+    // 这一条只管「中性」，不管「分得出强弱」。树里没有用例量后者：
+    // `test_play_game_counts_only_valid_games` 那 1.0/0.0/0.5 三支走的是 `set_fitness_override`
+    //（末尾 `assert(fast.games_played() == 0)` ⇒ 一场棋都没下），`test_play_match_rounds_up_to_even`
+    // 钉的是全和棋下的归一化。本轮用临时仪器量过一次（未入库，读数见 REVIEW_LOG 轮次189）：
+    // 同一档 regime 下 `cand_width_root = 1` 那支当候选 4 场读 **0.75**、反过来当参照读 **0.25**
+    //（SPRT 当场 reject）⇒ 这把尺清完表仍然有牙；但 `data/params/r1_champion.json` 那份（外部赛具
+    // @12 000 定价 p̂ 0.689）对默认 8 场读 0.5、`four_three` 砍到十分之一 8 场也读 0.5 ——
+    // 按 SE = 0.5/√对数，要在这把尺上判出 0.689 至少得 ~19 对 ≈ 38 场，8 场那档根本看不见这个量级。
+    std::cout << "  [r189] 同版自打 " << copy.games << " 场逐字读 0.5000（llr " << copy.llr
+              << "、verdict " << sprt_verdict_name(copy.verdict) << "）"
+              << " ⇒ 复制体不再可能被读成方向" << std::endl;
+    std::cout << "test_a_copy_of_the_champion_scores_exactly_half_at_the_training_regime passed"
+              << std::endl;
+}
+
 int main() {
     std::cout << "Running training tests..." << std::endl;
 
@@ -8299,6 +8357,7 @@ int main() {
     test_k1_pause_at_round_boundary_then_resume_gives_the_same_checkpoint();
     test_k1_the_balance_phase_has_no_controller_class_in_the_tree();
     test_black_dead_threat_genes_are_never_probed();
+    test_a_copy_of_the_champion_scores_exactly_half_at_the_training_regime();
 
     std::cout << "All training tests passed" << std::endl;
     return 0;

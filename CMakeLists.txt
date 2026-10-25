@@ -333,7 +333,7 @@ set_tests_properties(test_search    PROPERTIES TIMEOUT 900)   # 实测 470 s
 set_tests_properties(test_position  PROPERTIES TIMEOUT 120)
 set_tests_properties(test_session   PROPERTIES TIMEOUT 60)
 set_tests_properties(test_server    PROPERTIES TIMEOUT 180)
-set_tests_properties(test_training  PROPERTIES TIMEOUT 300)   # 丁-3 后实测 41 s（三条普查臂在 test_evaluator，不在这里）
+set_tests_properties(test_training  PROPERTIES TIMEOUT 300)   # 轮次189 实测 53.5 s（本轮那条同版 4 场的用例值 ~29 s，~7 s/局；三条普查臂在 test_evaluator，不在这里）
 set_tests_properties(test_pinned    PROPERTIES TIMEOUT 900)   # 六臂定深，d8 那两臂最慢
 
 # Every suite relies on plain assert(); a Release/RelWithDebInfo -DNDEBUG
