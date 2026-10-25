@@ -127,6 +127,7 @@ void GameManager::reset() {
     halt_search();
     std::lock_guard<std::mutex> lock(thinking_mutex_);
     board_.reset();
+    board_epoch_.fetch_add(1, std::memory_order_release);
     status_ = GameStatus::WAITING;
     winner_ = EMPTY;
     game_over_reason_.clear();
@@ -152,6 +153,7 @@ bool GameManager::set_position(const Board& board) {
 
     std::lock_guard<std::mutex> lock(thinking_mutex_);
     board_ = board;
+    board_epoch_.fetch_add(1, std::memory_order_release);
     status_ = GameStatus::WAITING;
     winner_ = EMPTY;
     game_over_reason_.clear();
@@ -183,6 +185,7 @@ bool GameManager::restore_game(const GameRestore& restore) {
         fresh_analyses.push_back(entry);
     }
     board_ = fresh;
+    board_epoch_.fetch_add(1, std::memory_order_release);
     analyses_ = std::move(fresh_analyses);
     if (restore.player_color == BLACK || restore.player_color == WHITE) {
         player_color_ = restore.player_color;
@@ -248,6 +251,7 @@ bool GameManager::make_move(int row, int col) {
     if (!board_.place_stone(row, col, turn)) {
         return false;
     }
+    board_epoch_.fetch_add(1, std::memory_order_release);
     // Playing a stone is the other way out of a hand-set position.
     position_pending_ = false;
     // The human's stone ages the table the same way the AI's does: one move, one
@@ -293,6 +297,7 @@ bool GameManager::undo(int& out_move_count, GameStatus& out_status) {
     int undone = 0;
     for (int i = 0; i < undo_count && board_.move_count() > 0; ++i) {
         board_.undo_last_move();
+        board_epoch_.fetch_add(1, std::memory_order_release);
         ++undone;
     }
     // The board and the replay list are the same history seen two ways, so a
@@ -394,7 +399,9 @@ bool GameManager::request_hint(int timeout_ms, int max_depth) {
     discard_pending_.store(false);
     int turn = current_turn();
     Board board_snapshot = board_;
-    const int snapshot_move_count = board_snapshot.move_count();
+    // 这一号的值就是「上面那次拷贝发生时的盘面版本」，收尾时拿它比的是同一格的号，而不是
+    // 再去读一次活盘（#105：`make_move`/`undo` 改盘不拿 `thinking_mutex_`，也不挡 `hint_active_`）。
+    const int snapshot_epoch = board_epoch_.load(std::memory_order_acquire);
     // Captured on this thread and copied into the worker: see start_ai_thinking.
     Reuse reuse;
     {
@@ -408,7 +415,7 @@ bool GameManager::request_hint(int timeout_ms, int max_depth) {
     budget.soft_time_ms = clamp_soft_time_ms(budget.soft_time_ms, timeout_ms);
 
     hint_thread_ = std::make_unique<std::thread>(
-        [this, board_snapshot, turn, timeout_ms, max_depth, snapshot_move_count, reuse,
+        [this, board_snapshot, turn, timeout_ms, max_depth, snapshot_epoch, reuse,
          budget]() mutable {
             engine_.set_soft_time_ms(budget.soft_time_ms);
             engine_.set_max_nodes(budget.max_nodes);
@@ -428,25 +435,25 @@ bool GameManager::request_hint(int timeout_ms, int max_depth) {
             if (!discard_pending_.load() && hint_callback_) {
                 // The answer describes board_snapshot. make_move and undo do not
                 // wait for an in-flight hint, so a stone landed in the meantime
-                // makes it advice about a board that no longer exists; compare
-                // under thinking_mutex_, which is what the AI commit path takes
-                // when it changes board_.
-                int move_count_now = 0;
+                // makes it advice about a board that no longer exists. 比的是**盘面版本号**
+                // 而不是活盘（#105）：那两条路改盘既不拿 `thinking_mutex_`、也不挡
+                // `hint_active_`，所以在锁里读 `board_` 也挡不住它们 —— 只有这个号两边都会动。
+                bool same_board = false;
                 {
                     std::lock_guard<std::mutex> commit_guard(thinking_mutex_);
-                    move_count_now = board_.move_count();
+                    same_board = board_matches_hint_snapshot(snapshot_epoch);
                     // The same test the answer is delivered on: when the board is
                     // still the position this hint was computed from, the next 求招
                     // on it is searching exactly what this one just searched, so it
                     // starts from this conclusion.
-                    if (move_count_now == snapshot_move_count) {
+                    if (same_board) {
                         hint_move_ = result.best_move;
                         hint_score_ = result.score;
                         hint_color_ = turn;
                         has_hint_ = (result.method == "alphabeta");
                     }
                 }
-                if (move_count_now != snapshot_move_count) {
+                if (!same_board) {
                     hint_callback_(Move(), 0);
                     hint_active_.store(false);
                     return;
@@ -569,6 +576,9 @@ void GameManager::ai_thinking_worker(int timeout_ms, int max_depth, Reuse reuse,
             status_ == GameStatus::PLAYING &&
             current_turn() == ai_color_ &&
             board_.place_stone(result.best_move.pos, ai_color_)) {
+            // 这一手改盘要能被别的线程知道，而它们读不到 `board_`（读不得，见求招收尾那段）：
+            // 号在这里 +1，与玩家那两条路同一口径。
+            board_epoch_.fetch_add(1, std::memory_order_release);
             // The table's clock steps once per committed stone, not once per think:
             // the records this think wrote stay in the table for the moves that
             // follow, which is what lets a later think meet the same position by a

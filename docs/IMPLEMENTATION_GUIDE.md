@@ -112,7 +112,7 @@ git push origin master                # 然后核对 git log --oneline -1 origin
    - `src/server/server.cpp` 的 `handle_message` 分发链（`:715-743`）加一个 `else if (type == "analyze_request")`。**它是会话级帧，所以不要动 `:705` 那个白名单**（白名单只管 `ping`/`check_position` 这类不需要会话的帧）。
    - 新 handler 里：
      - 用 `get_int_or(msg, "depth", 8)` / `get_int_or(msg, "budget", 20000)` 读参数（`server.cpp:25-40` 的两个 helper 已防 `{"row":"7"}` 这类异常）；
-     - 从 `GameManager::replay_snapshot()`（`game_manager.cpp:334-351`，`thinking_mutex_` 下拷贝）取整局；把 `MoveAnalysis` 逐字段转成 `GameRecord::moves`（`row/col/color/score/depth/nodes/method/...` 一一对应）；
+     - 从 `GameManager::replay_snapshot()`（`game_manager.cpp:341-358`，`thinking_mutex_` 下拷贝）取整局；把 `MoveAnalysis` 逐字段转成 `GameRecord::moves`（`row/col/color/score/depth/nodes/method/...` 一一对应）；
      - **起一个后台线程**跑 `ReplayAnalyzer` ＋ `ReplayReviewer`（都在 `src/training/replay_analyzer.h`），每完成一手 `send_message(session, analyze_progress)`，最后发一帧 `analyze_result`；
      - 玩家正在思考（`ai_thinking()`）时**直接拒绝**，回一帧 `error` 说明「AI 正在思考，复盘会偷走它的时钟」，不排队。
    - 线程安全：`WebSocketSession::send` 内部走 `net::post`（`server.cpp:352-370`），**后台线程可以直接调**；但 socket 关闭后不能再写，所以要么在 `clear_game_callbacks`（`:1660`）里 join/置停，要么用 `weak_ptr` ＋ `expired()` 检查。

@@ -320,9 +320,23 @@ private:
         think_finished_callback_ = std::move(cb);
     }
 
+    // 轮次190 #105：求招收尾那一句「这张盘还是不是我给它算的那张」抽成一个判据，让它可以
+    // 被同步地钉住（并发那一面由 `test_hint_answer_for_a_superseded_position` 盖）。比的必须是
+    // 号而不是子数：悔棋两子再落回一手会把子数补回原样，而那张盘已经不是原来那张。
+    bool board_matches_hint_snapshot(int snapshot_epoch) const {
+        return board_epoch_.load(std::memory_order_acquire) == snapshot_epoch;
+    }
+
   private:
     std::atomic<bool> ai_answer_delivered_{false};
     ThinkFinishedCallback think_finished_callback_;
+    // 轮次190 #105，加在类的最后（上面 #81 那条规矩：这个头文件的 `:142/188-196/204-208/239-247`
+    // 都被按行号指认过）。盘面版本号：每一个改 `board_` 的地方 +1，改盘的顺序也由它说话。
+    // 求招 worker 判断「这张盘还是不是我给它算的那张」时**只 load 这个号**，不回读 `board_` ——
+    // 玩家那两条路（`make_move` / `undo`）改盘不拿 `thinking_mutex_`，只挡
+    // `ai_thinking_`，而它们都不挡 `hint_active_`，所以那记回读是一 pair 真 race（TSan 量到）。
+    // 与轮次187 的 `pending_seq_` 同形：worker 交回结论的那一步只看原子号，不碰锁、不碰活盘。
+    std::atomic<int> board_epoch_{0};
 };
 
 }

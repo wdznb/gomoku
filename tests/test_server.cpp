@@ -3845,6 +3845,15 @@ void test_a_socket_that_closes_while_the_ai_is_thinking_does_not_wedge_the_io_th
     CHECK_MESSAGE(came_back,
                   "断开一条正在思考的会话必须自己收回来 —— 否则整台服务器连 ping 都不回");
 
+    // 收回来了才收线程。挂住的那一支要继续留在文件域里不析构（上面注释写的那次二次挂死），
+    // 而过了的这一支没理由把一条已完成的线程漏着 —— 轮次190 的 TSan 就把它记成了
+    // `thread leak`（1 条，创建点正是这条用例在 main 里那一行）。
+    if (came_back) {
+        g_wedge_joiner->join();
+        delete g_wedge_joiner;
+        g_wedge_joiner = nullptr;
+    }
+
     // 「收回来」不许是靠少做事换来的：这一条要变成 detach、标志要交回、盘要落进会话文件。
     CHECK_MESSAGE(h->entry->attached == nullptr, "断开之后这一条要挂成 detach");
     CHECK_MESSAGE(!game.is_ai_thinking(), "思考标志要交回来");
@@ -3856,6 +3865,90 @@ void test_a_socket_that_closes_while_the_ai_is_thinking_does_not_wedge_the_io_th
               << std::endl;
 }
 
+// 轮次190 #105：求招收尾那句「这张盘还是不是我算的那张」现在比的是**盘面版本号**，不是子数。
+// 这条钉两件事：(1) 每一处改 `board_` 的路都要把号 +1（号漏了，判据就会把动过的盘当没动）；
+// (2) 「悔棋退两子、再落一手把子数补回原样」这一格 —— 旧判据（比 move_count）在这里会说
+// 「还是那张盘」，把一份算在别的顺序上的推荐照样投递；号在这里说「不是」。**这条不需要线程，
+// 所以前提是能直接看的**（并发那一面由 :1710 那条盖）。
+void test_the_board_epoch_distinguishes_a_refilled_position_from_the_snapsotted_one() {
+    Harness h(scratch("r190_board_epoch"), std::string());
+    GameManager& game = *h.entry->game;
+    // restore_game 也要算一次：它是「会话从记录里被重建」那一条改盘路。
+    const int epoch_at_open = game.board_epoch_.load();
+    assert(game.restore_game(hint_pose_restore()));      // 8 子，BLACK 应手
+    assert(game.board_epoch_.load() == epoch_at_open + 1);
+    const int armed_at = game.board().move_count();
+    assert(armed_at == 8);
+
+    // (1) 每一格改盘都算一次：号在 restore_game 之后已经动过，这里逐路量增量。
+    int epoch = game.board_epoch_.load();
+    assert(game.make_move(0, 0));                        // 人落一子（也会点起 AI 那一手）
+    assert(game.board_epoch_.load() == epoch + 1);
+    epoch = game.board_epoch_.load();
+    join_think(game);                                    // AI 提交的那一子
+    assert(game.board_epoch_.load() == epoch + 1);
+    epoch = game.board_epoch_.load();
+    int undone_count = -1;
+    GameStatus undone_status = GameStatus::WAITING;
+    assert(game.undo(undone_count, undone_status));
+    // 悔一次退两子 ⇒ 号走两格，而不是一格
+    assert(game.board_epoch_.load() == epoch + 2);
+    epoch = game.board_epoch_.load();
+    game.reset();
+    assert(game.board_epoch_.load() == epoch + 1);
+    epoch = game.board_epoch_.load();
+    Board blank;
+    blank.place_stone(7, 7, BLACK);
+    assert(game.set_position(blank));
+    assert(game.board_epoch_.load() == epoch + 1);
+
+    // (2) 把子数补回原样的那一格：先立一个快照号，再动盘，动完子数一样、号不一样。
+    assert(game.restore_game(hint_pose_restore()));
+    assert(game.board().move_count() == armed_at);
+    const int snapshot_epoch = game.board_epoch_.load();
+    assert(game.board_matches_hint_snapshot(snapshot_epoch));   // 没动过 ⇒ 就是那张盘
+
+    assert(!game.is_ai_thinking());
+    assert(game.undo(undone_count, undone_status) && undone_count == armed_at - 2);
+    assert(game.make_move(0, 0));                               // 落回一手，盘面 7 子
+    join_think(game);                                           // AI 应一手 ⇒ 8 子，回到快照的大小
+    assert(game.board().move_count() == armed_at);              // 旧判据在这一步会说「还是那张盘」
+    assert(!game.board_matches_hint_snapshot(snapshot_epoch));  // 号说的是：不是
+
+    std::cout << "  [r190] 盘面号：restore/reset/set_position/人手/AI 手各 +1、悔棋一次 +2；"
+              << "子数补回 " << armed_at << " 的那一格旧判据会放行，号拦住了" << std::endl;
+    std::cout << "test_the_board_epoch_distinguishes_a_refilled_position_from_the_snapsotted_one passed"
+              << std::endl;
+}
+
+// 轮次190 的**测量**用例，登记为 #106 —— 缺省不跑（`GOMOKU_R190_MEASURE=1` 才跑），因为它现在必然红：
+// io 线程那一记「把整张盘拷进 state_sync」（`server.cpp:825` 的形状）与 AI worker 的提交
+// （`game_manager.cpp` 里 `board_.place_stone` 那一格）之间没有任何同步，而 #105 只修了求招那一条。
+// 跑法：`GOMOKU_R190_MEASURE=1 ./build-tsan/test_server` ⇒ TSan 报 race（读=这条循环 / 写=AI 提交）；
+// 不带变量 ⇒ 缺省门禁盖不到这一对，`races=0` 是「没被摸到」而不是「不存在」。轮次190 实测：
+// 两跑各 8 条报告，思考在飞期间整盘拷贝 12 244 880 次。
+void test_the_io_thread_board_copy_overlaps_the_ai_commit() {
+    if (std::getenv("GOMOKU_R190_MEASURE") == nullptr) {
+        std::cout << "  [#106] 跳过（要跑它请给 GOMOKU_R190_MEASURE=1）" << std::endl;
+        return;
+    }
+    Harness h(scratch("r190_board_overlap_measure"), std::string());
+    GameManager& game = *h.entry->game;
+    assert(game.restore_game(hint_pose_restore()));
+    game.set_config(1200000, 12, -1, 20000000);   // 一手要跑很久，读数窗才够宽
+    assert(game.make_move(3, 10));                 // 人落一子 ⇒ AI 那一手在飞
+    assert(game.is_ai_thinking());                 // 前提直接看，不拿墙钟当代理
+    long reads = 0;
+    while (game.is_ai_thinking()) {
+        Board copy = game.board();                 // handle_state 读的就是这一格
+        (void)copy.move_count();
+        ++reads;
+    }
+    join_think(game);
+    std::cout << "  [#106] 思考在飞期间的整盘拷贝 = " << reads
+              << " 次；这一对里 io 读 `board_`、worker 写 `board_`，中间没有东西" << std::endl;
+    std::cout << "test_the_io_thread_board_copy_overlaps_the_ai_commit passed" << std::endl;
+}
 int main() {
     std::cout << "Running server tests..." << std::endl;
 
@@ -3912,6 +4005,8 @@ int main() {
     test_a_stone_that_arrived_in_the_tail_window_is_held_and_then_applied();
     test_a_detached_session_over_the_cap_is_settled_and_shelved();
     test_a_socket_that_closes_while_the_ai_is_thinking_does_not_wedge_the_io_thread();
+    test_the_board_epoch_distinguishes_a_refilled_position_from_the_snapsotted_one();
+    test_the_io_thread_board_copy_overlaps_the_ai_commit();
 
     test_analyze_progress_then_exactly_one_result_per_ply();
     test_analyze_is_refused_while_the_ai_is_thinking();

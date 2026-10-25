@@ -1278,10 +1278,10 @@ true and 求招 was dead until a reload (round 75 had only freed it on the undo 
 shared deadline can strand the AI with no move" - `alphabeta.cpp:360-362` still falls back to
 `root_moves[0]`, so the worst case is a shallow move, not silence (kept as a test case instead); and "the
 hint thread and the AI thread race on the engine transposition table" - `start_ai_thinking` calls
-`stop_thinking()` and then joins *both* `search_thread_` and `hint_thread_` (`game_manager.cpp:319-326`), so
+`stop_thinking()` and then joins *both* `search_thread_` and `hint_thread_` (`game_manager.cpp:326-333`), so
 the two searches never overlap. Also refuted: a `ai_move` frame before the player has chosen a side (the
 server arms the AI only from `choose_side`/`set_position`), unclamped client `timeout_ms`/`max_depth`
-(`clamp_timeout_ms`/`clamp_max_depth` at `game_manager.cpp:288-289`, re-clamped in `handle_request_hint`),
+(`clamp_timeout_ms`/`clamp_max_depth` at `game_manager.cpp:292-293`, re-clamped in `handle_request_hint`),
 the io thread blocking while a search is joined (measured and accepted in round 42), a race on the websocket
 write (`WebSocketSession::send` posts onto the stream executor, `server.cpp:318-336`), and duplicate
 coordinate keys in the opening book.
@@ -1322,7 +1322,7 @@ they are recorded here as round-77 candidates rather than as regressions of this
   `set_position` → `choose_side` (human to move, so no `start_ai_thinking`, which is the only other site that
   clears the flag) → `request_hint{20000,8}` sequence printed **zero** frames in 15 s and still none after
   `stop_thinking`: the search ran (one `thinking_progress` at 3,133,223 nodes) and K1's
-  `!discard_pending_.load()` predicate at `game_manager.cpp:308` discarded the answer without an `error`
+  `!discard_pending_.load()` predicate at `game_manager.cpp:315` discarded the answer without an `error`
   reply. `restart` → `reset()` reproduced it the same way, while a fresh manager on the same port answered in
   10.67 s with the identical 20000/8 request - the single-factor control the brief asked for. Rescue paths
   exist but only via other frames (`error: Cannot undo` during 摆棋, `game_restarted` + a rotated-token
@@ -1343,7 +1343,7 @@ they are recorded here as round-77 candidates rather than as regressions of this
 (core rules, server/session lifecycle, training/CLI). R1: the black-four correction in
 `pattern.cpp:393-437` was gated on `if (run == 4)` (`:419`), so gap shapes never got the board-level
 exactly-five check - `match_gapped_run` (`:257-259`) only counts stones - and the comment at `:416-418`
-asserted a proof that function never makes. K2: `request_hint()` (`game_manager.cpp:286-296`) cleared
+asserted a proof that function never makes. K2: `request_hint()` (`game_manager.cpp:290-303`) cleared
 `stop_flag_` but never `discard_pending_`, the only flag K1's delivery predicate reads, and every path that
 goes through `halt_search()` (reset / set_position / restore_game / resign / destructor) leaves it raised,
 so a 求招 after 摆棋 or 重开 searched to completion and was then dropped without even an `error` frame.
@@ -1779,7 +1779,7 @@ exit **1** naming the flag (`Invalid --params (must not be empty)` is the log ta
 ## 轮次88 送到旧局面的推荐、必输的那一手堵、被当成界存下来的静态值 — bugfix round 88 batch S
 
 **Found.** Seven defects plus one stale comment, all re-read against `README.md` before dispatch:
-**S1** 求招 computed on a snapshot (`game_manager.cpp:310`) and delivered later (`:320-324`) while `make_move`
+**S1** 求招 computed on a snapshot (`game_manager.cpp:317`) and delivered later (`:320-324`) while `make_move`
 gates only on GAME_OVER and `ai_thinking_`, so a recommendation could name a square the player had already
 taken; **S2** `search_engine.cpp:113-127` returned the first five-completion point it found as `must_block`
 even when the opponent had **two** of them - blocking either leaves the other intact, because a completion
@@ -1984,6 +1984,38 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次190 #105 落地（求招收尾不再回读活盘，改比盘面版本号）—— 但先要把上一轮那句「TSan 红 2 条 race」读对：**1 条 race + 1 条 thread leak**，而门禁那段「把两条栈打出来」的 grep 从写下起就没匹配上过任何一行；顺着量还量出一族新的 **#106**（io 线程整盘拷贝 vs AI 提交写盘，7 条 race，缺省门禁盖不到）
+
+**先把仪器读对**（这是本轮的第一件事，因为上一轮的账本按它写了数）：`tools/valgrind_check.sh` 用 `grep -c "ThreadSanitizer: data race"` 数报告 —— TSan 每条发现打两行（`WARNING:` 与 `SUMMARY:`）⇒ 一条 race 被数成 2。改成数 `WARNING:` 头一行，并把 `thread leak` 也计入判决（`races=… deadlocks=… thread_leaks=…`），同时修那条明细输出：它的模式是 `^==.*== WARNING: ThreadSanitizer: data race`，而真实输出是 `WARNING: ThreadSanitizer: data race (pid=…)`（`==pid==` 前缀在这条行上根本没有）⇒ **这个「把两条访问和两个函数打出来」的分支自写下起一句没打印过**，本轮改完第一次打出了 `Read of size 4 … by thread T13 (mutexes: write M0)`。同一棵树修仪器前：`races=2 deadlocks=0 rc=66 69s`；修仪器后：`races=1 deadlocks=0 thread_leaks=1 rc=66 69s`。⇒ 轮次189 写在 A/B/D 三处的「2 条 race」是数出来的双份，本轮改判。
+
+**那 1 条 race 的准确形状**（读的一头 / 写的一头 / 三道闸的口径，全按当前代码与 TSan 的两条栈）：求招 worker 收尾在 `thinking_mutex_` 里读 `board_.move_count()`（`game_manager.cpp:441-444`），写的一头是 `undo()` → `board.cpp:104`（`game_manager.cpp:299`），而 `undo()` 与 `make_move()` 只挡 `ai_thinking_`（`:276`/`:218`）、**不挡 `hint_active_`**，`request_hint()`（`:383`）反过来两个都挡 ⇒ 「求招在飞时玩家悔棋/落子」是设计上允许的，那记回读就是无人保护的。另一条 `thread leak` 是轮次187 那条用例自己漏的：挂死探针的 `g_wedge_joiner` 在**通过**的那一支也没 join/delete（memcheck 把它记成 still reachable 所以一直没响，TSan 会响）。
+
+**修**（方向 = 用户 189 定的「解耦优先，通信与交互走消息队列，不是再加一把锁」；这里落地成 187 那条 `pending_seq_` 的同形：**worker 只读原子号，不碰活盘、不碰锁**）：`GameManager` 末尾加 `std::atomic<int> board_epoch_`（`game_manager.h:339`，成员加在类最后是为了不动 `:142/188-196/204-208/239-247` 那批被按行号指认的位置），六处改盘各 +1 —— `reset()` `:130`、`set_position()` `:156`、`restore_game()` `:188`、`make_move()` `:254`、`undo()` 每退一子 `:300`、AI 提交那一子 `:581`；求招把「快照是哪一张盘」记成号（`:404`），收尾比号（`:438-444`，判据抽成 `board_matches_hint_snapshot()`）。`thinking_mutex_` 那一层原样留着 —— 它保护的是 `hint_move_` 那组的提交，不是盘面。
+
+**用例** `test_the_board_epoch_distinguishes_a_refilled_position_from_the_snapsotted_one`（`tests/test_server.cpp:3873`）不需要线程：逐路钉增量（restore/reset/set_position/人手/AI 手各 +1，悔一次两子 ⇒ +2），再钉那格「悔两子、落一手、AI 应一手把**子数**补回 8」—— 号说「不是那张盘」，而旧的比子数在这里会说「是」。并发那一面仍由既有的 `test_hint_answer_for_a_superseded_position` 盖。
+
+**八臂变异台**（`sed` 单点拆行 / 换判据，跑完按 md5 回核）
+
+| 臂 | 改动 | 结果 |
+|---|---|---|
+| MA1 | 判据恒真（`return snapshot_epoch == snapshot_epoch`） | **红** 在既有那条并发用例 `test_server.cpp:1767`「被取代的 hint 不许交付 hint_result」 |
+| MA2 | 拆掉 `undo()` 那一子的 +1 | **红**，同一条 `:1767` |
+| MA3 | 拆掉 AI 提交的 +1 | 红在新用例 `:3889`（重跑 2/2 都落在这条断言上） |
+| MA4 | 拆掉 `reset()` 的 +1 | 红在 `:3898` |
+| MA6 | 拆掉 `make_move()` 的 +1 | 红在 `:3886` |
+| MA7 | 拆掉 `set_position()` 的 +1 | 红在 `:3903` |
+| MA8 | 拆掉 `restore_game()` 的 +1 | 红在 `:3879` |
+| MA5 | 尾巴换回「比子数」（旧判据） | **绿 —— 未杀** |
+
+七臂各红在自己那条路径的断言上（`sed <行号>d` 单点拆行，跑完按 md5 回核 `6aa7035a…`）。**顺带一次现场**：MA3 的头一跑没走到新用例，先红在 `test_server.cpp:2197` 的 `test_a_rejected_stone_delivers_the_end_a_worker_parked`（读到的帧序列是 `thinking_progress,move_made,thinking_progress,thinking_progress` 而不是单条 `move_made`），同一支臂重跑 2 次都落在 `:3889` ⇒ 那条既有用例的前提也受机器 pace 影响（轮次168 那一族），本轮只记现场、不判缺陷。
+
+MA5 为什么杀不掉，值得记：今天能把子数补回来的路只有 `make_move`，而它会先走 `start_ai_thinking` —— 那里头 join 掉在飞的求招线程 ⇒ 等号成立的状态永远到不了收尾。所以号买的不是今天的行为差别，而是**这条判据不再依赖「谁恰好会先 join 谁」**：改了那两条闸、或给求招加一条不等号的路，旧的比子数会悄悄放宽，号不会。
+
+**#106：量出来的一族，缺省门禁盖不到**（本轮把测量搬进树里，不再留在 /tmp）：`test_the_io_thread_board_copy_overlaps_the_ai_commit`（`tests/test_server.cpp:3930`）**默认直接 return**，给 `GOMOKU_R190_MEASURE=1` 才跑 —— 因为它现在必然红：io 线程那一记「把整张盘拷进 `state_sync`」（`server.cpp:825` 的形状）与 AI worker 的提交之间没有任何东西。带变量跑 TSan：**7 条 race**（写= `board.cpp:64/:65/:145` 的 `place_stone`/`set_stone_bits`，在 `thinking_mutex_` 里；读= main 线程的 `Board::Board(const Board&)`），思考在飞期间整盘拷贝 43 075 664 次；不带变量跑缺省门禁：**`clean races=0 deadlocks=0 thread_leaks=0`**。⇒ 这条绿灯的**范围**要写明白：它只覆盖用例摸得到的部分，#106 那一族在树里可复现但不在门禁路径上。修法与 #105 同方向但大一圈：让 `board_` 只有一个写者（AI 提交与求招交付都变成回 io 线程的消息），那会重排 `ai_answer_delivered_` / `move_callback_` / `think_finished_callback_` 的时序 —— 正是轮次183/187 踩过两次的那块地，所以它值一整轮，不顺手做。
+
+**门禁**（串行，`/tmp/r190/gates.sh` + `/tmp/r190/post.sh`）：段 1 强制重编 11 个编译单元、警告 3 条 —— 逐条数过全是既有账：`server.cpp:181` 的 `server_reason_of` 未用 ×2（#87 那条）与 `tests/test_training.cpp:3647` 的 `-Wrange-loop-construct`（189 记过），本轮没有新增警告；段 2 ctest **10/10 通过 896.84 s**（`test_server 35.23 s`（含新用例）、`test_search 540.92`、`test_pinned 253.37`、`test_training 54.26`）；段 3 锚点 **122 citations / 0 problems**、前端 **113/113**、README **765 行**、指导书 **849 行**（本轮的引用平移是就地换号，行数一字未动）；TSan 段在**改代码前**读 `races=1 deadlocks=0 thread_leaks=1 rc=66 69 s`、**改代码后**读 `clean races=0 deadlocks=0 thread_leaks=0 rc=0`（112 s，门禁后再验一次 65 s 同样 clean）；段 4 memcheck `test_server` **clean**（reports=0 / invalid_read=0 / invalid_write=0 / uninitialised=0 / definite_leak=0，1722 s）。门禁跑完后又改过一处注释（`game_manager.h` 里两条行号引用换成名字），改后重编 10 个 TU、`test_server` 单跑 35.59 s 全绿、TSan 段重跑 clean ⇒ 那一句「绿」覆盖的是最终文件。
+
+**没做的**：#106（上面那条，带复现命令）；`tools/valgrind_check.sh` 明细输出目前只打前 40 行；#105 的修没有跑 callgrind（本轮不主张任何代价差）。
 ## 轮次189 #102 落地：训练内部那把尺的中性点 —— 每场配对局开跑前清掉两侧置换表；拿 188 那颗 checkpoint 原状续 3 轮做对照，修前三轮全是 `1.000000 (accept, 6 局) → promoted`，修后三轮全是 `0.500000 (open, 8 局) → kept champion`
 
 **为什么这一格排在 #77 前面**：188 的判定靠的是外部赛具（中性，两次 null 逐字 0.5000、`n_inf=0`），而那批训练自己的晋级史建在一把偏的尺上 —— 190 轮里 183 轮的候选与当轮冠军**逐字相同**，其中 **179 轮的验证分读 1.000000**（该读 0.5），配上 `--accept-score 0.56` 就是「原地掷硬币也能晋级」。不先把这把尺修平，#77 的下一批只是再花 4 小时把同一个动作重复 190 次。
@@ -2033,9 +2065,9 @@ checkpoint 侧：修前 `best_version 190 → 193`（三轮都在「晋级」一
 
 ⇒ **有牙，但只对「会改着法的那种改动」有牙**：换根宽那一支两个方向读 0.75 / 0.25 且镜像一致（reject 落在弱的一侧）；而外部赛具定价过 p̂ 0.689 的 r1、以及把 `four_three` 砍到十分之一那支，在这把尺上**读不出差**。这不是尺坏了，是长度不够：按配对读数的 `SE = 0.5/√n_inf`（轮次188 S1 做进赛具的那把），要判出 0.689 至少需要 ~19 对 ≈ 38 场（本轮 4 对 ⇒ SE 0.25）。⇒ 对 #77 的含义写清楚：**内部验证赛只配当「有没有翻面」的粗筛，不能当定价的尺**；定价仍然只有 `tools/tree_match --pairs` 那一把（中性、按对出价、能扩到几百对）。
 
-**门禁**（串行五段，`/tmp/r189/gates.sh`）：段 1 强制重编 5 个编译单元、警告 1 条（`tests/test_training.cpp:3647` 那条 `-Wrange-loop-construct` 在 HEAD 上就有 ⇒ 记进 #87 那类构建噪声账）；段 2 ctest **10/10 通过，总 884.39 s**（`test_search 538.81`、`test_pinned 252.68`、`test_training 53.52`、`test_server 26.50`、`test_position 7.83`、`test_evaluator 4.91`、其余 4 条 <0.1 s）；段 3 锚点 **122 citations / 0 problems**、前端 **113/113**、README **765 行**、指导书 **849 行**（本轮改的那三处指导书引用是就地换号，行数没动）；段 4 **TSan `test_server` 红：2 条 race** ⇒ 登记 **#105**，本轮代码不在那两条栈里（硬证据：那台二进制建在 10-25 01:26、本轮没重编，同一个二进制轮次187 报 clean、今天 3/3 报同样 2 条）；段 5 memcheck `test_server` **clean**（reports=0 / invalid_read=0 / invalid_write=0 / uninitialised=0 / definite_leak=0，1719 s）。最终文件状态下把 `test_training` 单独重跑一遍：**49.99 s 全绿**（门禁段 2 之后又动过两次注释）。
+**门禁**（串行五段，`/tmp/r189/gates.sh`）：段 1 强制重编 5 个编译单元、警告 1 条（`tests/test_training.cpp:3647` 那条 `-Wrange-loop-construct` 在 HEAD 上就有 ⇒ 记进 #87 那类构建噪声账）；段 2 ctest **10/10 通过，总 884.39 s**（`test_search 538.81`、`test_pinned 252.68`、`test_training 53.52`、`test_server 26.50`、`test_position 7.83`、`test_evaluator 4.91`、其余 4 条 <0.1 s）；段 3 锚点 **122 citations / 0 problems**、前端 **113/113**、README **765 行**、指导书 **849 行**（本轮改的那三处指导书引用是就地换号，行数没动）；段 4 **TSan `test_server` 红：2 条 race** ⇒ 登记 **#105**，本轮代码不在那两条栈里（硬证据：那台二进制建在 10-25 01:26、本轮没重编，同一个二进制轮次187 报 clean、今天 3/3 报同样 2 条）；〔轮次190 读准：那是 **1 条 race + 1 条 thread leak** —— 门禁把 TSan 每条发现的 `WARNING:` 与 `SUMMARY:` 两行都数进了 `races=`，而 `thread leak` 当时根本不进判决；「3/3 复现」不变，每跑都是这 1+1。两条都在轮次190 修掉，见那一节与 B 段那两条〕；段 5 memcheck `test_server` **clean**（reports=0 / invalid_read=0 / invalid_write=0 / uninitialised=0 / definite_leak=0，1719 s）。最终文件状态下把 `test_training` 单独重跑一遍：**49.99 s 全绿**（门禁段 2 之后又动过两次注释）。
 
-**没做的**：#77 下一批（现在才有资格重训：尺平了，但上面那表说明**每轮 8 场的内部赛只能当粗筛**）；#104 那个「每次适配评估的逐次分数」读数口仍然欠着 —— 本轮的 179/183 是靠 checkpoint 的 `versions` 指纹与日志正则在外面拼的，不是产品给的；把 38 场那档的牙齿量成一条用例没做（值 ~4 分钟的套件，TIMEOUT 300 撑不住），只留了上面的临时读数。**新登 #105**：TSan 段那 2 条 race —— 求招 worker 在 `thinking_mutex_` 下读 `board_.move_count()`（`game_manager.cpp:436-437`），而 `GameManager::undo()`（`:272` 只挡 `ai_thinking_`，一路走到 `board.cpp:104`）**不拿这把锁**就在改同一格；`make_move`（`:215`）同形。闸门口径按代码数出来：`request_hint`（`:378`）挡 `ai_thinking_ || hint_active_`，而玩家那两条路不挡 `hint_active_` ⇒ 求招在飞时悔棋/落子是允许的，这就是入口。`:432` 那句注释「compare under thinking_mutex_, which is what the AI commit path takes when it changes board_」的前提只对 AI 那一条路成立；而且那个比较还决定要不要把结论存进 `hint_move_`（`:439-443`）⇒ 后果不止 UB，还包括「给一张已经不存在的盘存了个 hint」。用户已定方向：**解耦优先，通信与交互走消息队列**，不是再加一把锁。赛具那一侧本轮没动（`src/` 只碰了 `trainer.cpp`），`--pairs` 报表的读数沿用 188。
+**没做的**：#77 下一批（现在才有资格重训：尺平了，但上面那表说明**每轮 8 场的内部赛只能当粗筛**）；#104 那个「每次适配评估的逐次分数」读数口仍然欠着 —— 本轮的 179/183 是靠 checkpoint 的 `versions` 指纹与日志正则在外面拼的，不是产品给的；把 38 场那档的牙齿量成一条用例没做（值 ~4 分钟的套件，TIMEOUT 300 撑不住），只留了上面的临时读数。**新登 #105**：TSan 段那 2 条 race —— 求招 worker 在 `thinking_mutex_` 下读 `board_.move_count()`（`game_manager.cpp:443-444`），而 `GameManager::undo()`（`:272` 只挡 `ai_thinking_`，一路走到 `board.cpp:104`）**不拿这把锁**就在改同一格；`make_move`（`:215`）同形。闸门口径按代码数出来：`request_hint`（`:378`）挡 `ai_thinking_ || hint_active_`，而玩家那两条路不挡 `hint_active_` ⇒ 求招在飞时悔棋/落子是允许的，这就是入口。`:432` 那句注释「compare under thinking_mutex_, which is what the AI commit path takes when it changes board_」的前提只对 AI 那一条路成立；而且那个比较还决定要不要把结论存进 `hint_move_`（`:439-443`）⇒ 后果不止 UB，还包括「给一张已经不存在的盘存了个 hint」。用户已定方向：**解耦优先，通信与交互走消息队列**，不是再加一把锁。赛具那一侧本轮没动（`src/` 只碰了 `trainer.cpp`），`--pairs` 报表的读数沿用 188。
 
 ## 轮次188 #77 真训练一批系数，先把尺子做进仪器 —— 量出来的是：训练内部那把验证赛**不是中性的**（同版候选读 1.0 而不是 0.5），而外部赛具是（两次 null 逐字 0.5000、`n_inf=0`）；练到 190 轮反而**比只练 1 轮的那份差**
 
@@ -2135,7 +2167,7 @@ checkpoint 侧：修前 `best_version 190 → 193`（三轮都在「晋级」一
 - `ws_rtt_probe` 连上、发 `ping` ⇒ **rc=124**（5 s 超时）⇒ 挂的不是这一局，是唯一的反应器；
 - 两条线程全停在 `futex_do_wait`：主线程 `voluntary_ctxt_switches=7256`（它在等 join），第二条 **`utime=0 stime=0 voluntary=1`**（它一睁眼就撞在锁上）；`SigBlk=0` ⇒ 不是信号被挡。
 
-机制（代码里就在那个形状）：`on_disconnect`（`server.cpp:695`）**先拿 `games_mutex_`**，再走 `detach_socket` → `entry.game->halt_search()`（`:1422`）—— 那一步是 join 掉正在跑的那条 worker；而 worker 交回思考标志的最后一步 `think_finished_callback_`（`game_manager.cpp:638` 调用，装的是 `server.cpp:1809`）里第一件事就是拿**同一把** `games_mutex_`（读 `pending_seq_`）。⇒ 环：io 线程持锁等 worker，worker 等锁 ⇒ 两边都不会先撒手。这条环是轮次183 给「`ai_move` 已发、标志未清」那扇窗口补取件单时装进去的（那次只把**取队列**挪回 io 线程，**取号**留在了锁里）。
+机制（代码里就在那个形状）：`on_disconnect`（`server.cpp:695`）**先拿 `games_mutex_`**，再走 `detach_socket` → `entry.game->halt_search()`（`:1422`）—— 那一步是 join 掉正在跑的那条 worker；而 worker 交回思考标志的最后一步 `think_finished_callback_`（`game_manager.cpp:648` 调用，装的是 `server.cpp:1809`）里第一件事就是拿**同一把** `games_mutex_`（读 `pending_seq_`）。⇒ 环：io 线程持锁等 worker，worker 等锁 ⇒ 两边都不会先撒手。这条环是轮次183 给「`ai_move` 已发、标志未清」那扇窗口补取件单时装进去的（那次只把**取队列**挪回 io 线程，**取号**留在了锁里）。
 
 受这个环影响的入口是三条，全都是「持着 `games_mutex_` 去 join」这一形：`on_disconnect`（`:695`→`:1422`）、`restart`/`set_position` 换会话（`:1242`/`:1264` 里那句 `detach_socket`）、`resume` 与标签页接管（`:1466` 那个锁段里 `:1471` 断开旧 socket、`:1500` 直接 `halt_search()`）⇒ 客户端**刷新页面、换一局、开第二个标签页**都可能撞上，不只是赛具掐进程。修法落在 worker 那一侧，一次把三条都拆掉。
 
@@ -2365,7 +2397,7 @@ range-loop 拷贝＝旧账，**本轮新代码零警告**）；ctest **9/9 通�
 
 **改了什么**（三轮试错之后剩下的形状，`git diff` 就是这些）：
 
-- `GameManager` 只多两样：**`ai_answer_delivered_`**（在 `move_callback_` 之前立、每次思考开始时收，`game_manager.cpp:595` 附近）与 **`set_think_finished_callback`**（worker 交回标志之后调用，两个出口都调，含认输那条早退）。它自己**不**存队列。
+- `GameManager` 只多两样：**`ai_answer_delivered_`**（在 `move_callback_` 之前立、每次思考开始时收，`game_manager.cpp:605` 附近）与 **`set_think_finished_callback`**（worker 交回标志之后调用，两个出口都调，含认输那条早退）。它自己**不**存队列。
 - 队列在 `GameServer`：`pending_moves_`（一手，`WebSocketSession*` 键）＋ `pending_seq_` 代号。`handle_make_move` 拆成「判一下要不要存」＋ `do_make_move`（今天那段真正的落子与回帧，原封不动），当场与延后两条路跑的是同一段代码 ⇒ 帧序（`move_made` 先于 `game_over`、`deferred_end_for_` 那套挂账）一字不改。
 - **取件必须回 io 线程**：worker 的收尾只做 `net::post(ioc_, …)`。第一次尝试让 worker 自己取件，挂死（未入库、不占轮次号） —— 取出来的那手会调 `make_move`，而 `make_move` 自己就点下一手思考，`start_ai_thinking` 开头又是 join 上一个 worker，等于让线程 join 自己。回到 io 线程还顺手把「只有 io 线程动这局棋」这条老不变量还了回来：这张表因此只需要 `games_mutex_`，不需要第二把锁。
 - **代号过滤**：取件单带着它出发时的 `pending_seq_`；比存货老的单什么都不做。入队那一边在锁里重读一次 `is_ai_thinking()`，真错过了就当场自己取 —— 两个方向都不留空窗。
@@ -2377,9 +2409,9 @@ range-loop 拷贝＝旧账，**本轮新代码零警告**）；ctest **9/9 通�
 
 **变异台**（每条都打红，跑完按备份 md5 逐字还原）：M1 不入队 → 红在②；M2 去掉代号过滤 → 红在⑤；M3 终止不清存货 → 红在⑤。要说一句实话：**M2 第一次跑是绿的** —— ①-④ 都不依赖迟到单，是那条假绿的绿把我自己骗过去；⑤这一臂就是为它补的。补完之后 M2 才红。这条记成仪器账：**「新加的保护没有对应断言」和「断言是绿的」是同一件事。**
 
-**行锚**：`game_manager.h` / `server.h` 的新增全部落在**类尾私有段**（被指认的 `game_manager.h:142/188-196/204-208/239-247`、`server.h:94/108/114/137/163/212/234-255` 一行未动 —— 两个头文件确实变长了：`server.h` 278→304、`game_manager.h` 308→330，长的 26/22 行全在类尾私有段之后）；`server.cpp` 的新行按 `git diff` 的 hunk 逐段点名 —— `:696-697`（断开丢存货）、`:972-1042`（`handle_make_move` 拆成判定 + `apply_pending_move` + `do_make_move`，同一段里删掉原来的 7 行）、`:1099`／`:1195`／`:1219`／`:1243`（悔棋／认输／终止／重开各一行丢存货）、`:1784-1785`（连 think-finished 一起清，行号按轮次186 之后的树给））、`:1809-1818`（装回调 + 取件的 `net::post`）；`game_manager.cpp` 净 +7 行（四个点：思考开始收记号、认输出口通知、交子前立记号、末尾通知）；`test_server.cpp` 的用例追加在 `main` 之前（README/账上指认的 `test_server.cpp:3267/3297/3392/3399` 不动）。**因插入而后移的旧行号已按内容逐条重算**：`game_manager.cpp:590→595`、`:631→636`、`:598→603`、`:616-630→621-635`、`:552→554`（轮次178、轮次169 与轮次141 那几处指认同步改正）；`server.cpp:939-942→941-944`、`:749→751`（`tests/test_server.cpp:2083`、`IMPLEMENTATION_GUIDE.md:541` 各一处）。
+**行锚**：`game_manager.h` / `server.h` 的新增全部落在**类尾私有段**（被指认的 `game_manager.h:142/188-196/204-208/239-247`、`server.h:94/108/114/137/163/212/234-255` 一行未动 —— 两个头文件确实变长了：`server.h` 278→304、`game_manager.h` 308→330，长的 26/22 行全在类尾私有段之后）；`server.cpp` 的新行按 `git diff` 的 hunk 逐段点名 —— `:696-697`（断开丢存货）、`:972-1042`（`handle_make_move` 拆成判定 + `apply_pending_move` + `do_make_move`，同一段里删掉原来的 7 行）、`:1099`／`:1195`／`:1219`／`:1243`（悔棋／认输／终止／重开各一行丢存货）、`:1784-1785`（连 think-finished 一起清，行号按轮次186 之后的树给））、`:1809-1818`（装回调 + 取件的 `net::post`）；`game_manager.cpp` 净 +7 行（四个点：思考开始收记号、认输出口通知、交子前立记号、末尾通知）；`test_server.cpp` 的用例追加在 `main` 之前（README/账上指认的 `test_server.cpp:3267/3297/3392/3399` 不动）。**因插入而后移的旧行号已按内容逐条重算**：`game_manager.cpp:600→595`、`:631→636`、`:598→603`、`:616-630→621-635`、`:552→554`（轮次178、轮次169 与轮次141 那几处指认同步改正）；`server.cpp:939-942→941-944`、`:749→751`（`tests/test_server.cpp:2083`、`IMPLEMENTATION_GUIDE.md:541` 各一处）。
 
-**顺带量到、本轮没动的一批：`server.cpp` 里更早就漂了的行号指认**。今天逐一比对（左边是文本里写的，右边是这一棵树上那句话真正的位置）：`test_server.cpp:2085` 的 `server.cpp:1626-1634` → 实际 `:1859-1860`（挂 end frame 的那一段），同句的 `game_manager.cpp:424-426` → 实际 `:649`／`:660`（两处 `game_over_callback_`）；`test_search.cpp:8084` 的 `server.cpp:1674` → 实际 `:1804`（`msg["seldepth"]`）；`IMPLEMENTATION_GUIDE.md:118` 的 `:1660` → 实际 `:1779`（`clear_game_callbacks`）；`:142` 的 `server.cpp:1068` → 实际 `:1148`（`entry["tt_hits"]`）；`game_manager.h:42` 的 `game_manager.cpp:209/:505` → 实际 `:256/:578`（两处 `MoveAnalysis{…}`）。**这些在本轮接到这棵树之前就已经是错的**（不是本轮的 +68/+7 造成的，本轮只是让它们更偏），逐条改要动 6 处注释与 2 处指导书，属于一次独立的大扫除 —— 记为 **#86**，不混进这条修复。
+**顺带量到、本轮没动的一批：`server.cpp` 里更早就漂了的行号指认**。今天逐一比对（左边是文本里写的，右边是这一棵树上那句话真正的位置）：`test_server.cpp:2085` 的 `server.cpp:1626-1634` → 实际 `:1859-1860`（挂 end frame 的那一段），同句的 `game_manager.cpp:431-433` → 实际 `:649`／`:660`（两处 `game_over_callback_`）；`test_search.cpp:8084` 的 `server.cpp:1674` → 实际 `:1804`（`msg["seldepth"]`）；`IMPLEMENTATION_GUIDE.md:118` 的 `:1660` → 实际 `:1779`（`clear_game_callbacks`）；`:142` 的 `server.cpp:1068` → 实际 `:1148`（`entry["tt_hits"]`）；`game_manager.h:42` 的 `game_manager.cpp:212/:505` → 实际 `:256/:578`（两处 `MoveAnalysis{…}`）。**这些在本轮接到这棵树之前就已经是错的**（不是本轮的 +68/+7 造成的，本轮只是让它们更偏），逐条改要动 6 处注释与 2 处指导书，属于一次独立的大扫除 —— 记为 **#86**，不混进这条修复。
 
 **门禁**（最终那棵树上一条串行流水线：强制增量重建 → ctest → 两个检查 → TSan → memcheck）：构建 `recompiles=7`、`warnings=2`（下面单说）；ctest **9/9 通过，总 797.05 s**（`test_search` 490.29、`test_pinned` 240.94、`test_server` 29.03、`test_training` 23.83）；`readme_anchor_check` 122 条引用 0 问题；`web_frontend_check` 113/113；`memcheck test_server` **clean** —— reports=0、invalid_read=0、invalid_write=0、uninitialised=0、definite_leak=0，**1570 s**。
 
@@ -2388,7 +2420,7 @@ range-loop 拷贝＝旧账，**本轮新代码零警告**）；ctest **9/9 通�
 | 树 | 脚本行 | 逐条 |
 |---|---|---|
 | HEAD 基线 `2e2d775`（`git worktree add ~/tm24/head-tsan HEAD`，同一脚本同一档） | `test_server TSAN REPORTS races=2 deadlocks=0 rc=66 49s` | 1 条：`core/board.h:61 Board::move_count()` —— `request_hint` 线程读盘面 |
-| 本轮第一版 | `races=6 deadlocks=0 rc=66 54s` | 上面那条 **+2**：`game_manager.cpp:562`（worker 判 `move_callback_` 空）、`:596`（调用它）—— 删掉 `game_manager.cpp` 顶上探针残留的那一行空行之后，这两处落在 `:561`／`:595` |
+| 本轮第一版 | `races=6 deadlocks=0 rc=66 54s` | 上面那条 **+2**：`game_manager.cpp:569`（worker 判 `move_callback_` 空）、`:596`（调用它）—— 删掉 `game_manager.cpp` 顶上探针残留的那一行空行之后，这两处落在 `:561`／`:595` |
 | 本轮最终（用例改了顺序、并删掉探针残留的那一行空行之后） | `test_server TSAN REPORTS races=2 deadlocks=0 rc=66 57s` | 与基线**同一条**（`board.h:61`，脚本 stdout 里 `All server tests passed!`） |
 
 多出来的两条，对侧的写都点名 `tests/test_server.cpp:3641` 的 `game.set_move_callback(…)`（那是第一版那棵树上的行号；改序之后同一句在 `:3645`）—— 我的 ③ 那一臂在一颗**还在飞的思考**上换回调。`move_callback_` 是个裸 `std::function`，产品里换它/清它的入口都被「先 `halt_search()`（真的 join worker 与 hint 线程）再动回调」这条顺序挡着（`server.cpp:1416-1423`，接管/重开路径 `:1500`）；测试里没有任何东西挡，所以是我自己把这条不变量破了。修法不是加锁，是**让测试守同一条纪律**：③ 把 `join_think(game)` 排到换回调之前（`join_think` 真的 join 线程，不是看标志）。
@@ -2559,7 +2591,7 @@ range-loop 拷贝＝旧账，**本轮新代码零警告**）；ctest **9/9 通�
 
 **这一轮只问一个问题**：轮次177 记下「同一颗子一跑被收、一跑被 `make_move` 拒，报一句笼统的 `Invalid move`」。拒它的六个条件里，「已占」「轮到谁」「禁手」只看盘面，「AI 在响」「已结束」只看状态 —— 所以第一个要切开的问题是**「两侧的盘到那一刻一不一样」**，而旧夹具答不出这句话。
 
-**仪器 ①（进仓库）：`tools/tree_match.cpp` 的 `drift` 字段**。任何一局作废，夹具就向**两侧**各发一次 `request_replay`，把「手摆 base 子 + 本局 moves 子」拼成各自的 stone 序列做比对，结果既写进记录的新字段 `drift`，也附进 `reason`：一致 ⇒「两侧盘面一致（N 子）⇒ 拒子与盘无关」；不一致 ⇒「第几子起不同、两边各是什么、各多少子」。判据来自 `src/server/game_manager.cpp:214-248` 那六个 `return false`。
+**仪器 ①（进仓库）：`tools/tree_match.cpp` 的 `drift` 字段**。任何一局作废，夹具就向**两侧**各发一次 `request_replay`，把「手摆 base 子 + 本局 moves 子」拼成各自的 stone 序列做比对，结果既写进记录的新字段 `drift`，也附进 `reason`：一致 ⇒「两侧盘面一致（N 子）⇒ 拒子与盘无关」；不一致 ⇒「第几子起不同、两边各是什么、各多少子」。判据来自 `src/server/game_manager.cpp:217-251` 那六个 `return false`。
 
 **仪器 ②（不进仓库，跑完就还原）：给六个分支起名**。临时在当前树上给每个分支加一行 `[reject] <tag> cell=… stones=… thinking=… status=… player=… ai=…` 的 stderr，编 `gomoku_server` 再跑三场全场；跑完 `cp` 回原文件、`git diff --stat src/` 为空、强制重建。**两次采到的样本都是同一条分支**：
 
@@ -2574,7 +2606,7 @@ range-loop 拷贝＝旧账，**本轮新代码零警告**）；ctest **9/9 通�
     同一刻递进来的子：被拒（reject 分支 = ai_thinking）
     回调之后 200 ms：ai_thinking_=0
 
-机制就写在代码里：`ai_move` 帧在 `game_manager.cpp:595` 发出（`send_message` 就在回调里同步走），而标志要到 `:636` 才清（轮次183 起这一段多了取队列的通知，行号后移）。中间这段就是被吞的那一手所在的窗口；`make_move` **不拿** `thinking_mutex_`，所以 `ai_thinking_` 是唯一挡着并发写盘的那道闸。顺带一条自证：先试图在回调**里**自旋等标志落下，永远等不到——这正说明清标志严格发生在回调返回之后。
+机制就写在代码里：`ai_move` 帧在 `game_manager.cpp:605` 发出（`send_message` 就在回调里同步走），而标志要到 `:636` 才清（轮次183 起这一段多了取队列的通知，行号后移）。中间这段就是被吞的那一手所在的窗口；`make_move` **不拿** `thinking_mutex_`，所以 `ai_thinking_` 是唯一挡着并发写盘的那道闸。顺带一条自证：先试图在回调**里**自旋等标志落下，永远等不到——这正说明清标志严格发生在回调返回之后。
 
 **发生率（八批）**：pass1 0/418、pass2 **1**/418、单开局重放 0/400、hunt1 0/418、hunt2 **1**/418、dg1 **1**/418、dg2 0/418、dg3 **1**/418 ⇒ **4/3326 ≈ 0.12 %**。单开局重放 400 局一次都不出（那局棋两套配置着法完全相同，读逐字 0.5000）⇒ 它不是某条开局的性质，是**时序**：对面用快路径在亚毫秒内回子时才会撞进窗口。
 
@@ -2619,7 +2651,7 @@ range-loop 拷贝＝旧账，**本轮新代码零警告**）；ctest **9/9 通�
 - 判定：这份档**没有带来可测增益**，点估计还偏负；但 36 对的区间 [0.254, 0.579] 横跨一半 ⇒ 既不能判「变强」也不能判「变弱」，能判的是「**不值一次晋升**」。**理由换了**：轮次173 那次是「12 对泡在 10 % 噪声里」，这次是「地板已经是 0，缺的是有信息的对数」。要把 36 推到 ~100，要么开局集再翻一倍多，要么找更分家的档。
 - 训练档是**活的**：同口径的 null 读 0 对有信息，这一档读 36 对 ⇒ 它改的 `black.distance_to_stones 1→2`、`white.cand_width_root 24→15`、`white.double_three 30000→38400` 确实进了着法层（轮次174 证明的黑侧 `double_three/double_four` 那两格死基因之外的那些）。
 
-**新指认出一条与引擎无关的赛具抖动**：game 247（开局号 123，B 执黑）在 pass1 里 default 落 (4,2) 被 trained **收**、pass2 里同一张盘同一颗子被 **拒**，报 `Invalid move`。分岔点之前 13 手逐字相同 ⇒ 不是着法分歧，是握手：`src/server/game_manager.cpp:215`（`ai_thinking_` 还在响）或 `:235`（回合守卫）二选一 —— 赛具把子递给服务器的那一刻，接收侧的回合状态还没倒过来。**本轮没修**，登记为下一条要量的数：relay 抵达时接收侧仍在 thinking 的比例，以及它在真实对局里会不会把玩家的落子吞掉。实测代价 1/418 局，分数与配对结构都没被动到。
+**新指认出一条与引擎无关的赛具抖动**：game 247（开局号 123，B 执黑）在 pass1 里 default 落 (4,2) 被 trained **收**、pass2 里同一张盘同一颗子被 **拒**，报 `Invalid move`。分岔点之前 13 手逐字相同 ⇒ 不是着法分歧，是握手：`src/server/game_manager.cpp:218`（`ai_thinking_` 还在响）或 `:235`（回合守卫）二选一 —— 赛具把子递给服务器的那一刻，接收侧的回合状态还没倒过来。**本轮没修**，登记为下一条要量的数：relay 抵达时接收侧仍在 thinking 的比例，以及它在真实对局里会不会把玩家的落子吞掉。实测代价 1/418 局，分数与配对结构都没被动到。
 
 **没跑 / 未得的账**
 - 那 2 条坏开局来自**记录本身**（记录是当时那套禁手口径跑出来的）；没去追生成侧为什么允许它，那是另一条线。
@@ -2837,7 +2869,7 @@ M1 咬不住的原因是可解释的：默认帽本来就够高，把它抬到 1
 
 ## 轮次169 「新根降一层」探针：省 3.4–29× 节点是**真的**，但那不是复用——是把棋走浅一层，而浅了的那手在唯一改变着法的盘面上**弱 77,859 点**；同一份节省不用付这一层的买法是预搜（`--ponder`，线上默认 0），量到 **168 节点拿到与全深度逐字相同的答案**。判**不落地**（不改产品代码），交付的是仪器 `tools/new_root_depth_probe.cpp` + `new_root_depth_probe` 目标 + 三份读数 — the "drop a layer at the new root" probe: the 3.4–29× node saving is real but it is *not* reuse — it is playing one ply shallower, and on the one pose where the move actually changes, the shallower move prices **77,859 points weaker** under a deeper reference; the same saving without paying that ply is what the idle pre-search (`--ponder`, shipped but default 0) buys — measured at **168 nodes for a byte-identical full-depth answer**. Judged NOT-TO-LAND: no product code changes; the deliverable is the instrument plus three readings.
 
-**那个说法指的是什么**：一次 d6 的思考把「我方落子 + 对手应手」之后的那个局面当成**第 2 层节点**来搜，所以给它写的置换表记录是 depth 4；下一次思考的根正是那个局面，而要的是 depth 6 —— `src/search/alphabeta.cpp:372` 的门是 `entry.depth >= depth`，4 ≥ 6 不成立，记录只拿去排序、不拿去截断。「降一层」= 下一次只要求 D−1（严格说要 D−2 才够到根自己那条记录）。这不是新机制的猜测：`src/server/game_manager.cpp:554` 那段注释写的就是这笔深度账，它给出的解法是预搜。
+**那个说法指的是什么**：一次 d6 的思考把「我方落子 + 对手应手」之后的那个局面当成**第 2 层节点**来搜，所以给它写的置换表记录是 depth 4；下一次思考的根正是那个局面，而要的是 depth 6 —— `src/search/alphabeta.cpp:372` 的门是 `entry.depth >= depth`，4 ≥ 6 不成立，记录只拿去排序、不拿去截断。「降一层」= 下一次只要求 D−1（严格说要 D−2 才够到根自己那条记录）。这不是新机制的猜测：`src/server/game_manager.cpp:561` 那段注释写的就是这笔深度账，它给出的解法是预搜。
 
 **仪器**：`tools/new_root_depth_probe.cpp`（`build/new_root_depth_probe`，只链 `${GOMOKU_CORE_SOURCES}`，不改任何产品行为）。盘面 = `tests/test_pinned.cpp` 的四条钉臂 × 两色，每格再加一个「对手自选应手」变体；每条热臂都从头重放一遍上一手，重放的节点数逐字等于门禁的 221774 / 156428 / 300347 / 175088（重放不一致会当场打印「重放不确定」并作废该格）。全部按节点定价（帽 8,000,000），墙不参与判定。两次整跑逐字节相同、无一条不确定。
 
@@ -4301,7 +4333,7 @@ creator callgrind-3.26.0；`--separate-callers` 没开，所以调用归属用 `
 
 ### 读数 4：并发与内存——新线程干净，脏的是别人家的一条时间假设
 
-- **TSan**（`build-tsan`，`tools/valgrind_check.sh tsan test_server`）：`rc=66`，**1 条 data race**。逐帧读完，读写两端全在 `test_hint_answer_for_a_superseded_position` 里（读点 `game_manager.cpp:437` 的 `Board::move_count()`，写点是主线程的 `undo`／`restore_game`），也就是 `REVIEW_LOG:1275` 记过的那对 hint 线程已知账。**`run_analysis` 与 `analyze_*` 在报告里出现 0 次**（`grep -c run_analysis /tmp/v2/tsan_err.txt` = 0）：本轮新增的那条线程只读自己拷出来的 `GameRecord`，发帧走 `WebSocketSession::send` 的 `net::post`，不碰 `GameManager`、不碰 `games_mutex_`。
+- **TSan**（`build-tsan`，`tools/valgrind_check.sh tsan test_server`）：`rc=66`，**1 条 data race**。逐帧读完，读写两端全在 `test_hint_answer_for_a_superseded_position` 里（读点 `game_manager.cpp:444` 的 `Board::move_count()`，写点是主线程的 `undo`／`restore_game`），也就是 `REVIEW_LOG:1275` 记过的那对 hint 线程已知账。**`run_analysis` 与 `analyze_*` 在报告里出现 0 次**（`grep -c run_analysis /tmp/v2/tsan_err.txt` = 0）：本轮新增的那条线程只读自己拷出来的 `GameRecord`，发帧走 `WebSocketSession::send` 的 `net::post`，不碰 `GameManager`、不碰 `games_mutex_`。
 - **memcheck（`build-vg`）——本轮新登记一条仪表账**：带上甲-3 那三条用例，`test_server` 在 memcheck 下 **2/2 次都停在 `tests/test_server.cpp:1734` 的 `assert(hint_results == 0)`**（`rc=134`，valgrind **报告 0 条**、definite leak 0）；把那三条从 `main` 里编译掉，同一个二进制**跑完 rc=0、报告 0 条**。这条用例在 `main` 里排在甲-3 之前 17 行（`:3082`），不可能被后跑的代码「执行到」，所以差的只是二进制布局与线程调度；它的前提是「棋子在搜索还在跑的时候被退回」，而 memcheck 慢 20-50 倍，这类靠时间差成立的前提本来就站不住。**判：hint 路径的一条既有时间假设，不是甲-3 的缺陷**；`reports=0` 说明本轮新增的线程没有引入任何未初始化读、越界或泄漏。跟进项（下一轮单独做）：把这条用例改成不依赖时间差的判定（`docs/STRESS_TEST_RULES.md` §5 的「按既存记录」同一处理方式）。
 - **析构那一格**：`TrackedGame` 现在带 `std::thread` 成员，所以本轮给它写了析构函数置停＋join——在 joinable 的 `std::thread` 上析构是 `std::terminate`，是整个进程不是这一局；四个 join 点（`stop()`、`detach_socket()`、idle sweep 两处）在它之前，析构只是最后那道谁都可能忘也忘不掉的保险。
 
@@ -4801,8 +4833,8 @@ IPC 选型有一条硬约束来自实测：一次并发压测曾把临时端口�
 | --- | --- |
 | `src/search/search_engine.h:95`＋`src/search/search_engine.cpp:458` | `SearchEngine::ponder_search(board, color, max_depth, node_cap, stop_flag)`：只有 AlphaBeta 一层，没有开局库、没有 VCF/VCT、没有 resign 探针、没有进度帧、**没有墙钟**，`elapsed_ms` 留 0 |
 | `src/server/game_manager.cpp:53` | `ponder_node_budget(think_nodes, percent)`：上一次思考节点数的百分比，地板 4000、天花板 200000 |
-| `src/server/game_manager.cpp:603` | arm 判据（五件事同时成立才点）：`percent > 0` ＋ `method == "alphabeta"` ＋ 没认输 ＋ PV 第二着存在 ＋ 棋还活着且轮到人手；落点是提交块之内、`thinking_mutex_` 之下 |
-| `src/server/game_manager.cpp:621-635` | 起线程：`Board root = board_` 再摆上预测的应手，副本由线程所有；`ponder_arms_` 先加，再发布 `std::thread` |
+| `src/server/game_manager.cpp:613` | arm 判据（五件事同时成立才点）：`percent > 0` ＋ `method == "alphabeta"` ＋ 没认输 ＋ PV 第二着存在 ＋ 棋还活着且轮到人手；落点是提交块之内、`thinking_mutex_` 之下 |
+| `src/server/game_manager.cpp:631-645` | 起线程：`Board root = board_` 再摆上预测的应手，副本由线程所有；`ponder_arms_` 先加，再发布 `std::thread` |
 | `src/server/game_manager.cpp:106` | `cancel_ponder()`＝置停→join→复位 `ponder_stop_`；被 `make_move`（`:220`）、`undo`（`:277`）、`request_hint`（`:387`）、`start_ai_thinking`（`:475`）、`halt_search`（`:100`）调用 |
 | `src/server/server.cpp:1231`＋`:557` | `open_session()` 把服务器那一份百分比发给每一局；构造时折回 0..100 |
 | `src/main.cpp:74` | `--ponder <percent>`，越界与非数一律 `rc=1` |
@@ -4863,7 +4895,7 @@ IPC 选型有一条硬约束来自实测：一次并发压测曾把临时端口�
 
 ### 异形登记（照文档做，但形状不一样）
 
-1. 文档 `:300` 把这一条写成搜索内部的一个开关：`if (limits_.ponder && limits_.hint_move…) { /* 预搜对手应手 */ }`。本树的决定权在**会话的所有者**（`game_manager.cpp:603`），`SearchLimits::ponder`（`src/search/search_limits.h:68`）这个字段仍然没有任何读者，也没有人写它。理由与轮次139 那条同源：一个没有任何节点行为差异的旗标是一句主张，不是一个机制——树里预搜与正搜的差异全在调用方（有没有钟、有没有帧、有没有快路径、提交不提交）。
+1. 文档 `:300` 把这一条写成搜索内部的一个开关：`if (limits_.ponder && limits_.hint_move…) { /* 预搜对手应手 */ }`。本树的决定权在**会话的所有者**（`game_manager.cpp:613`），`SearchLimits::ponder`（`src/search/search_limits.h:68`）这个字段仍然没有任何读者，也没有人写它。理由与轮次139 那条同源：一个没有任何节点行为差异的旗标是一句主张，不是一个机制——树里预搜与正搜的差异全在调用方（有没有钟、有没有帧、有没有快路径、提交不提交）。
 2. 文档没写预搜该花多少。本树定成「上一次思考节点数的百分比 ＋ 地板 4000 ＋ 天花板 200000」，其中地板是读数 1 那条 41.00 % → 45.80 % 的读数买来的；天花板是给「客户端可以要到 depth 20／两分钟」那一格兜底。
 3. **默认 0（关）**，靠 `--ponder` 打开，与 `--shared-tt`、D-4 同一先例：文档没有为「每个等待中的会话多一条引擎线程」定价 CPU，而这台机器上一轮刚因为连接风暴卡过。因此 `:124` 那一格现在是**带开关达标**：`--ponder 50` 读 45.80 %，不带就是轮次140 记的 8.76 %。要不要把默认值抬到 25 % 或 50 %，是用户的一句话，不是本轮可以自代的（读数 1 的 100 % 臂已经给出「别往上」的方向）。
 
@@ -4953,7 +4985,7 @@ scattered 四孤子、pos24 二十四子）× 两色，共用一张会话表连�
 所以节点数是计数而不是负载表。口径要写清：这支仪器走的是 `AlphaBetaSearch` 一层，
 不经 `SearchEngine` 的快路径与预算整形（这三副局面本来也不触发快路径），所以它量的是「分层搜索的跨手复用」，
 不是产品那面墙下的时长。每轮的走法是「本方最佳着法 + 引擎自己在 PV 里预测的对手应手」，代龄按子推进
-（`advance_generation()`，与 `game_manager.cpp:208/504`、`self_play.cpp:119` 同一形状），然后：
+（`advance_generation()`，与 `game_manager.cpp:211/504`、`self_play.cpp:119` 同一形状），然后：
 
 - **先探新根**：`session_tt.probe(board.zobrist_hash(), entry, 0)` —— 这是文档 G3 那一格「根节点命中率」的字面仪器；
 - **冷臂**：同一副局面、全新表、无提示，`AlphaBetaSearch` 定深 6；
@@ -5003,7 +5035,7 @@ C 行的四个内容项（TT `static_eval`、候选格缓存、局部 stand_pat�
 账说明它恰好是这一格的解：预搜的落点正是 P2，它以 depth 6 入库，那么下一次思考问的孩子就是 depth 5，
 表里的记录深度够了，命中才变成剪枝。
 
-- 形状：AI 落子提交之后（`game_manager.cpp:504` 那一处推进代龄的地方），拿本次 `stats.pv[1]` 起一次
+- 形状：AI 落子提交之后（`game_manager.cpp:511` 那一处推进代龄的地方），拿本次 `stats.pv[1]` 起一次
   后台思考，预算取 `hard` 的一档（建议 0.5 倍，且必须可被下一手取消）；对手真走这一手 → 下一手直接吃到
   深层记录；对手走了别的 → 取消，本轮不写脏答案（表里多几条记录不影响正确性，深度门仍守）。
 - 验收仪器就是 `/tmp/g3/g3_driver.cpp`：加一条「会话里先跑预置再跑第二手」的臂，判据是 20 个可比臂的
@@ -6021,7 +6053,7 @@ alpha 分布与静态分分布分开重算，本轮记录里 p50／min／max 那
 | `src/search/alphabeta.h:34-40` | `SearchInfo` 末尾加 `int tt_hits`，注释说明为什么是 `int`：一命中必是一被访问的节点，所以 `tt_hits <= nodes_searched`，与这个结构自己给 `nodes_searched` 用的收窄（`alphabeta.cpp:480`）是同一条界 |
 | `src/search/alphabeta.cpp:489` | `to_info()` 补上那一行漏的抄写 |
 | `src/search/search_engine.h:39-45` + `search_engine.cpp:382` | `SearchResult.tt_hits`，会话与 复盘 唯一走的路 |
-| `src/server/game_manager.h:41-49` + `game_manager.cpp:505-510` | `MoveAnalysis.tt_hits`——**加在最后而不是中间**，因为两处 `MoveAnalysis{…}` 是按位置初始化的，插一个字段会把后面每一个位置都改读 |
+| `src/server/game_manager.h:41-49` + `game_manager.cpp:512-517` | `MoveAnalysis.tt_hits`——**加在最后而不是中间**，因为两处 `MoveAnalysis{…}` 是按位置初始化的，插一个字段会把后面每一个位置都改读 |
 | `src/server/server.cpp:202/219/1063` | `record_of` / `analysis_of` 两个桥各补一行，复盘 JSON 多出 `"tt_hits"` |
 | `src/training/game_record.h:36-40` + `game_record.cpp:73/167` | `MoveRecord` 同名字段；写的时候多一个键，读的时候 `read_int("tt_hits", 0)`——**和 `partial_depth` 一族同样的向后兼容**：改动之前落盘的对局记录照样读得回来，读成「没记下命中」而不是坏文件 |
 | `src/training/self_play.cpp:133` | 训练侧的每一手也填这个数，否则会话有、训练档没有，同一个字段两种真相 |
@@ -6617,13 +6649,13 @@ test_search.cpp` 之后 `git status` 只剩本轮没动的三份未跟踪文档�
 | 这些复制值多少钱 | 那三份仪表自报的口径是 94 ns/份：2000 节点臂 **0.01 ms 对 1.22 s**、20000 臂 0.01 ms 对 2.79 s、200 000 臂 0.02 ms 对 4.35 s，即 ~0.0005 %。**同一台机器重跑同一个探针量到 90.0 ns**，4 ns 的差就是这台机器的墙钟噪声等级 —— 所以这一栏只当量级看，本轮不用它下结论（结论用读数 4 的指令数） | 同上，每臂末尾 `at 94 ns/copy:` 行 vs `/tmp/d5/gate_probe.log` |
 | 复制的大头在哪 | `src/search/vcf.cpp:420` 的 `Board after = board;`（每个防守应手一份）占 **53.8 %／70.0 %／75.7 %**；`alphabeta.cpp:601` 那一手一份只占 23.1 %／14.6 %／10.4 % | 同上，`site … ( % of the run's counted copies)` 行 |
 
-而 `SearchController` 在生产里**一个调用者都没有**：`grep -rn SearchController src/` 除了它自己那对文件之外为空，服务器与自对弈都直接调 `SearchEngine::search(const Board&, …)`（`src/server/game_manager.cpp:363`、`:467`、`src/training/self_play.cpp:68`），且这三处传的都是**调用方自己拥有的快照**（`board_snapshot`、`snapshot`、`board`）。本轮给控制器补上的形态，正是生产路径一直在用的形态。
+而 `SearchController` 在生产里**一个调用者都没有**：`grep -rn SearchController src/` 除了它自己那对文件之外为空，服务器与自对弈都直接调 `SearchEngine::search(const Board&, …)`（`src/server/game_manager.cpp:370`、`:467`、`src/training/self_play.cpp:68`），且这三处传的都是**调用方自己拥有的快照**（`board_snapshot`、`snapshot`、`board`）。本轮给控制器补上的形态，正是生产路径一直在用的形态。
 
 ### 实现
 
 - `src/search/controller.h:53` 新增私有成员 `Board search_board_;`，`:58` 的签名从 `search_worker(Board board, …)` 改成 `search_worker(const Board& board, …)`；`src/search/controller.cpp:37` 在**无条件 join 之后**写一次 `search_board_ = board;`，`:39` 用 `std::cref(search_board_)` 起线程。线程参数表里不再放第二份 Board：旧的按值交接要为一次 think 付「构造实参 + move 进形参」这一对（178.7 ns），现在只付一次 copy-assign（90.0 ns）。
 - **与文档字面不同的一处，故意不照做**：文档给的两个选项之一是「在 worker 内自行构造可变副本」，但 `engine_.search()` 收的是 `const Board&`（`src/search/search_engine.h:68`），worker 内没有任何人需要可变副本；照字面写等于**再加**一份 4664 B 的复制，与「去掉不必要的复制」正好相反。括号里第二个选项「直接 copy 一次」才是落地的形状，只是那一次 copy 放在调用方而不是被调方 —— 交接之后 caller 的板子归 caller 继续改，这正是 `:585` 那句「不再按值收」要的语义。
-- 「透传 `SearchLimits` 与上一手 `hint`」这半句**没有新增管道**：`max_depth`／`hard_time_ms`／`max_nodes` 与 `hint` 全是引擎上的 setter（`search_engine.h:90`、`:109-117`），`SearchController::engine()`（`controller.h:35`）本来就把手柄交了出去，生产路径就是这么用的（`game_manager.cpp:356-361` 连着 `:363` 那一次 `engine_.search(board_snapshot, …)`）。给一个没有生产调用者的类再加一层同名转发参数，只是多一个会被忘记同步的地方。这条偏差按上表如实记，不当作已完成。
+- 「透传 `SearchLimits` 与上一手 `hint`」这半句**没有新增管道**：`max_depth`／`hard_time_ms`／`max_nodes` 与 `hint` 全是引擎上的 setter（`search_engine.h:90`、`:109-117`），`SearchController::engine()`（`controller.h:35`）本来就把手柄交了出去，生产路径就是这么用的（`game_manager.cpp:363-368` 连着 `:363` 那一次 `engine_.search(board_snapshot, …)`）。给一个没有生产调用者的类再加一层同名转发参数，只是多一个会被忘记同步的地方。这条偏差按上表如实记，不当作已完成。
 
 ### 测试
 
@@ -7389,7 +7421,7 @@ memcheck 的时间尺度上本来就活不下来，所以这一层不能和第�
 **压测包装器自己的读数缺陷，按原样申报而不是当发现交出去**：`vg_rows.txt` 的四行印
 `uninitialised=1`（NEG 臂 `2`），而 `valgrind_check.sh` 的内层行同一臂印 `uninitialised=0`。
 读代码就能定位：`vg_r124_c4.sh:report()` 把 `grep -c 'uninitialised'` 打在**脚本自己的
-stdout**（`$WORK/$t.log`）上，而 `tools/valgrind_check.sh:236` 那条 `printf` 的**字段名本身**
+stdout**（`$WORK/$t.log`）上，而 `tools/valgrind_check.sh:243` 那条 `printf` 的**字段名本身**
 含这个词，于是一行表头就是一次命中，两目标臂两次。真实计数在 valgrind 的 stderr 上：`test_training`、
 `test_search`、`test_server` 与 NEG 四臂的内层行都印 `uninitialised=0 definite_leak=0`，本轮改用
 `assert_text.sh` 直接读那份 stderr 也是为了把这一句钉死。`tools/valgrind_check.sh` 一字未动。
@@ -8585,8 +8617,8 @@ O(candidates) 的威胁探针决定要不要跑，跑多少有上限。
   那一条竞争**不是 strand、也不是原子发布**，是真阳性：函数对
   `gomoku::GameManager::undo` → `gomoku::Board::undo_last_move`（读栈里**没有**任何 mutex）
   对 `gomoku::GameManager::request_hint` 的 worker → `gomoku::Board::move_count`（读栈里点名 `write M0`，
-  即 `src/server/game_manager.cpp:377-379` 在 `thinking_mutex_` 下读）。写侧 `:220` 的守卫只看
-  `ai_thinking_`，与 hint 的 `hint_active_` 不是一把锁（`src/server/game_manager.cpp:220-241`、`:324-332`）。
+  即 `src/server/game_manager.cpp:384-386` 在 `thinking_mutex_` 下读）。写侧 `:220` 的守卫只看
+  `ai_thinking_`，与 hint 的 `hint_active_` 不是一把锁（`src/server/game_manager.cpp:223-244`、`:324-332`）。
   **本轮不改**：B3 没碰 `src/server/`，把它塞进引擎轮次会让这枚提交的判据混进协议语义——已单独排队
   （任务 #35），走 bugfix 批次的老流程（先写能红的用例，再改）。
 - **DRD 只做交叉核对**：`drd test_training` **reports=0 / 84 s / `DRD_RC=0`**。这一行当时还是旧格式打印的
@@ -9879,7 +9911,7 @@ updateTurnInfo('');`（+5/0）。`handleStateSync` 其余行、`handleGameOver` 
 **裁决（其余条目，全部不外派）。** `error` 帧把「游戏结束 - …」冲掉：README:307 把顶栏定成共用报告行、
 红=拒绝/错误，给终局加哑等于吞掉 README:326-327 明文欠玩家的那条错误。`handleReplay:726/:739` 摆棋中复位
 `replayIndex`：已 HOLD 的 D5。`handleUndoSuccess:1832` 的 `game_status === 'game_over'` 分支：服务端 `undo`
-把 GAME_OVER 一律映射回 PLAYING（`game_manager.cpp:231-235`），无法构造。`reasonText`、手/子单位链、
+把 GAME_OVER 一律映射回 PLAYING（`game_manager.cpp:234-238`），无法构造。`reasonText`、手/子单位链、
 落子记录行序：逐函数读过，干净。TT2 的确认半边（`exitSetup(true)`）在两棵树上都逐字不动 `#turn-info` ⇒
 **无可观察差异**，且确认唯一的调用者 `handlePositionSet`（`:1359`）自己就写 `updateTurnInfo('')`，没有残留泄漏。
 
@@ -9915,7 +9947,7 @@ HEAD 负例 `/d/tmp/r116_head_mine` = `git show f2d73f8:web/app.js` + 当前 tes
 早退保持的正是接管后的那份状态。
 
 **裁决（其余条目，全部不外派）。** 呈现链域：`search_engine.cpp:291-292` 在改名 `resign` 之前写的
-`depth`/`nodes` 到不了任何帧——`game_manager.cpp:398-408` 在 `result.resigned` 时于 `place_stone` 与
+`depth`/`nodes` 到不了任何帧——`game_manager.cpp:405-415` 在 `result.resigned` 时于 `place_stone` 与
 `analyses_.push_back` 之前就 return，这份分析根本不进快照，`server.cpp:1036-1046` 也就发不出；
 `:355-357` 收尾那帧 `thinking_progress` 用的是 `info.depth`，而此处它恰是 0，与 replay 里 greedy 的 0
 一致，且帧不入 `analyses_`；VCT 的 90000 不点红是 README:338 自己定的阈值 `|score| >= 99999`，与
@@ -9935,7 +9967,7 @@ must_block 的 99000 同律；曲线的白棋取反与 `human` 跳手逐字就�
 （`error` 帧把「游戏结束 - …」冲掉）不外派：README:307 把顶栏定成共用的报告行、红=拒绝/错误，
 给终局加哑就等于吞掉 README:326-327 明文欠玩家的那一条错误。求招域其余五条见下段。
 
-我自己那条服务端候选也判 **无可观察差异**：`game_manager.cpp:330-339` 的投递守卫只比
+我自己那条服务端候选也判 **无可观察差异**：`game_manager.cpp:337-346` 的投递守卫只比
 `move_count`，把数补回来必须走两次 `make_move`，而头一次的 AI 重挂（`:190` → `:350-357`）会在
 `search_thread_` 建出来之前先 `join` 掉 `hint_thread_`，守卫永远只看到差一手的计数。（`Board` 确实
 在 `src/core/board.h:69` 暴露 `zobrist_hash()`，若哪天这条变得可构造，身份比对就有现成的键。）
@@ -10504,7 +10536,7 @@ lineWidth 2 与旧代码逐字一致），`highlightMove` 只写状态并重绘�
 轮数守卫排在这条拒绝之前，两棵树都是退出码 1，测试会话在注释里记下了这一点并改用 `--rounds 1`。
 
 **Held.** 训练数据审计给出的四条排进轮次107：K1 导出条件用 `is_decisive()`，而 README:574 说的是
-「终局」、README:63 说的是「完局」——满盘判和（`game_manager.cpp:445-452`，winner EMPTY）因此不进
+「终局」、README:63 说的是「完局」——满盘判和（`game_manager.cpp:452-459`，winner EMPTY）因此不进
 `records.jsonl`，而 trainer 自己却把 `move_limit`/`board_full` 的未分胜负局写进同一个文件
 （`trainer.cpp:269-270`），两个生产者对「完局」的理解不一致；改的时候必须同时改 `:1460` 与冷重建的
 `:1207`，否则和棋局会在一次 resume 后被追加两次。K2 `server.cpp:546-549` 会话目录建不出来时顺手清了
@@ -10666,7 +10698,7 @@ HH3 三条（思考中行点击不改 `replayIndex`、不在思考时同一点�
   `info.nodes_searched` 填进结果，再在 `:297` 把「一层都没跑完、退回 `root_moves[0]`」这一手
   改名为 `method = "greedy"`；而 `src/search/alphabeta.cpp:393` 的
   `info_.nodes_searched = nodes_searched_` 是无条件收尾的。于是这一手经
-  `game_manager.cpp:422` → `server.cpp:1021-1022` 落成
+  `game_manager.cpp:429` → `server.cpp:1021-1022` 落成
   `{"method":"greedy","depth":0,"nodes":N>0}`——名字已是快速路径，数据还是 AlphaBeta 的。
 - **GG2（高，取消被服务器回答推翻）** README:355-357（确认是唯一写服务器的一步、取消直接丢掉副本、摆棋
   再点一次等同取消）、:366（清空只清副本）、:377（被拒时留在摆棋里重试）。`web/app.js:1436-1448`
@@ -10744,10 +10776,10 @@ Elo 增量与 `games++` 两行逐字不动（+5/−5）；`main_trainer.cpp` 与
 false，提交门换成 `layer_complete && !stop_flag.load() && !aborted_`（+8/−2）。安全性论证：`aborted_` 只在
 `:266` 清，故新门绝不可能提交一个节点被短路过的层——它不比旧门松，唯一的行为变化就是那条被丢弃的完整层。
 
-**Not defects.** 1. AI 与人类的禁手对称成立：`game_manager.cpp:174` 拒人类禁手，AI 提交路径 `:420` 不查，但
+**Not defects.** 1. AI 与人类的禁手对称成立：`game_manager.cpp:176` 拒人类禁手，AI 提交路径 `:420` 不查，但
 `result.best_move` 的每个来源都已先过滤（`search_engine.cpp:61-81`、`alphabeta.cpp:33/:127`、
 `opening_book.cpp:236`）。2. `no_legal_move` 冻不住会话：`:48-55` 只在下满 225 格时触发，而那时
-`check_game_over`（`game_manager.cpp:446`）已判和棋。3. undo/replay 奇偶一致（`undo()` 的弹出上限
+`check_game_over`（`game_manager.cpp:453`）已判和棋。3. undo/replay 奇偶一致（`undo()` 的弹出上限
 `analyses_.size()`，`replay_snapshot()` 同一条不变量的反向）。4. `Board` 落子时不清
 `neighbor_count_[placed]` 是对的，因为 `undo_last_move` 严格按栈序移除。5. `SearchController` 无生产调用方、
 搜索非并行，README:596-597/399 已明说。另否掉/挂起：`elo` 的 `games` 按场计而非按局（README:49 只要求「自适应
@@ -10798,7 +10830,7 @@ flush 的 `net::post` 撞上 rotate）每条都指到了把它清掉的那一行
 `no_sessions` 生效之前把 `--no-sessions` 与显式 `--sessions`/`--records` 共存判为冲突，stderr 同时点名两边并
 `return 1`（+15/0，两处 clear 保留，`--no-book` 路径不动）。另有一处文档自洽由我直接改：README:503 的
 `session` 样本写着 `move_count: 6` 配 `current_turn: "white"`，与 README:219-220 的奇偶规则和
-`server.cpp:1309`（`replay.move_count % 2`，且 `game_manager.cpp:261` 让这个计数含摆棋 base）都对不上，
+`server.cpp:1309`（`replay.move_count % 2`，且 `game_manager.cpp:265` 让这个计数含摆棋 base）都对不上，
 改为 `move_count: 5`（1/1 行，仍 658）。
 
 **Not defects.** H 的 4 条（见上，`server.cpp:1557-1567`）；I 的 `forbidden_penalty` 范围守卫无生产消费者
@@ -10827,8 +10859,8 @@ flush 的 `net::post` 撞上 rotate）每条都指到了把它清掉的那一行
 
 - **DD3（高，帧序/所有权）**：`handle_make_move` 的失败早退只把 `deferred_end_for_` 交回槽位主人，却没有把
   worker 在这一窗里 park 进 `deferred_end_frame_` 的终局帧发出去，也没清空它。窗口是真的：`server.cpp:939-942`
-  先装槽位，AI worker 随后可在同一局里落成制胜一手并触发 game_over 回调（`game_manager.cpp:424/426`，回调在
-  worker 线程上跑，见 `server.cpp:1626-1634`），而玩家那一手被终局门禁（`game_manager.cpp:148`）拒掉。后果不是
+  先装槽位，AI worker 随后可在同一局里落成制胜一手并触发 game_over 回调（`game_manager.cpp:431/426`，回调在
+  worker 线程上跑，见 `server.cpp:1626-1634`），而玩家那一手被终局门禁（`game_manager.cpp:149`）拒掉。后果不是
   「这一局少一帧」而已：被搁置的帧会在**下一个** session 落合法子时由成功路径发出，等于把上一局的 `game_over`
   塞给无关对局。
 - **DD4（中，我自己在轮次98写错的契约）**：CC1 的流式扫描在见到第四种符号时 `return kinds.size() <= 3;` 提前
@@ -10877,7 +10909,7 @@ cmake/ctest）探针验证，HEAD 原文 `ls: cannot access '.../head/build/gomo
 **Found.** 三个只读审计（app.js 摆棋×终局×回放、摆棋文档/模板装载边界、game_manager↔server 状态机与
 线程生命周期）交回 11 条，逐条读码后留下 4 条，其余被我否掉或挂起。裁决证据都在行号上：
 
-- **CC3（高）帧序**：AI 那侧 `game_manager.cpp:424` 先 `move_callback_` 再 `:426 check_game_over()`，
+- **CC3（高）帧序**：AI 那侧 `game_manager.cpp:431` 先 `move_callback_` 再 `:426 check_game_over()`，
   所以 `ai_move` 总在 `game_over` 之前落地；人这条路是反的 —— `make_move` 内部 `:188` 就跑完
   `check_game_over()`，而 `server.cpp:938-943` 的 `move_made` 要更晚才发。一记取胜的落子因此回成
   `game_over, move_made`：前端先按终局收摊（`handleGameOver` 关掉棋盘、写「游戏结束」），随后那帧
@@ -10968,7 +11000,7 @@ CC1b 无可观察差异，未立案。测试会话的 diff 只在 `tests/`（`te
   「`session`（`resume` 的回应、服务器开局新会话时的主动播报）携带**服务器权威棋盘**：前端必须照它们
   重画棋盘并采纳其中的 `current_turn`，否则页面上可能显示服务器并没有的子」。可达路径是断线自动重连
   撞上服务器换进程/会话目录被清；摆棋中还会把 确认 永久按死（只有 取消 能救）。
-- **BB2** `src/server/game_manager.cpp:294-295`：`request_hint` 的守卫只有 `ai_thinking_ || hint_active_`，
+- **BB2** `src/server/game_manager.cpp:298-299`：`request_hint` 的守卫只有 `ai_thinking_ || hint_active_`，
   同文件的 `make_move:148`、`resign:283`、`choose_side`、`set_position` 全都在终局处拒绝。原始帧序
   `choose_side → resign → request_hint` 仍被受理：为一局不会再落的棋烧满 `timeout_ms`，再回一手
   `hint_result`，而同一连接随后 `make_move` 拿到的却是 `Invalid move`。前端只是顺手挡住了按钮。
@@ -10996,7 +11028,7 @@ CC1b 无可观察差异，未立案。测试会话的 diff 只在 `tests/`（`te
 `playerColor === null || gameStatus === 'game_over'`（`app.js:282/:1019/:1696`），而 README:453-454 把这一击的
 回答就写成「base 棋局无落子记录，悔棋返回 Cannot undo」，且没有任何一帧带「已落手数」（`replay.move_count`
 含 `base` 子）。任何 `error` 帧都清 `hintInFlight`：轮次77 钉过的、防止 求招 卡死的那扇门。`std::thread`
-构造抛异常会把 `ai_thinking_` 永久留在 true（`game_manager.cpp:370` 先置标志后建线程）——机理为真，但只有
+构造抛异常会把 `ai_thinking_` 永久留在 true（`game_manager.cpp:377` 先置标志后建线程）——机理为真，但只有
 `ulimit -u` 掐光线程预算才构造得出来，**挂起而非驳回**，日后有确定性复现再开。审计自己承认打不动的：
 `genetic.cpp:112` 硬编码 0.5（没人设 `mutation_rate`）、`trainer.cpp:289` 的 `game_id_base` 撞号、
 `trainer.cpp:389` 的 int  cast、`black_profile`/`white_profile` 默认、`method` 非字符串→`""`（兄弟闸门
@@ -11107,7 +11139,7 @@ untouched.
 ## 轮次95 逐手耗时只量了 AlphaBeta 那一段 — bugfix round 95 batch Z
 
 **Found.** Z1 (`src/search/search_engine.cpp`, verified by me at `87b91f0` before dispatching). README:57
-promises 逐手引擎分析（方法/分值/深度/节点/**耗时**), and `game_manager.cpp:418-421` writes
+promises 逐手引擎分析（方法/分值/深度/节点/**耗时**), and `game_manager.cpp:425-428` writes
 `result.elapsed_ms` into `analyses_` and into the `ai_move` frame's `thinking_time_ms`. At HEAD the field had
 exactly one assignment in the whole file — `:279` `result.elapsed_ms = info.elapsed_ms;` — and `info.elapsed_ms`
 comes from `alphabeta.cpp:385-386`, i.e. from `start_time_` that AlphaBeta stamps at its own entry (`:270`).
@@ -11197,7 +11229,7 @@ success path's order (`on_connect` → `start()` → `do_accept()`) is untouched
 extra character-level change is one trailing-whitespace cleanup on a blank line inside the hunk).
 
 **Not defects (verified by reading, after three auditors produced them):** the claim that `request_hint`
-(`game_manager.cpp:310`) snapshots `board_` off-lock while the AI worker writes it under `thinking_mutex_` is wrong -
+(`game_manager.cpp:317`) snapshots `board_` off-lock while the AI worker writes it under `thinking_mutex_` is wrong -
 `:302` refuses while `ai_thinking_` is set and `ai_thinking_worker` clears it only *after* its commit block
 (`:423`), and `halt_search` joins the worker before returning, so the hand-shake keeps the two off the board at the
 same time; the sample loader does check feature arity (`data_collector.cpp:258`, error string at `:260`, with
@@ -11286,7 +11318,7 @@ injection), so a test for it would be a hand-invoked handler call proving nothin
 `session` frame carries `position_pending` (`server.cpp:1260`) that `web/app.js` never reads, and `handleSession`
 resets `baseStones` at `:271` without re-seeding it from `msg.board` the way `handlePositionSet` (`:1262`) and
 `handleStateSync` (`:1637`) do - so the `pendingPosition` guard at `:922-925` is false right after a 摆棋 resume and
-the first click is dropped until the `request_replay` reply re-seeds at `:649`. Likewise `game_manager.cpp:261` sets
+the first click is dropped until the `request_replay` reply re-seeds at `:649`. Likewise `game_manager.cpp:265` sets
 `move_count` to 盘上子数 (base + played), so `resumedStatusText` (`app.js:308-325`) prints 「已恢复对局：N 手」 with N
 inflated by the base stones and never reaches its 「已恢复摆好的局面」 branch, correcting itself one RTT later. Both are
 one-RTT self-healing, both need a real socket pair to observe, and the harness has no frame injection - so they wait
@@ -11329,7 +11361,7 @@ README-vs-code defaults). **W1** README:529-531 tells a client what a `replay` f
 writes eight: `search_engine.cpp:92` returns `forced` when exactly one candidate point survives, `:109` returns
 `greedy_five` (score 100000) when a root candidate completes its own five, and `:150` returns `must_block`
 (score 99000) for the single point that has to be blocked. All three **commit a stone**, so they land in `analyses_`
-(`game_manager.cpp:418-420`), travel in the `replay` frame, and are printed verbatim by `web/app.js:804`; a reader
+(`game_manager.cpp:425-427`), travel in the `replay` frame, and are printed verbatim by `web/app.js:804`; a reader
 following the documented enum treats them as unknown values.
 
 **Fixed.** README only: the enum now lists all eight engine paths and states that the last three are pre-AlphaBeta
@@ -11376,7 +11408,7 @@ fast paths from real boards and asserts only `method`/`score`/`depth` — `force
 `must_block 99000 0` — which is what makes the enum in the doc exhaustive rather than guessed.
 **X3** (`tests/readme_anchor_check.js`, a standalone script, not in `ctest`) printed `README.md lines: 658` and
 `citations found: 27`, cross-checked the doc enum against the ten labels `search_engine.cpp` actually assigns (the
-two extras, `resign` and `no_legal_move`, cannot reach a replay frame - `game_manager.cpp:395` returns on
+two extras, `resign` and `no_legal_move`, cannot reach a replay frame - `game_manager.cpp:402` returns on
 `result.resigned` and `:407` pushes only for a valid `best_move`), and in doing so surfaced a *separate* defect for
 the next round: eight pre-existing `README:NNN` citations in `src/`, `web/` and `tests/` drifted onto blank or
 unrelated lines (`params.cpp:231`→154, `test_training.cpp:2200`→154, `app.js:193`→545, `search_engine.cpp:11`→336,
@@ -11467,14 +11499,14 @@ while the numeric family is `0` on both trees (identical message). The tester's 
 
 13. **一条微秒级的竞态也可以拿数据验收。** 做法：把竞态窗口本身量出来（`move_callback_` 到 `ai_thinking_` 交回，2 000 次采样：均值 20 µs、最大 146 µs），再在**同一份二进制**里用一个环境变量把窗口撑到已知宽度做 A/B（20 ms 档：今天的代码 418 局丢 90 颗合法子、作废 90 局；修好的代码 0 丢 0 废、122 颗全部取回）。自然档必须一起留在这里（0 丢），否则「撑开窗口」会被读成造出来的问题；反过来，只有自然档那一行也**不能**当成「没问题」——它只是说这件事需要几千局才撞一次。〔183〕
 
-14. **服务端那一族回调的同步全靠「调用顺序」，没有机制保证 —— 本轮的测试第一次把它撞出来。** `move_callback_` 一家五个（progress / move / hint / game_over / think_finished）都是裸 `std::function`：worker 在提交段读它（`game_manager.cpp:561` 判空、`:595` 调用），io 线程写它。产品里唯一的保护是那句顺序 ——「先 `halt_search()`（真的 join worker 与 hint 线程）再动回调」（`server.cpp:1416-1423`；接管/重开路径 `:1500`）。TSan 的证据形状就说这么多：HEAD 基线 1 条报告（`core/board.h:61`，`request_hint` 线程读盘面），本轮第一版多出的 2 条**点名的是测试自己**（用例在一颗还在飞的思考上换回调），按同一条纪律排好序后回到与基线逐字相同的读数。⇒「这条不变量存在」现在可测了；「它有机制保证」还没有。〔183；机制本身记为 #85〕〔187 补一条同族的新账：这一族真正破过一次，而且不是破在「顺序」上，是破在**回调在 worker 线程上拿了 io 线程 join 时持有的锁** —— `think_finished`（`:1809`）读 `pending_seq_` 要 `games_mutex_`，而 `on_disconnect` 正抱着它在 `:1422` join 它（A 段第 18 条，已修 + 有用例）。#85 要的机制因此有了明确形状，记为 **#93**。〕
+14. **服务端那一族回调的同步全靠「调用顺序」，没有机制保证 —— 本轮的测试第一次把它撞出来。** `move_callback_` 一家五个（progress / move / hint / game_over / think_finished）都是裸 `std::function`：worker 在提交段读它（`game_manager.cpp:568` 判空、`:595` 调用），io 线程写它。产品里唯一的保护是那句顺序 ——「先 `halt_search()`（真的 join worker 与 hint 线程）再动回调」（`server.cpp:1416-1423`；接管/重开路径 `:1500`）。TSan 的证据形状就说这么多：HEAD 基线 1 条报告（`core/board.h:61`，`request_hint` 线程读盘面），本轮第一版多出的 2 条**点名的是测试自己**（用例在一颗还在飞的思考上换回调），按同一条纪律排好序后回到与基线逐字相同的读数。⇒「这条不变量存在」现在可测了；「它有机制保证」还没有。〔183；机制本身记为 #85〕〔187 补一条同族的新账：这一族真正破过一次，而且不是破在「顺序」上，是破在**回调在 worker 线程上拿了 io 线程 join 时持有的锁** —— `think_finished`（`:1809`）读 `pending_seq_` 要 `games_mutex_`，而 `on_disconnect` 正抱着它在 `:1422` join 它（A 段第 18 条，已修 + 有用例）。#85 要的机制因此有了明确形状，记为 **#93**。〕
 
 15. **VCT 根扫描那句「我赢」现在先看对面的成五点 —— 而且它 43 次交回全部来自「活四」那一条支。** 分支归因（`tools/vct_slice_probe.cpp` 的 `root_branch`，209 条开局 × 线上那一档）：43/43 走 `vct.cpp:388`（成活四），`:363` 本手成五、`:396` 成双四、`:405` 防守枚举为空三条在 418 臂里**一次都没交回过**；那 28 个伪报**全部**是「黑落子之前对面就已经攥着成五点」（race_before>0 占 28/28）⇒ 不是「挡住以后还有余地」，是根本轮不到它。修法是一条规则（威胁主张只有在对面没有下一手成五点时才成立），落在三条进攻候选循环（`vct.cpp:156`/`:262`/`:373`，位置都在「本手成五」那条 sound 分支之后）＋ 一个判据 `defender_can_make_five`（`:474`：走 `active_empty()`，且先把格子抄进缓冲再落子 —— `place/undo` 会改 `active_empty_` 本身）。半径：`result` 变 28 臂（WIN→不答，反向 0），真次序的答案（方法/分数/落点）**0 处**变化，56 对整树赛逐手 0 分岔（其余 153 条开局被 #90 打断）。**代价写在同一条里**：拒掉假胜着以后这个相位更慢（黑侧进门臂均值 320→668 ms、7 条臂第一次撞满 4 800 ms 的切片、可回收份额 1.93 %→4.03 %），而总节点降 3.2 % —— 线上今天不吃这个时间（那 28 臂由快路径/VCF 先答），但动快路径次序的人要吃。〔184〕
 
 16. **这台赛具跑长了会撞内存墙，而且「每局一个新会话」是设计不是漏。** 当前树实测：一台 `gomoku_server --no-book` 接 120 局（每局两条新链接）RSS 从 **21 MB 涨到 1695 MB**，**+14 MB/局 ≈ 7 MB/会话** —— 与「每引擎一张 2^18 槽置换表 ≈ 8.4 MB」那条老数量级一致。机制：detach 下来的会话要等 `kReattachWindowSeconds = 30 * 60`（`server.cpp:130`）才下架，而 `restart`/`set_position` 在「这一局有子」时都会转会话（`server.cpp:1258-1266`）。**约 250 个会话/台**开始握手超时（418 局那场因此废掉 158 局）。便宜修法（让赛具整片复用链接）被**证伪**：同一条开局、同一座位，这条链接上第一跑 7 手、第三跑 3 手 ⇒ 棋谱依赖跑序，而这台夹具值钱的地方正是「不依赖跑序」。⇒ 只剩服务端两条（给已 detach 的会话设上限 / 会话共享一张表），登记 **#91**；在它落地之前，全量读数的可用规模是 **~100-120 局/台**，或按 `--shard` 切小、跑完换服务器。〔185；**名额那一枪已在轮次186 落地，见下面第 17 条**〕
 
 17. **`--max-sessions` 之后，「一场 418 局」不再是内存上的问题。** 名额把 detach 会话的停留从「30 分钟窗口」换成「最多 N 个」：同一台服务器接同样 24 局，不带名额 RSS **345 MB**、带 16 个名额 **155 MB**（峰值 260 —— 名额是在 10 s 一跳的 tick 上兑现的，瞬时会越过 N），会话文件数两臂都是 48（一个不少）、作废 0；被下架的 token 之后 `handle_resume` 仍 `resumed:true` ⇒ **丢的是引擎（那张置换表），不是那局棋**。缺省 0 = 今天的行为不变。两条边界钉在用例上：欠写的那条**跳过而不卡住名额**（M2 红在 ⑥）、活会话不进名额（**M1 是等价变异** —— `attach_socket` 已把 `detached_ms` 归零，所以那一半没有断言能区分）。〔186〕
-18. **断开一条正在思考的链接，挂住的不是这一局，是整台服务器。** 形状：`on_disconnect`（`server.cpp:695`）先拿 `games_mutex_` → `detach_socket` → `halt_search()`（`:1422`）join worker；而 worker 交回思考标志的最后一步（`game_manager.cpp:638` 调的 `think_finished_callback_`，装的是 `server.cpp:1809`）第一件事就是拿同一把锁。现场读数：SIGINT 之后 7 分钟不退出、日志里 `Shutting down` 0 句、`ping` 超时（rc=124）、`/proc` 两条线程都停在 `futex_do_wait` 且第二条 `utime=0 voluntary=1`（一睁眼就撞锁）。撞上它的入口有三条，全是「持 `games_mutex_` 去 join」这一形 —— `on_disconnect`（`:695`→`:1422`）、`restart`/`set_position` 换会话（`:1242`/`:1264`）、`resume` 与标签页接管（`:1466` 锁段里的 `:1471`/`:1500`）⇒ 客户端刷新页面、换一局、开第二个标签页都够得着，不只是赛具掐进程。修法是 `pending_seq_` 改原子、回调只读不拿锁（队列与号的写入仍成对在 `games_mutex_` 下，所以「迟到的取件单」语义不变）；修后同一个形状重跑 ⇒ `ping` p50 0.26 ms、SIGINT→退出 59 ms。用例 `test_a_socket_that_closes_while_the_ai_is_thinking_does_not_wedge_the_io_thread`，变异 M1（退回 HEAD 形状）红在那条判据上。⇒ 这条环是轮次183 补取件单时装进去的：那次把**取队列**挪回 io 线程，**取号**留在了锁里。〔187〕
+18. **断开一条正在思考的链接，挂住的不是这一局，是整台服务器。** 形状：`on_disconnect`（`server.cpp:695`）先拿 `games_mutex_` → `detach_socket` → `halt_search()`（`:1422`）join worker；而 worker 交回思考标志的最后一步（`game_manager.cpp:648` 调的 `think_finished_callback_`，装的是 `server.cpp:1809`）第一件事就是拿同一把锁。现场读数：SIGINT 之后 7 分钟不退出、日志里 `Shutting down` 0 句、`ping` 超时（rc=124）、`/proc` 两条线程都停在 `futex_do_wait` 且第二条 `utime=0 voluntary=1`（一睁眼就撞锁）。撞上它的入口有三条，全是「持 `games_mutex_` 去 join」这一形 —— `on_disconnect`（`:695`→`:1422`）、`restart`/`set_position` 换会话（`:1242`/`:1264`）、`resume` 与标签页接管（`:1466` 锁段里的 `:1471`/`:1500`）⇒ 客户端刷新页面、换一局、开第二个标签页都够得着，不只是赛具掐进程。修法是 `pending_seq_` 改原子、回调只读不拿锁（队列与号的写入仍成对在 `games_mutex_` 下，所以「迟到的取件单」语义不变）；修后同一个形状重跑 ⇒ `ping` p50 0.26 ms、SIGINT→退出 59 ms。用例 `test_a_socket_that_closes_while_the_ai_is_thinking_does_not_wedge_the_io_thread`，变异 M1（退回 HEAD 形状）红在那条判据上。⇒ 这条环是轮次183 补取件单时装进去的：那次把**取队列**挪回 io 线程，**取号**留在了锁里。〔187〕
 19. **这台 VM 的墙钟可以在两天里自己飘 40-50 倍，而代码一个字没动。** 同一棵树、同一套旗标：185 跑 809.8 ms/局 → 186 跑 38 789 / 31 837 ms/局 → 187 复现 795.8 ms/局（第 0 局 1354 ms 对 1355 ms）。排除法：引擎侧每局 `Σ elapsed_ms` 两边都是 ~670 ms（不变）；`ping` 往返 p50 0.12 ms 且 `TCP_NODELAY` 开不开都一样（不是 Nagle×delayed-ACK，也不是 WS 框架 —— 全仓没设过 `no_delay`，但它在这里不咬人）；48 会话 + 344 MB 的全量落盘只要 54 ms（10 s 一跳最多占反应器 0.5 %）；两臂 pace 在健康机器上差 0.7 %（旗标无关）。⇒ **规矩**：每一跑必须自带 `ms/局` 那一列，跨跑比较之前先看它；它自己飘过 2× 就当环境变了，这跑的墙钟不进任何结论。按局计的读数（内存斜率、胜负、节点）不受影响。〔187〕
 20. **夹具的每一局都不进训练 records —— 这是设计，不是漏。** `flush_entry` 里那句「只有从空盘起步的局才算训练记录」（`server.cpp:1653-1657`）把带 `base` 的摆棋局挡在 records 流外面，而赛具每一局都发 `set_position` ⇒ 实测 24 局只出 2 行 records（那 2 行 = 开局集第 1 行那条 `{}` ⇒ 夹具不发 `set_position` ⇒ 无 `base` × 两座位）。⇒ **#77 的训练样本不能从赛具这条路拿**，只能走自对弈侧；以前把「赛具有 records」算进成本的那笔要改掉。〔187〕
 21. **外部赛具是一把中性的尺，训练内部那把不是 —— 这次是量出来的，不是推的。** 外部：两次同版 null（一台引擎打它自己）在 209 条 / 418 局与 386 条 / 772 局上都读**逐字 0.5000、`n_inf = 0`**（386 对全 split），同命令复跑 772 局的**落点序列逐手相同**。内部：190 轮批里 183 轮产出的候选与当轮冠军**逐字相同**，而这些「同版打同版」的验证赛 **179/183 读 1.000000**（该读 0.5）⇒ `--accept-score 0.56` 与 SPRT 的中性假设都坐在一个偏置上面，187/190 轮在晋级一台没改的引擎。⇒ 训练日志里的「晋级 / 适配分 / Elo」在 #102 修好之前不许当证据。〔188〕
@@ -11482,8 +11514,12 @@ while the numeric family is `0` on both trees (identical message). The tester's 
 23. **开局档的天花板是自对弈盘面的重复率，不是采样参数。** 批的 3 040 条 records（190 轮 × 16 局）在 20 带 × 每带 60 条的采样下命中 53 407 次 ⇒ **53 052 是重复盘面（99.3 %）**、89 条装不进、0 条奇数子、0 条死盘 ⇒ 只出 **266 条**新局面，与在库 209 条合档去重 = **386 条**（`--check` 不可装 = 0）。要把判定推到 ±0.04 需要 ~750 对 ⇒ 得先造更多样的对局（改开局线采样 / 换 seed 族 / 多点深度带），调 `--per-band` 没用。〔188〕
 24. **训练内部那把尺现在读得出「没改过的引擎 = 没改过的引擎」。** 修法一句：每场配对局开跑前清掉两侧引擎的置换表（`src/training/trainer.cpp:81-82`）。判据不是自说的 —— 拿 188 那颗 checkpoint **原状续 3 轮**做前后对照（旗标逐字照抄那批的 `batch.sh`）：拆掉那两行的那臂三轮都是 `verification score 1.000000 (sprt accept, llr 3.176851, 6 games) -> promoted`、`best_version 190 → 193`；修好的那臂三轮都是 `0.500000 (sprt open, llr -2.671954, 8 games) -> kept champion`、`best_version` 停在 **190**。两臂的 `distinct versions` 都是 **8**、冠军 JSON 与 188 那份逐字相同 ⇒ 系数一个字没动，所以修前那三次「晋级」晋的是同一台引擎。同一修把**适配分**也摆平了（`measure_fitness:41 → play_match:180 → score_match` 是同一条路）：第 191 轮 `best fitness` 从 1.000000 掉到 0.500000。两个读数正好落在树里早就钉着的 SPRT 字面值上（`:4675-4686`：六胜 +3.1768510、每对 split -0.6679885）⇒ 这把尺的算术第一次被真数据逐一对上。用例 `tests/test_training.cpp:8159`，四臂变异台 2 红（拆两行 / 只清执白那台）2 绿（只清执黑那台 = 两座位条件对称、挪到局后 = 等价构造）。成本按局计 **+2 场验证局/轮（62 → 64，+3.2 %）**。⇒ #77 下一批可以重训了；188 那批的**晋级史**不作证据，但它的**外部定价**（赛具 null 逐字 0.5000）不受这条影响。〔189〕
 
-### B. 已被改判的旧说法（别再引用这几句）
 
+25. **求招的收尾判据不再读活盘 —— `board_` 有一份版本号，worker 只比号（#105 落地）。** 形状（读一头 / 写一头 / 三道闸）：求招 worker 收尾在 `thinking_mutex_` 里读 `board_.move_count()`（`game_manager.cpp:441-444`），写的一头是 `undo()`（`:275` 起）→ `board.cpp:104`，而 `undo()`/`make_move()` 只挡 `ai_thinking_`（`:276`/`:218`）**不挡 `hint_active_`**，`request_hint()`（`:383`）两个都挡 ⇒ 「求招在飞时玩家悔棋」是设计上允许的，那记回读无人保护。修法按「解耦优先、不加锁」：`std::atomic<int> board_epoch_`（`game_manager.h:339`）在六处改盘各 +1（`:130` `reset` / `:156` `set_position` / `:188` `restore_game` / `:254` 人手 / `:300` 悔棋每退一子 / `:581` AI 提交），求招把快照记成号（`:404`）、收尾比号（`:444`）。八臂变异台里两臂红在**既有**那条并发用例上（判据恒真、以及拆掉 `undo()` 的 +1 ⇒ `test_server.cpp:1767`「被取代的 hint 不许交付」），其余各红在新用例自己那条路径的断言上；MA5（尾巴换回比子数）**未杀** —— 今天能把子数补回原样的路会先 join 掉求招线程，号买的是「那两道闸以后被改动也不会悄悄放宽」。同轮把两处仪器账修平（见下面 B 段两条）并把轮次187 用例漏的那条 `thread leak` join 回来：同一棵树修仪器前 `races=2 rc=66`、修仪器后 `races=1 thread_leaks=1 rc=66`、代码修好后 `clean races=0 deadlocks=0 thread_leaks=0 rc=0`（112 s）。
+
+26. **io 线程的整盘拷贝与 AI 提交之间什么都没有 —— 量出来了，但缺省门禁盖不到（#106）。** 轮次190 把测量搬进树：`test_the_io_thread_board_copy_overlaps_the_ai_commit`（`tests/test_server.cpp:3930`）默认直接 return，给 `GOMOKU_R190_MEASURE=1` 才跑。带变量跑 TSan ⇒ **7 条 race**：写 = `board.cpp:64/:65/:145`（`place_stone`/`set_stone_bits`，AI worker 在 `thinking_mutex_` 里），读 = main 线程的 `Board::Board(const Board&)`（正是 `server.cpp:825` 那记 `state_sync` 的形状），思考在飞期间整盘拷贝 43 075 664 次；不带变量跑同一套门禁 ⇒ `clean races=0`。⇒ 今天「TSan 绿」的准确含义是「用例摸得到的那部分没有 race」，不是「盘面没有跨线程共享」。修法同方向但大一圈：让 `board_` 只剩一个写者（AI 提交与求招交付都变成回 io 线程的消息），这会重排 `ai_answer_delivered_` / `move_callback_` / `think_finished_callback_` 的时序 —— 轮次183/187 各踩过一次的那块地，值一整轮，不顺手做。
+
+### B. 已被改判的旧说法（别再引用这几句）
 | 旧说法 | 现在怎么说 | 出处 |
 |---|---|---|
 | 「赛具噪声地板 ≈10 % 的局，成因是战术层不受节点帽管」 | 数字（9/90）对，归因错：地板是开局库的每进程抽签；**关库后 = 0** | 174 → 176/177 改账 |
@@ -11500,6 +11536,8 @@ while the numeric family is `0` on both trees (identical message). The tester's 
 | 「#102 的机制是两侧各热一半，分辨实验会把那 179 个 1.0 翻成 0.0 或回到 0.5」 | 机制验了，但描述要改准：破点是**一对里两局的起手条件不对称**，不是「各热一半」。四臂实测：拆两行 ⇒ 用例红；只清「执白那台」⇒ 红；只清「执黑那台」⇒ **绿**（每台引擎都恰好执黑时冷、执白时热 ⇒ 两座位对称，镜像仍然成立）；挪到局后 ⇒ 绿（等价构造）。而轮次189 那份**临时**探针（把 `:232/:240` 两局的先后交换，仪器没入库，复现要自己改那两行）读到的是 **0.7500**，不是预测的 0.0 | 188（预测）→ 189（实测四臂 + 临时探针） |
 | 「戊-3 五相一键训练状态机已落地」（`docs/IMPLEMENTATION_GUIDE.md:569` 那张表） | **代码里没有**：全仓无 `train_start/pause/status` 处理器、`BalanceController` 无类；能用的只有 CLI（`--checkpoint/--resume`）与 戊-1 的 `--worker` 模式 | 188 自查 |
 | 「开局集再 harvest 一下能到 ~600 条」 | 同一批 3 040 条 records 的上限是 **266 条新盘**（重复盘面 99.3 %），合档 386 条；要到 ~750 对得先改**对局的多样性**，不是采样参数 | 188 改账 |
+| 「轮次189 门禁段 4 报『TSan 红：2 条 race』」 | 数错了。`tools/valgrind_check.sh` 用 `grep -c "ThreadSanitizer: data race"` 数报告，而 TSan 每条发现打两行（`WARNING:` + `SUMMARY:`）⇒ 一条被数成两条。真相：**1 条 race + 1 条 thread leak**（后者是轮次187 那条用例自己漏的 join）。「同一个二进制 187 clean、今天 3/3 复现」这条不变 —— 每跑都是那 1+1 | 189 → 190 仪器改数 |
+| 「门禁会把 race 的两条访问与两个函数打成明细」 | 那句 `grep -A24 "^==.*== WARNING: ThreadSanitizer: data race"` 与 TSan 的实际输出（`WARNING: ThreadSanitizer: data race (pid=…)`，行首没有 `==pid== ` 那个空格形状）**从不匹配** ⇒ 这个分支自写下起一句没打印过，红的时候只有一句计数。轮次190 修好，第一次读到 `Read of size 4 … by thread T13 (mutexes: write M0)` | 189 自查（190 修） |
 
 ### C. 棋力提升路线（按「每单位成本的期望棋力」排）
 
@@ -11534,7 +11572,9 @@ while the numeric family is `0` on both trees (identical message). The tester's 
 - **`#94` 落盘整段在 io 线程 + `games_mutex_` 下做**：`on_flush_tick`（`server.cpp:1699`）整段抱锁遍历每个会话写文件，`detach_socket`/`flush_all` 走同一段。健康机器上量到的是 48 会话 54 ms（一跳占反应器 0.5 %）⇒ **不 binding**，本轮因此不动它；但它是「外部一抖就变成每手一等」的那根放大器（轮次186 的慢窗里它就是一直握着锁的那只手）。要收口就得把写盘挪出 io 线程，而那是轮次186 已经写下「不搬」的那条取舍（io 线程持锁做磁盘 I/O 是整个落盘设计刻意避开的）—— 重启它需要自己的理由与读数，不该挂在 #91 后面顺手做。
 - **`#102` 训练内部那把验证赛不是中性的 —— 一台引擎打自己读的是 1.0，不是 0.5 —— 轮次189 已落地**：188 那批 190 轮里 183 轮的候选与当轮冠军**逐字相同**，其中 **179 轮验证分 = 1.000000**（4 轮 0.625）；配上 `--accept-score 0.56` 就是「183 轮在晋级一台没改的引擎」。机制已验，但比原先写的窄：破的是**一对里两局起手条件不对称**（第二局带着第一局烘热的置换表），不是「两侧各热一半」—— 四臂变异台里「只清执黑那台」是**绿的**（两座位仍然对称），「只清执白那台」是红的。修法：`play_game` 开头清两侧表（`src/training/trainer.cpp:81-82`），适配分那条路（`measure_fitness → play_match → score_match`）一起正。判据是同一颗 checkpoint 原状续 3 轮的前后对照（修前三轮 `1.000000 / accept / 6 局 / promoted`、`best_version 190→193`；修后三轮 `0.500000 / open / 8 局 / kept`、`best_version` 停 190，两臂 `distinct versions` 都是 8）。用例 `tests/test_training.cpp:8159`。**仍欠的那一半**：188 那批的冠军轨迹是这把坏尺选出来的，**要结论得重训**（#77）；而重训要不要开（以及开多少轮）现在有了成本读数 —— 每轮 +2 场验证局（+3.2 %），一批 190 轮在健康机器上按 188 的 75.9 s/轮 ≈ 4 小时。
 - **`#103` 服务端 records 的导出条件与实测不自洽**：`export_game_record`（`server.cpp:1594-1606`）要 `!exported && base.empty() && is_decisive()`。轮次188 的 null 那跑两台服务器各落 418 个会话文件，records 却**各只有 1 行**，而每台北都有两局满足「空 base + 决定性结束」。⇒ 有一条去重/时序条件在代码读出来的规则之外，待查（训练侧的 records 是精确的：3 040 数据局 ⇒ 3 040 行，所以本轮判定不受影响）。
-- **`#105` 求招 worker 读的 `board_.move_count()` 与玩家那两条路写的同一格没有共同的锁**：轮次189 的 TSan 门禁段 3/3 复现 2 条 race，两条都收在 `src/core/board.h:61`（`move_count()`）。读的一头是求招收尾（`game_manager.cpp:436-437`，在 `thinking_mutex_` 下比较「盘面还是不是这手棋算的那张盘」）；写的一头是 `undo()` → `board_.undo_last_move()`（`:295` → `board.cpp:104`）。**闸门的口径按代码数清楚了三条**：`undo`（`:272`）与 `make_move`（`:215`）只挡 `ai_thinking_`，**不挡 `hint_active_`**；`request_hint`（`:378`）反过来挡 `ai_thinking_ || hint_active_` ⇒ 求招期间玩家落子/悔棋是**允许的**，而那正是这条 race 的入口（浏览器里点「悔棋」而求招还在飞）。`:432` 那句注释「compare under `thinking_mutex_`, which is what the AI commit path takes when it changes `board_`」的前提只对 AI 提交那条路成立：`thinking_mutex_` 挡不住不拿它的写者，所以这个比较读到的是一格没人保护的 `int`，而且它拿来做判据之后还会决定要不要把这次结论存进 `hint_move_`（`:439-443`）⇒ 后果不只是 UB，还包括「给一张已经不存在的盘存了个hint」。窗口受机器 pace 控制 —— 同一个 TSan 二进制（10-25 01:26 建、本轮没重编）轮次187 报 clean、轮次189 报 2 条，本轮 `git status` 只碰 `src/training/trainer.cpp`，两条栈里也没有任何本轮改过的文件 ⇒ **HEAD 上就是红的，不是 189 带的**。**方向（用户 189 定）：解耦优先，通信与交互走消息队列**，不是再加一把锁 —— 187 那条环（io 持 `games_mutex_` 去 join worker）正是「用锁去修共享」的下一个坑。待办：把「答案算的是哪张盘」做成随消息带过去的快照标识（或让求招收尾走 post 回 io 线程，与 183/187 那条「排队的玩家一手必须回 io 线程执行」同形），而不是回读活盘。
+- **`#105` 求招 worker 回读活盘的那一格 —— 轮次190 已落地（改成比盘面版本号）**：原形状（轮次189 量到、190 读准）：**1 条 race**（189 记的「2 条」是仪器把 `WARNING:` 与 `SUMMARY:` 数成两条，见 B 段），收在 `src/core/board.h:61`（`move_count()`）。读的一头是求招收尾在 `thinking_mutex_` 下的那一读（`game_manager.cpp:443-444`），写的一头是 `undo()` → `board_.undo_last_move()`（`:299` → `board.cpp:104`）。**闸门口径**：`undo()`（`:276`）与 `make_move()`（`:218`）只挡 `ai_thinking_`、**不挡 `hint_active_`**，`request_hint()`（`:383`）两个都挡 ⇒ 求招在飞时玩家落子/悔棋是设计允许的，那记回读无人保护；旧注释（`:438` 上面那三行）说「compare under `thinking_mutex_`, which is what the AI commit path takes」只对 AI 那条路成立。修法按用户 189 定的方向（解耦优先、走消息，不加锁），落地成 187 `pending_seq_` 的同形：`std::atomic<int> board_epoch_`（`game_manager.h:339`）在六处改盘各 +1（`:130`/`:156`/`:188`/`:254`/`:300` 悔棋每一子/`:581`），求招把快照记成号（`:404`）、收尾比号（`:444`，判据抽成 `board_matches_hint_snapshot()`）。仪器同轮修平：`races=` 改数 `WARNING:` 头一行、`thread_leaks=` 进判决、那段从来没打印过的明细 grep 修好，另把 187 用例漏的 join 补上 ⇒ 同一棵树修前 `races=1 thread_leaks=1 rc=66`、修后 `clean races=0 deadlocks=0 thread_leaks=0 rc=0`（112 s）。八臂变异台一臂**未杀**（MA5 把尾巴换回比子数）：今天能把子数补回原样的路会先 join 掉求招线程，所以号买的是「那两道闸以后被改动也不会悄悄放宽」，不是今天的行为差。**同族更宽的那一格另立 #106。**
+
+- **`#106` io 线程整盘拷贝 vs AI 提交写盘：量到了，缺省门禁盖不到（轮次190）**：`test_the_io_thread_board_copy_overlaps_the_ai_commit`（`tests/test_server.cpp:3930`）默认 return，`GOMOKU_R190_MEASURE=1` 才跑。带变量 ⇒ TSan **7 条 race**：写 = `board.cpp:64/:65/:145`（`place_stone`/`set_stone_bits`，AI worker 在 `thinking_mutex_` 里），读 = main 线程 `Board::Board(const Board&)`（`server.cpp:825` 那记 `state_sync` 的形状），思考在飞期间拷贝 43 075 664 次；不带变量 ⇒ `clean races=0`。⇒ 「TSan 绿」= 「用例摸得到的部分没有 race」，不是「盘面没有跨线程共享」。修法比 #105 大一圈：让 `board_` 只剩一个写者（AI 提交与求招交付都回 io 线程，与 183/187 的「排队的玩家一手必须回 io 线程执行」同形），代价是要重排 `ai_answer_delivered_` / `move_callback_` / `think_finished_callback_` 的时序 —— 那块地已经踩过两次（worker 自 join、worker 就地拿 `games_mutex_`），所以它要自己一轮：先量「提交回 io 之后，178 那 4/3326 吞子窗口与 183 的一手队列各自会变成什么」，再动代码。
 
 - **`#104` 适配评估的逐次分数没有读数口**：`hill climbing ran N iterations, M evaluations, best fitness X` 只报最好那一次；24 次评估各自的分数、平局率、候选是否 ≡ 冠军，日志与 checkpoint 都没有（checkpoint 实测键 = `best_version/elo/games_played/rounds_completed/samples_collected/seed/versions`）⇒ 想判「内部选点有没有牙」只能靠版本比对这种外围办法。欠一个便宜的读数口（每评估一行 `fitness` + 是否复制体）。〔轮次189 又走了一次外围办法才拿到判据：把 checkpoint 里 `versions[]` 的规范化 JSON 串与日志里 `verification score … -> promoted/kept` 那几列正则拼起来重放晋级史，才得出「183 轮复制体 / 其中 179 轮读 1.000000」这张表（8 行 node 脚本，产品里没有这个读数，也没有留任何仪器）。顺带一条同源的没解释读数：修后那三轮都是 `kept champion`，而 `champion elo` 仍逐轮在动（1516.000 → 1515.264 → 1514.561）；验证局的逐场胜负与和棋**落不进任何地方**（records 只收数据局，见 A 段第 20 条），所以连「这一轮的 0.5 是 4 胜 4 负还是四场和棋」都读不出来 —— 分为什么掉更没有解释。这条也在 #104 的欠口里。〕
 

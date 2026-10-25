@@ -192,7 +192,7 @@ for t in "${targets[@]}"; do
     # counters would read like a memcheck row that found nothing.
     reports=$(grep -c "^==.*==" "$log" 2>/dev/null); reports=${reports:-0}
     invalid_read=0; invalid_write=0; uninit=0; leak_def=0
-    conflicts=0; races=0; deadlocks=0
+    conflicts=0; races=0; deadlocks=0; leaks=0
     if [ "$tool" = memcheck ]; then
         invalid_read=$(grep -c "Invalid read of size" "$log" 2>/dev/null); invalid_read=${invalid_read:-0}
         invalid_write=$(grep -c "Invalid write of size" "$log" 2>/dev/null); invalid_write=${invalid_write:-0}
@@ -201,26 +201,33 @@ for t in "${targets[@]}"; do
     elif [ "$tool" = drd ]; then
         conflicts=$(grep -c "Conflicting accesses" "$log" 2>/dev/null); conflicts=${conflicts:-0}
     elif [ "$tool" = tsan ]; then
-        races=$(grep -c "ThreadSanitizer: data race" "$log" 2>/dev/null); races=${races:-0}
-        deadlocks=$(grep -c "ThreadSanitizer: deadlock" "$log" 2>/dev/null); deadlocks=${deadlocks:-0}
+        # Count the report HEADERS, not the phrase. TSan prints each finding twice -
+        # the "WARNING:" block and its "SUMMARY:" line - so the bare phrase used to
+        # report races=2 where there was exactly one racing pair. A thread leak is a
+        # defect too (an unjoined thread), and before this line it could hide behind
+        # races=0 with a non-zero rc nobody looked at.
+        races=$(grep -c "WARNING: ThreadSanitizer: data race" "$log" 2>/dev/null); races=${races:-0}
+        deadlocks=$(grep -c "WARNING: ThreadSanitizer: deadlock" "$log" 2>/dev/null); deadlocks=${deadlocks:-0}
+        leaks=$(grep -c "WARNING: ThreadSanitizer: thread leak" "$log" 2>/dev/null); leaks=${leaks:-0}
     fi
 
     if [ "$tool" = tsan ]; then
-        if [ "$races" != 0 ] || [ "$deadlocks" != 0 ]; then
+        if [ "$races" != 0 ] || [ "$deadlocks" != 0 ] || [ "$leaks" != 0 ]; then
             verdict="TSAN REPORTS"
         elif [ "$rc" != 0 ]; then
             verdict="ABORTED rc=$rc"
         else
             verdict="clean"
         fi
-        printf '%-14s %s  races=%s deadlocks=%s rc=%s %ss\n' \
-               "$t" "$verdict" "$races" "$deadlocks" "$rc" "$secs"
+        printf '%-14s %s  races=%s deadlocks=%s thread_leaks=%s rc=%s %ss\n' \
+               "$t" "$verdict" "$races" "$deadlocks" "$leaks" "$rc" "$secs"
 
         # The pairs, not just the count: a race is only adjudicable by the two
         # accesses and the two functions, and strand/atomic involvement is what
-        # decides whether it is real.
+        # decides whether it is real. The header line is `WARNING: ...` with no
+        # `==pid==` prefix on it, which is why this used to print nothing at all.
         if [ "$races" != 0 ]; then
-            grep -A24 "^==.*== WARNING: ThreadSanitizer: data race" "$log" \
+            grep -A24 "WARNING: ThreadSanitizer: data race" "$log" \
                 | grep -E "^ *([0-9]+ +(go| pthread)|(Read|Write|Atomic|Prev|Location) )" \
                 | head -40
         fi

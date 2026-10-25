@@ -319,7 +319,7 @@ VCF 的树形不是宽树，是**窄而深的强制链**：每一层的冲四点
 
 - 全局 `ponder_slots_`，默认 **1**：拿不到槽就**不 arm**（不排队、不发帧、不重试），下一手再说；
 - 训练 `train_quota > 0` 时槽数置 **0**（与 §4.4 的让位规则同一口径，避免两套优先级打架）；
-- 槽在 `cancel_ponder()` 的 join 之后释放（含 `make_move` / `undo` / `request_hint` / `halt_search` 四条异常路径，`game_manager.cpp:220/277/387/475`）；
+- 槽在 `cancel_ponder()` 的 join 之后释放（含 `make_move` / `undo` / `request_hint` / `halt_search` 四条异常路径，`game_manager.cpp:223/277/387/475`）；
 - **验收仪器**：12 个并发会话同时等待，`ponder_arms()` 的并发峰值必须 ≤ 1；且每会话 think 的 p99 与单会话档差 ≤ 5 %。这条仪器是 P-1 唯一的存在理由——没有它，槽就是个摆设。
 
 #### 2.6.4 默认值：建议抬到 25 %，不抬到 50 %
