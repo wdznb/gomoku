@@ -475,7 +475,7 @@ void test_elo_system() {
 
 // Round 101 FF1: the bracket behind the rating table disagreed with the promotion
 // rule it sits next to. README:198 makes a verification match 8 games, so a 5-3
-// candidate scores 0.625, which trainer.cpp:551-553 promotes (>= the 0.56 bar, open match)
+// candidate scores 0.625, which trainer.cpp:564-566 promotes (>= the 0.56 bar, open match)
 // while the old `>= 0.75 / <= 0.25` test booked *both* sides a draw - the table
 // printed a match somebody had clearly taken as nobody winning. The bracket now
 // follows what a match score means: above half is a win, below half a loss, exactly
@@ -3573,8 +3573,8 @@ void test_server_refuses_no_sessions_with_a_stated_path() {
 }
 
 // Round 101 FF2: `--resume CK --seed N` used to start, parse N, and then let the
-// resume overwrite it (trainer.cpp:771 assigns the seed the checkpoint recorded, and
-// trainer.cpp:629 always writes one), so the reproducibility the caller asked for was
+// resume overwrite it (trainer.cpp:784 assigns the seed the checkpoint recorded, and
+// trainer.cpp:642 always writes one), so the reproducibility the caller asked for was
 // not the run that actually happened. The parser now refuses the pair, the same class
 // as the --params/--resume contradiction it sits next to.
 //
@@ -8278,6 +8278,90 @@ void test_a_decisive_record_needs_both_a_winner_and_a_replayable_ending() {
               << std::endl;
 }
 
+// #104：逐次评估的读数口（轮次201）。以前一轮只留一行「best fitness」，于是「内部选点有没有
+// 牙」这种问题只能靠树外的脚本从 checkpoint 的 versions 指纹里拼（轮次189/191 就是这么来的，
+// 那两份仪器没入库）。现在每一次评估都有一行，这一条钉这个读数**本身可信**：行数、步号、
+// 分数、是否被接受、评的是不是冠军本体，五样都能从优化器的状态独立复算。
+void test_hill_climbing_reports_every_evaluation() {
+    CoefficientPair base;  // 两侧同值的默认系数，与 test_hill_climbing 同一副起点
+    HillClimbingConfig settings;
+    settings.max_iterations = 80;
+    settings.stagnation_limit = 60;
+
+    std::vector<HillClimbingOptimizer::EvaluationRecord> records;
+    {
+        HillClimbingOptimizer optimizer(pair_deviation_score, settings, 4242);
+        optimizer.set_evaluation_observer(
+            [&records](const HillClimbingOptimizer::EvaluationRecord& e) { records.push_back(e); });
+        int iterations = 0;
+        double best = 0.0;
+        optimizer.run(base, iterations, best);
+
+        // ① 一次评估恰好一行。轮次201 的第一版把「收敛那一支」的 emit 放在了 else 分支末尾，
+        //    于是每个被拒的探针发两行 —— 这一条就是逮它的（发漏与发重同样红）。
+        assert(records.size() == static_cast<size_t>(optimizer.evaluations()));
+        assert(records.size() == static_cast<size_t>(iterations) + 1);
+        // ② 第 0 行是起步那一评：分数 == 起步分、没被接受、且明写「就是冠军本体」
+        assert(records.front().step == 0);
+        assert(records.front().same_as_start);
+        assert(!records.front().accepted);
+        assert(records.front().fitness == deviation_score(base));
+        // ③ 步号是连续的 1..iterations（被跳过的空扰动不占号，与 iterations_run 同口径）
+        for (size_t i = 1; i < records.size(); ++i) {
+            assert(records[i].step == static_cast<int>(i));
+            assert(!records[i].same_as_start || records[i].fitness == records.front().fitness);
+        }
+        // ④ accepted 那一列可以独立复算：只有严格改进才接受，而「当前分」只在接受时移动
+        double current = records.front().fitness;
+        size_t accepted_count = 0;
+        for (size_t i = 1; i < records.size(); ++i) {
+            assert(records[i].accepted == (records[i].fitness > current + 1e-9));
+            if (records[i].accepted) {
+                ++accepted_count;
+                current = records[i].fitness;
+            }
+        }
+        assert(current == best);
+        assert(accepted_count >= 1);
+        records.clear();
+    }
+
+    // ⑤ 收敛那一支也必须发出去：脚本化的分数只认 black.live_four 变大，其它探针一律持平被拒，
+    //    stagnation_limit 压到 2 ⇒ 循环一定从 `return best_coefficients` 那条路出去。少发一行
+    //    就是 records 比 evaluations 少 —— 这一条与 ① 同形，但走的是那条早退分支。
+    HillClimbingConfig tight;
+    tight.max_iterations = 40;
+    tight.stagnation_limit = 2;
+    std::vector<HillClimbingOptimizer::EvaluationRecord> tail;
+    HillClimbingOptimizer climbing([](const CoefficientPair& p) {
+        return static_cast<double>(p.black.live_four);
+    }, tight, 99);
+    climbing.set_evaluation_observer(
+        [&tail](const HillClimbingOptimizer::EvaluationRecord& e) { tail.push_back(e); });
+    int tail_iterations = 0;
+    double tail_best = 0.0;
+    const CoefficientPair moved = climbing.run(base, tail_iterations, tail_best);
+    (void)moved;
+    assert(climbing.converged());                        // 确实从「收敛 + return」那条支路出去
+    assert(tail.size() == static_cast<size_t>(climbing.evaluations()));  // ⇒ 早退之前那一行没漏发
+    assert(!tail.empty() && tail.back().step == tail_iterations);
+    assert(!tail.back().accepted);                       // 收尾那一评就是把它逼停的那一评（被拒）
+    double tail_current = tail.front().fitness;
+    bool tail_saw_accept = false;
+    for (size_t i = 1; i < tail.size(); ++i) {
+        assert(tail[i].accepted == (tail[i].fitness > tail_current + 1e-9));
+        if (tail[i].accepted) {
+            tail_current = tail[i].fitness;
+            tail_saw_accept = true;
+        }
+    }
+    assert(tail_current == tail_best);                   // 复算出来的「当前分」就是交出去的 best
+    assert(tail_best >= static_cast<double>(base.black.live_four));   // 这条脚本分数只会往上走
+    if (!tail_saw_accept) assert(tail_best == static_cast<double>(base.black.live_four));
+
+    std::cout << "test_hill_climbing_reports_every_evaluation passed" << std::endl;
+}
+
 int main() {
     std::cout << "Running training tests..." << std::endl;
 
@@ -8300,6 +8384,7 @@ int main() {
     test_data_collector_samples();
     test_augmented_samples_match_manual_transforms();
     test_hill_climbing();
+    test_hill_climbing_reports_every_evaluation();
     test_genetic();
     test_genetic_seed_covers_the_whole_box();
     test_hill_climbing_empty_steps();

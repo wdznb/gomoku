@@ -415,7 +415,7 @@ git push origin master                # 然后核对 git log --oneline -1 origin
 
 1. **反对称的唯一支点是 `evaluator.cpp:267/270`**：两侧必须按「**子的颜色**」取系数（`my_color` / `opponent(my_color)`），不能按「我方/对方」取同一套。`eval(W) = S_W − S_B`、`eval(B) = S_B − S_W`，这样才恒等取负。
 2. **换系数集必须 `tt.clear()`**：TT 的 `static_eval` 只存 BLACK 符号（`transposition.h:44-52`），这个约定只在同一套系数内成立。
-3. **序列化要兼容旧文件**：`kParams` 是一基因一行（`params.cpp:42-63`，落地后仍是 14 行，按色只在向量与 JSON 这两层边界展开）、`to_json_string` 是扁平结构（`:280-288`）、checkpoint 的 `versions[]` 就是那个扁平对象（`trainer.cpp:632-635`）。单份文件读成「两侧同值」，不要造新格式。
+3. **序列化要兼容旧文件**：`kParams` 是一基因一行（`params.cpp:42-63`，落地后仍是 14 行，按色只在向量与 JSON 这两层边界展开）、`to_json_string` 是扁平结构（`:280-288`）、checkpoint 的 `versions[]` 就是那个扁平对象（`trainer.cpp:645-648`）。单份文件读成「两侧同值」，不要造新格式。
 4. **`sanitize` 与 `CrossRule` 必须逐色各跑一遍**（`params.cpp:180-211`、`:518-544`），否则一套合法、另一套越界的文件会被静默接受。
 5. **威胁阶梯两侧必须同阶（±20 %）**：否则「白方」就是另一个引擎，Elo 失去意义。允许两侧不同的是位置项 / 贴边 / 候选宽度 / 防守权重——**注意：`kParams` 里没有「防守权重」这一基因**（14 个可调量是 9 个威胁 + `position_weight_scale` / `distance_to_stones` / `edge_penalty` / `cand_width_root` / `cand_width_deep`），所以这一项在这一版是**给不出来的**，丁-4 只能在四项里挑。
 6. 基因数从 14 变 28，`TUNABLE_COUNT` 与 `CoefficientVector::to_vector/from_vector` 都要跟着改；`measure_fitness`（`trainer.cpp:41-57`）与 `score_match`（`:186-260`）假定「候选 = 一套系数」，要重定义为「候选 = 一对」。

@@ -513,6 +513,19 @@ TrainerRound Trainer::run_round() {
         settings.stagnation_limit = config_.stagnation_generations * 3;
 
         HillClimbingOptimizer optimizer(fitness, settings, round_seed);
+        // #104：逐次评估的读数口。以前一轮只留一行「best fitness」，那 183/190 次「晋的是
+        // 复制体」只能靠外面的脚本从 checkpoint 的 versions 指纹里拼出来 —— 这条把每次评估
+        // 的分数、有没有被接受、评的是不是冠军本体直接落到同一份日志里。
+        if (log_) {
+            const int logged_round = result.round;
+            optimizer.set_evaluation_observer(
+                [this, logged_round](const HillClimbingOptimizer::EvaluationRecord& e) {
+                    log_("round " + std::to_string(logged_round) + ": eval " +
+                         std::to_string(e.step) + " fitness " + std::to_string(e.fitness) +
+                         (e.accepted ? " accepted" : " kept") +
+                         (e.same_as_start ? " champion-itself" : ""));
+                });
+        }
         int iterations_run = 0;
         double best_fitness = 0.0;
         candidate = optimizer.run(result.champion, iterations_run, best_fitness);

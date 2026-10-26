@@ -39,9 +39,20 @@ CoefficientPair HillClimbingOptimizer::run(const CoefficientPair& base,
     best_history_.clear();
 
     std::vector<int> current = CoefficientVector::to_vector(base);
+    const std::vector<int> start = current;   // 「候选 ≡ 冠军」就是与这一套逐字相同
     CoefficientPair current_coefficients = CoefficientVector::pair_from_vector(current);
     double current_fitness = fitness_(current_coefficients);
     evaluations_++;
+    auto emit = [this](const EvaluationRecord& record) {
+        if (observer_) observer_(record);
+    };
+    {
+        EvaluationRecord baseline;
+        baseline.step = 0;
+        baseline.fitness = current_fitness;
+        baseline.same_as_start = true;
+        emit(baseline);
+    }
 
     CoefficientPair best_coefficients = current_coefficients;
     best_fitness = current_fitness;
@@ -66,10 +77,20 @@ CoefficientPair HillClimbingOptimizer::run(const CoefficientPair& base,
             CoefficientVector::pair_from_vector(candidate);
         const double candidate_fitness = fitness_(candidate_coefficients);
         evaluations_++;
+        // 接受与否先算成一条判据，读数与走子用的是**同一个** bool —— 否则日志里那列
+        // accepted 可能与真正走的那一步不一致。
+        const bool accepted = candidate_fitness > current_fitness + 1e-9;
+        EvaluationRecord record;
+        record.step = steps;
+        record.fitness = candidate_fitness;
+        record.accepted = accepted;
+        record.same_as_start = (candidate == start);
+        record.gene_index = index;
+        record.multiplier = config_.multipliers[slot];
 
         // Accept only strict improvements over the point we are standing on, so
         // the walk climbs instead of drifting sideways through ties.
-        if (candidate_fitness > current_fitness + 1e-9) {
+        if (accepted) {
             current = candidate;
             current_coefficients = candidate_coefficients;
             current_fitness = candidate_fitness;
@@ -84,10 +105,12 @@ CoefficientPair HillClimbingOptimizer::run(const CoefficientPair& base,
                 converged_ = true;
                 iterations_run = steps;
                 best_history_.push_back(best_fitness);
+                emit(record);   // 收敛这一支直接 return，读数必须在 return 之前发出去
                 return best_coefficients;
             }
         }
 
+        emit(record);
         best_history_.push_back(best_fitness);
         iterations_run = steps;
     }
