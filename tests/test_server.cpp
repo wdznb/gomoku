@@ -1084,7 +1084,9 @@ void test_resign_survives_interruption() {
         // session's reuse record in the worker's arguments and A7 the budget with
         // it; this game has neither, so both stay at the engine's own defaults.
         game.stop_flag_.store(true);
-        std::thread worker(&GameManager::ai_thinking_worker, &game, 2000, 2,
+        // 轮次205 #113：快照现在是调用方交进来的（worker 不再读活盘），这两处直调
+        // worker 的用例因此按值递一份盘面进去 —— 与线上 `start_ai_thinking` 同一形状。
+        std::thread worker(&GameManager::ai_thinking_worker, &game, game.board(), 2000, 2,
                            GameManager::Reuse{}, GameManager::Budget{});
         worker.join();
 
@@ -1110,7 +1112,9 @@ void test_resign_survives_interruption() {
         game.discard_pending_.store(true);
         game.set_game_over_callback([&](int, const std::string&) { ++frames; });
         game.stop_flag_.store(true);
-        std::thread worker(&GameManager::ai_thinking_worker, &game, 2000, 2,
+        // 轮次205 #113：快照现在是调用方交进来的（worker 不再读活盘），这两处直调
+        // worker 的用例因此按值递一份盘面进去 —— 与线上 `start_ai_thinking` 同一形状。
+        std::thread worker(&GameManager::ai_thinking_worker, &game, game.board(), 2000, 2,
                            GameManager::Reuse{}, GameManager::Budget{});
         worker.join();
         assert(game.status() == GameStatus::PLAYING);
@@ -1352,7 +1356,7 @@ void test_a_shelved_played_session_keeps_its_token() {
 
 // Round 81, C1: handle_resign's "started" guard must count played plies, not
 // stones on the board. A hand-set position installs its base stones as the board
-// itself (game_manager.cpp:159), so replay_snapshot().move_count is non-zero while
+// itself (game_manager.cpp:160), so replay_snapshot().move_count is non-zero while
 // analyses_ is still empty - and undo already refuses to give those stones back
 // for the same reason. Settling such a position handed the opponent 白棋胜（认输）
 // over zero moves on the default player_color_(BLACK).
@@ -4226,6 +4230,66 @@ int callback_swap_death_arm() {
     return 0;
 }
 
+// 轮次205 #113：`thinking_mutex_ 撤掉之后，跨线程那一跳靠什么成立。
+// 本轮的仪器（临时按线程记数的获取点表）量到那把锁真有两根线程：求招 worker 抱着它写提示
+// 缓存（该点 distinct_threads=2），AI worker 抱着它复制活盘（每一手都是新线程，恒为 2）。
+// 撤锁的根据不是「反正没人抢」，是把这两处都换成交接：结论**发布**进原子槽、由属主线程
+// **取用**；盘面快照在属主线程复制好按值交进去。这条用例钉的就是交接本身的四个形状：
+//   ① 发布不改属主线程的状态（没取用之前 `current_hint_` 还是空的）；
+//   ② 取用发生在属主线程上，取到的正是那条线程发布的内容（含颜色闸门）；
+//   ③ 槽取空了（`exchange(nullptr)`）—— 留着没取的那一份必须由取用方回收，否则是漏；
+//   ④ 盘面被整块换掉时，**还没被取用的发布也一起作废**（旧形状里 worker 已经写进字段，
+//      悔棋/摆棋只能清自己那一份，清不掉还在飞的这一份）。
+// 变异口径：MUT-A 把 `adopt_published_hint()` 摘空 ⇒ ② 当场红（复用永远拿不到）；
+// MUT-B 让 `discard_hint_cache()` 只清 `current_hint_` 不回收槽 ⇒ ④ 红（还留着一份旧发布），
+//          并且 valgrind 那一臂会把这份报成 definite leak；
+// MUT-C 把 worker 侧那次 `exchange` 换回「直接写 `current_hint_`」⇒ TSan 应当读出 race
+//          （这一支同时是无锁臂的存活证明：TSan 在缺省的树上读 races=0）。
+void test_hint_conclusion_crosses_threads_through_the_slot() {
+    GameManager game;
+    game.discard_hint_cache();
+    assert(!game.current_hint_.valid);
+    assert(game.published_hint_.load() == nullptr);
+
+    // ① 另一根线程发布，属主线程这边什么都还没发生。
+    std::thread publisher([&game] {
+        delete game.published_hint_.exchange(
+            new GameManager::HintConclusion{Move(7, 7, BLACK), 1234, BLACK, true},
+            std::memory_order_acq_rel);
+    });
+    publisher.join();
+    assert(!game.current_hint_.valid);
+    assert(game.published_hint_.load() != nullptr);
+
+    // ② 取用发生在属主线程：拿到的正是那条线程发布的结论。
+    const GameManager::Reuse reused = game.take_hint(BLACK);
+    assert(reused.valid);
+    assert(reused.score == 1234);
+    assert(reused.move.pos.row == 7 && reused.move.pos.col == 7);
+    assert(game.current_hint_.valid && game.current_hint_.color == BLACK);
+
+    // ③ 槽被取空，之后每次取用读的都是属主线程自己那份缓存。
+    assert(game.published_hint_.load() == nullptr);
+    const GameManager::Reuse again = game.take_hint(BLACK);
+    assert(again.valid && again.score == 1234);
+    // 颜色闸门照旧：同一个数字递给另一侧就是反的。
+    assert(!game.take_hint(WHITE).valid);
+
+    // ④ 盘面整块换掉的那条路：没被取用的发布要一起作废，且不留垃圾。
+    std::thread stale([&game] {
+        delete game.published_hint_.exchange(
+            new GameManager::HintConclusion{Move(3, 8, BLACK), 99, BLACK, true},
+            std::memory_order_acq_rel);
+    });
+    stale.join();
+    game.discard_hint_cache();
+    assert(game.published_hint_.load() == nullptr);
+    assert(!game.current_hint_.valid);
+    assert(!game.take_hint(BLACK).valid);
+
+    std::cout << "test_hint_conclusion_crosses_threads_through_the_slot passed" << std::endl;
+}
+
 int main() {
     if (const char* arm = std::getenv("GOMOKU_CALLBACK_SWAP_DEATH_ARM"); arm != nullptr) {
         return callback_swap_death_arm();
@@ -4299,6 +4363,7 @@ int main() {
     test_analyze_refuses_the_positions_it_cannot_rebuild_and_the_games_it_cannot_read();
     test_games_mutex_records_one_owner_thread();
     test_callback_swap_refuses_a_second_thread_and_a_flying_think();
+    test_hint_conclusion_crosses_threads_through_the_slot();
 
 
     std::cout << "All server tests passed!" << std::endl;

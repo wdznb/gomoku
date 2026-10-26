@@ -177,7 +177,8 @@ public:
     GameStatus status() const { return status_; }
     int winner() const { return winner_; }
     // Copies the session's own game for the replay view. Not const: it takes
-    // thinking_mutex_, which the AI worker also holds when it commits a stone.
+    // the session lock that used to sit here (`thinking_mutex_`, removed in
+    // 轮次205 #113), which the AI worker also held when it commits a stone.
     ReplaySnapshot replay_snapshot();
     
     void set_coefficients(const ThreatCoefficients& coeffs);
@@ -229,8 +230,8 @@ private:
     GameStatus status_;
     int winner_;
     // True between "position installed" and "the player chose a side or played"
-    // (see set_position). Only ever touched on the io thread and under
-    // thinking_mutex_ inside set_position / reset.
+    // (see set_position). Only ever touched on the io thread - it used to be
+    // additionally fenced by `thinking_mutex_` inside set_position / reset.
     bool position_pending_ = false;
     std::string game_over_reason_;
     std::vector<MoveAnalysis> analyses_;
@@ -258,7 +259,6 @@ private:
     std::unique_ptr<std::thread> search_thread_;
     std::unique_ptr<std::thread> hint_thread_;
     std::unique_ptr<std::thread> ponder_thread_;
-    std::mutex thinking_mutex_;
     
     int timeout_ms_;
     int max_depth_;
@@ -278,15 +278,25 @@ private:
 
     // What the session's last completed AlphaBeta think concluded, for the next
     // think of the same colour to reuse as a root candidate and an aspiration
-    // centre (design doc 2.4.3 ①③). `hint_color_` is whose perspective
-    // `hint_score_` speaks from, and it is the gate: a think for the other colour
+    // centre (design doc 2.4.3 ①③). `color` is whose perspective
+    // `score` speaks from, and it is the gate: a think for the other colour
     // would read the same number with the sign meaning the opposite. Any path that
     // replaces the board outright - 悔棋, 摆棋, 重开, a restored record - invalidates
     // it, because the number no longer describes a position that exists.
-    Move hint_move_;
-    int hint_score_ = 0;
-    int hint_color_ = EMPTY;
-    bool has_hint_ = false;
+    //
+    // 轮次205 #113：一份结论分两段走。**发布**在思考线程那一侧（一次原子 exchange，
+    // 与 `pending_result_` 同形），**取用与失效**只在属主线程 —— `current_hint_` 因此
+    // 只有一个读者一个写者，`thinking_mutex_` 不再为它存在。以前是 worker 抱着锁直接写
+    // 那四个字段（本轮的仪器量到该获取点恒有两根线程），所以锁看着像「缓存需要锁」，
+    // 其实需要的是「跨线程的那一跳有出口」。
+    struct HintConclusion {
+        Move move;
+        int score = 0;
+        int color = EMPTY;
+        bool valid = false;
+    };
+    HintConclusion current_hint_;
+    std::atomic<HintConclusion*> published_hint_{nullptr};
 
     // One think's share of the above, read on the thread that spawns the worker.
     struct Reuse {
@@ -294,9 +304,23 @@ private:
         int score = 0;
         bool valid = false;
     };
-    Reuse take_hint(int for_color) const {
-        if (!has_hint_ || hint_color_ != for_color) return Reuse{};
-        return Reuse{hint_move_, hint_score_, true};
+    // 取用之前先把别人发布的结论收进属主线程自己的那份 —— 这就是「消息队列回属主」的
+    // 那一跳：worker 只管 exchange 一次，谁在属主线程上谁 adopt。
+    void adopt_published_hint() {
+        const std::unique_ptr<HintConclusion> taken(
+            published_hint_.exchange(nullptr, std::memory_order_acq_rel));
+        if (taken) current_hint_ = *taken;
+    }
+    // 盘面被整块换掉的那几条路（悔棋 / 摆棋 / 重开 / 恢复棋谱）：属主线程自己的那份作废，
+    // 顺带把还没被取用的发布也丢掉 —— 它描述的是已经不存在的局面。
+    void discard_hint_cache() {
+        current_hint_ = HintConclusion{};
+        delete published_hint_.exchange(nullptr, std::memory_order_acq_rel);
+    }
+    Reuse take_hint(int for_color) {
+        adopt_published_hint();
+        if (!current_hint_.valid || current_hint_.color != for_color) return Reuse{};
+        return Reuse{current_hint_.move, current_hint_.score, true};
     }
 
     // One think's share of the budget config, read on the spawning thread for the
@@ -324,9 +348,17 @@ private:
     // The reuse is what take_hint() handed back on the thread that spawned this
     // worker: the engine's hint is written by the searching thread and read by no
     // other, so the worker never touches the session's own members for it.
-    void ai_thinking_worker(int timeout_ms, int max_depth, Reuse reuse, Budget budget);
+    //
+    // 轮次205 #113：盘面快照也归这条线程所有，但**取它的是属主线程** —— 快照在
+    // `start_ai_thinking` 里复制好、按值交进来（与求招臂 :405/:422 和预搜臂 :636/:660
+    // 同一个形状）。以前是这条线程抱着 `thinking_mutex_` 复制活盘，本轮的仪器在的那个
+    // 获取点读到「两根线程」（每一手思考都是一根新线程），那把锁于是非删不可：它守的
+    // 不是并发写，而是「跨线程去读别人的盘」。复制份数不变：本来就要拷一次。
+    void ai_thinking_worker(Board snapshot, int timeout_ms, int max_depth, Reuse reuse,
+                            Budget budget);
     // Stop and join the idle pre-search, leaving `ponder_stop_` ready for the next one.
-    // Same rule as halt_search: never with thinking_mutex_ held.
+    // Same rule as halt_search: never with the session's own lock held (there is no
+    // lock here any more; the rule survives as "join before you touch").
     void cancel_ponder();
     // Sets game-over state without joining the search threads, so it is safe to
     // call from ai_thinking_worker itself.

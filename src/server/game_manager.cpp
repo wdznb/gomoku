@@ -81,7 +81,9 @@ GameManager::~GameManager() {
 }
 
 // Hard abort then join, so no thread is running when this returns. Must be
-// called without thinking_mutex_: the worker takes that lock to commit a stone,
+// called while the search is still in flight: since 轮次205 #113 the worker commits
+// nothing at all (it publishes into an atomic slot), and before that it held the session
+// lock to do so,
 // and joining while holding it would deadlock against the thread being joined.
 void GameManager::halt_search() {
     discard_pending_.store(true);
@@ -104,7 +106,8 @@ void GameManager::halt_search() {
     drop_pending_result();
 }
 
-// Stop and join the idle pre-search. Never called with thinking_mutex_ held: the
+// Stop and join the idle pre-search. Never called with the session lock held (there
+// hasn't been one since 轮次205 #113) - the rule that mattered was the join order: the
 // caller is about to touch engine_ or board_, and the ponder thread is the only other
 // thing that touches either of them while it runs.
 void GameManager::cancel_ponder() {
@@ -129,7 +132,6 @@ void GameManager::set_ponder(int percent) {
 
 void GameManager::reset() {
     halt_search();
-    std::lock_guard<std::mutex> lock(thinking_mutex_);
     board_.reset();
     board_epoch_.fetch_add(1, std::memory_order_release);
     status_ = GameStatus::WAITING;
@@ -137,7 +139,7 @@ void GameManager::reset() {
     game_over_reason_.clear();
     analyses_.clear();
     position_pending_ = false;
-    has_hint_ = false;
+    discard_hint_cache();
     // A new game has no previous think, and 上一手耗时 is exactly the kind of number
     // that would otherwise carry across the boundary and damp the first move of the
     // next game by the last move of this one.
@@ -155,7 +157,6 @@ bool GameManager::set_position(const Board& board) {
     // a stone onto the board that replaces the one it searched.
     halt_search();
 
-    std::lock_guard<std::mutex> lock(thinking_mutex_);
     board_ = board;
     board_epoch_.fetch_add(1, std::memory_order_release);
     status_ = GameStatus::WAITING;
@@ -163,7 +164,7 @@ bool GameManager::set_position(const Board& board) {
     game_over_reason_.clear();
     analyses_.clear();
     position_pending_ = true;
-    has_hint_ = false;
+    discard_hint_cache();
     return true;
 }
 
@@ -172,7 +173,6 @@ bool GameManager::restore_game(const GameRestore& restore) {
     // commit its stone onto the board being rebuilt.
     halt_search();
 
-    std::lock_guard<std::mutex> lock(thinking_mutex_);
     // Rebuilt on a scratch board so a record that goes illegal half way leaves
     // the session's own board untouched and the caller can fall back to a
     // fresh game.
@@ -199,7 +199,7 @@ bool GameManager::restore_game(const GameRestore& restore) {
     winner_ = restore.status == GameStatus::GAME_OVER ? restore.winner : EMPTY;
     game_over_reason_ = restore.status == GameStatus::GAME_OVER ? restore.reason : std::string();
     position_pending_ = restore.position_pending;
-    has_hint_ = false;
+    discard_hint_cache();
     return true;
 }
 
@@ -311,7 +311,7 @@ bool GameManager::undo(int& out_move_count, GameStatus& out_status) {
     }
     // A hint from the position that was just unpicked no longer describes a
     // position the session will search.
-    has_hint_ = false;
+    discard_hint_cache();
     
     if (board_.move_count() == 0) {
         status_ = GameStatus::WAITING;
@@ -325,7 +325,8 @@ bool GameManager::undo(int& out_move_count, GameStatus& out_status) {
     
     // Capture the post-undo state now, before the worker is re-armed below.
     // Once start_ai_thinking() runs, that worker writes board_/status_ under
-    // thinking_mutex_; reading them from the io thread afterwards would race.
+    // thinking_mutex_ (removed in 轮次205 #113); reading them from the io thread
+    // afterwards would have raced.
     out_move_count = board_.move_count();
     out_status = status_;
 
@@ -341,7 +342,6 @@ bool GameManager::undo(int& out_move_count, GameStatus& out_status) {
 }
 
 ReplaySnapshot GameManager::replay_snapshot() {
-    std::lock_guard<std::mutex> lock(thinking_mutex_);
     ReplaySnapshot snapshot;
     snapshot.moves = analyses_;
     snapshot.winner = winner_;
@@ -362,7 +362,6 @@ ReplaySnapshot GameManager::replay_snapshot() {
 void GameManager::resign(int color) {
     halt_search();
 
-    std::lock_guard<std::mutex> lock(thinking_mutex_);
     if (status_ == GameStatus::GAME_OVER) return;
     
     resign_now(color);
@@ -407,11 +406,7 @@ bool GameManager::request_hint(int timeout_ms, int max_depth) {
     // 再去读一次活盘（#105：`make_move`/`undo` 改盘不拿 `thinking_mutex_`，也不挡 `hint_active_`）。
     const int snapshot_epoch = board_epoch_.load(std::memory_order_acquire);
     // Captured on this thread and copied into the worker: see start_ai_thinking.
-    Reuse reuse;
-    {
-        std::lock_guard<std::mutex> lock(thinking_mutex_);
-        reuse = take_hint(turn);
-    }
+    Reuse reuse = take_hint(turn);
 
     // The budget is the session's, but 求招 carries its own timeout and that is the
     // hard deadline the soft window has to fit inside.
@@ -442,20 +437,19 @@ bool GameManager::request_hint(int timeout_ms, int max_depth) {
                 // makes it advice about a board that no longer exists. 比的是**盘面版本号**
                 // 而不是活盘（#105）：那两条路改盘既不拿 `thinking_mutex_`、也不挡
                 // `hint_active_`，所以在锁里读 `board_` 也挡不住它们 —— 只有这个号两边都会动。
-                bool same_board = false;
-                {
-                    std::lock_guard<std::mutex> commit_guard(thinking_mutex_);
-                    same_board = board_matches_hint_snapshot(snapshot_epoch);
-                    // The same test the answer is delivered on: when the board is
-                    // still the position this hint was computed from, the next 求招
-                    // on it is searching exactly what this one just searched, so it
-                    // starts from this conclusion.
-                    if (same_board) {
-                        hint_move_ = result.best_move;
-                        hint_score_ = result.score;
-                        hint_color_ = turn;
-                        has_hint_ = (result.method == "alphabeta");
-                    }
+                const bool same_board = board_matches_hint_snapshot(snapshot_epoch);
+                // The same test the answer is delivered on: when the board is
+                // still the position this hint was computed from, the next 求招
+                // on it is searching exactly what this one just searched, so it
+                // starts from this conclusion.
+                // 轮次205 #113：结论只做一次原子发布（与 #106 那个 `pending_result_` 同形），
+                // 取用与失效都在属主线程的 `take_hint` / `discard_hint_cache` 里 —— 这条线程
+                // 从此不再碰会话的字段，`thinking_mutex_` 也就没了第二根线程。
+                if (same_board) {
+                    delete published_hint_.exchange(
+                        new HintConclusion{result.best_move, result.score, turn,
+                                           result.method == "alphabeta"},
+                        std::memory_order_acq_rel);
                 }
                 if (!same_board) {
                     hint_callback_(Move(), 0);
@@ -492,16 +486,15 @@ void GameManager::start_ai_thinking(int timeout_ms, int max_depth) {
     // The worker's commit path checks status_ == PLAYING, so without this
     // promotion the AI's first stone is silently dropped and the human's
     // next make_move is rejected by the turn guard - session lockup.
-    {
-        std::lock_guard<std::mutex> lock(thinking_mutex_);
-        if (status_ == GameStatus::WAITING) {
-            status_ = GameStatus::PLAYING;
-        }
-        // Read under the same lock the workers write the hint under, and handed to
-        // the new thread by value: from here on, only that thread talks to the
-        // engine.
-        reuse = take_hint(ai_color_);
+    // 两条 worker 都在上面 join 掉了（`stop_thinking` → join → `cancel_ponder`），所以这里
+    // 没有第二个写者：轮次205 #113 把锁撤了，纪律换成「join 之后属主线程才动这些字段」。
+    if (status_ == GameStatus::WAITING) {
+        status_ = GameStatus::PLAYING;
     }
+    // 快照在**属主线程**上复制好、按值交进去：那条线程读的是自己这份副本，不再读活盘；
+    // 复制份数与改前相同（改前是它在锁里拷一份）。提示也是按值交进去的，同一个理由。
+    Board snapshot = board_;
+    reuse = take_hint(ai_color_);
 
     stop_flag_.store(false);
     discard_pending_.store(false);
@@ -510,8 +503,8 @@ void GameManager::start_ai_thinking(int timeout_ms, int max_depth) {
     max_depth_ = max_depth;
     
     search_thread_ = std::make_unique<std::thread>(
-        &GameManager::ai_thinking_worker, this, timeout_ms, max_depth, reuse,
-        take_budget());
+        &GameManager::ai_thinking_worker, this, std::move(snapshot), timeout_ms, max_depth,
+        reuse, take_budget());
 }
 
 void GameManager::start_ai_thinking() {
@@ -526,13 +519,8 @@ void GameManager::stop_thinking() {
     ponder_stop_.store(true);
 }
 
-void GameManager::ai_thinking_worker(int timeout_ms, int max_depth, Reuse reuse,
-                                     Budget budget) {
-    Board snapshot;
-    {
-        std::lock_guard<std::mutex> lock(thinking_mutex_);
-        snapshot = board_;
-    }
+void GameManager::ai_thinking_worker(Board snapshot, int timeout_ms, int max_depth,
+                                     Reuse reuse, Budget budget) {
 
     engine_.set_soft_time_ms(budget.soft_time_ms);
     engine_.set_max_nodes(budget.max_nodes);
@@ -564,7 +552,6 @@ void GameManager::ai_thinking_worker(int timeout_ms, int max_depth, Reuse reuse,
 // 自己调；服务端由 io 线程在 commit_pending() 里调。
 void GameManager::apply_search_result(SearchResult result) {
     if (result.resigned) {
-        std::lock_guard<std::mutex> lock(thinking_mutex_);
         // Interruption is not a refutation: the proven loss is the engine's own
         // conclusion, so 终止 must still end the game. Skipping it here would
         // leave the session with ai_color_ to move and no frame coming.
@@ -585,7 +572,6 @@ void GameManager::apply_search_result(SearchResult result) {
     int ponder_nodes = 0;
 
     if (move_callback_ && result.best_move.pos.is_valid()) {
-        std::lock_guard<std::mutex> lock(thinking_mutex_);
         // A user stop_thinking sets stop_flag_ but leaves discard_pending_
         // false: the worker still commits its last completed best move so
         // the game does not get stuck with ai_color_ to move and no re-arm.
@@ -614,10 +600,10 @@ void GameManager::apply_search_result(SearchResult result) {
             // Only AlphaBeta's number is a position value: the tactical and forced
             // paths report a sentinel, and centring a window on one of those buys
             // nothing but widened re-searches.
-            hint_move_ = result.best_move;
-            hint_score_ = result.score;
-            hint_color_ = ai_color_;
-            has_hint_ = (result.method == "alphabeta");
+            delete published_hint_.exchange(
+                new HintConclusion{result.best_move, result.score, ai_color_,
+                                   result.method == "alphabeta"},
+                std::memory_order_acq_rel);
             // ai_move 与标志交回之间不再有「窗口」：两件事同在本函数里，而本函数整段
             // 在属主线程上跑 —— io 线程不可能在这中间读一条玩家消息（轮次178 的
             // 4/3326 就是旧形状下那段尾巴；旧补丁按 io 线程排队取件，这里不需要了）。

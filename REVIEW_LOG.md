@@ -1984,6 +1984,43 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次205 #113：`thinking_mutex_` 撤掉了 —— 先把十一个获取点按线程量出来，再把跨线程那一跳改成交接，同一棵树上 TSan 读 races=0
+
+**先量，不动行为。** 临时仪器（不入库；`/tmp/r205/witness.log`）在 `game_manager.cpp` 那 11 个 `thinking_mutex_` 获取点各插一行按线程记数，跑 assert 生效的 `build-vg/test_server` 全套，读到的是**每点 × 每线程**的表：
+
+| 获取点（改前的行） | 是谁 | distinct_threads |
+|---|---|---|
+| `reset()` :132 / `set_position()` :158 / `restore_game()` :175 / `resign()` :365 / `request_hint` 取提示 :412 | 属主线程（都在 `halt_search()` 真的 join 之后） | **1** |
+| `replay_snapshot()` :344、`start_ai_thinking()` :496 | 属主线程 + 自己起线程驱动的用例 | 2 |
+| 求招 worker 写提示缓存 :447 | **只有 worker**（非属主线程） | 1 |
+| AI worker 复制活盘 :533 | **每一手思考都是一根新线程** | **2** |
+| `apply_search_result()` 的认输分支 :567 / 提交分支 :588 | 装了属主通知＝属主线程；无头用法＝worker | 2 |
+
+第二台仪器更直接：把 `thinking_mutex_` 就地换成轮次199 那个 `OwnerCheckedMutex`（只登记属主、不改行为），assert 生效的套件**当场崩**在 `test_shutdown_flush_keeps_a_zero_stone_resign_out_of_the_records` 之后那条求招用例里（`/tmp/r205/ownercheck2.log`）。⇒ 「这把锁恒只有一根线程拿」被机器证伪；**它守的从来不是并发写，而是「跨线程去读/碰别人的东西」**，而这两处都能改成交接。
+
+**落实（`src/server/game_manager.h` + `.cpp`；没有新锁 —— 撤了一把）**
+- **提示结论 → 一次原子发布**：worker 不再碰会话字段，改为 `published_hint_.exchange(new HintConclusion{…}, acq_rel)`；属主线程在 `take_hint()` 里先 `adopt_published_hint()`（`exchange(nullptr)` 把别人发布的那份收进自己这份）。与轮次193 #106 的 `pending_result_` 同一个形状，「生产者与消费者从不同时在场」在这条路上成立：每个取用点都在 join 之后。
+- **失效要连未取用的发布一起回收**：悔棋 / 摆棋 / 重开 / 恢复棋谱那四处以前只清 `has_hint_`；现在走 `discard_hint_cache()`，清自己那份**并且** `exchange(nullptr)` + `delete` 回收还在槽里的那份。旧形状这里确有漏：worker 已写进字段的那一份属主线程清不掉。
+- **AI 的盘面快照改由属主线程取**：`start_ai_thinking` 里 `Board snapshot = board_;` 按值交进线程（与求招臂 :405/:422、预搜臂 :622/:660 同形 —— 那两条早就是这么办的），worker 签名跟着改；**复制份数不变**（改前是它在锁里拷一份）。两处直调 worker 的用例（`tests/test_server.cpp:1087`/`:1113`）按值递盘。
+- 11 个获取点全撤，成员删除；原本靠锁保证的意思改由**树上已有的纪律**承担：改盘/换盘的路先 `halt_search()`（真的 join），#85 那两半的闸也还在。
+
+**新用例** `test_hint_conclusion_crosses_threads_through_the_slot`（`tests/test_server.cpp:4233` 起）四段各钉一半：① 别的线程发布之后、取用之前，属主线程的 `current_hint_` 仍为空（发布 ≠ 生效）；② 取用拿到的正是那条线程发布的内容（分数 / 格子 / 颜色闸门都核）；③ 槽被取空，第二次取用读的是自己那份缓存，`take_hint(WHITE)` 仍拒；④ 盘面整块换掉时**没被取用的发布也作废**且槽里不留东西。
+
+**变异台**（`/tmp/r205/arms.log`，逐支从快照 `cp` 还原，不用 `git checkout`）
+
+| 臂 | 改的地方 | 结果 |
+|---|---|---|
+| MUT-A | `adopt_published_hint()` 摘空 | **rc=134**，红在 `cold_at_pair.nodes == 10375`（轮次141 G3 的复用钉值） |
+| MUT-B | `discard_hint_cache()` 不回收槽 | **rc=134**，红在 `replayed.nodes == 1268`（同类钉值） |
+
+两支都**先于**本轮新用例红 —— 复用与失效这两条路早就有别的钉值看着，这比「只有我这条用例红」更硬。话也据此写准：新用例钉的是**交接的形状**（谁生效、何时回收），生产路径的行为读者是那两条既有钉值；给 ①-④ 各配一支只打它自己的臂在形状上不成立（任何让发布/取用变形的改法都会先撞 G3 的节点钉值）。
+
+**门禁**：撤锁后的树上先拿到两条 —— `test_server    clean  races=0 deadlocks=0 thread_leaks=0 rc=0 61s`、套件 56 条 rc=0；指认按内容重算两处（`docs/IMPLEMENTATION_GUIDE.md:115` 的 `game_manager.cpp:343-358` → `:344-358`，同行那句「`thinking_mutex_` 下拷贝」改成实况；`tests/test_server.cpp:1359` 的 `:159` → `:160`）之后 anchor 回到 **150/150 ok、122 条引用 0 problems**。一条链继续在跑（`/tmp/r205/gates.log`）：强制全量重建 **356 单元 0 warning、192 s** → ctest → anchor → web → TSan → memcheck `test_server`（按轮次204 量出的两步法给够预算）。**TSan 存活臂这一支没跑成**：我给它的 python 补丁锚点与文件里的实际换行不符（`AssertionError: anchor 0`），脚本按「锚点不中就什么也不改」的形状安全退出，所以那一臂**没有读数**，不能写成已证 —— 它欠的内容很具体：把 worker 那次 `exchange` 换回「直接写 `current_hint_`」，TSan 必须读出 races>0 并点名这两个字段，否则「races=0」在这棵树上只是仪器没说话。**缺口写在这里，下一轮第一件事是把它补上**（锚点按当前文件重取，别再凭记忆写）。
+
+**还剩的账（#113 继续）**：树上还有 `games_mutex_`（20 处，轮次199 已做成属主登记型）、`end_frame_mutex_`（4 处）、`SearchController::result_mutex_`（2 处）、`OpeningBook::rng_mutex_`（1 处）、进程级 TT 的 16 个分片锁（只在 `shared_` 时拿，是吞吐的守护者，轮次134/J 量到融合表要 72-bit 键 ⇒ 预期判「保留并给读数」）。七把里现在剩六把，本轮的方法留下来可复用：**要撤一把锁，先给它的每个获取点记一根线程的账**。
+
+---
+
 ## 轮次204 #112：把轮次203 自己记下的三格做掉 —— 死赋值删掉（行中性，指认不再平移），③ 有了自己的读者臂，④ 的分数那一半**证明是多余的**
 
 轮次203 末尾记了三格欠账（#112）：`play_game` 里那两行 `out->score` 是变异台量出来的死赋值；断言③/④ 还欠一支真正改到写分那一行的臂；memcheck `test_training` 那一臂没跑完。本轮做前两格，第三格在本节末。
