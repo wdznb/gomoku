@@ -20,6 +20,9 @@ enum class VCTResult {
 struct VCTMove {
     VCTResult result;
     Move best_move;
+    // #88：WIN 必须带着**能逐手核对的那条线**回来。约定只有一条 —— 分数不是 100000+ 的那些
+    // 出口（撞帽、超时、depth<=0、只到根扫描第一手的四条分支）都不会往里塞东西，所以
+    // 「一句没法核对的主胜着」不可能带半截线回来；根扫描当场答的那四类，变例就是那一手。
     std::vector<Move> variation;
 
     VCTMove() : result(VCTResult::UNKNOWN) {}
@@ -73,10 +76,10 @@ private:
     }
 
     int vct_attack(Board& board, int color, int depth, int alpha, int beta,
-                   std::atomic<bool>& stop_flag);
+                   std::atomic<bool>& stop_flag, std::vector<Move>& out_line);
 
     int vct_defend(Board& board, int color, int depth, int alpha, int beta,
-                   std::atomic<bool>& stop_flag);
+                   std::atomic<bool>& stop_flag, std::vector<Move>& out_line);
 
     std::vector<Move> generate_attacks(const Board& board, int color);
     std::vector<Move> generate_defenses(const Board& board, int color, int attack_row, int attack_col);

@@ -125,7 +125,9 @@ std::vector<Move> VCTSearch::generate_defenses(const Board& board, int color,
 }
 
 int VCTSearch::vct_defend(Board& board, int color, int depth, int alpha, int beta,
-                           std::atomic<bool>& stop_flag) {
+                           std::atomic<bool>& stop_flag, std::vector<Move>& out_line) {
+    // #88 的约定：out_line 只在「这一层交回 100000+」时被填，其余任何出口都是空的。
+    out_line.clear();
     nodes_searched_++;
     if (nodes_searched_ > node_limit_ || aborted(stop_flag)) return 0;
     if (depth <= 0) return 0;
@@ -138,6 +140,7 @@ int VCTSearch::vct_defend(Board& board, int color, int depth, int alpha, int bet
     // (the previous std::min made this node pretend the attacker was picking
     // their worst move).
     int best_score = -INT_MAX;
+    std::vector<Move> best_line;
     bool evaluated_any = false;
 
     for (const auto& move : attacks) {
@@ -148,6 +151,7 @@ int VCTSearch::vct_defend(Board& board, int color, int depth, int alpha, int bet
 
         if (board.has_five_in_a_row(move.pos.row, move.pos.col, color)) {
             board.undo_last_move();
+            out_line.push_back(move);
             return 100000 + depth;
         }
 
@@ -171,21 +175,25 @@ int VCTSearch::vct_defend(Board& board, int color, int depth, int alpha, int bet
 
         if (has_live_four) {
             board.undo_last_move();
+            out_line.push_back(move);
             return 100000 + depth;
         }
 
         if (pattern.four_count >= 2) {
             board.undo_last_move();
+            out_line.push_back(move);
             return 100000 + depth;
         }
 
         auto defenses = generate_defenses(board, color, move.pos.row, move.pos.col);
         if (defenses.empty()) {
             board.undo_last_move();
+            out_line.push_back(move);
             return 100000 + depth;
         }
 
         int worst_for_attacker = INT_MAX;
+        std::vector<Move> worst_line;
         for (const auto& def : defenses) {
             board.place_stone(def.pos.row, def.pos.col, def.color);
 
@@ -214,12 +222,21 @@ int VCTSearch::vct_defend(Board& board, int color, int depth, int alpha, int bet
             if (defender_has_tempo) {
                 board.undo_last_move();
                 worst_for_attacker = -100000 - depth;
+                worst_line.clear();
                 break;
             }
 
-            int score = vct_attack(board, color, depth - 1, alpha, beta, stop_flag);
+            std::vector<Move> child_line;
+            int score = vct_attack(board, color, depth - 1, alpha, beta, stop_flag, child_line);
             board.undo_last_move();
-            worst_for_attacker = std::min(worst_for_attacker, score);
+            // 变例跟着**对防守方最好的那一手**走：这一层交回的分数就是它，线也必须是它的线，
+            // 否则交出去的那条线核的是另一条分支。
+            if (score < worst_for_attacker) {
+                worst_for_attacker = score;
+                worst_line.clear();
+                worst_line.push_back(def);
+                worst_line.insert(worst_line.end(), child_line.begin(), child_line.end());
+            }
             if (worst_for_attacker <= -100000) break;
         }
 
@@ -227,17 +244,22 @@ int VCTSearch::vct_defend(Board& board, int color, int depth, int alpha, int bet
 
         if (worst_for_attacker > best_score) {
             best_score = worst_for_attacker;
+            best_line.clear();
+            best_line.push_back(move);
+            best_line.insert(best_line.end(), worst_line.begin(), worst_line.end());
         }
         alpha = std::max(alpha, best_score);
         if (alpha >= beta) break;
     }
 
     if (!evaluated_any) return 0;
+    if (best_score >= 100000) out_line = best_line;
     return best_score;
 }
 
 int VCTSearch::vct_attack(Board& board, int color, int depth, int alpha, int beta,
-                           std::atomic<bool>& stop_flag) {
+                           std::atomic<bool>& stop_flag, std::vector<Move>& out_line) {
+    out_line.clear();
     nodes_searched_++;
     if (nodes_searched_ > node_limit_ || aborted(stop_flag)) return 0;
     if (depth <= 0) return 0;
@@ -246,6 +268,7 @@ int VCTSearch::vct_attack(Board& board, int color, int depth, int alpha, int bet
     if (attacks.empty()) return 0;
 
     int best_score = -INT_MAX;
+    std::vector<Move> best_line;
     bool evaluated_any = false;
 
     for (const auto& move : attacks) {
@@ -256,6 +279,7 @@ int VCTSearch::vct_attack(Board& board, int color, int depth, int alpha, int bet
 
         if (board.has_five_in_a_row(move.pos.row, move.pos.col, color)) {
             board.undo_last_move();
+            out_line.push_back(move);
             return 100000 + depth;
         }
 
@@ -278,21 +302,25 @@ int VCTSearch::vct_attack(Board& board, int color, int depth, int alpha, int bet
 
         if (has_live_four) {
             board.undo_last_move();
+            out_line.push_back(move);
             return 100000 + depth;
         }
 
         if (pattern.four_count >= 2) {
             board.undo_last_move();
+            out_line.push_back(move);
             return 100000 + depth;
         }
 
         auto defenses = generate_defenses(board, color, move.pos.row, move.pos.col);
         if (defenses.empty()) {
             board.undo_last_move();
+            out_line.push_back(move);
             return 100000 + depth;
         }
 
         int worst_for_attacker = INT_MAX;
+        std::vector<Move> worst_line;
         for (const auto& def : defenses) {
             board.place_stone(def.pos.row, def.pos.col, def.color);
 
@@ -319,12 +347,19 @@ int VCTSearch::vct_attack(Board& board, int color, int depth, int alpha, int bet
             if (defender_has_tempo) {
                 board.undo_last_move();
                 worst_for_attacker = -100000 - depth;
+                worst_line.clear();
                 break;
             }
 
-            int score = vct_defend(board, color, depth - 1, alpha, beta, stop_flag);
+            std::vector<Move> child_line;
+            int score = vct_defend(board, color, depth - 1, alpha, beta, stop_flag, child_line);
             board.undo_last_move();
-            worst_for_attacker = std::min(worst_for_attacker, score);
+            if (score < worst_for_attacker) {
+                worst_for_attacker = score;
+                worst_line.clear();
+                worst_line.push_back(def);
+                worst_line.insert(worst_line.end(), child_line.begin(), child_line.end());
+            }
             if (worst_for_attacker <= -100000) break;
         }
 
@@ -332,12 +367,16 @@ int VCTSearch::vct_attack(Board& board, int color, int depth, int alpha, int bet
 
         if (worst_for_attacker > best_score) {
             best_score = worst_for_attacker;
+            best_line.clear();
+            best_line.push_back(move);
+            best_line.insert(best_line.end(), worst_line.begin(), worst_line.end());
         }
         alpha = std::max(alpha, best_score);
         if (alpha >= beta) break;
     }
 
     if (!evaluated_any) return 0;
+    if (best_score >= 100000) out_line = best_line;
     return best_score;
 }
 
@@ -359,6 +398,7 @@ VCTMove VCTSearch::search(const Board& board, int color, int max_depth,
 
     int best_score = -INT_MAX;
     Move best_move;
+    std::vector<Move> best_line;
 
     for (const auto& move : attacks) {
         if (aborted(stop_flag)) break;
@@ -417,6 +457,7 @@ VCTMove VCTSearch::search(const Board& board, int color, int max_depth,
         }
 
         int worst = INT_MAX;
+        std::vector<Move> worst_line;
         for (const auto& def : defenses) {
             mutable_board.place_stone(def.pos.row, def.pos.col, def.color);
 
@@ -443,13 +484,21 @@ VCTMove VCTSearch::search(const Board& board, int color, int max_depth,
             if (defender_has_tempo) {
                 mutable_board.undo_last_move();
                 worst = -100000 - max_depth;
+                worst_line.clear();
                 break;
             }
 
+            std::vector<Move> child_line;
             int score = vct_defend(mutable_board, color, max_depth - 1,
-                                   -INT_MAX, INT_MAX, stop_flag);
+                                   -INT_MAX, INT_MAX, stop_flag, child_line);
             mutable_board.undo_last_move();
-            worst = std::min(worst, score);
+            // 根上的分数是「对防守方最好的那一手」给的，交出去的变例也必须是那一手的。
+            if (score < worst) {
+                worst = score;
+                worst_line.clear();
+                worst_line.push_back(def);
+                worst_line.insert(worst_line.end(), child_line.begin(), child_line.end());
+            }
         }
 
         mutable_board.undo_last_move();
@@ -457,12 +506,16 @@ VCTMove VCTSearch::search(const Board& board, int color, int max_depth,
         if (worst > best_score) {
             best_score = worst;
             best_move = move;
+            best_line.clear();
+            best_line.push_back(move);
+            best_line.insert(best_line.end(), worst_line.begin(), worst_line.end());
         }
     }
 
     if (best_score >= 100000) {
         result.result = VCTResult::WIN;
         result.best_move = best_move;
+        result.variation = best_line;
     } else {
         result.result = VCTResult::UNKNOWN;
     }

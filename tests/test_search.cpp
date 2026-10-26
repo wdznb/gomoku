@@ -9525,6 +9525,42 @@ void test_vct_root_threat_loses_the_race_when_the_defender_holds_a_five() {
               << std::endl;
 }
 
+// 轮次197 那条真线的前 34 手：tools/match_openings.jsonl 第 13 条的 14 子 + VCT 自己搜出来的
+// forcing 线。#89 与 #88 两条用例都用它，因为「递归层走到过」与「递归的胜着能不能逐手核对」
+// 是同一格上的一对问题。
+const int kVctRaceLine[34][2] = {
+    {7, 7}, {5, 5}, {6, 8}, {9, 5}, {7, 5}, {7, 6}, {8, 6}, {9, 7},
+    {6, 4}, {5, 3}, {6, 7}, {6, 5}, {6, 9}, {6, 10}, {5, 9}, {4, 10},
+    {7, 9}, {4, 9}, {9, 9}, {8, 9}, {8, 8}, {6, 6}, {11, 11}, {10, 10},
+    {8, 10}, {9, 11}, {9, 8}, {5, 8}, {7, 8}, {10, 8}, {7, 10}, {7, 11},
+    {4, 6}, {5, 7},
+};
+
+// 摆上前 stones 手（严格黑白交替，第 1 手黑）⇒ stones 为偶数时轮黑。
+Board vct_race_line_prefix(int stones) {
+    Board board;
+    for (int i = 0; i < stones; ++i) {
+        assert(board.place_stone(kVctRaceLine[i][0], kVctRaceLine[i][1],
+                                 i % 2 == 0 ? BLACK : WHITE));
+    }
+    return board;
+}
+
+// 这一手落下之后，`who` 一方还有几个「下一手成五」的点 —— 用例自己扫 225 格，不复用 VCT 的
+// 防守枚举（轮次184 的口径：只有独立数出来的那个数才能判 VCT，否则是被它自己判）。
+int race_points_of(Board& scratch, int who) {
+    int count = 0;
+    for (int r = 0; r < BOARD_SIZE; ++r) {
+        for (int c = 0; c < BOARD_SIZE; ++c) {
+            if (!scratch.is_empty(r, c)) continue;
+            if (!scratch.place_stone(r, c, who)) continue;
+            if (scratch.has_five_in_a_row(r, c, who)) ++count;
+            scratch.undo_last_move();
+        }
+    }
+    return count;
+}
+
 // #89：#84 那条判据在递归的两处（vct_defend / vct_attack）也各有一份，可它们从来没有断言读者。
 // 先量再钉（轮次197 的配对台：同一棵树、同一张新表，只把其中一处的判断改成永假）：
 //   ① tools/match_openings.jsonl 全部 209 条 × 深度 6/8/10/12 = 836 格；
@@ -9542,13 +9578,6 @@ void test_vct_root_threat_loses_the_race_when_the_defender_holds_a_five() {
 // 那处改成永假 ⇒ 第二段的 attack_rejections() 断言红。两处的读者是分开的。根扫描那一处不在这条
 // 用例的覆盖里（这两格 root 计数都是 0），它的读者是上面那条 test_vct_root_threat_…用例。
 void test_vct_recursive_race_gates_have_assertion_readers() {
-    const int kLine[34][2] = {
-        {7, 7}, {5, 5}, {6, 8}, {9, 5}, {7, 5}, {7, 6}, {8, 6}, {9, 7},
-        {6, 4}, {5, 3}, {6, 7}, {6, 5}, {6, 9}, {6, 10}, {5, 9}, {4, 10},
-        {7, 9}, {4, 9}, {9, 9}, {8, 9}, {8, 8}, {6, 6}, {11, 11}, {10, 10},
-        {8, 10}, {9, 11}, {9, 8}, {5, 8}, {7, 8}, {10, 8}, {7, 10}, {7, 11},
-        {4, 6}, {5, 7},
-    };
     std::atomic<bool> stop(false);
     Evaluator evaluator;
 
@@ -9556,14 +9585,12 @@ void test_vct_recursive_race_gates_have_assertion_readers() {
     //    当时量到 nodes=1、result=UNKNOWN、best=(-1,-1)：这一格的三个计数把「拒发生在哪一层」
     //    分开钉住了 —— 把 vct_defend 那条判断改成永假，defend_rejections() 就归 0。
     {
-        Board board;
-        for (int i = 0; i < 34; ++i) {
-            assert(board.place_stone(kLine[i][0], kLine[i][1], i % 2 == 0 ? BLACK : WHITE));
-        }
+        Board board = vct_race_line_prefix(34);
         TranspositionTable tt;
         VCTSearch vct(evaluator, tt);
         const VCTMove r = vct.search(board, BLACK, 2, stop);
         assert(r.result != VCTResult::WIN);
+        assert(r.variation.empty());  // #88 的约定：不是 100000+ 的出口不许带半截线
         assert(vct.root_rejections() == 0);
         assert(vct.attack_rejections() == 0);
         assert(vct.defend_rejections() >= 1);
@@ -9573,10 +9600,7 @@ void test_vct_recursive_race_gates_have_assertion_readers() {
     //    而根上的答案仍然是那句「我赢在 (5,7)」—— 也就是这一处**放行了**真正成立的那条线，
     //    只把赛跑输掉的候选摘掉。改永假 ⇒ attack_rejections() 归 0，这一条立刻红。
     {
-        Board board;
-        for (int i = 0; i < 32; ++i) {
-            assert(board.place_stone(kLine[i][0], kLine[i][1], i % 2 == 0 ? BLACK : WHITE));
-        }
+        Board board = vct_race_line_prefix(32);
         TranspositionTable tt;
         VCTSearch vct(evaluator, tt);
         const VCTMove r = vct.search(board, BLACK, 3, stop);
@@ -9588,6 +9612,85 @@ void test_vct_recursive_race_gates_have_assertion_readers() {
     }
 
     std::cout << "test_vct_recursive_race_gates_have_assertion_readers passed" << std::endl;
+}
+
+// #88：递归判胜过去只填 best_move，那句「我赢」在库里没有任何可逐手核对之物（轮次181 因此
+// 只能靠独立重建顶一次：#104 找到真胜线、#140/#145 找不到 ⇒ 未证）。现在 search() 交回的
+// 变例走的就是「分数最低那一手防守」那条分支，所以这一条用例把整条线**自己重放一遍**，逐手核
+// 三件事：防守手没有反先（成五 / 活四 / 冲四 / 双四），进攻手落下之后对面不存在「下一手成五」
+// 的点（#84 那条赛跑判据，独立扫 225 格数出来，不复用 VCT 的枚举），最后一手确实是根扫描认得
+// 的四类胜着之一。核不上就是产品缺陷，不是断言写松的理由。
+void test_vct_recursive_win_returns_a_ply_by_ply_checkable_variation() {
+    std::atomic<bool> stop(false);
+    Evaluator evaluator;
+    const Board root = vct_race_line_prefix(32);
+
+    TranspositionTable tt;
+    VCTSearch vct(evaluator, tt);
+    const VCTMove r = vct.search(root, BLACK, 3, stop);
+    assert(r.result == VCTResult::WIN);
+
+    // 这一格量的到的线是 3 手：B(5,7) → W(5,4) → B(4,6)（轮次198 打印出来的原值，与那条真线上
+    // 的同一批子只是次序不同）。递归交回的胜着必须把「对面最好的那手防守」和「自己跟进的那手」
+    // 一起带回来 —— 只填 best_move 的那条老出口会在这里红（size 1）。
+    assert(r.variation.size() >= 3);
+    assert(r.variation.front().pos.row == r.best_move.pos.row);
+    assert(r.variation.front().pos.col == r.best_move.pos.col);
+
+    Board replay = root;
+    for (size_t i = 0; i < r.variation.size(); ++i) {
+        const Move& ply = r.variation[i];
+        const bool attacker_turn = (i % 2 == 0);
+        // 着法必须落在空格上、颜色必须交替 ⇒ 这条线真的是从这一格走出来的。
+        assert(replay.is_empty(ply.pos.row, ply.pos.col));
+        assert(ply.color == (attacker_turn ? BLACK : WHITE));
+        assert(replay.place_stone(ply.pos.row, ply.pos.col, ply.color));
+
+        const PositionPattern pattern = PatternRecognizer::recognize_position(
+            replay, ply.pos.row, ply.pos.col, ply.color);
+        const bool last = (i + 1 == r.variation.size());
+        if (attacker_turn) {
+            if (last) {
+                // 终手必须是四类胜着之一：本手成五 / 活四 / 双四（第四类「没有防守点」要靠私有
+                // 的 generate_defenses，用例够不着 —— 记在这儿，不当成已核）。
+                const bool five = replay.has_five_in_a_row(ply.pos.row, ply.pos.col, BLACK);
+                bool live_four = false;
+                for (int d = 0; d < 4; ++d) {
+                    if (pattern.directions[d].type == PatternType::LIVE_FOUR) live_four = true;
+                }
+                assert(five || live_four || pattern.four_count >= 2);
+            }
+            // 赛跑：进攻手每一手之后，对面都不能还攥着「下一手成五」的点。
+            assert(race_points_of(replay, WHITE) == 0);
+        } else {
+            // 防守手不能反先 —— 线里出现这种手就说明交回来的不是那条最小值分支。
+            assert(!replay.has_five_in_a_row(ply.pos.row, ply.pos.col, WHITE));
+            bool tempo = false;
+            for (int d = 0; d < 4; ++d) {
+                const PatternType t = pattern.directions[d].type;
+                if (t == PatternType::LIVE_FOUR || t == PatternType::RUSH_FOUR) tempo = true;
+            }
+            assert(!tempo && pattern.four_count < 2);
+        }
+    }
+
+    // 约定的另一半：根扫描当场答的那四类（本手成五 / 活四 / 双四 / 没有防守点）交回的就是那一手，
+    // 不许多出别的东西 —— 下面这格黑 (10,5..7) 摆上 (10,4) 就是活四，线长必须正好 1。
+    {
+        Board board;
+        for (int c = 0; c < 3; ++c) assert(board.place_stone(0, c, WHITE));
+        for (int c = 5; c <= 7; ++c) assert(board.place_stone(10, c, BLACK));
+        TranspositionTable tt;
+        VCTSearch vct(evaluator, tt);
+        const VCTMove direct = vct.search(board, BLACK, 6, stop);
+        assert(direct.result == VCTResult::WIN);
+        assert(direct.variation.size() == 1);
+        assert(direct.variation.front().pos.row == direct.best_move.pos.row);
+        assert(direct.variation.front().pos.col == direct.best_move.pos.col);
+    }
+
+    std::cout << "test_vct_recursive_win_returns_a_ply_by_ply_checkable_variation passed"
+              << std::endl;
 }
 
 int main() {
@@ -9796,6 +9899,7 @@ int main() {
     test_named_node_budget_prices_the_tactical_phases();
     test_vct_root_threat_loses_the_race_when_the_defender_holds_a_five();
     test_vct_recursive_race_gates_have_assertion_readers();
+    test_vct_recursive_win_returns_a_ply_by_ply_checkable_variation();
 
     std::cout << "All search tests passed!" << std::endl;
     return 0;
