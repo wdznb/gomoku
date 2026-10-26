@@ -3807,6 +3807,8 @@ namespace {
 Harness* g_wedge_probe = nullptr;
 std::thread* g_wedge_joiner = nullptr;
 std::atomic<bool> g_wedge_returned{false};
+// #85：这一臂的 attach / 点 AI / 断开都在同一根临时线程上，属主要落到它头上才可核对。
+std::atomic<std::thread::id> g_wedge_probe_thread_id{};
 }  // namespace
 
 // 断开一条**正在思考**的链接，会不会把整台服务器钉死。
@@ -3841,18 +3843,24 @@ void test_a_socket_that_closes_while_the_ai_is_thinking_does_not_wedge_the_io_th
     CHECK_MESSAGE(settled.entry->attached == nullptr, "没在飞的断开同样要收干净（对照臂）");
     const int ticks = static_cast<int>(std::max<long long>(2000, unit_ms * 8) / 10) + 1;
 
-    auto* h = new Harness(scratch("r187_disconnect_while_thinking"), std::string());
-    g_wedge_probe = h;
-    GameManager& game = *h->entry->game;
-    game.set_config(1200000, 8, -1, 400000);   // 一次思考要跑一阵，断开才赶得上它
-    assert(game.make_move(7, 7));               // 人落一子：make_move 自己把 AI 那一手点起来
-    CHECK_MESSAGE(game.is_ai_thinking(), "断开之前那条 worker 必须还在飞");
-
-    g_wedge_returned.store(false);
-    g_wedge_joiner = new std::thread([h] {
-        h->server.on_disconnect(h->socket.get());   // io 线程在那一刻做的事：拿锁 + join worker
+    // 轮次199 #85 之后，这条的形状必须与产品同形：**同一会话的 attach（装回调）、点起 AI、
+    // 断开（清回调）都在那一根临时线程上**。以前 attach 在 main、断开在临时线程，本身就是
+    // 一次跨线程交换回调 —— 那条属主断言（`game_manager.h:385`）第一次跑就把它逮住了。
+    // 主线程只等**有界的工作量**，不碰会话；join 之后才读结果，于是「读到的是哪一手」仍然有序。
+    auto* joiner = new std::thread([] {
+        auto* local = new Harness(scratch("r187_disconnect_while_thinking"), std::string());
+        GameManager& g = *local->entry->game;
+        g.set_config(1200000, 8, -1, 400000);   // 一次思考要跑一阵，断开才赶得上它
+        const bool started = g.make_move(7, 7);  // 人落一子：make_move 自己把 AI 那一手点起来
+        // 断开之前那条 worker 必须还在飞 —— 不在飞这一条就退化成对照臂，白跑。
+        CHECK_MESSAGE(started && g.is_ai_thinking(),
+                      "断开之前那条 worker 必须还在飞");
+        g_wedge_probe_thread_id.store(std::this_thread::get_id());
+        g_wedge_probe = local;                   // 发布；主线程只在 join 之后读它
+        local->server.on_disconnect(local->socket.get());   // io 线程在那一刻做的事：拿锁 + join worker
         g_wedge_returned.store(true);
     });
+    g_wedge_joiner = joiner;
     for (int tick = 0; tick < ticks && !g_wedge_returned.load(); ++tick) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
@@ -3873,9 +3881,17 @@ void test_a_socket_that_closes_while_the_ai_is_thinking_does_not_wedge_the_io_th
     }
 
     // 「收回来」不许是靠少做事换来的：这一条要变成 detach、标志要交回、盘要落进会话文件。
-    CHECK_MESSAGE(h->entry->attached == nullptr, "断开之后这一条要挂成 detach");
-    CHECK_MESSAGE(!game.is_ai_thinking(), "思考标志要交回来");
-    CHECK_MESSAGE(std::filesystem::exists(h->session_file()), "断开那一刻的盘要落进会话文件");
+    // 读的是那一根线程发布出来的会话 —— join 已经把「那次交换都在同一线程」之后的结果排在后面。
+    Harness* const wedged = g_wedge_probe;
+    CHECK_MESSAGE(wedged != nullptr, "临时线程没把会话摆出来，这一臂就没跑到断开");
+    CHECK_MESSAGE(wedged->entry->attached == nullptr, "断开之后这一条要挂成 detach");
+    CHECK_MESSAGE(!wedged->entry->game->is_ai_thinking(), "思考标志要交回来");
+    CHECK_MESSAGE(std::filesystem::exists(wedged->session_file()), "断开那一刻的盘要落进会话文件");
+    // #85 的另一半：断开这一臂把回调清干净之后，属主仍然是那条线程 —— 清回调不是「换个属主」，
+    // 而是同一次独占里的最后一次交换。
+    CHECK_MESSAGE(wedged->entry->game->callbacks_owner() ==
+                      g_wedge_probe_thread_id.load(),
+                  "回调的属主必须就是装它、清它的那一根线程（#85）");
 
     std::cout << "  [r187] 断开一条在飞的思考：join 回来了、detach 落盘了、标志交回了（单位 = 一手完整搜索 "
               << unit_ms << " ms，上界 " << ticks * 10 << " ms）" << std::endl;
@@ -4120,7 +4136,100 @@ int games_owner_death_arm() {
     return 0;
 }
 
+// #85：`GameManager` 那六个回调的交换以前只靠一句顺序（先 halt_search 再动它们）。轮次199
+// 把同一句话做成两半的闸：只在**装它的那根线程**上换、且**没有在飞的东西**时换。四段各钉一半：
+//   ① 一个新会话：还没人换过 ⇒ 属主是默认 id，而这一手可以换；换过一次之后属主就是本线程。
+//   ② 另一根线程**只能读**：属主仍是第一手的线程，而它自己「不能换」为真 —— 这就是产品里
+//      第一道断言拦的东西。
+//   ③ 在飞的那一半：把 `ai_thinking_` 直接置真（白盒，与产品里 worker 在飞时读到的形状一样），
+//      同一线程的 `callbacks_swappable_here()` 必须翻转成假。这一半不需要崩进程就能核。
+//   ④ 两道断言各自的反面（fork + execv 重跑自己，与 #93 那条同一个手法）：
+//      `=thread` ⇒ 第二根线程去换；`=flying` ⇒ 同一线程但思考在飞时去换。两种都必须 SIGABRT。
+void test_callback_swap_refuses_a_second_thread_and_a_flying_think() {
+    Harness h(scratch("r199_callback_owner"), std::string());
+    GameManager& game = *h.entry->game;
+
+    // ① Harness 的 attach 已经换过一次，所以属主 = 本线程；这里再换一次必须被放行。
+    assert(game.callbacks_owner() == std::this_thread::get_id());
+    assert(game.callbacks_swappable_here());
+    game.set_move_callback([&](const Move&, int, int) {});
+    assert(game.callbacks_owner() == std::this_thread::get_id());
+
+    // ② 另一根线程读到的还是这根线程，而它自己不算能换
+    {
+        std::thread::id seen_owner = std::this_thread::get_id();
+        bool other_can_swap = true;
+        std::thread::id other_id{};
+        std::thread other([&] {
+            other_id = std::this_thread::get_id();
+            seen_owner = game.callbacks_owner();
+            other_can_swap = game.callbacks_swappable_here();
+        });
+        other.join();
+        assert(other_id != std::this_thread::get_id());
+        assert(seen_owner == std::this_thread::get_id());
+        assert(!other_can_swap);
+    }
+
+    // ③ 在飞的形状：标志一置真，同一线程也不许换（读谓词不触发断言，所以这一段不用子进程）
+    {
+        game.ai_thinking_.store(true);
+        assert(!game.callbacks_swappable_here());
+        game.ai_thinking_.store(false);
+        game.hint_active_.store(true);
+        assert(!game.callbacks_swappable_here());
+        game.hint_active_.store(false);
+        game.ponder_active_.store(true);
+        assert(!game.callbacks_swappable_here());
+        game.ponder_active_.store(false);
+        assert(game.callbacks_swappable_here());
+    }
+
+    // ④ 两道断言的反面都必须当场崩
+    char self[4096];
+    const ssize_t len = ::readlink("/proc/self/exe", self, sizeof(self) - 1);
+    assert(len > 0);
+    self[len] = '\0';
+    const std::string path(self);
+    for (const char* which : {"thread", "flying"}) {
+        const pid_t child = ::fork();
+        assert(child >= 0);
+        if (child == 0) {
+            ::setenv("GOMOKU_CALLBACK_SWAP_DEATH_ARM", which, 1);
+            char* argv[] = {const_cast<char*>(path.c_str()), nullptr};
+            ::execv(path.c_str(), argv);
+            ::_exit(127);
+        }
+        int status = 0;
+        assert(::waitpid(child, &status, 0) == child);
+        assert(WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT);
+    }
+
+    std::cout << "test_callback_swap_refuses_a_second_thread_and_a_flying_think passed"
+              << std::endl;
+}
+
+// ④ 的那两面：只有对应的断言失灵，子进程才会走到「返回 0」。
+int callback_swap_death_arm() {
+    const std::string which = std::getenv("GOMOKU_CALLBACK_SWAP_DEATH_ARM");
+    Harness h(scratch(which == "thread" ? "r199_callback_death_thread"
+                             : "r199_callback_death_flying"),
+              std::string());
+    GameManager& game = *h.entry->game;
+    if (which == "thread") {
+        std::thread other([&game] { game.set_move_callback(nullptr); });
+        other.join();
+    } else {
+        game.ai_thinking_.store(true);
+        game.set_move_callback(nullptr);   // 同一线程，但思考在飞
+    }
+    return 0;
+}
+
 int main() {
+    if (const char* arm = std::getenv("GOMOKU_CALLBACK_SWAP_DEATH_ARM"); arm != nullptr) {
+        return callback_swap_death_arm();
+    }
     if (std::getenv("GOMOKU_GAMES_OWNER_DEATH_ARM") != nullptr) {
         return games_owner_death_arm();
     }
@@ -4189,6 +4298,7 @@ int main() {
     test_analyze_is_refused_while_the_ai_is_thinking();
     test_analyze_refuses_the_positions_it_cannot_rebuild_and_the_games_it_cannot_read();
     test_games_mutex_records_one_owner_thread();
+    test_callback_swap_refuses_a_second_thread_and_a_flying_think();
 
 
     std::cout << "All server tests passed!" << std::endl;

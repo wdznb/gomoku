@@ -6,6 +6,7 @@
 #include "../search/search_engine.h"
 #include <memory>
 #include <atomic>
+#include <cassert>
 #include <thread>
 #include <functional>
 #include <mutex>
@@ -135,10 +136,39 @@ public:
     
     bool is_ai_thinking() const { return ai_thinking_.load(); }
     
-    void set_progress_callback(ProgressCallback cb) { progress_callback_ = cb; }
-    void set_move_callback(MoveCallback cb) { move_callback_ = cb; }
-    void set_hint_callback(HintCallback cb) { hint_callback_ = cb; }
-    void set_game_over_callback(GameOverCallback cb) { game_over_callback_ = cb; }
+    // #85：回调族的交换以前只靠一句顺序 —— 先 `halt_search()`（真的 join）再动这六个
+    // `std::function`，注释写着「Only ever called after the search has been joined」，但那
+    // 是当前树的读数，不是约束。这里把它做成机制，形状与轮次199 的 `OwnerCheckedMutex` 相同：
+    // 第一次交换的线程记成属主，此后每一次交换都要求**同一线程**且**没有在飞的东西**
+    //（`ai_thinking_` / `hint_active_` / `ponder_active_` 全假），否则断言当场崩。
+    // 没有新锁、没有等待：两个判断都只是原子读。
+    void set_progress_callback(ProgressCallback cb) {
+        claim_callback_swap();
+        progress_callback_ = std::move(cb);
+    }
+    void set_move_callback(MoveCallback cb) {
+        claim_callback_swap();
+        move_callback_ = std::move(cb);
+    }
+    void set_hint_callback(HintCallback cb) {
+        claim_callback_swap();
+        hint_callback_ = std::move(cb);
+    }
+    void set_game_over_callback(GameOverCallback cb) {
+        claim_callback_swap();
+        game_over_callback_ = std::move(cb);
+    }
+
+    // 观察面：属主是谁、这一手在这里能不能交换。引擎没有任何地方按它们分支。
+    std::thread::id callbacks_owner() const {
+        return callbacks_owner_.load(std::memory_order_relaxed);
+    }
+    bool callbacks_swappable_here() const {
+        const std::thread::id recorded = callbacks_owner();
+        const bool same_thread =
+            recorded == std::thread::id{} || recorded == std::this_thread::get_id();
+        return same_thread && !anything_in_flight();
+    }
     
     const Board& board() const { return board_; }
     // The session's table, exposed so the generation a committed stone advances can
@@ -316,7 +346,11 @@ private:
     // 不装回调时（单元测试与训练器的无头用法）worker 就地提交，与这一轮之前逐字同形：
     // 那条路上属主线程在 join 之前不读盘，本来就没有第二个读者。
     using OwnerNotify = std::function<void()>;
-    void set_owner_notify(OwnerNotify cb) { owner_notify_ = std::move(cb); }
+    // 第六个同族、同一个闸（轮次193 #106 之后 worker 只碰这一位，所以它更需要在飞时禁换）。
+    void set_owner_notify(OwnerNotify cb) {
+        claim_callback_swap();
+        owner_notify_ = std::move(cb);
+    }
     // 属主线程：把 worker 停下（或被中止）的那份结论落盘。槽空就是空操作 —— 通知迟到
     // 是正常形状（`halt_search` 会先把槽取走，`exchange` 让两边恰好有一个拿到它）。
     void commit_pending();
@@ -332,6 +366,30 @@ private:
     // 轮次193 #106：结论槽。同一局同一刻只有一手思考，生产者（worker）与消费者
     // （`commit_pending`）从不同时在场，所以一个原子指针就是完整的队列。
     std::atomic<SearchResult*> pending_result_{nullptr};
+    // #85：回调族的属主线程（第一次交换时登记）。与轮次199 那把锁的属主槽同一形状：
+    // 一次 CAS 登记、若干次 relaxed 读，没有第二把锁。
+    std::atomic<std::thread::id> callbacks_owner_{};
+
+    // 在飞 = 有别的线程可能正拿着这六个 function 走。三个旗标各自覆盖一条路：
+    // 思考、求招、预搜。
+    bool anything_in_flight() const {
+        return ai_thinking_.load(std::memory_order_relaxed) ||
+               hint_active_.load(std::memory_order_relaxed) ||
+               ponder_active_.load(std::memory_order_relaxed);
+    }
+
+    void claim_callback_swap() {
+        // 两条分开 assert：一条合取只会说「不成立」，说不出是哪一半 —— 而这两半的修法不同。
+        const std::thread::id swapper = std::this_thread::get_id();
+        const std::thread::id first = callbacks_owner_.load(std::memory_order_relaxed);
+        assert((first == std::thread::id{} || first == swapper) &&
+               "回调族只能由第一次交换它的那个线程再交换（#85）");
+        assert(!anything_in_flight() &&
+               "有思考/求招/预搜在飞时不许交换回调（#85）");
+        const std::thread::id self = std::this_thread::get_id();
+        std::thread::id recorded{};
+        callbacks_owner_.compare_exchange_strong(recorded, self, std::memory_order_relaxed);
+    }
     OwnerNotify owner_notify_;
     // 两条提交路的同一具身体：无头路径由 worker 自己调，服务端由属主线程调。
     void apply_search_result(SearchResult result);
