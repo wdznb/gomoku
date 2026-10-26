@@ -1996,7 +1996,9 @@ no existing assertion was edited.
 
 **读者**：`test_games_owner_records_one_owner_thread`（③段读的还是**成员** `games_owner_` 的属主）、`test_owner_only_section_records_one_owner_thread`（类型 + 两臂信号）、`test_hint_adoption_refuses_a_second_thread`（取用点）—— 全套 58 条 rc=0，anchor 122 引用 0 problems。
 
-**门禁**（`/tmp/r209/chain.log`，按段计警告）：强制全量重建 **356 编译单元 0 warning、165 s** → `ctest -j1` **rc=0** → anchor **122 引用 0 problems、150 指认 150/150 ok** → web **113/113** → TSan `test_server` **clean races=0 62 s** → memcheck `test_server` 第 6 臂在跑（提交时未收口，rc 一到记进本节）。
+**门禁**（`/tmp/r209/chain.log`，按段计警告）：强制全量重建 **356 编译单元 0 warning、165 s** → `ctest -j1` **rc=0** → anchor **122 引用 0 problems、150 指认 150/150 ok** → web **113/113** → TSan `test_server` **clean races=0 62 s** → memcheck `test_server` **clean：reports=0 invalid_read=0 invalid_write=0 uninitialised=0 definite_leak=0，1592 s（stage6 rc=0，含建表 1649 s）**。六臂全绿。
+
+**顺手把 #113 下一把的证据量了**（`SearchController::result_mutex_`）：它的 `search_worker`（`src/search/controller.cpp:63`）调的是**旧的五参 `engine_.search(board, color, max_depth, time_limit_ms, stop_flag_)`**，`set_soft_time_ms` / `set_max_nodes` / `set_prev_move_elapsed_ms` / `set_hint` 一个都没设 —— 也就是它表达不出软窗口、节点帽、上一手耗时、提示复用这**四件产品 AI 臂每天都在用的事**（对比 `game_manager.cpp` 的 `start_ai_thinking`：先 join、`Board snapshot = board_`、`take_hint`、`take_budget`）。加上它产品侧 0 用户、5 处测试用户 ⇒ 补 §585 那半句等于**再养一条异步思考路**，与「解耦」相反；退役它 + 那 5 处用例才是数据支持的方向，但那要动 `docs/ENGINE_REDESIGN.md:58`（「重构时不应破坏」）这句话 —— 是要你点头的取舍，我不自己删。
 ---
 
 ## 轮次208 #113：`games_mutex_` 也降级成只登记 —— 一台真实赛具量出 419 次获取、被走到的 18 个点全部只有一根线程；产品里的 `std::mutex` 到此清零
