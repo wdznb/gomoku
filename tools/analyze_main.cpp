@@ -112,6 +112,59 @@ struct Totals {
     int reasons[kScreenReasonCount] = {0};
 };
 
+// 段 A 的每一条判据现在只有一个阈值，不分黑白。这组计数用来回答「分了会怎样」：
+// 把同一批手的 |swing| 按落子颜色分开看，再看两侧的候选率、静默带剔除率。
+// 摆幅样本的口径和 BIG_SWING 那条判据看到的一致：非 replay/book、有下一手、
+// 两端都不在将杀带里（|score| < 90000）——带内的摆幅是饱和分相减的假差值。
+struct SideStats {
+    int plies = 0;        // 这个颜色落下的所有手（含 replay 前缀）
+    int candidates = 0;
+    int noise = 0;
+    int opening = 0;
+    int replayed = 0;
+    int judged = 0;       // 进了摆幅样本的手数，下面那个分位数的分母
+    int mate_excluded = 0;  // 非重放、有下一手，但两端之一在将杀带里（被判据跳过的那些）
+    long long signed_swing_sum = 0;  // 带符号摆幅的和（口径同 judged）：色别评估偏移的证据
+    long long score_sum = 0;         // 引擎当时报的分（同一批手）：这一色在引擎眼里平均是多少
+    long long wide_signed_sum = 0;   // 带符号摆幅的和，口径放宽到所有非重放、有下一手的手
+    long long wide_score_sum = 0;    // 同口径的平均报分（将杀带内的饱和分也计进来）
+    int wide_n = 0;
+    // 按判据分开的候选来源：一条阈值改不改得动池子，看它自己那一格有多大。
+    int reasons[kScreenReasonCount] = {0};
+    std::vector<int> abs_swings;
+
+    void collect_percentiles() {
+        if (abs_swings.empty()) return;
+        std::sort(abs_swings.begin(), abs_swings.end());
+    }
+    int at(double q) const {
+        if (abs_swings.empty()) return 0;
+        size_t idx = static_cast<size_t>(q * (abs_swings.size() - 1));
+        if (idx >= abs_swings.size()) idx = abs_swings.size() - 1;
+        return abs_swings[idx];
+    }
+    double mean_signed_swing() const {
+        return judged > 0 ? static_cast<double>(signed_swing_sum) / judged : 0.0;
+    }
+    double mean_score() const {
+        return judged > 0 ? static_cast<double>(score_sum) / judged : 0.0;
+    }
+    double mean_wide_signed() const {
+        return wide_n > 0 ? static_cast<double>(wide_signed_sum) / wide_n : 0.0;
+    }
+    double mean_wide_score() const {
+        return wide_n > 0 ? static_cast<double>(wide_score_sum) / wide_n : 0.0;
+    }
+};
+
+// 将杀带常量与 src/training/replay_analyzer.cpp 里 ScreenConfig 的 mate_band 默认同值；
+// 段 A 没有暴露 --mate-band，所以这里跟着默认走，不需要第二个开关。
+constexpr int kMateBandForSplit = 90000;
+
+bool in_mate_band_for_split(int score) {
+    return std::abs(score) >= kMateBandForSplit;
+}
+
 bool load_cards(const std::string& dir, std::vector<TacticsCard>& out, int& parse_errors) {
     namespace fs = std::filesystem;
     std::error_code ec;
@@ -411,6 +464,8 @@ int main(int argc, char** argv) {
 
     std::vector<TacticsCard> card_buffer;
     Totals totals;
+    SideStats black;
+    SideStats white;
     std::map<std::string, int> kinds;
     std::string line;
     int game_index = 0;
@@ -452,6 +507,29 @@ int main(int argc, char** argv) {
         totals.replayed += screen.replayed;
         totals.flat += screen.flat;
         for (int r = 0; r < kScreenReasonCount; ++r) totals.reasons[r] += screen.reasons[r];
+
+        for (const PlyScreen& ply : screen.plies) {
+            SideStats& side = ply.side == WHITE ? white : black;
+            ++side.plies;
+            if (ply.candidate) ++side.candidates;
+            if (ply.reason == ScreenReason::NOISE) ++side.noise;
+            if (ply.reason == ScreenReason::OPENING) ++side.opening;
+            if (ply.reason == ScreenReason::REPLAYED) ++side.replayed;
+            ++side.reasons[static_cast<int>(ply.reason)];
+            if (ply.reason == ScreenReason::REPLAYED) continue;
+            if (ply.ply >= screen.total_plies - 1) continue;  // 最后一手没有摆幅
+            ++side.wide_n;
+            side.wide_signed_sum += ply.swing;
+            side.wide_score_sum += ply.score;
+            if (in_mate_band_for_split(ply.score) || in_mate_band_for_split(ply.next_score)) {
+                ++side.mate_excluded;
+                continue;
+            }
+            ++side.judged;
+            side.signed_swing_sum += ply.swing;
+            side.score_sum += ply.score;
+            side.abs_swings.push_back(std::abs(ply.swing));
+        }
 
         if (!json_out) {
             std::cout << "game " << std::setw(3) << game_index << "  plies " << std::setw(3)
@@ -596,6 +674,38 @@ int main(int argc, char** argv) {
               << "  noise " << totals.noise << "  opening " << totals.opening << "  replayed "
               << totals.replayed << "  flat_games " << totals.flat << "  parse_errors "
               << totals.parse_errors << "\n";
+    black.collect_percentiles();
+    white.collect_percentiles();
+    std::cout << "per-side stage A (swing>=" << screen_config.swing_threshold
+              << "  quiet<" << screen_config.quiet_band << "  opening<"
+              << screen_config.opening_plies << "):\n";
+    for (const auto& row : {std::pair<const char*, const SideStats&>("black", black),
+                             std::pair<const char*, const SideStats&>("white", white)}) {
+        std::cout << "  " << std::left << std::setw(6) << row.first << std::right
+                  << "  plies " << std::setw(6) << row.second.plies << "  cand " << std::setw(5)
+                  << row.second.candidates << " (" << std::setw(5)
+                  << percent(row.second.candidates, row.second.plies) << ")"
+                  << "  noise " << std::setw(5) << row.second.noise << " ("
+                  << std::setw(5) << percent(row.second.noise, row.second.plies) << ")"
+                  << "  opening " << std::setw(5) << row.second.opening << "\n"
+                  << "          |swing| of " << row.second.judged
+                  << " (mate-excluded " << row.second.mate_excluded << "): p50 "
+                  << row.second.at(0.50) << "  p90 " << row.second.at(0.90) << "  p95 "
+                  << row.second.at(0.95) << "  p99 " << row.second.at(0.99) << "  max "
+                  << row.second.at(1.0) << "  mean_signed " << std::fixed
+                  << std::setprecision(0) << row.second.mean_signed_swing() << "\n"
+                  << "          wide(n=" << row.second.wide_n << "): mean_signed "
+                  << row.second.mean_wide_signed() << "  mean_score "
+                  << row.second.mean_wide_score() << std::setprecision(1) << "\n"
+                  << "          reasons: big_swing "
+                  << row.second.reasons[static_cast<int>(ScreenReason::BIG_SWING)]
+                  << "  method_shift " << row.second.reasons[static_cast<int>(ScreenReason::METHOD_SHIFT)]
+                  << "  must_block_run "
+                  << row.second.reasons[static_cast<int>(ScreenReason::MUST_BLOCK_RUN)] << "  mate_cross "
+                  << row.second.reasons[static_cast<int>(ScreenReason::MATE_CROSS)] << "  depth_dip "
+                  << row.second.reasons[static_cast<int>(ScreenReason::DEPTH_DIP)] << "  none "
+                  << row.second.reasons[static_cast<int>(ScreenReason::NONE)] << "\n";
+    }
     if (review) {
         std::cout << "kinds:";
         for (const auto& entry : kinds) std::cout << "  " << entry.first << " " << entry.second;
