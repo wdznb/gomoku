@@ -78,6 +78,13 @@ GameManager::GameManager()
 
 GameManager::~GameManager() {
     halt_search();
+    // 轮次206 #113：join 之后这两个槽再没有生产者，所以在这里收干净 —— 不收就是漏。
+    // 这不是假想：轮次205 那条 deferred 的 memcheck 臂在这一棵树上读到
+    // `reports=62 definite_leak=6`（每块 24 字节 = 一份 `HintConclusion`）：一局打完之后再没有
+    // 下一次 arm 的会话，那份发布永远没人 adopt。机制本身（一次原子发布 + 属主取用）是对的，
+    // 缺的是**取用方退出时的回收点**。读数与复现见 REVIEW_LOG 轮次205/206。
+    delete published_hint_.exchange(nullptr, std::memory_order_acq_rel);
+    delete pending_result_.exchange(nullptr, std::memory_order_acq_rel);
 }
 
 // Hard abort then join, so no thread is running when this returns. Must be

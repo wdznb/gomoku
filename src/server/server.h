@@ -187,7 +187,10 @@ private:
     // Only the io thread ever assigns deferred_end_for_, but an AI worker can report
     // a settlement for the same session pointer concurrently, so this pair needs its
     // own lock and nothing else may be locked while holding it.
-    std::mutex end_frame_mutex_;
+    // 轮次206 #113：这一节不再是一把会阻塞的锁。量出来的形状是「四个获取点恒同一根线程」
+    // （见 REVIEW_LOG 轮次206 的仪器表），所以留下机制、去掉成本：属主登记 + 断言，
+    // 一次 relaxed CAS，没有 mutex，也没有等待。
+    OwnerOnlySection end_frame_owner_;
     WebSocketSession* deferred_end_for_ = nullptr;
     json deferred_end_frame_;
     

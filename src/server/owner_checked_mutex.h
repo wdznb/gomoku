@@ -59,6 +59,47 @@ private:
     std::atomic<std::thread::id> owner_{};
 };
 
+// 轮次206 #113 的这一档连那把内部 mutex 都不留：**只登记属主，从不阻塞**。
+//
+// 它存在的理由是一次量出来的读数，不是一句偏好。`GameServer::end_frame_mutex_` 那四个获取点
+// 挂上按线程记数的仪器后，在真实赛具（24 局、两台服务器）与整套服务端用例里读到的都是
+// `distinct=1`（唯一没被走到的那一处是「玩家那一手被拒」的收回路径，也在同一根线程上）；
+// asio 的 io_context 只有一根线程，所以这四个点从来都是同一根线程串行跑到，锁挡的是一件
+// 不会发生的事，而每一次获取都要付一次原子 RMW。
+//
+// 但「今天只有一根线程」不是约束 —— 轮次199 为 `games_mutex_` 写下的正是这句话，所以这里
+// 保留同一件机制：第一次进入的线程登记进属主槽，之后任何**别的**线程进来当场 assert 崩，
+// 而观察面（`owner()` / `current_thread_is_owner()` / `owner_slot_is_lock_free()`）让测试
+// 不必把进程搞崩也能核对。取舍与 #93 相同：`NDEBUG` 下不拦人。
+//
+// 它**不是**互斥量：同一根线程重复进入永远成功（这正是它和 `OwnerCheckedMutex` 的分别）。
+// 只有在「同一个对象恒由一根线程独占触碰」时才能这样替换，而那句话必须由仪器拿到，不是猜。
+class OwnerOnlySection {
+public:
+    void lock() { claim_owner(); }
+    void unlock() {}
+
+    std::thread::id owner() const { return owner_.load(std::memory_order_relaxed); }
+
+    bool current_thread_is_owner() const {
+        const std::thread::id recorded = owner();
+        return !(recorded == std::thread::id{}) && recorded == std::this_thread::get_id();
+    }
+
+    bool owner_slot_is_lock_free() const { return owner_.is_lock_free(); }
+
+private:
+    void claim_owner() {
+        const std::thread::id self = std::this_thread::get_id();
+        std::thread::id recorded = std::thread::id{};
+        if (owner_.compare_exchange_strong(recorded, self, std::memory_order_relaxed)) return;
+        assert(recorded == self &&
+               "这一节只许一根线程触碰（#113）：换了线程就不是「串行」，而是有人在跨线程共享它");
+    }
+
+    std::atomic<std::thread::id> owner_{};
+};
+
 }  // namespace gomoku
 
 #endif  // GOMOKU_OWNER_CHECKED_MUTEX_H

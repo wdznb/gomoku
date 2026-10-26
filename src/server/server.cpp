@@ -988,7 +988,7 @@ void GameServer::do_make_move(std::shared_ptr<WebSocketSession> session, int row
     // game_over ahead of the move_made below; the AI path sends ai_move first, so
     // hold the ending until this frame has gone out.
     {
-        std::lock_guard<std::mutex> lock(end_frame_mutex_);
+        std::lock_guard<OwnerOnlySection> lock(end_frame_owner_);
         deferred_end_for_ = session.get();
     }
     if (!game->make_move(row, col)) {
@@ -997,7 +997,7 @@ void GameServer::do_make_move(std::shared_ptr<WebSocketSession> session, int row
         // so that ending goes out to this session as it did before, not to nobody.
         json held;
         {
-            std::lock_guard<std::mutex> lock(end_frame_mutex_);
+            std::lock_guard<OwnerOnlySection> lock(end_frame_owner_);
             deferred_end_for_ = nullptr;
             held.swap(deferred_end_frame_);
         }
@@ -1019,7 +1019,7 @@ void GameServer::do_make_move(std::shared_ptr<WebSocketSession> session, int row
     send_message(session, response);
     json deferred;
     {
-        std::lock_guard<std::mutex> lock(end_frame_mutex_);
+        std::lock_guard<OwnerOnlySection> lock(end_frame_owner_);
         deferred_end_for_ = nullptr;
         deferred.swap(deferred_end_frame_);
     }
@@ -1795,7 +1795,7 @@ void GameServer::setup_game_callbacks(std::shared_ptr<WebSocketSession> session,
         // source (AI, resign, 判负) goes straight out as before.
         bool held = false;
         {
-            std::lock_guard<std::mutex> lock(end_frame_mutex_);
+            std::lock_guard<OwnerOnlySection> lock(end_frame_owner_);
             if (deferred_end_for_ == session.get()) {
                 deferred_end_frame_ = std::move(msg);
                 held = true;

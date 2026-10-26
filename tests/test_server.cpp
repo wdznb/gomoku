@@ -2139,7 +2139,7 @@ void test_a_rejected_stone_delivers_the_end_a_worker_parked() {
         h.entry->game->set_config(300, 1);
 
         {
-            std::lock_guard<std::mutex> lock(h.server.end_frame_mutex_);
+            std::lock_guard<OwnerOnlySection> lock(h.server.end_frame_owner_);
             h.server.deferred_end_for_ = h.socket.get();
         }
         h.entry->game->start_ai_thinking();
@@ -2155,13 +2155,13 @@ void test_a_rejected_stone_delivers_the_end_a_worker_parked() {
             h.server.ioc_.restart();
             h.server.ioc_.poll();
             {
-                std::lock_guard<std::mutex> lock(h.server.end_frame_mutex_);
+                std::lock_guard<OwnerOnlySection> lock(h.server.end_frame_owner_);
                 parked = !h.server.deferred_end_frame_.is_null();
             }
             if (!parked) std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
         if (!parked) {
-            std::lock_guard<std::mutex> lock(h.server.end_frame_mutex_);
+            std::lock_guard<OwnerOnlySection> lock(h.server.end_frame_owner_);
             std::cout << "  [r99dd3] TIMEOUT after 60 s: ai_thinking="
                       << h.entry->game->ai_thinking_.load()
                       << " status=" << static_cast<int>(h.entry->game->status_)
@@ -2203,7 +2203,7 @@ void test_a_rejected_stone_delivers_the_end_a_worker_parked() {
         assert(end["reason"] == "five");
 
         {
-            std::lock_guard<std::mutex> lock(h.server.end_frame_mutex_);
+            std::lock_guard<OwnerOnlySection> lock(h.server.end_frame_owner_);
             assert(h.server.deferred_end_for_ == nullptr);
             assert(h.server.deferred_end_frame_.is_null());
         }
@@ -4290,7 +4290,76 @@ void test_hint_conclusion_crosses_threads_through_the_slot() {
     std::cout << "test_hint_conclusion_crosses_threads_through_the_slot passed" << std::endl;
 }
 
+// 轮次206 #113：`OwnerOnlySection` —— 「只登记属主、从不阻塞」这一档机制自己的读者。
+// 它替掉的是 `GameServer::end_frame_mutex_`：那四个获取点挂上按线程记数的仪器后，整套服务端
+// 用例与一场真实赛具（24 局、两台服务器）读到的都是同一根线程（`distinct=1`，唯一没被走到的
+// 那一处是玩家被拒收回路径，也在同一根线程），所以阻塞的成本买的是一件不会发生的事。
+// 但「今天一根线程」不是约束（轮次199 为 `games_mutex_` 写过同一句话），于是保留机制：
+//   ① 全新对象：属主槽是默认 id，`current_thread_is_owner()` 为假（还没有主张可违反）；
+//   ② 第一次进入登记本线程，槽必须是**原子**的（「无锁」在这里是可核对的，不是形容词）；
+//   ③ 同一根线程重复进入永远合法 —— 这正是它与互斥量的分别，也是它敢不阻塞的理由；
+//   ④ 换一根线程进入必须当场死于 SIGABRT（子进程自己演，父进程只看信号；断言被编译掉时
+//      子进程正常退出 0 ⇒ 这条臂红，而不是挂在 join 上）。手法与 #93/#85 的死臂同形。
+int owner_section_death_arm(const char* which) {
+    OwnerOnlySection section;
+    {
+        std::lock_guard<OwnerOnlySection> first(section);
+        if (std::string(which) == "=thread") {
+            std::thread other([&section] {
+                std::lock_guard<OwnerOnlySection> second(section);  // 应当在这里崩
+            });
+            other.join();  // 只有断言失灵才走到这里
+            return 0;
+        }
+    }
+    // "=same"：同一根线程再进一次，永远合法 ⇒ 进程正常退出
+    std::lock_guard<OwnerOnlySection> again(section);
+    return 0;
+}
+
+void test_owner_only_section_records_one_owner_thread() {
+    OwnerOnlySection fresh;
+    assert(fresh.owner() == std::thread::id{});
+    assert(!fresh.current_thread_is_owner());
+    assert(fresh.owner_slot_is_lock_free());
+
+    {
+        std::lock_guard<OwnerOnlySection> held(fresh);
+        assert(fresh.owner() == std::this_thread::get_id());
+        assert(fresh.current_thread_is_owner());
+    }
+    { std::lock_guard<OwnerOnlySection> again(fresh); }  // ③ 重复进入合法
+    assert(fresh.owner() == std::this_thread::get_id());
+
+    // ④ 死臂：跨线程必须当场崩；同线程的控制臂必须正常退出 0。
+    std::error_code ec;
+    const std::string path = std::filesystem::read_symlink("/proc/self/exe", ec).string();
+    assert(!ec && !path.empty());
+    for (const char* which : {"=thread", "=same"}) {
+        const pid_t child = ::fork();
+        assert(child >= 0);
+        if (child == 0) {
+            ::setenv("GOMOKU_OWNER_SECTION_DEATH_ARM", which, 1);
+            char* argv[] = {const_cast<char*>(path.c_str()), nullptr};
+            ::execv(path.c_str(), argv);
+            ::_exit(127);
+        }
+        int status = 0;
+        assert(::waitpid(child, &status, 0) == child);
+        if (std::string(which) == "=thread") {
+            assert(WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT);
+        } else {
+            assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+        }
+    }
+
+    std::cout << "test_owner_only_section_records_one_owner_thread passed" << std::endl;
+}
+
 int main() {
+    if (const char* arm = std::getenv("GOMOKU_OWNER_SECTION_DEATH_ARM"); arm != nullptr) {
+        return owner_section_death_arm(arm);
+    }
     if (const char* arm = std::getenv("GOMOKU_CALLBACK_SWAP_DEATH_ARM"); arm != nullptr) {
         return callback_swap_death_arm();
     }
@@ -4364,6 +4433,7 @@ int main() {
     test_games_mutex_records_one_owner_thread();
     test_callback_swap_refuses_a_second_thread_and_a_flying_think();
     test_hint_conclusion_crosses_threads_through_the_slot();
+    test_owner_only_section_records_one_owner_thread();
 
 
     std::cout << "All server tests passed!" << std::endl;

@@ -1984,6 +1984,32 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次206 #113：`end_frame_mutex_` 撤掉 —— 仪器先在用例与真实赛具上读到「四个获取点恒一根线程」，机制换成不阻塞的属主登记
+
+接着 #113 走。轮次205 撤掉 `thinking_mutex_` 之后树上还剩六把，这一轮动的是 `GameServer::end_frame_mutex_`（守住 `deferred_end_for_` 与 `deferred_end_frame_` 那两个成员，四个获取点）。**先量**：把按线程记数的临时仪器挂在这四个获取点上（不入库，`/tmp/r206/witness.log`），跑两遍：
+
+| 跑的是什么 | site 0 起手 | site 1 拒子收回 | site 2 交回 | site 3 挂起 |
+|---|---|---|---|---|
+| `test_server` 全套（56 条） | `distinct=1` | `distinct=1` | `distinct=1` | `distinct=1` |
+| 真实赛具：两台 `gomoku_server` + `tree_match` 24 局（`/tmp/r206/srvA.log`、`srvB.log`） | `distinct=1` | **`distinct=0`（没被走到）** | `distinct=1` | `distinct=1` |
+
+两台服务器的 tid 各自恒定（io 线程），没有任何一个点出现过第二个线程。机制层面这也对得上：asio 这一个 `io_context` 只有一根线程，这四个点全在 handler / 回调里，而 #106 之后回调本身就在属主线程上。⇒ **这把锁的阻塞成本买的是一件不会发生的事**，而它每一次获取都要付一次原子 RMW。
+
+**落实（`src/server/owner_checked_mutex.h` 加一档，`server.h`/`server.cpp` 换形状）**
+- 新增 `OwnerOnlySection`：**只登记属主、从不阻塞** —— `lock()` 是一次 relaxed CAS 登记 + 对不上就 `assert`，`unlock()` 是空的；观察面与 #93 同形（`owner()` / `current_thread_is_owner()` / `owner_slot_is_lock_free()`）。成员改名为 `end_frame_owner_`（不再叫 mutex 是因为它不是 mutex），四个获取点只换模板参数，顺序与早退一处没动。
+- 写清楚它的**边界**（不是互斥量！）：同一根线程重复进入永远合法，所以只有在「同一个对象恒由一根线程独占触碰」时才允许这样替换 —— 而那句话必须由仪器拿到，本轮就是那两张表。取舍沿用 #93：`NDEBUG` 下不拦人。
+- 测试里那四处白盒读成员的地方（`test_server.cpp` 的 deferral 用例）跟着换成新类型 —— 顺带一提：它们本身就是「测试线程 = 属主线程」的形状，换完仍然一根线程，正好多一层读者。
+
+**新用例** `test_owner_only_section_records_one_owner_thread`（含死臂）四段：① 全新对象属主是默认 id 且 `current_thread_is_owner()` 为假；② 第一次进入登记本线程、属主槽必须 `is_lock_free()`（「无锁」在这里是可核对的数，不是形容词）；③ 同一根线程重复进入合法（它就是靠这条与互斥量分家）；④ 跨线程进入的子进程必须死于 `SIGABRT`，同线程的对照臂必须正常退出 0 —— 两条都只看信号/退出码，手法与 #93/#85 的死臂同形。
+
+**门禁**（一条链串行，`/tmp/r206/chain.log`）：强制全量重建 **356 编译单元 0 warning**（注意：脚本第一次报 `warnings=244` 是**我的包装把整条链的日志当成这一段**数的 —— 那 244 行全是 TSan 建表时 `atomic_base.h` 的 `-Wtsan` 库内警告；按段重数之后 release 树是 0，这条按段计数的规矩写进仪器账）→ `ctest -j1` rc=0 → `readme_anchor_check` **122 条 README 引用 0 problems、150 条源码指认 150/150 ok** → `web_frontend_check` **113/113** → TSan `test_server` **clean races=0 deadlocks=0 thread_leaks=0 rc=0 58s** → memcheck `test_server` **clean：reports=0 invalid_read=0 invalid_write=0 uninitialised=0 definite_leak=0，1571 s（rc=0）** —— 就是轮次205 那条判红 `definite_leak=6` 的臂，本轮**由它自己收口**：回收点加上去之后 6 → 0，同一把仪器、同一棵树、同一条命令。
+
+**存活臂读出的不是「有 race」，是「仪器看不见那个窗口」**：把 `published_hint_.exchange(...)` 改回「worker 直接写 `current_hint_`」之后，TSan 仍然读 `clean races=0`（125 s 那一臂）—— 因为树上每一个 `take_hint` / `adopt_published_hint` 都在 join 之后，两个线程从不同时在场。⇒ 上一轮「races=0」那句话不能当「撤锁安全」的证据（这条更正也写在轮次205 的门禁段里），真正的依据是那条顺序纪律，而它今天**没有运行时读者** —— 记作 #114：在取用点上断言 `!anything_in_flight()`，配 fork+exec 的死臂。
+
+**#113 的账**：七把里现在撤了叁把（`thinking_mutex_` 轮次205、`end_frame_mutex_` 本轮，加上 #93 把 `games_mutex_` 做成属主登记那一半），剩四把：`games_mutex_`（20 处，仍是真 mutex —— 本轮的仪器形状正好可以用来量它恒一根线程这件事，量到就能同样降级成 `OwnerOnlySection`）、`SearchController::result_mutex_`（2 处，而 `SearchController` 全树只有 5 处测试用户、产品里 0 用户 —— 这条要先判「留着还是退役」，见 `docs/ENGINE_REDESIGN.md:58` 与 §585 那半句没实现的「透传 `SearchLimits` 与上一手 `hint`」）、`OpeningBook::rng_mutex_`（1 处，换成无状态抽签会改变抽签序列 ⇒ 语义决定）、进程级 TT 的 16 个分片锁（只在 `shared_` 时拿，是吞吐守护者，轮次134/J 量到融合表要 72-bit 键 ⇒ 预期判「保留并给读数」）。
+
+---
+
 ## 轮次205 #113：`thinking_mutex_` 撤掉了 —— 先把十一个获取点按线程量出来，再把跨线程那一跳改成交接，同一棵树上 TSan 读 races=0
 
 **先量，不动行为。** 临时仪器（不入库；`/tmp/r205/witness.log`）在 `game_manager.cpp` 那 11 个 `thinking_mutex_` 获取点各插一行按线程记数，跑 assert 生效的 `build-vg/test_server` 全套，读到的是**每点 × 每线程**的表：
@@ -2015,7 +2041,11 @@ no existing assertion was edited.
 
 两支都**先于**本轮新用例红 —— 复用与失效这两条路早就有别的钉值看着，这比「只有我这条用例红」更硬。话也据此写准：新用例钉的是**交接的形状**（谁生效、何时回收），生产路径的行为读者是那两条既有钉值；给 ①-④ 各配一支只打它自己的臂在形状上不成立（任何让发布/取用变形的改法都会先撞 G3 的节点钉值）。
 
-**门禁**：撤锁后的树上先拿到两条 —— `test_server    clean  races=0 deadlocks=0 thread_leaks=0 rc=0 61s`、套件 56 条 rc=0；指认按内容重算两处（`docs/IMPLEMENTATION_GUIDE.md:115` 的 `game_manager.cpp:343-358` → `:344-358`，同行那句「`thinking_mutex_` 下拷贝」改成实况；`tests/test_server.cpp:1359` 的 `:159` → `:160`）之后 anchor 回到 **150/150 ok、122 条引用 0 problems**。一条链继续在跑（`/tmp/r205/gates.log`）：强制全量重建 **356 单元 0 warning、192 s** → ctest → anchor → web → TSan → memcheck `test_server`（按轮次204 量出的两步法给够预算）。**TSan 存活臂这一支没跑成**：我给它的 python 补丁锚点与文件里的实际换行不符（`AssertionError: anchor 0`），脚本按「锚点不中就什么也不改」的形状安全退出，所以那一臂**没有读数**，不能写成已证 —— 它欠的内容很具体：把 worker 那次 `exchange` 换回「直接写 `current_hint_`」，TSan 必须读出 races>0 并点名这两个字段，否则「races=0」在这棵树上只是仪器没说话。**缺口写在这里，下一轮第一件事是把它补上**（锚点按当前文件重取，别再凭记忆写）。
+**门禁**：撤锁后的树 TSan `test_server clean races=0 deadlocks=0 thread_leaks=0 rc=0 62s`、套件 56 条 rc=0、强制全量重建 356 单元 0 warning、ctest -j1 rc=0 958 s、anchor 150/150 ok + 122 引用 0 problems、web 113/113 —— 但**链子末尾那一条 memcheck 把它判红了**：`test_server VALGRIND ERRORS reports=62 invalid_read=0 invalid_write=0 uninitialised=0 definite_leak=6 1562s`（rc=1，`/tmp/r205/gates.log`）。
+
+**这一臂抓到的是本轮自己造的缺陷**（六块、每块 24 字节 = 一份 `HintConclusion`）：机制（一次原子发布 + 属主取用）没错，**缺的是取用方退出时的回收点** —— 一局打完之后再没有下一次 arm，那份发布永远没人 adopt。轮次199 的 memcheck `test_server` 是 clean 的，所以这不是旧账，是 #113 撤 `thinking_mutex_` 时带进来的；修在轮次206（析构里把两个槽收干净）。
+
+**顺带改正本节上面的一处措辞**：「仪器量到该获取点恒有两根线程」字面成立（每一手思考都是*新的一根*线程），但轮次206 的 TSan 存活臂把那一处改回「直接写共享字段」之后**仍然读 races=0** ⇒ 那些线程从不同时在场，「races=0」不是「撤锁安全」的证据。真正的证据是**取用点都在 join 之后**这条顺序纪律，而它今天只有注释与用例形状守着 —— 记作 #114 第一格：在 `take_hint` / `adopt_published_hint` 上断言 `!anything_in_flight()`，把纪律做成机制。另记一条仪器账：本轮 stage1 的 `warnings=244` 是**我的包装脚本把整条链的日志（含 TSan 建表那一段的 `-Wtsan` 库内警告）当成 stage1 的计数**，按段重数之后 release 全量重建是 356 编译单元 **0 warning**。）
 
 **还剩的账（#113 继续）**：树上还有 `games_mutex_`（20 处，轮次199 已做成属主登记型）、`end_frame_mutex_`（4 处）、`SearchController::result_mutex_`（2 处）、`OpeningBook::rng_mutex_`（1 处）、进程级 TT 的 16 个分片锁（只在 `shared_` 时拿，是吞吐的守护者，轮次134/J 量到融合表要 72-bit 键 ⇒ 预期判「保留并给读数」）。七把里现在剩六把，本轮的方法留下来可复用：**要撤一把锁，先给它的每个获取点记一根线程的账**。
 
