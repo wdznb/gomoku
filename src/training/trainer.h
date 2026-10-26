@@ -131,6 +131,25 @@ struct TrainingConfig {
     std::string checkpoint_path;
 };
 
+// 轮次203 #110：一场验证赛的**逐场台账**。存在的理由就是聚合量盖不住的那类矛盾：
+// 188 那批 190 轮里 **180 轮只报「6 games」**（请求是 8，SPRT 在一对边界上提前收口，
+// `trainer.cpp` 的 `test.end_pair()` / `stop_requested()` 那两句），而分数一律读
+// 1.000000 —— 从那一行看不出这 6 场是哪 6 场、候选两侧各赢几场、有没有 INVALID 被剔出
+// 分母、停在第几对，而核对「内部尺 1.000 对 外部赛具 0.500」要的就是这些。
+// 被丢弃的场**也在台账里**（`valid=false`），否则「剔了几场」只能由分母反推。
+// 这条路径是单线程的（`score_match` 自己按对跑），容器按值随 `MatchOutcome` 返回，
+// 不需要新的锁，也不需要队列。
+struct VerificationGame {
+    int pair_index = 0;    // 第几对（0 起）；一对的两场共用同一个开局
+    int seat = 0;          // 候选坐哪一侧：1 = 这一场候选执黑，2 = 候选执白
+    double score = 0.0;    // 候选侧的分；`valid=false` 的场恒 0 且不在分母里
+    bool valid = false;    // false = SelfPlay 交回 `GameEndReason::INVALID`
+    int plies = 0;         // 这一场落了几子（含开局那几手）
+    int winner = EMPTY;    // 胜者的颜色（EMPTY = 未分胜负/被丢弃）
+    std::string reason;    // `GameRecord::reason_name()` 的原样取值：five / forbidden /
+                           // resign / board_full / move_limit / invalid
+};
+
 struct TrainerRound {
     int round = 0;
     // 丁-3：一轮的双方各是一对系数（`CoefficientPair`），不是一套。两侧同值时
@@ -147,6 +166,9 @@ struct TrainerRound {
     SprtVerdict verification_verdict = SprtVerdict::OPEN;
     double verification_llr = 0.0;
     int verification_match_games = 0;
+    // #110：上面那四个数的出处。条数恒为偶数（一对两场一起记，早停也不留半对），
+    // 其中 `valid` 那几条的条数就是 `verification_match_games`。
+    std::vector<VerificationGame> verification_games;
     bool accepted = false;
     int games_played = 0;
     int samples_collected = 0;
@@ -157,12 +179,15 @@ struct TrainerRound {
 // One match's answer. `score` is what the optimisers rank candidates on and what
 // the Elo table books; the three fields after it are the sequential test's own
 // reading of the same games, kept so a round can show *why* a candidate was
-// promoted instead of only the fraction that cleared the bar.
+// promoted instead of only the fraction that cleared the bar. `game_log` 是同一场
+// 比赛的逐场台账，口径见上面 `VerificationGame`（#110）：与那四个聚合量同源、由同一次
+// `score_match` 填，被丢弃的场也在里面。
 struct MatchOutcome {
     double score = 0.0;
     int games = 0;
     SprtVerdict verdict = SprtVerdict::OPEN;
     double llr = 0.0;
+    std::vector<VerificationGame> game_log;
 };
 
 // 3.6 training main loop: optimise coefficients, prove the result over the table
@@ -244,7 +269,7 @@ private:
     // Both games of a pair get the same `opening`, once with each colour.
     double play_game(SearchEngine& black, SearchEngine& white, int black_owner,
                      const std::vector<Move>& opening, bool* played = nullptr,
-                     double margin_weight = 0.0);
+                     double margin_weight = 0.0, VerificationGame* out = nullptr);
     SearchEngine& prepare(SearchEngine& engine) const;
     int generate_data_games(int games, int threads);
 

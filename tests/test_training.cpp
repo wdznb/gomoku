@@ -475,7 +475,7 @@ void test_elo_system() {
 
 // Round 101 FF1: the bracket behind the rating table disagreed with the promotion
 // rule it sits next to. README:198 makes a verification match 8 games, so a 5-3
-// candidate scores 0.625, which trainer.cpp:564-566 promotes (>= the 0.56 bar, open match)
+// candidate scores 0.625, which trainer.cpp:588-590 promotes (>= the 0.56 bar, open match)
 // while the old `>= 0.75 / <= 0.25` test booked *both* sides a draw - the table
 // printed a match somebody had clearly taken as nobody winning. The bracket now
 // follows what a match score means: above half is a win, below half a loss, exactly
@@ -2171,7 +2171,7 @@ void test_data_game_ids_unique_across_batches() {
 }
 
 // Round 112 PP1: the id a data game got used to be games_played_ + 1 + t * 1000, i.e. a
-// fixed offset off a counter every round advances (trainer.cpp:89 and :457 add each
+// fixed offset off a counter every round advances (trainer.cpp:98 and :619 add each
 // merged record, plus the fitness and verification games). A long run therefore
 // re-reaches the offset legitimately: on the round where games_played_ is 1000, worker
 // 0's base is exactly the base worker 1 used on the games_played_ = 0 round, so two
@@ -3471,7 +3471,7 @@ void test_trainer_refuses_an_empty_flag_value() {
 // Round 99 DD6, labelled as what it is: a help-text assert. Only the usage
 // entries for --stagnation and --hill-iterations were rewritten, and the two
 // claims they now make are the code's existing behaviour - the 3x probe budget is
-// trainer.cpp:513 and the N+1 ceiling is hill_climbing.cpp skipping a step whose
+// trainer.cpp:536 and the N+1 ceiling is hill_climbing.cpp skipping a step whose
 // neighbour is identical. No call path changes, so there is nothing else to pin.
 void test_trainer_help_states_the_probe_budget() {
 #ifndef _WIN32
@@ -3573,7 +3573,7 @@ void test_server_refuses_no_sessions_with_a_stated_path() {
 }
 
 // Round 101 FF2: `--resume CK --seed N` used to start, parse N, and then let the
-// resume overwrite it (trainer.cpp:784 assigns the seed the checkpoint recorded, and
+// resume overwrite it (trainer.cpp:819 assigns the seed the checkpoint recorded, and
 // trainer.cpp:642 always writes one), so the reproducibility the caller asked for was
 // not the run that actually happened. The parser now refuses the pair, the same class
 // as the --params/--resume contradiction it sits next to.
@@ -8362,6 +8362,97 @@ void test_hill_climbing_reports_every_evaluation() {
     std::cout << "test_hill_climbing_reports_every_evaluation passed" << std::endl;
 }
 
+// #110 的读者：一场验证赛的**逐场台账**要能自己复算出那四个聚合量。
+// 先量的（轮次203；读数与命令在 REVIEW_LOG 同轮小节）：188 那批 190 轮的 verification 行里
+// **180 行只报「6 games」**（请求是 8 —— SPRT 在一对边界上提前收口），分数一律 1.000000。
+// 那一行说不出这 6 场是哪 6 场、几场 INVALID 被剔出分母、候选在两侧各赢几场，而
+// 「内部尺读 1.000 对 外部赛具给同一冠军定价 0.500」这类矛盾只有逐场核对才裁得动。
+// 变异口径：MUT-A 把两处 `if (valid) test.add_game(...)` 改成无条件 ⇒ 红在②（分母）；
+// MUT-B 删掉两处 `game_log.push_back` ⇒ 红在①（条数）；MUT-C 摘掉 `out->score = result`
+// （逐场分停在 0）⇒ 红在③（复算）；MUT-D 把 `seat` 恒写 1 ⇒ 红在④（每对一黑一白）；
+// MUT-E 把早停的 `break` 挪到一对的第一场之后 ⇒ 红在①（不留半对）。
+void test_verification_match_keeps_a_per_game_ledger() {
+    TrainingConfig config = fast_training_config();
+    config.verification_games = 4;  // 两对，够把「一对两场、两侧各一遍」的形状钉出来
+    Trainer trainer(ThreatCoefficients(), config);
+
+    // 同版对局：一台引擎打它自己（#102 的那档中性）。这里要的是它的**逐场形状**，
+    // 不是它的分数 —— 分数那一半由轮次189 那条用例钉着。
+    const MatchOutcome copy =
+        trainer.score_match(CoefficientPair(), CoefficientPair(), config.verification_games);
+
+    // ①条数 = 2 × 对数：一对的两场一起进台账，早停也不许只记半对。
+    assert(copy.game_log.size() == static_cast<size_t>(config.verification_games));
+
+    // ②分母：`games` 是**有效场**的条数，台账里还带着被丢弃的那些。
+    int valid_rows = 0;
+    double valid_sum = 0.0;
+    for (const VerificationGame& game : copy.game_log) {
+        if (game.valid) {
+            ++valid_rows;
+            valid_sum += game.score;
+        } else {
+            assert(game.score == 0.0);  // 丢弃的场既不进分母、也不带分
+        }
+    }
+    assert(valid_rows == copy.games);
+
+    // ③复算：日志那一个分数就是台账里那些分的平均（缺省这档一场都没被丢，所以台账=分母）。
+    assert(copy.games == static_cast<int>(copy.game_log.size()));
+    assert(std::abs(valid_sum / static_cast<double>(copy.games) - copy.score) < 1e-12);
+
+    // ④每对恰是一场候选执黑、一场候选执白，且两侧同开局 ⇒ 同版对局的每对两场之和恒 1.0。
+    //   `seat` 写反、或分数记成「坐 1 号位那侧」而不是「候选侧」，这一条当场红。
+    for (size_t i = 0; i < copy.game_log.size(); i += 2) {
+        const VerificationGame& first = copy.game_log[i];
+        const VerificationGame& second = copy.game_log[i + 1];
+        assert(first.seat == 1);
+        assert(second.seat == 2);
+        assert(first.pair_index == second.pair_index);
+        assert(first.pair_index == static_cast<int>(i / 2));
+        assert(first.valid && second.valid);  // 这一档没有 INVALID 场；前提写成观察
+        assert(std::abs(first.score + second.score - 1.0) < 1e-12);
+        assert(!first.reason.empty());
+        assert(first.plies > 0 && second.plies > 0);
+    }
+
+    // ⑤注入的目标不下棋 ⇒ 台账必须是空的（`score_match` 那条早退不许留下半条场）。
+    TrainingConfig injected = fast_training_config();
+    Trainer proxy(ThreatCoefficients(), injected);
+    proxy.set_fitness_override([](const CoefficientPair&) { return 0.25; });
+    const MatchOutcome injected_outcome =
+        proxy.score_match(CoefficientPair(), CoefficientPair(), injected.verification_games);
+    assert(injected_outcome.game_log.empty());
+
+    // ⑥落盘处：聚合行之后逐场各一行，条数与台账一致，且每行带着它自己那场的分。
+    std::vector<std::string> lines;
+    TrainingConfig logged = fast_training_config();
+    logged.hill_climbing_iterations = 4;  // 这一段的成本在优化器那一侧，钉日志不需要它跑满
+    Trainer announcing(ThreatCoefficients(), logged);
+    announcing.set_log_callback(
+        [&lines](const std::string& line) { lines.push_back(line); });
+    const TrainerRound round = announcing.run_round();
+    assert(static_cast<int>(round.verification_games.size()) == round.verification_match_games);
+    int printed = 0;
+    for (const std::string& line : lines) {
+        if (line.find(": verif pair ") == std::string::npos) continue;
+        ++printed;
+        assert(line.find("score ") != std::string::npos);
+        assert(line.find(" valid ") != std::string::npos);
+        assert(line.find(" plies ") != std::string::npos);
+        assert(line.find(" reason ") != std::string::npos);
+    }
+    assert(printed == static_cast<int>(round.verification_games.size()));
+    // 聚合行仍然逐字在原位（这一轮只是往它后面追加行，没有改它）。
+    bool aggregate_line = false;
+    for (const std::string& line : lines) {
+        if (line.find(": verification score ") != std::string::npos) aggregate_line = true;
+    }
+    assert(aggregate_line);
+
+    std::cout << "test_verification_match_keeps_a_per_game_ledger passed" << std::endl;
+}
+
 int main() {
     std::cout << "Running training tests..." << std::endl;
 
@@ -8385,6 +8476,7 @@ int main() {
     test_augmented_samples_match_manual_transforms();
     test_hill_climbing();
     test_hill_climbing_reports_every_evaluation();
+    test_verification_match_keeps_a_per_game_ledger();
     test_genetic();
     test_genetic_seed_covers_the_whole_box();
     test_hill_climbing_empty_steps();

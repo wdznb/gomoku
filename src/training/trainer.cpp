@@ -67,7 +67,7 @@ SearchEngine& Trainer::prepare(SearchEngine& engine) const {
 
 double Trainer::play_game(SearchEngine& black, SearchEngine& white, int black_owner,
                           const std::vector<Move>& opening, bool* played,
-                          double margin_weight) {
+                          double margin_weight, VerificationGame* out) {
     SelfPlayConfig settings;
     settings.max_depth = config_.search_depth;
     settings.timeout_ms = config_.timeout_ms;
@@ -84,25 +84,36 @@ double Trainer::play_game(SearchEngine& black, SearchEngine& white, int black_ow
     GameRecord record = play.run(opening, nullptr, nullptr);
     const bool valid = record.reason != GameEndReason::INVALID;
     if (played) *played = valid;
+    // 逐场台账在**任何返回之前**填好，包括被丢弃那一条：`pair_index / seat / score`
+    // 是调用方（`score_match`）才有的信息，这里只交回这一场自己的事实。
+    if (out) {
+        out->valid = valid;
+        out->plies = static_cast<int>(record.moves.size());
+        out->winner = record.winner;
+        out->reason = record.reason_name();
+        out->score = 0.0;  // 覆盖调用方写进去的分，只在下面正常路径上再赋值
+    }
     // Same yardstick as the data side: an INVALID game is discarded, so it
     // must not inflate games_played_ in the checkpoint or the progress line.
     if (valid) { games_played_++; note_opening_game(record, opening); }
     if (!valid) return 0.0;
 
+    double result;
     if (record.winner == EMPTY) {
         // Unfinished games score half: they must not hand either side a result
         // the board does not show.
-        return 0.5;
+        result = 0.5;
+    } else {
+        const int winner_owner = record.winner == BLACK ? black_owner : 3 - black_owner;
+        const double binary = winner_owner == 1 ? 1.0 : 0.0;
+        result = margin_weight <= 0.0
+                     // 默认形状：胜负对原样返回。这一句早退是「w = 0 与今天逐字节一致」那条
+                     // 要求（指导书 §4 丁-1 实现思路 3）的执行处，不是省几行浮点。
+                     ? binary
+                     : blend_fitness(binary, game_margin(record, settings.max_moves), margin_weight);
     }
-    const int winner_owner = record.winner == BLACK ? black_owner : 3 - black_owner;
-    const double binary = winner_owner == 1 ? 1.0 : 0.0;
-    if (margin_weight <= 0.0) {
-        // 默认形状：胜负对原样返回。这一句早退是「w = 0 与今天逐字节一致」那条
-        // 要求（指导书 §4 丁-1 实现思路 3）的执行处，不是省几行浮点。
-        return binary;
-    }
-    const double margin = game_margin(record, settings.max_moves);
-    return blend_fitness(binary, margin, margin_weight);
+    if (out) out->score = result;
+    return result;
 }
 
 double Trainer::blend_fitness(double binary, double margin, double weight) {
@@ -228,16 +239,28 @@ MatchOutcome Trainer::score_match(const CoefficientPair& candidate,
         // (design doc 2.8 #4).
         const std::vector<Move> opening = match_opening_for(rounds_completed_ + i);
         bool valid = false;
+        VerificationGame first_row;
+        first_row.pair_index = i;
+        first_row.seat = 1;  // 这一场候选执黑（`black_owner` 就是 1）
         const double first =
-            play_game(candidate_engine, reference_engine, 1, opening, &valid, margin_weight);
+            play_game(candidate_engine, reference_engine, 1, opening, &valid, margin_weight,
+                      &first_row);
+        first_row.score = first;
+        outcome.game_log.push_back(first_row);
         if (valid) {
             score += first;
             ++played_games;
             test.add_game(first);
         }
         valid = false;
+        VerificationGame second_row;
+        second_row.pair_index = i;
+        second_row.seat = 2;  // 同一开局换边：这一场候选执白
         const double second =
-            play_game(reference_engine, candidate_engine, 2, opening, &valid, margin_weight);
+            play_game(reference_engine, candidate_engine, 2, opening, &valid, margin_weight,
+                      &second_row);
+        second_row.score = second;
+        outcome.game_log.push_back(second_row);
         if (valid) {
             score += second;
             ++played_games;
@@ -555,6 +578,7 @@ TrainerRound Trainer::run_round() {
     result.verification_verdict = check.verdict;
     result.verification_llr = check.llr;
     result.verification_match_games = check.games;
+    result.verification_games = check.game_log;
     // The test's answer is the promotion rule whenever it has one: an ACCEPT is
     // the same evidence the score bar was going to ask for, reached in fewer
     // games, and a REJECT says the record is worse than the fraction it averaged
@@ -601,6 +625,17 @@ TrainerRound Trainer::run_round() {
              std::to_string(result.verification_match_games) + " games) -> " +
              (result.accepted ? "promoted" : "kept champion") + ", champion elo " +
              std::to_string(result.champion_elo));
+        // #110：聚合行之后逐场各一行。上面那行今天能说「6 games、score 1.000000」，
+        // 说不出的是这 6 场里候选两侧各赢几场、有没有 INVALID 被剔出分母、SPRT 停在
+        // 第几对 —— 而那正是核对内部尺与外部赛具读数（0.500 对 1.000）唯一能核的东西。
+        // 被丢弃的场也印（valid=0），一条场都不许只留在分母里。
+        for (const VerificationGame& game : result.verification_games) {
+            log_("round " + std::to_string(result.round) + ": verif pair " +
+                 std::to_string(game.pair_index) + " seat " + (game.seat == 1 ? "black" : "white") +
+                 " score " + std::to_string(game.score) + " valid " +
+                 std::to_string(game.valid ? 1 : 0) + " plies " + std::to_string(game.plies) +
+                 " reason " + game.reason);
+        }
     }
 
     if (!config_.checkpoint_path.empty()) {

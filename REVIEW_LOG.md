@@ -1984,7 +1984,48 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
-## 轮次202 按色别的复盘阈值：量完判**不落地** —— 分色能动的池子只有 ≤0.3 pt，而且符号在两批语料之间翻面；段 A 的按色别报表入库当仪器
+## 轮次203 #104 后半：验证赛的逐场结果有了落盘处 —— 台账能自己复算出那四个聚合量，四支变异臂各断一段，一支量出「死赋值」
+
+**先量的**（都是已提交的日志，命令在末行）：188 那批 `--verification-games 8` 的 190 轮里 **180 轮的验证行只报「6 games」**、10 轮报 8 —— SPRT 在一对边界上收口（`trainer.cpp:273` 的 `test.end_pair()` 与 `:274` 的 `if (test.stop_requested()) break;`）；分数分布 `1.000000 ×180、0.625 ×6、0.5 ×3、0.6875 ×1`。195 那 24 轮全 8 场、全 `0.500000`（#102 修平后的空盘平台）。**那一行日志交不出的东西正好是要核对的东西**：这 6 场是哪 6 场、候选两侧各赢几场、有没有 INVALID 被剔出分母、停在第几对 —— 而「内部尺读 1.000 对 外部赛具给同一冠军定价 0.500」这类矛盾只有逐场才裁得动。
+
+**落实**（`src/training/trainer.h` + `trainer.cpp`，单线程路径，按值返回，没有新锁也没有队列）：
+- 新类型 `VerificationGame{pair_index, seat, score, valid, plies, winner, reason}`，`reason` 直接取 `GameRecord::reason_name()`，不再造一份映射；`MatchOutcome::game_log` 与 `TrainerRound::verification_games` 各带一份。
+- `play_game` 的出参多一个可选 `VerificationGame*`（`trainer.h:245-247` 的签名，缺省 `nullptr` ⇒ 数据侧与既有调用一字不改），**在任何返回之前**填好，包括被丢弃那一条。
+- `score_match` 每一场各 `push_back` 一条（一对两场一起记），聚合出口与分母算法**逐字没动**。
+- 落盘处：`round R: verification score …` 那条聚合行之后，逐场各一行 `round R: verif pair P seat black|white score X valid 0|1 plies N reason=…`。聚合行的文字一个字节没改（有断言守着）。
+
+**真跑的一条**（`--rounds 1 --verification-games 4 --depth 4 --max-nodes 500 --timeout-ms 300 --max-moves 20 --data-games 4 --seed 7`）：
+
+```
+round 1: verification score 0.625000 (sprt open, llr -0.472508, 4 games) -> promoted
+round 1: verif pair 0 seat black score 0.500000 valid 1 plies 20 reason move_limit
+round 1: verif pair 0 seat white score 1.000000 valid 1 plies 16 reason resign
+round 1: verif pair 1 seat black score 0.500000 valid 1 plies 20 reason move_limit
+round 1: verif pair 1 seat white score 0.500000 valid 1 plies 20 reason move_limit
+```
+
+0.625 = (0.5 + 1.0 + 0.5 + 0.5) / 4 —— 聚合行第一次能由它自己下面那四行复算出来；而且看得见了：这一轮的「优势」全部来自候选**执白那一场认输赢的**，执黑三场全是手数的和棋。
+
+**用例** `test_verification_match_keeps_a_per_game_ledger`（`tests/test_training.cpp:8374` 起，六段）：①条数 = 2 × 对数；②分母 = 台账里 `valid` 的条数（丢弃的场也在台账里且 `score==0`）；③复算 = 有效场的分平均恰等于 `score`；④每对恰一场 `seat==1`、一场 `seat==2`、`pair_index` 与序号对上、两侧分数之和恒 1.0（同版自打 ⇒ 镜像），`reason` 非空、`plies > 0`；⑤`set_fitness_override` 那条早退 ⇒ 台账必须空；⑥逐场行的条数与台账一致、每行带 `score/valid/plies/reason` 四个字段，且聚合行仍在原位。
+
+**变异台**（`/tmp/r203/arms.log`，每支都从快照重建再 `cp` 还原，不用 `git checkout`）：
+
+| 臂 | 改的地方 | 结果 |
+|---|---|---|
+| MUT-B | 删掉两处 `game_log.push_back` | 红在 ①（`copy.game_log.size()`，`:8385`） |
+| MUT-D | `second_row.seat` 恒写 1 | 红在 ④（`second.seat == 2`，`:8410`） |
+| MUT-E | 逐场行的循环改成 `if (false)` | 红在 ⑥（`printed == size`，`:8445`） |
+| MUT-C | 摘掉 `play_game` 里的 `out->score = result` | **rc=0，全套绿**（编译确认 `trainer.cpp` 重编过 1 次，墙钟 118 s 跑完 250 条用例） |
+
+MUT-C 这一支不是「断言没牙」，是**那一行本来就是死赋值**：真正写分的是 `score_match` 里的 `first_row.score = first;` / `second_row.score = second;`，`play_game` 那份被调用方覆盖。⇒ 记两条：`play_game` 那两行 `out->score` 是 #87 同族的死代码（删它要连 `trainer.cpp` 的指认一起重算，与 #86 同批最省）；③/④ 的读者要另做一支改 `first_row.score`（**本轮没做，写在缺口里**）。
+另一条缺口照记：**被丢弃那半没有可达夹具** —— `SelfPlay::run` 只对非法前缀报 `INVALID`，而验证局是引擎自己从空盘下的，所以 MUT-A（把 `if (valid)` 改成无条件入账）在这台机器上打不红，②的丢弃分支只有 `else assert(game.score == 0.0)` 这一个读者（与轮次198 的 MUT-D 同形）。
+
+**门禁**：强制全量重建 **356 编译单元 0 warning 165 s** → `ctest -j1` **rc=0、952 s** → `readme_anchor_check` **150 条源码指认 150/150 ok、122 条 README 引用 0 problems** → `web_frontend_check` **113/113** → 终树再把 `test_training` 重编重跑：新用例 `passed`、`All training tests passed`。**指认重算是这一轮的账**：`trainer.cpp` 被插进 4 段共 +31 行，逐条按内容重算并改回 —— `IMPLEMENTATION_GUIDE.md:344` 的 `126-178 → 137-189` 与 `:108-112 → :119-123`、`:421` 的 `186-260 → 197-282`、`:461` 的 `268 → 291`、`:511` 的 `312-478 → 335-502`、`:384` 的 `388 → 411`、`:418` 的 `645-648 → 681-684`、`ENGINE_REDESIGN_V2.md:388` 的 `343 → 366`、`test_training.cpp` 的 `564-566 → 588-590`、`784 → 819`、`89 和 457 → 98 和 619`、`513 → 536`（指导书行数不变）。**没跑的臂与门禁**：链子在 stage2 anchor 处 `rc=1` 中止（那两条 PROBLEM 就是上面这些平移），指认修好后补跑的是 anchor、web 与 `test_training` 单体，**memcheck `test_training` 欠一遍**（它原生 ~150 s、memcheck 档按轮次194 的口径要给到 ≥1500 s，本轮预算没够）；`--fitness-margin-weight` 那条 w>0 的路径本轮没量（逐场台账与它同源，`score` 会是连续值，④的「每对和为 1.0」在那一档不成立，用例走的是缺省 w=0）。
+**复现命令**：`grep -o ', [0-9]* games)' /tmp/r188/batch.log | sort | uniq -c`、`/tmp/r203/arms.log`、`./build/gomoku_train --rounds 1 --verification-games 4 --depth 4 --max-nodes 500 --timeout-ms 300 --max-moves 20 --data-games 4 --seed 7 | grep verif`。
+
+---
+
+## 轮次202 按色别的复盘阈值：量完判不落地 —— 分色能动的池子只有 ≤0.3 pt，而且符号在两批语料之间翻面；段 A 的按色别报表入库当仪器
 
 这一格在 D 段只留了一句「按色别的复盘阈值：未做」，**没有写要分哪几个阈值、各分成多少**。所以本轮不动产品代码，先按纪律量：给 `tools/analyze_main.cpp` 的段 A 加一块按落子颜色分开的报表，跑在这台机器上现成的 records 上，读完了再判值不值得长出第二个阈值。
 
@@ -11967,6 +12008,6 @@ while the numeric family is `0` on both trees (identical message). The tester's 
 
 - **`#106` io 线程整盘拷贝 vs AI 提交写盘 —— 轮次193 已落地**：worker 不再写 `board_`；结论经「一次原子 `exchange` + 一次 post」回属主线程，提交段（落子、回调、结算、标志交回）整段在 `apply_search_result()` / `commit_pending()` 里跑。带 `GOMOKU_R190_MEASURE=1` 的 TSan：改前 **7 条**、改后 **clean**；#178 的吞子窗口与 #81 的 `PendingMove` 表随之删除。仍欠：旧形状下新用例 `test_the_reply_after_ai_move_is_never_swallowed` 会不会红没有量（那条 4/3326 的仪器不在树里）；`exchange` / `delete parked` 这半边进程内不可分别观测（M4a 未杀），看门人是 memcheck。
 
-- **`#104` 适配评估的逐次分数没有读数口**：`hill climbing ran N iterations, M evaluations, best fitness X` 只报最好那一次；24 次评估各自的分数、平局率、候选是否 ≡ 冠军，日志与 checkpoint 都没有（checkpoint 实测键 = `best_version/elo/games_played/rounds_completed/samples_collected/seed/versions`）⇒ 想判「内部选点有没有牙」只能靠版本比对这种外围办法。欠一个便宜的读数口（每评估一行 `fitness` + 是否复制体）。〔轮次189 又走了一次外围办法才拿到判据：把 checkpoint 里 `versions[]` 的规范化 JSON 串与日志里 `verification score … -> promoted/kept` 那几列正则拼起来重放晋级史，才得出「183 轮复制体 / 其中 179 轮读 1.000000」这张表（8 行 node 脚本，产品里没有这个读数，也没有留任何仪器）。顺带一条同源的没解释读数：修后那三轮都是 `kept champion`，而 `champion elo` 仍逐轮在动（1516.000 → 1515.264 → 1514.561）；验证局的逐场胜负与和棋**落不进任何地方**（records 只收数据局，见 A 段第 20 条），所以连「这一轮的 0.5 是 4 胜 4 负还是四场和棋」都读不出来 —— 分为什么掉更没有解释。这条也在 #104 的欠口里。〕
+- **`#104` 适配评估的逐次分数没有读数口**：`hill climbing ran N iterations, M evaluations, best fitness X` 只报最好那一次；24 次评估各自的分数、平局率、候选是否 ≡ 冠军，日志与 checkpoint 都没有（checkpoint 实测键 = `best_version/elo/games_played/rounds_completed/samples_collected/seed/versions`）⇒ 想判「内部选点有没有牙」只能靠版本比对这种外围办法。欠一个便宜的读数口（每评估一行 `fitness` + 是否复制体）。〔轮次189 又走了一次外围办法才拿到判据：把 checkpoint 里 `versions[]` 的规范化 JSON 串与日志里 `verification score … -> promoted/kept` 那几列正则拼起来重放晋级史，才得出「183 轮复制体 / 其中 179 轮读 1.000000」这张表（8 行 node 脚本，产品里没有这个读数，也没有留任何仪器）。顺带一条同源的没解释读数：修后那三轮都是 `kept champion`，而 `champion elo` 仍逐轮在动（1516.000 → 1515.264 → 1514.561）；验证局的逐场胜负与和棋**落不进任何地方**（records 只收数据局，见 A 段第 20 条），所以连「这一轮的 0.5 是 4 胜 4 负还是四场和棋」都读不出来 —— 分为什么掉更没有解释。这条也在 #104 的欠口里。〕〔**203 后半关闭**：验证赛的逐场结果有了落盘处 —— `VerificationGame` 台账随 `MatchOutcome::game_log` / `TrainerRound::verification_games` 返回，聚合行之后逐场各一行（pair / seat / score / valid / plies / reason），「这一轮的 0.5 是 4 胜 4 负还是四场和棋」从此读得出来；每对两场之和恒 1.0 由用例④钉住。仍欠的两格写在轮次203：`play_game` 里那两行 `out->score` 是变异台量出来的死赋值（#87 同族，与 #86 同批删最省）、以及「丢弃场」那一支没有可达夹具 ⇒ ②的 invalid 分支只有一个读者。memcheck 欠一遍。〕
 - **`#107` `is_〔**201 已关闭**：`HillClimbingOptimizer` 加 `EvaluationRecord` + `set_evaluation_observer()`，`run()` 每评一条（含起步那评，标 `champion-itself`）；`Trainer` 把它写成 `round R: eval k fitness X accepted|kept`。新用例 `test_hill_climbing_reports_every_evaluation`（`tests/test_training.cpp:8285`）五段把这份读数钉成可信的：行数 == `evaluations()`、步号连续、`accepted` 可独立复算、早退那一支不漏发；四臂 `MUT-1..4` 各红在 `:8302`/`:8346`/`:8318`/`:8306`。真跑一局的 7 行 eval 与「7 evaluations, best fitness 0.750000」逐字对得上（`/tmp/r201_train.log`）。验证局的逐场胜负仍未落进任何地方 —— 那是 #104 里另一件没做的事（这条欠口在轮次189 那段），本轮只交了**适配评估**这一半。〕decisive()` 两半都没有单独断言 —— 轮次192 关闭（两条无条件断言 + 一次枚举进树）**：`src/training/game_record.h:64-67` 是 `winner != EMPTY && reason != MOVE_LIMIT && reason != INVALID` 三个条件两半。191 只记了 winner 那一半，并且以为 reason 半由 `tests/test_training.cpp:608-611` 那条 `if` 钉着。192 在**新用例进树之前**用四条臂量（各重编 7 个编译单元、跑整套 `test_training`）：删掉 winner 项 ⇒ **绿**、删掉两项 reason ⇒ **绿**、恒真 ⇒ 红在 `:610` ⇒ **两半各自都自由**；`:610` 逮不住 reason 半的原因是同一记录上一行刚断言过 `winner == EMPTY`（恒真那条会红 ⇒ 那个 `if` 的 body 本局确实执行了，「没走到截断」不是原因）。对「未完局不许进 records」这一路，两半仍是**冗余防护**（现场那份 `playing` 会话同时带着 `winner:"draw"`(EMPTY) 与 `reason:"invalid"`，见 A 段第 27 条）⇒ 191 的 HN1 仍须两半一起拆才红；两条读数不矛盾：一条说「这一路有两个挡板」，一条说「每个挡板都没有用例单独核过」。落地：`tests/test_training.cpp:8213` `test_a_decisive_record_needs_both_a_winner_and_a_replayable_ending`（注册在 `main` 末尾，+44 行 / 0 删，注册数 132 → 133），四条断言 `:8221` / `:8226` / `:8234` / `:8244` 各有臂杀死（`:8221` ← T_R3 / T_R4i，`:8226` ← T_R5i，`:8234` ← T_R1，`:8244` ← T_R6i），隔离轮与逐字恢复见轮次192 那段。
 
