@@ -4245,6 +4245,21 @@ int callback_swap_death_arm() {
 //          并且 valgrind 那一臂会把这份报成 definite leak；
 // MUT-C 把 worker 侧那次 `exchange` 换回「直接写 `current_hint_`」⇒ TSan 应当读出 race
 //          （这一支同时是无锁臂的存活证明：TSan 在缺省的树上读 races=0）。
+// 轮次206 #114：把「取用/失效只在属主线程」这句话做成机制之后，它自己的死臂。
+// 存活臂（本轮 chain 的 stage-liveness）证明 TSan 看不见那个窗口，所以能说话的不是
+// 「有没有 race」，而是「换一根线程来取用会不会当场崩」。
+int hint_adopt_death_arm(const char* which) {
+    GameManager game;
+    game.take_hint(BLACK);                      // 第一次取用 = 登记属主（这里是主线程）
+    if (std::string(which) == "=thread") {
+        std::thread other([&game] { game.discard_hint_cache(); });   // 换线程取用 ⇒ 该崩
+        other.join();
+        return 0;                               // 断言失灵才会走到这里
+    }
+    game.discard_hint_cache();                  // "=same"：同一根线程再取一次，合法
+    return 0;
+}
+
 void test_hint_conclusion_crosses_threads_through_the_slot() {
     GameManager game;
     game.discard_hint_cache();
@@ -4356,9 +4371,46 @@ void test_owner_only_section_records_one_owner_thread() {
     std::cout << "test_owner_only_section_records_one_owner_thread passed" << std::endl;
 }
 
+// #114 的读者：同一局里第一次取用登记属主；换线程取用必须死，同线程重复取用必须活。
+// 变异口径：MUT-#114 把 `discard_hint_cache` 里那句 lock_guard 摘掉 ⇒ 下面那条死臂的
+//            子进程会正常退出 0 ⇒ 这条用例红（不是挂在 join 上，父进程只看信号）。
+void test_hint_adoption_refuses_a_second_thread() {
+    GameManager quiet;
+    assert(!quiet.hint_adoption_thread_is_owner());        // 还没人取用过：没有主张可违反
+    quiet.take_hint(BLACK);
+    assert(quiet.hint_adoption_thread_is_owner());          // 第一次取用把本线程记成属主
+    quiet.discard_hint_cache();                            // 同线程重复进入：合法
+    assert(quiet.hint_adoption_thread_is_owner());
+
+    std::error_code ec;
+    const std::string path = std::filesystem::read_symlink("/proc/self/exe", ec).string();
+    assert(!ec && !path.empty());
+    for (const char* which : {"=thread", "=same"}) {
+        const pid_t child = ::fork();
+        assert(child >= 0);
+        if (child == 0) {
+            ::setenv("GOMOKU_HINT_ADOPT_DEATH_ARM", which, 1);
+            char* argv[] = {const_cast<char*>(path.c_str()), nullptr};
+            ::execv(path.c_str(), argv);
+            ::_exit(127);
+        }
+        int status = 0;
+        assert(::waitpid(child, &status, 0) == child);
+        if (std::string(which) == "=thread") {
+            assert(WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT);
+        } else {
+            assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+        }
+    }
+    std::cout << "test_hint_adoption_refuses_a_second_thread passed" << std::endl;
+}
+
 int main() {
     if (const char* arm = std::getenv("GOMOKU_OWNER_SECTION_DEATH_ARM"); arm != nullptr) {
         return owner_section_death_arm(arm);
+    }
+    if (const char* arm = std::getenv("GOMOKU_HINT_ADOPT_DEATH_ARM"); arm != nullptr) {
+        return hint_adopt_death_arm(arm);
     }
     if (const char* arm = std::getenv("GOMOKU_CALLBACK_SWAP_DEATH_ARM"); arm != nullptr) {
         return callback_swap_death_arm();
@@ -4434,6 +4486,7 @@ int main() {
     test_callback_swap_refuses_a_second_thread_and_a_flying_think();
     test_hint_conclusion_crosses_threads_through_the_slot();
     test_owner_only_section_records_one_owner_thread();
+    test_hint_adoption_refuses_a_second_thread();
 
 
     std::cout << "All server tests passed!" << std::endl;

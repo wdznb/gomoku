@@ -4,6 +4,7 @@
 #include "../core/board.h"
 #include "../core/evaluator.h"
 #include "../search/search_engine.h"
+#include "owner_checked_mutex.h"
 #include <memory>
 #include <atomic>
 #include <cassert>
@@ -297,6 +298,8 @@ private:
     };
     HintConclusion current_hint_;
     std::atomic<HintConclusion*> published_hint_{nullptr};
+    // 只登记、不阻塞：谁第一次取用/失效，谁就是这一局提示缓存的属主线程；换线程取用当场 assert。
+    OwnerOnlySection hint_adopter_;
 
     // One think's share of the above, read on the thread that spawns the worker.
     struct Reuse {
@@ -306,7 +309,14 @@ private:
     };
     // 取用之前先把别人发布的结论收进属主线程自己的那份 —— 这就是「消息队列回属主」的
     // 那一跳：worker 只管 exchange 一次，谁在属主线程上谁 adopt。
+    //
+    // 轮次206 #114：这一跳的**方向**得有读者。轮次205 的存活臂证明 TSan 看不见那个窗口
+    // （树上每一次取用都在 join 之后，两根线程从不同时在场），所以「races=0」不能当证据；
+    // 而 `anything_in_flight()` 也不是那条纪律 —— 读代码看到的：`request_hint` 在 :404 就把
+    // `hint_active_` 置真，之后 :416 才取用，用那个谓词断言会**在正常路径上当场假崩**。
+    // 能成立的那句话是「取用只在属主线程」，于是就用只登记不阻塞的那一档机制去钉它。
     void adopt_published_hint() {
+        const std::lock_guard<OwnerOnlySection> owner(hint_adopter_);
         const std::unique_ptr<HintConclusion> taken(
             published_hint_.exchange(nullptr, std::memory_order_acq_rel));
         if (taken) current_hint_ = *taken;
@@ -314,9 +324,12 @@ private:
     // 盘面被整块换掉的那几条路（悔棋 / 摆棋 / 重开 / 恢复棋谱）：属主线程自己的那份作废，
     // 顺带把还没被取用的发布也丢掉 —— 它描述的是已经不存在的局面。
     void discard_hint_cache() {
+        const std::lock_guard<OwnerOnlySection> owner(hint_adopter_);
         current_hint_ = HintConclusion{};
         delete published_hint_.exchange(nullptr, std::memory_order_acq_rel);
     }
+    bool hint_adoption_thread_is_owner() const { return hint_adopter_.current_thread_is_owner(); }
+
     Reuse take_hint(int for_color) {
         adopt_published_hint();
         if (!current_hint_.valid || current_hint_.color != for_color) return Reuse{};
