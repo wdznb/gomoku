@@ -91,7 +91,7 @@ double Trainer::play_game(SearchEngine& black, SearchEngine& white, int black_ow
         out->plies = static_cast<int>(record.moves.size());
         out->winner = record.winner;
         out->reason = record.reason_name();
-        out->score = 0.0;  // 覆盖调用方写进去的分，只在下面正常路径上再赋值
+        // `score` 故意不在这里写 —— 调用方在每次返回后覆盖它（见 `score_match`），轮次203 的 MUT-C 量到这一点。
     }
     // Same yardstick as the data side: an INVALID game is discarded, so it
     // must not inflate games_played_ in the checkpoint or the progress line.
@@ -112,7 +112,7 @@ double Trainer::play_game(SearchEngine& black, SearchEngine& white, int black_ow
                      ? binary
                      : blend_fitness(binary, game_margin(record, settings.max_moves), margin_weight);
     }
-    if (out) out->score = result;
+    // 分数由调用方写进台账：这里再写一次会被覆盖（轮次203 MUT-C：摘掉这一句全套仍然 rc=0）。
     return result;
 }
 
