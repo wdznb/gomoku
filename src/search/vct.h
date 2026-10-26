@@ -38,6 +38,16 @@ public:
     // prices VCT with. Observability only; nothing in the engine branches on it.
     int nodes_searched() const { return nodes_searched_; }
 
+    // #89 的观察面：上一次 search() 里「对面此刻已经攥着成五点」这条判据（#84 立的规矩）
+    // 拒掉了几条候选，按那三个调用点分开数：search() 的根扫描、vct_defend、vct_attack。
+    // 根扫描那一处的行为早有结论级用例钉着；递归两处实测只动工作量、不动 result 与 best_move
+    //（轮次197 的配对台 1496 格里 610 格节点数不同、结论分岔 0；批次、帽与口径的账记在
+    // REVIEW_LOG 与 tests/test_search.cpp 那条用例的头上），所以「这一局到底走到过递归层没有」
+    // 除了这三个计数没有别的读者 —— 用例钉的就是它们：哪一处改成永假，对应那个计数就归 0。
+    int root_rejections() const { return root_rejections_; }
+    int defend_rejections() const { return defend_rejections_; }
+    int attack_rejections() const { return attack_rejections_; }
+
     // Optional absolute wall-clock deadline. VCT otherwise bounds work only by
     // node_limit_, so it can overrun the caller's timeout_ms by seconds; the
     // search engine sets this once so VCT/VCF/AlphaBeta share a single budget.
@@ -51,6 +61,9 @@ private:
     TranspositionTable& tt_;
     int node_limit_;
     int nodes_searched_;
+    int root_rejections_ = 0;
+    int defend_rejections_ = 0;
+    int attack_rejections_ = 0;
     std::chrono::steady_clock::time_point deadline_{};
     bool has_deadline_ = false;
 

@@ -154,6 +154,7 @@ int VCTSearch::vct_defend(Board& board, int color, int depth, int alpha, int bet
         // #84：见 search() 里那条同形的判断 —— 这一层也只看「挡我」的点，不看对面此刻能不能
         // 直接把五做成。丢掉这条候选，不是丢掉整个节点（别的候选可能先把那个点填上）。
         if (defender_can_make_five(board, color)) {
+            ++defend_rejections_;
             board.undo_last_move();
             continue;
         }
@@ -260,6 +261,7 @@ int VCTSearch::vct_attack(Board& board, int color, int depth, int alpha, int bet
 
         // #84：同 search()/vct_defend 那条 —— 对面此刻就能把五做成，这条候选不是胜着。
         if (defender_can_make_five(board, color)) {
+            ++attack_rejections_;
             board.undo_last_move();
             continue;
         }
@@ -343,6 +345,9 @@ VCTMove VCTSearch::search(const Board& board, int color, int max_depth,
                            std::atomic<bool>& stop_flag) {
     VCTMove result;
     nodes_searched_ = 0;
+    root_rejections_ = 0;
+    defend_rejections_ = 0;
+    attack_rejections_ = 0;
 
     Board mutable_board = board;
 
@@ -371,6 +376,7 @@ VCTMove VCTSearch::search(const Board& board, int color, int max_depth,
         // #84：这一手没把对面的成五点填掉，就不是胜着 —— 它不必来挡，先落那一子棋就结束了。
         // 下面三条威胁分支和那条防守循环都只算「挡我这条威胁」的点，看不出这一层。
         if (defender_can_make_five(mutable_board, color)) {
+            ++root_rejections_;
             mutable_board.undo_last_move();
             continue;
         }

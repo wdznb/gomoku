@@ -9525,6 +9525,71 @@ void test_vct_root_threat_loses_the_race_when_the_defender_holds_a_five() {
               << std::endl;
 }
 
+// #89：#84 那条判据在递归的两处（vct_defend / vct_attack）也各有一份，可它们从来没有断言读者。
+// 先量再钉（轮次197 的配对台：同一棵树、同一张新表，只把其中一处的判断改成永假）：
+//   ① tools/match_openings.jsonl 全部 209 条 × 深度 6/8/10/12 = 836 格；
+//   ② 随机中局 120 个（seed 7）× 深度 4/6/8 = 360 格，帽 6 万；
+//   ③ 随机中局 40 个（seed 11）× 深度 4/6 = 120 格，帽 100 万，其中 30 格仍撞帽、90 格跑完；
+//   ④ 下面这条真线的 36 个前缀 × 深度 3..7 = 180 格，帽 20 万。
+// 合起来 1496 格：result 与 best_move 一格都没变（判 WIN 的格数两侧各自相等：62/62、67/67、
+// 16/16），只有 610 格的节点数在动。所以「递归层这一局走到过没有、拒掉的是不是同一件事」在
+// search() 交回的答案里根本没有出口，能钉它的只有 vct.h 上那两个按调用点分开的计数。
+// 两格局面都是从这条线上挑出来的**便宜**格（①那格 nodes=1、②那格 nodes=4147，都不撞帽）。
+//
+// 局面来自 tools/match_openings.jsonl 第 13 条（(7,7)(5,5)(6,8)(9,5)…共 14 子）之后 VCT 自己
+// 搜出来的那串 forcing 线；两格的黑白子数都相等 ⇒ 轮黑，与探针当时用的轮次一致。
+// 变异口径：把 vct_defend 那处改成永假 ⇒ 第一段的 defend_rejections() 断言红；把 vct_attack
+// 那处改成永假 ⇒ 第二段的 attack_rejections() 断言红。两处的读者是分开的。根扫描那一处不在这条
+// 用例的覆盖里（这两格 root 计数都是 0），它的读者是上面那条 test_vct_root_threat_…用例。
+void test_vct_recursive_race_gates_have_assertion_readers() {
+    const int kLine[34][2] = {
+        {7, 7}, {5, 5}, {6, 8}, {9, 5}, {7, 5}, {7, 6}, {8, 6}, {9, 7},
+        {6, 4}, {5, 3}, {6, 7}, {6, 5}, {6, 9}, {6, 10}, {5, 9}, {4, 10},
+        {7, 9}, {4, 9}, {9, 9}, {8, 9}, {8, 8}, {6, 6}, {11, 11}, {10, 10},
+        {8, 10}, {9, 11}, {9, 8}, {5, 8}, {7, 8}, {10, 8}, {7, 10}, {7, 11},
+        {4, 6}, {5, 7},
+    };
+    std::atomic<bool> stop(false);
+    Evaluator evaluator;
+
+    // ① 34 子 + 深度 2：根扫描一条都不拒（root==0），唯一的递归节点是 vct_defend，它拒 3 条。
+    //    当时量到 nodes=1、result=UNKNOWN、best=(-1,-1)：这一格的三个计数把「拒发生在哪一层」
+    //    分开钉住了 —— 把 vct_defend 那条判断改成永假，defend_rejections() 就归 0。
+    {
+        Board board;
+        for (int i = 0; i < 34; ++i) {
+            assert(board.place_stone(kLine[i][0], kLine[i][1], i % 2 == 0 ? BLACK : WHITE));
+        }
+        TranspositionTable tt;
+        VCTSearch vct(evaluator, tt);
+        const VCTMove r = vct.search(board, BLACK, 2, stop);
+        assert(r.result != VCTResult::WIN);
+        assert(vct.root_rejections() == 0);
+        assert(vct.attack_rejections() == 0);
+        assert(vct.defend_rejections() >= 1);
+    }
+
+    // ② 32 子 + 深度 3：这一次轮到 vct_attack 那一处拒（当时量到 atk=6、def=0、nodes=4147），
+    //    而根上的答案仍然是那句「我赢在 (5,7)」—— 也就是这一处**放行了**真正成立的那条线，
+    //    只把赛跑输掉的候选摘掉。改永假 ⇒ attack_rejections() 归 0，这一条立刻红。
+    {
+        Board board;
+        for (int i = 0; i < 32; ++i) {
+            assert(board.place_stone(kLine[i][0], kLine[i][1], i % 2 == 0 ? BLACK : WHITE));
+        }
+        TranspositionTable tt;
+        VCTSearch vct(evaluator, tt);
+        const VCTMove r = vct.search(board, BLACK, 3, stop);
+        assert(r.result == VCTResult::WIN);
+        assert(r.best_move.pos.row == 5 && r.best_move.pos.col == 7);
+        assert(vct.root_rejections() == 0);
+        assert(vct.defend_rejections() == 0);
+        assert(vct.attack_rejections() >= 1);
+    }
+
+    std::cout << "test_vct_recursive_race_gates_have_assertion_readers passed" << std::endl;
+}
+
 int main() {
     std::cout << "Running search tests..." << std::endl;
 
@@ -9730,6 +9795,7 @@ int main() {
     // 轮次176：命名了节点预算的那一手，战术层只花自己那份份额（且只收紧、不放宽）。
     test_named_node_budget_prices_the_tactical_phases();
     test_vct_root_threat_loses_the_race_when_the_defender_holds_a_five();
+    test_vct_recursive_race_gates_have_assertion_readers();
 
     std::cout << "All search tests passed!" << std::endl;
     return 0;
