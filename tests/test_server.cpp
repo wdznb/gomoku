@@ -4054,15 +4054,15 @@ void test_an_unfinished_game_stays_out_of_the_record_stream_until_it_ends() {
 //   ② 别的线程只能读，读到的还是第一手那个线程 —— 自己不算属主。这一半就是产品里那句
 //      assert 拦住的东西：worker 线程来拿这把锁，形状先不对，断言再当场崩。
 //   ③ 真服务器：走过任何一条取锁的 handler（`open_session` 就取），属主必须是驱动它的那个线程。
-void test_games_mutex_records_one_owner_thread() {
+void test_games_owner_records_one_owner_thread() {
     // ① 空槽与锁free 属性
     {
-        OwnerCheckedMutex fresh;
+        OwnerOnlySection fresh;
         assert(fresh.owner() == std::thread::id{});
         assert(!fresh.current_thread_is_owner());
         assert(fresh.owner_slot_is_lock_free());
         {
-            std::lock_guard<OwnerCheckedMutex> lock(fresh);
+            std::lock_guard<OwnerOnlySection> lock(fresh);
             assert(fresh.owner() == std::this_thread::get_id());
             assert(fresh.current_thread_is_owner());
         }
@@ -4072,8 +4072,8 @@ void test_games_mutex_records_one_owner_thread() {
 
     // ② 另一个线程读到同一个属主，但它自己不是
     {
-        OwnerCheckedMutex held;
-        std::lock_guard<OwnerCheckedMutex> lock(held);
+        OwnerOnlySection held;
+        std::lock_guard<OwnerOnlySection> lock(held);
         const std::thread::id owner_here = std::this_thread::get_id();
         std::thread::id seen_owner = std::this_thread::get_id();
         bool other_is_owner = true;
@@ -4124,17 +4124,17 @@ void test_games_mutex_records_one_owner_thread() {
         assert(WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT);
     }
 
-    std::cout << "test_games_mutex_records_one_owner_thread passed" << std::endl;
+    std::cout << "test_games_owner_records_one_owner_thread passed" << std::endl;
 }
 
 // ④ 那一面：只有断言失灵才会走到「返回 0」。主线程放手之后再 join，所以断言被编译掉时
 // 另一手能正常拿到锁、进程正常退出，父进程按「没崩」判红，而不是挂在那里等。
 int games_owner_death_arm() {
-    OwnerCheckedMutex m;
+    OwnerOnlySection m;
     std::thread other;
     {
-        std::lock_guard<OwnerCheckedMutex> held(m);
-        other = std::thread([&m] { std::lock_guard<OwnerCheckedMutex> inner(m); });
+        std::lock_guard<OwnerOnlySection> held(m);
+        other = std::thread([&m] { std::lock_guard<OwnerOnlySection> inner(m); });
     }
     other.join();
     return 0;
@@ -4482,7 +4482,7 @@ int main() {
     test_analyze_progress_then_exactly_one_result_per_ply();
     test_analyze_is_refused_while_the_ai_is_thinking();
     test_analyze_refuses_the_positions_it_cannot_rebuild_and_the_games_it_cannot_read();
-    test_games_mutex_records_one_owner_thread();
+    test_games_owner_records_one_owner_thread();
     test_callback_swap_refuses_a_second_thread_and_a_flying_think();
     test_hint_conclusion_crosses_threads_through_the_slot();
     test_owner_only_section_records_one_owner_thread();

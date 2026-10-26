@@ -139,7 +139,7 @@ public:
     
     // #85：回调族的交换以前只靠一句顺序 —— 先 `halt_search()`（真的 join）再动这六个
     // `std::function`，注释写着「Only ever called after the search has been joined」，但那
-    // 是当前树的读数，不是约束。这里把它做成机制，形状与轮次199 的 `OwnerCheckedMutex` 相同：
+    // 是当前树的读数，不是约束。这里把它做成机制，形状与轮次199 那把带锁的属主登记型相同（那个类型已在轮次209 删除，机制留在 `OwnerOnlySection` 里）：
     // 第一次交换的线程记成属主，此后每一次交换都要求**同一线程**且**没有在飞的东西**
     //（`ai_thinking_` / `hint_active_` / `ponder_active_` 全假），否则断言当场崩。
     // 没有新锁、没有等待：两个判断都只是原子读。

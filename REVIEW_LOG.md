@@ -1984,6 +1984,21 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次209 #115：`OwnerCheckedMutex` 删掉了 —— 轮次208 之后它在产品里没有使用者，机制留在只登记的那一档里
+
+轮次205-208 连着把 `src/server/` 的三把阻塞锁降级成 `OwnerOnlySection`（每台服务器 419 次获取全部 `distinct=1` 那台仪器量的），带真 mutex 的 `OwnerCheckedMutex` 就此**只剩测试在用** —— 这是 #87 那一族的死代码，删。
+
+**改了什么**
+- `src/server/owner_checked_mutex.h`：删类型本体（约 45 行），文件头那段历史改写成「轮次199 为什么先做带锁的、轮次205-208 凭什么把锁体删掉、以后**什么时候还必须用真锁**」——判据写在仪器上：只有「一个对象恒由一根线程独占触碰」被量到才允许 `OwnerOnlySection`；真有第二根线程并发进入的仍然要用锁（本轮之后 `src/` 里剩的三处见轮次208 的更正段）。删掉随之无用的 `#include <mutex>`。
+- `tests/test_server.cpp`：7 处类型引用换成 `OwnerOnlySection`；那条用例改名 `test_games_mutex_records_one_owner_thread` → **`test_games_owner_records_one_owner_thread`**（成员在轮次208 就不叫 mutex 了）；它①段那句「出作用域不回收属主」的语义两种类型一致，照旧成立。
+- `src/server/game_manager.h:142` 那条历史注释里「形状与轮次199 的 `OwnerCheckedMutex` 相同」补上「该类型已于轮次209 删除，机制留在 `OwnerOnlySection`」，免得下一个读者去找一个不存在的类型。
+- **机制没有被削弱**：#93 的死臂（第二根线程来拿 → 子进程必死 `SIGABRT`）与 #114 的死臂照旧在，`claim_owner()` 这一半本来就是断言的所在；锁体从来没参与判定。
+
+**读者**：`test_games_owner_records_one_owner_thread`（③段读的还是**成员** `games_owner_` 的属主）、`test_owner_only_section_records_one_owner_thread`（类型 + 两臂信号）、`test_hint_adoption_refuses_a_second_thread`（取用点）—— 全套 58 条 rc=0，anchor 122 引用 0 problems。
+
+**门禁**（`/tmp/r209/chain.log`，按段计警告）：强制全量重建 **356 编译单元 0 warning、165 s** → `ctest -j1` **rc=0** → anchor **122 引用 0 problems、150 指认 150/150 ok** → web **113/113** → TSan `test_server` **clean races=0 62 s** → memcheck `test_server` 第 6 臂在跑（提交时未收口，rc 一到记进本节）。
+---
+
 ## 轮次208 #113：`games_mutex_` 也降级成只登记 —— 一台真实赛具量出 419 次获取、被走到的 18 个点全部只有一根线程；产品里的 `std::mutex` 到此清零
 
 `#113` 的第四把，也是最大的一把（20 个获取点）。**先量**：临时仪器（不入库，`/tmp/r208/srvA.log`、`srvB.log`）在 20 个获取点各记「哪根线程拿过、拿了几次」，跑两遍：
