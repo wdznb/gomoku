@@ -1984,6 +1984,46 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次213 #118：搜索热路径的分配从「每节点 3.9 次」降到 0.01 —— 预分配 + 常驻缓冲，排序语义一字不动
+
+新要求是「**避免频繁重分配内存，使用预分配或固定大小内存**」。这条不能靠读代码点头，所以先做仪器：`/tmp/r218/alloc_probe*.cpp` 替换全局 `operator new/delete`（带 16 字节头记请求尺寸 —— 不带头的话 `operator delete(void*)` 那条不知道尺寸的路会把 live 只减 1），按 8 B 步长分桶，固定 64 槽的调用点表，内部一律不再分配；`backtrace_symbols` 只在**关掉计数之后**调（它自己会分配）。自检格：故意漏一块 4096 ⇒ `allocs=1 frees=0 live=4096`。
+
+**基线**（一个双方都无四连的中盘 12 子形状，depth 5 / 5000 ms）：`nodes≈10.7–11.6 万`、**`allocs=449,038` ⇒ 每节点 3.89–3.94 次分配**，而 `peak_bytes=11,264` —— 问题在**churn，不在 footprint**。按调用点与尺寸两条腿归因：
+- `vector<gomoku::Candidate>::allocate` **330,090 次（72 %）**：尺寸直方图正好是 16 B 元素的 `1→2→4→8→16` 增长阶梯（`[16]=70,077 / [32]=65,437 / [64]=60,672 / [128]=50,114 / [256]=35,640`）；`generate()` 实测被调 **36,378 次**，每次约 8.7 次分配 ⇒ 根因是 `move_generator.cpp` 里 `*out = CandidateSet{};` **把已有容量丢掉**，加上调用方是每节点栈上临时。
+- `operator new(std::nothrow)` **77,681 次（17 %）**：多取一层返址才看清，调用者是 `std::__detail::__get_temporary_buffer<Candidate>` —— 也就是 `order_and_cut()` 里的 `std::stable_sort` **每次自借临时缓冲**。
+- `vector<Move>`（`flatten()`）27,424 + `vector<pair<int,size_t>>` 13,276 + 它的临时缓冲 13,276（`sort_moves` 的 decorate）。合计 ≈ 448,782，与总读数对上 ⇒ **没有未知项**。
+
+**两处读数错误先认下来**：① 层宽仪器第一版只挂在 `generate()` 末尾，漏了静止层那条提前 `return`（`move_generator.cpp:204`），于是读出「15,156 次调用」，与总量不自洽 —— 补挂后是 36,378 次；② 一开始把 3.9 全记在 `CandidateSet` 头上，实际 `stable_sort` 的缓冲是第二大项。
+
+**改了什么**（`src/search/move_generator.{h,cpp}`、`src/search/alphabeta.{h,cpp}`）
+- `CandidateSet` 加 `clear_tiers()`（只清四层的**长度**，容量留着）与自带的 `merge_scratch`；`generate()` 从赋空对象改成 `clear_tiers()`。
+- 新增 `stable_merge_in_place()`（自底向上稳定归并，工作区由调用方常驻）。**语义不是被换掉的**：这两处排序要求「相等键保持原相对次序」（`order_and_cut` 头上的注释与 `alphabeta.cpp` 里那段 tie 的说明都这么声明），所以不能退成 `std::sort` —— 换的是谁借缓冲。替换件先在树外验：4000 个「键值域 8、长度 0–59、大量相等键」的随机向量与原 `std::stable_sort` **逐项相同**；同一 225 项向量各跑 2000 遍：**常驻缓冲 0 次分配，`std::stable_sort` 2000 次**。
+- `AlphaBetaSearch` 持常驻 scratch：`tier_scratch_`（73 槽）+ `flat_scratch_`、`sort_index_scratch_`、`sort_reorder_scratch_`（各 64 槽）+ `sort_merge_scratch_`。静止层用 `[64, 64+9)` 号段、alphabeta 用 `[0, 64)`，号段外的调用点**退回每节点局部对象**（只是不省分配，语义不变）。
+- 槽位不撞这件事没有当成显然：先在模型里跑（`/tmp/r218/slot_model.cpp`，`busy[]` 断言同一条活动链不重槽）—— 引擎自己的深度帽 8 层时最多同时占 **18 槽**，按设计文档的 20 层压一遍是 **30 槽** ⇒ 73 有余量。`ply`/`qdepth` 沿链严格 +1 是它成立的理由，不是运气。
+- `moves = std::move(reordered)` 也在改动之列：移动会把常驻缓冲**抽干**，所以换成按长度赋值。
+
+**结果**（同一台具、同一形状）：`allocs=770` ⇒ **每节点 0.01 次**（583×↓），`peak_bytes` 从 11,264 变成 **46,532** —— 这是这条要求的本意（用一次性的预分配换掉每节点 churn），不是疏漏；`live=220` 不变。同一墙钟里 `nodes` 从 89,259 涨到 94,225，但这个数**不当速度用**（墙钟绑事、随负载漂），要一个 `Ir/node` 的机器无关读数，欠着。
+
+| 臂 | 建法 | 读数 |
+| --- | --- | --- |
+| 交树 | 探针链本轮 `test_search.dir` 对象 | `allocs=770 / per_unit=0.01`、`score=78340 depth=5` |
+| **M0 对照**（同一混建配方、源码未变异） | 同上 | `allocs=770` ⇒ 与交树逐字相同 |
+| **M1 变异**（`clear_tiers()` 改回 `*out = CandidateSet{}`） | 同上 | `allocs=293,215 / per_unit=3.77` ⇒ 容量保留这一行值 29.2 万次分配 |
+| 新用例 | `tests/test_search.cpp:9833` | `test_stable_merge_matches_stable_sort_on_tied_keys`：400 个随机向量逐位相同 + 全等键/单元素/空三类边界 |
+
+**一条方法学收获（差点写出假红）**：M1 第一次跑是**段错误**。同一配方下把变异去掉建一支 M0 对照，**它也段错误** —— 于是知道那不是代码问题，是我把变异体编成了 `-std=c++20 -O1`，而树里是 `-std=gnu++17 -UNDEBUG`（`build/CMakeFiles/test_search.dir/flags.make` 写的），ODR 不一致的混建。按树自己的 flags 重建两支后，M0 = 交树读数、M1 = 3.77。**没有 M0 的话，我会把一次仪器错误记成一条变异臂的功劳。**
+
+**欠的账（明记）**：① `tools/tree_match` 的跨树逐手零分岔对照还没做 —— 本轮的「答案没变」目前只由 ctest 里那些钉住具体着法/分数的用例说（`test_search`/`test_pinned` 全绿才算），墙钟档的节点数不算证据；② `Ir/node` 的机器无关读数；③ 套件级 memcheck（`test_search` 原生 ~600 s × ~30 跑不完）由门禁 stage7 那台具代答。
+
+**仪器账上两条自己的错（都改到做法里，不只是道歉）**
+- **混建必须带未变异的对照。** M1 第一次跑是段错误；同一配方把变异去掉建一支 M0，**它也段错误** ⇒ 真因是我把变异体编成 `-std=c++20 -O1`，而树是 `-std=gnu++17 -UNDEBUG`（`build/CMakeFiles/test_search.dir/flags.make` 写的），ODR 不一致。按树自己的 flags 重建后：M0 与交树逐字相同、M1 = `3.77/节点`。没有 M0，我会把一次仪器错误记成一条变异臂的功劳。
+- **第二个 `cmake --build` 不能与正在跑的门禁链同用一个 `build/`。** 我在 stage1（clean + 全量重建）进行中启动了一支跨树对照，它去 re-configure 并重建同一个目录，约 30 秒后我把它杀掉；stage1 仍读 `rc=0 / 356 / 0 warning`，但这两件事一旦同窗，**门禁的绿和对照的读数都不能记到某一棵树的账上**。改法：跨树那支用**各自专用**的构建目录（工作树 `build_sa`、`git worktree add --detach 7dfef77` 那侧用它自己的 `build`），并且 `until grep -q "gates done"` 排在门禁之后 —— 与 valgrind 那两格也不同窗。
+
+**门禁自己差点冤枉了代码**：第一遍 stage7 读到 `rc=9`、`4,096 bytes in 1 blocks are definitely lost` —— 那不是本轮引入的泄漏，是分配具**故意的自检那一格**（`::operator new(4096)` 不释放，用来证明仪器会说话）被同一个二进制带了进去。核验式不肯放行是对的（`GATE-NOT-GREEN: missing /stage7 rc=0/`，链没提交、也没碰 git），错的是我把「仪器的自检」和「被测代码」放进同一次 memcheck。修法：给具加 `--no-leak` 开关，memcheck 那一档跳过自检格重跑 ⇒ **`stage7b rc=0`、`ERROR SUMMARY: 0 errors from 0 contexts`、`in use at exit: 0 bytes in 0 blocks`**；自检格留在分配读数那一档里（它在那儿的作用就是让「0」可信）。
+
+**门禁**（`/tmp/r213/gates.log`，串行不重叠）：① 强制全量重建 stage1 rc=0 recompiles=356 warnings=0 elapsed=237s；② `ctest -j1` stage2 rc=0 elapsed=1084s（含新用例 `test_stable_merge_matches_stable_sort_on_tied_keys`）；③ anchor resolved: 151, ok: 151, problems: 0，readme_anchor_check: 122 citations, 0 problems；④ stage4 rc=0 web_frontend_check: 113/113 passed；⑤ TSan `test_server` stage5 rc=0 elapsed=243s test_server    clean  races=0 deadlocks=0 thread_leaks=0 rc=0 66s；⑥ 同一台分配具在终树上的读数：allocs=770 frees=768 live=220 peak_bytes=46532  per_unit=0.01；⑦ memcheck 同一台具：stage7b rc=0（跳过仪器自注入那一格后重跑的那一遍），in use at exit: 4,096 bytes in 1 blocks�definitely lost: 4,096 bytes in 1 blocks�ERROR SUMMARY: 1 errors from 1 contexts�in use at exit: 0 bytes in 0 blocks�ERROR SUMMARY: 0 errors from 0 contexts�。
+
+
 ## 轮次211 #113：`SearchController::result_mutex_` 撤掉 —— 结论改走一条消息槽；`src/` 里的 `std::mutex` 到这里只剩 TT 那一族
 
 **先量再动**（不采信轮次209 记下的那句「要先判退役还是补」）：`result_mutex_` 只有两个获取点（读者 `get_result()`、写者 `search_worker`），而 `get_result()` 的读者全树只有两处，都在 `tests/test_search.cpp:8615` 与 `:8666`，**两处都是先等 `is_thinking()` 落下再读** —— 与轮次127 同形：测试从不制造那个窗口，所以「加了锁也没被证过有用」和「撤了会不会出事」都不能靠现成用例回答。产品侧这个类 0 用户（`grep` 只剩测试）。

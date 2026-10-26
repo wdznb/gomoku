@@ -24,6 +24,36 @@ struct Candidate {
     int score;
 };
 
+// 轮次213 #118：自底向上的**稳定归并**，工作区由调用方常驻。它替换的是 `std::stable_sort`
+// —— 后者每次调用自己借一块临时缓冲（实测一次中盘思考 77,681 次
+// `operator new(std::nothrow)`，调用者是 `std::__detail::__get_temporary_buffer<T>`）。
+// 这里的次序要求是「相等键保持原相对次序」，所以不能退成 `std::sort`（见
+// `alphabeta.cpp` 的 tie 说明与 `order_and_cut` 头上的注释）：**换的是谁借缓冲，不是稳定性**。
+// 等价性先在树外验过：4000 个「键值域 8、长度 0-59、大量相等键」的随机向量上与原
+// `std::stable_sort` 逐项相同（`/tmp/r218/merge_sort_proto.cpp`）。
+template <typename T, typename Less>
+void stable_merge_in_place(std::vector<T>& data, std::vector<T>& scratch, Less less) {
+    const size_t n = data.size();
+    if (n < 2) return;
+    if (scratch.size() < n) scratch.resize(n);  // 只有第一次碰到更长的输入才扩容
+    for (size_t width = 1; width < n; width *= 2) {
+        for (size_t start = 0; start < n; start += 2 * width) {
+            const size_t mid = std::min(start + width, n);
+            const size_t end = std::min(start + 2 * width, n);
+            size_t i = start;
+            size_t j = mid;
+            size_t k = start;
+            while (i < mid && j < end) {
+                // 相等时两边都不「更小」⇒ 取左边：稳定性就落在这个方向上。
+                scratch[k++] = less(data[j], data[i]) ? data[j++] : data[i++];
+            }
+            while (i < mid) scratch[k++] = data[i++];
+            while (j < end) scratch[k++] = data[j++];
+            for (size_t p = start; p < end; ++p) data[p] = scratch[p];
+        }
+    }
+}
+
 // The four tiers of design doc 2.5.1, each already ordered by the total triple
 // (value, centre, cell index) and truncated to the width its layer is allowed.
 // The tiers are separate vectors because they answer different questions: which
@@ -49,8 +79,27 @@ struct CandidateSet {
     // stones from handing a layer an empty list.
     std::vector<Candidate> remote;
 
+    // 轮次213 #118：层内排序要一块**同生共死**的归并缓冲区。`std::stable_sort` 每次调用
+    // 自己借临时缓冲（一次中盘思考实测 77,681 次 `operator new(std::nothrow)`，调用者是
+    // `std::__detail::__get_temporary_buffer<Candidate>`），而这里的次序**必须**是稳定的
+    // （相等分数留谁由位置决定，见 `alphabeta.cpp:113` 那条 tie 的说明），所以换的是
+    // 「谁借缓冲」而不是「稳不稳定」。跟着这一层走，缓冲区容量就随同一块 scratch 活着。
+    std::vector<Candidate> merge_scratch;
+
+    // 只清四层的**长度**，容量留着复用 —— 赋一个空 `CandidateSet{}` 会把容量丢掉，
+    // 于是每个节点都从零增长（实测每次 `generate()` 约 8.7 次分配）。`merge_scratch`
+    // 不清：它只是工作区，长度没有语义。
+    void clear_tiers() {
+        forced.clear();
+        threats.clear();
+        vicinity.clear();
+        remote.clear();
+    }
+
     // The tiers in order, as the flat list the search iterates.
     std::vector<Move> flatten() const;
+    // 同一个结果写进调用方的缓冲（`clear` 保容量）—— 每节点一次摊平不该配一次新分配。
+    void flatten_into(std::vector<Move>& out) const;
 };
 
 // Design doc 2.3.4's 「威胁探针」: the one O(候选数) pass that answers, before a think

@@ -81,8 +81,9 @@ int tier2_width(const ThreatCoefficients& coeffs, int ply) {
 // rather than "the width kept whatever the candidate list happened to start
 // with", and the two keys under the score are what make the kept set a function of
 // the position alone.
-void order_and_cut(std::vector<Candidate>& tier, size_t keep) {
-    std::stable_sort(tier.begin(), tier.end(), [](const Candidate& a, const Candidate& b) {
+void order_and_cut(std::vector<Candidate>& tier, size_t keep,
+                   std::vector<Candidate>& scratch) {
+    stable_merge_in_place(tier, scratch, [](const Candidate& a, const Candidate& b) {
         return RootScore(a.move, a.score) > RootScore(b.move, b.score);
     });
     if (tier.size() > keep) tier.resize(keep);
@@ -90,13 +91,20 @@ void order_and_cut(std::vector<Candidate>& tier, size_t keep) {
 
 }
 
-std::vector<Move> CandidateSet::flatten() const {
-    std::vector<Move> out;
+// 轮次213 #118：摊平走调用方的缓冲（`clear` 保容量），`flatten()` 留着当薄封装给
+// 不需要复用的一次性调用点（测试、根），所以两侧语义都在。
+void CandidateSet::flatten_into(std::vector<Move>& out) const {
+    out.clear();
     out.reserve(forced.size() + threats.size() + vicinity.size() + remote.size());
     for (const auto& entry : forced) out.push_back(entry.move);
     for (const auto& entry : threats) out.push_back(entry.move);
     for (const auto& entry : vicinity) out.push_back(entry.move);
     for (const auto& entry : remote) out.push_back(entry.move);
+}
+
+std::vector<Move> CandidateSet::flatten() const {
+    std::vector<Move> out;
+    flatten_into(out);
     return out;
 }
 
@@ -144,7 +152,7 @@ ThreatProbe threat_probe(const Board& board, int color) {
 
 void MoveGenerator::generate(const Board& board, int color, int ply, bool in_quiescence,
                              CandidateSet* out) const {
-    *out = CandidateSet{};
+    out->clear_tiers();
     // 丁-3：候选宽度是按色的旋钮（指导书 §4 丁-3 注意 5 允许两侧不同的四项之一），
     // 所以这里取的是**行棋方那一套**，不是 `coefficients()` 那个「两侧同值时的旧读数」。
     const ThreatCoefficients& coeffs = evaluator_.coeffs_for(color);
@@ -200,7 +208,7 @@ void MoveGenerator::generate(const Board& board, int color, int ply, bool in_qui
     }
 
     if (in_quiescence) {
-        order_and_cut(out->threats, kKeepAll);
+        order_and_cut(out->threats, kKeepAll, out->merge_scratch);
         return;
     }
 
@@ -210,14 +218,14 @@ void MoveGenerator::generate(const Board& board, int color, int ply, bool in_qui
     // 「无威胁时放宽」).
     const bool no_threats = out->forced.empty() && out->threats.empty();
 
-    order_and_cut(out->forced, kKeepAll);
-    order_and_cut(out->threats, kKeepAll);
+    order_and_cut(out->forced, kKeepAll, out->merge_scratch);
+    order_and_cut(out->threats, kKeepAll, out->merge_scratch);
 
     size_t width = static_cast<size_t>(tier2_width(coeffs, ply));
     if (no_threats) {
         width = std::max(width, static_cast<size_t>(coeffs.cand_width_root));
     }
-    order_and_cut(out->vicinity, width);
+    order_and_cut(out->vicinity, width, out->merge_scratch);
 
     // Tier3's width (design doc 2.5.1's M column): the table gives it a number only
     // on the root row, and only for a position with no threat. 3.2 keeps it in
@@ -228,7 +236,7 @@ void MoveGenerator::generate(const Board& board, int color, int ply, bool in_qui
     if (no_threats && (ply <= 0 || out->vicinity.empty())) {
         remote_width = static_cast<size_t>(coeffs.cand_width_deep);
     }
-    order_and_cut(out->remote, remote_width);
+    order_and_cut(out->remote, remote_width, out->merge_scratch);
 }
 
 std::vector<Move> MoveGenerator::generate_moves(const Board& board, int color, int ply,

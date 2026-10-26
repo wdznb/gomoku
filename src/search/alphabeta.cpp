@@ -89,7 +89,13 @@ void AlphaBetaSearch::sort_moves(std::vector<Move>& moves, const Board& board, i
     int count = static_cast<int>(moves.size()) - start;
     if (count <= 1) return;
 
-    std::vector<std::pair<int, size_t>> scored;
+    // 轮次213 #118：decorate 数组取这一 ply 的常驻缓冲（`clear` 保容量）。号段外的调用点
+    // 退回局部对象，只是不省分配，语义一样。
+    const bool in_slots = (ply >= 0 && ply < kPlySlots);
+    std::vector<std::pair<int, size_t>> overflow_scored;
+    std::vector<std::pair<int, size_t>>& scored =
+        in_slots ? sort_index_scratch_[ply] : overflow_scored;
+    scored.clear();
     scored.reserve(count);
     for (int i = 0; i < count; ++i) {
         const Move& m = moves[start + i];
@@ -119,7 +125,8 @@ void AlphaBetaSearch::sort_moves(std::vector<Move>& moves, const Board& board, i
     // order the A6 pins already describe.
     // stable_sort is the same belt from the other side, with nothing left to
     // stabilise.
-    std::stable_sort(scored.begin(), scored.end(), [&](const std::pair<int, size_t>& a,
+    // #118：同一件事，但归并工作区是成员里那块（`std::stable_sort` 会每次自借临时缓冲）。
+    stable_merge_in_place(scored, sort_merge_scratch_, [&](const std::pair<int, size_t>& a,
                                                         const std::pair<int, size_t>& b) {
         if (a.first != b.first) return a.first > b.first;
         const int ha = heuristics_.history_value(color, moves[a.second].pos);
@@ -133,12 +140,16 @@ void AlphaBetaSearch::sort_moves(std::vector<Move>& moves, const Board& board, i
         return pa.to_index() < pb.to_index();
     });
 
-    std::vector<Move> reordered(moves.size());
+    // #118：重排结果同样走这一 ply 的常驻缓冲。原来是 `moves = std::move(reordered);`
+    // —— 移动会把常驻缓冲抽干，下一次又从零分配；改成按长度赋值并保留容量。
+    std::vector<Move> overflow_reordered;
+    std::vector<Move>& reordered = in_slots ? sort_reorder_scratch_[ply] : overflow_reordered;
+    reordered.assign(moves.size(), Move());
     for (size_t i = 0; i < static_cast<size_t>(start); ++i) reordered[i] = moves[i];
     for (size_t i = 0; i < scored.size(); ++i) {
         reordered[start + i] = moves[scored[i].second];
     }
-    moves = std::move(reordered);
+    moves = reordered;
 }
 
 int AlphaBetaSearch::static_score(const Board& board, int color, uint64_t hash,
@@ -212,7 +223,14 @@ NodeResult AlphaBetaSearch::quiescence(Board& board, int alpha, int beta, int co
     // decorate-sort-undecorate is what keeps this ordering, and so this subtree's
     // cut pattern and the bounds it hands back, a function of the position rather
     // than of the candidate list's order).
-    CandidateSet forcing;
+    // 轮次213 #118：这一层的候选走**按 qdepth 分配的常驻槽**（原先是每个静止层节点在栈上
+    // 新建一个 `CandidateSet`，而 `generate()` 又赋空对象把容量丢掉）。这一层的 `threats`
+    // 要在整棵子树期间一直可读 —— 下面的循环是边遍历边递归 —— 而 `qdepth` 沿链严格 +1，
+    // 所以号段给到 [kPlySlots, kPlySlots + kQdepthSlots)，与 alphabeta 的 ply 号段不相交。
+    CandidateSet overflow_set;
+    CandidateSet& forcing = (qdepth >= 0 && qdepth < kQdepthSlots)
+        ? tier_scratch_[kPlySlots + qdepth]
+        : overflow_set;
     move_gen_.generate(board, color, /*ply=*/0, /*in_quiescence=*/true, &forcing);
     if (forcing.threats.empty()) return {stand_pat, true};
 
@@ -398,7 +416,18 @@ NodeResult AlphaBetaSearch::alphabeta(Board& board, int depth, int alpha, int be
         return quiescence(board, alpha, beta, color, stop_flag, 0, hash, node_eval);
     }
 
-    auto moves = generate_moves(board, color, ply);
+    // 轮次213 #118：候选与摊平结果都走这一 ply 的常驻缓冲（`ply` 沿链严格 +1，父框在子树
+    // 期间只读自己那一份 ⇒ 不会互相覆盖）。超出号段时退回局部对象，只是不省分配。
+    std::vector<Move> overflow_moves;
+    std::vector<Move>& moves =
+        (ply >= 0 && ply < kPlySlots) ? flat_scratch_[ply] : overflow_moves;
+    {
+        CandidateSet overflow_set;
+        CandidateSet& set =
+            (ply >= 0 && ply < kPlySlots) ? tier_scratch_[ply] : overflow_set;
+        move_gen_.generate(board, color, ply, /*in_quiescence=*/false, &set);
+        set.flatten_into(moves);
+    }
     if (moves.empty()) return {static_score(board, color, hash, node_eval), true};
 
     sort_moves(moves, board, color, tt_move, ply);

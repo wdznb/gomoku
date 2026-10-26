@@ -9824,6 +9824,69 @@ void test_controller_result_travels_through_the_slot() {
               << ", slot holds only the newest)" << std::endl;
 }
 
+// 轮次213 #118：`stable_merge_in_place` 是与 `std::stable_sort` **等价**的替换件（把每次
+// 自借临时缓冲的那条路换成调用方常驻的工作区，排序语义不动）。等价性必须有树内的钉子，
+// 不然「换排序实现」这种改动只由一台树外仪器说一句话就进了搜索的热路径。
+// 钉两半：① 相等键的**相对次序**必须逐位相同（这才是 stable 的全部意义，也是
+// `order_and_cut` / `sort_moves` 那两处注释反复声明的东西）；② 元素多重集不变（没有丢、
+// 没有重、没有凭空造）。键值域故意压到 6 —— 大量相等键才分得出稳定与不稳定。
+void test_stable_merge_matches_stable_sort_on_tied_keys() {
+    auto less = [](const Candidate& a, const Candidate& b) {
+        return a.score > b.score;  // 与 `order_and_cut` 同向：分数大的在前
+    };
+    std::uint32_t state = 0x243f6a88u;
+    auto next = [&state] {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        return state;
+    };
+    for (int trial = 0; trial < 400; ++trial) {
+        const int n = static_cast<int>(next() % 48);
+        std::vector<Candidate> base;
+        base.reserve(n);
+        for (int i = 0; i < n; ++i) {
+            // (score, 位置) 两样都编上序号：位置随 i 走，等分时谁是「原来在前」就有唯一答案。
+            base.push_back(Candidate{Move(1 + (i % 14), 1 + ((i * 7) % 14), BLACK),
+                                     static_cast<int>(next() % 6)});
+        }
+        std::vector<Candidate> reference = base;
+        std::stable_sort(reference.begin(), reference.end(), less);
+        std::vector<Candidate> mine = base;
+        std::vector<Candidate> scratch;
+        stable_merge_in_place(mine, scratch, less);
+        assert(mine.size() == reference.size());               // ② 数量
+        for (size_t i = 0; i < reference.size(); ++i) {
+            assert(mine[i].score == reference[i].score);        // ① 逐位同分
+            assert(mine[i].move.pos.row == reference[i].move.pos.row);  // ① 等分时的次序
+            assert(mine[i].move.pos.col == reference[i].move.pos.col);
+        }
+    }
+    // 空、单元素、以及**全部相等键**这三类边界：稳定性在「全等」上最看得见。
+    std::vector<Candidate> all_equal;
+    for (int i = 0; i < 30; ++i) {
+        all_equal.push_back(Candidate{Move(7, 1 + i, BLACK), 5});
+    }
+    const std::vector<Candidate> before = all_equal;
+    std::vector<Candidate> scratch;
+    stable_merge_in_place(all_equal, scratch, less);
+    assert(all_equal.size() == before.size());
+    for (size_t i = 0; i < before.size(); ++i) {                 // 全等键 ⇒ 一字不动
+        assert(all_equal[i].score == before[i].score);
+        assert(all_equal[i].move.pos.row == before[i].move.pos.row);
+        assert(all_equal[i].move.pos.col == before[i].move.pos.col);
+    }
+    std::vector<Candidate> one{Candidate{Move(3, 3, WHITE), 1}};
+    stable_merge_in_place(one, scratch, less);
+    assert(one.size() == 1 && one[0].move.pos.row == 3);
+    std::vector<Candidate> empty;
+    stable_merge_in_place(empty, scratch, less);
+    assert(empty.empty());
+    std::cout << "test_stable_merge_matches_stable_sort_on_tied_keys passed "
+                 "(400 个随机向量逐位相同 + 全等键/单元素/空 三类边界)"
+              << std::endl;
+}
+
 int main() {
     std::cout << "Running search tests..." << std::endl;
 
@@ -9875,6 +9938,7 @@ int main() {
     test_controller_think_ignores_later_caller_board_edits();
     test_controller_second_think_uses_the_new_position();
     test_controller_result_travels_through_the_slot();
+    test_stable_merge_matches_stable_sort_on_tied_keys();
     test_forced_move();
     test_fast_path_labels_fill_no_depth();
     test_search_result_fields_initialized_on_fast_paths();

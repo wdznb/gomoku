@@ -8,6 +8,7 @@
 #include "move_generator.h"
 #include "search_limits.h"
 #include "search_state.h"
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <functional>
@@ -122,6 +123,29 @@ private:
     // stats_.root_scores；被切断的层不搬——那半张表里的数来自短路的子树，和 PV
     // 是同一条纪律。
     std::vector<RootMoveScore> layer_scores_;
+
+    // 轮次213 #118：四层候选与摊平结果的**常驻缓冲**，按调用链上的槽位复用。
+    // 换掉的形状是「每个节点在栈上新建一个 `CandidateSet`，`generate()` 里再赋一个空对象
+    // 把容量丢掉」—— 实测一次中盘思考因此付出 330,090 次 `vector<Candidate>` 分配
+    // （`allocs/node` 3.89–3.94）。
+    // 槽位为什么不会撞：alphabeta 链上 `ply` 严格 +1、静止层链上 `qdepth` 严格 +1，
+    // 两者用不相交的号段，所以同一条活动调用链上没有任何两层拿到同一个槽；这个不变量
+    // 先在模型里跑过（`/tmp/r218/slot_model.cpp`）：引擎自己的深度帽 8 层时最多同时占
+    // 18 槽，按设计文档的 20 层压一遍是 30 槽 ⇒ 64 + 8 + 1 = 73 有余量，
+    // 号段外的调用点退回每节点局部对象（只是不省分配，语义不变）。
+    static constexpr int kPlySlots = 64;        // 与 search_state.h 的 kMaxPly 同一约定
+    static constexpr int kQdepthSlots = 9;      // kMaxQdepth(8) + 1
+    static constexpr int kTierScratchSlots = kPlySlots + kQdepthSlots;
+    std::array<CandidateSet, kTierScratchSlots> tier_scratch_;
+    std::array<std::vector<Move>, kPlySlots> flat_scratch_;
+    // `sort_moves` 的每一层也要地方放它的 decorate 数组、重排结果与归并工作区：
+    // 实测每节点各一次分配（`vector<pair<int,size_t>>` 与它的
+    // `__get_temporary_buffer<pair<int,unsigned long>>` 各 13,276 次）。
+    // decorate 与归并区成对，都是同一种 `pair<int, size_t>`。
+    std::array<std::vector<std::pair<int, size_t>>, kPlySlots> sort_index_scratch_;
+    std::array<std::vector<Move>, kPlySlots> sort_reorder_scratch_;
+    std::vector<std::pair<int, size_t>> sort_merge_scratch_;
+
     int node_limit_;
     // Only the layered accounting left in the object: the counters and the three
     // ways a think can end live in the context, so the stop test is one function
