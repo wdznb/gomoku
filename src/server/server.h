@@ -183,7 +183,12 @@ private:
     // thread that first locks it and asserts every later lock comes from the same
     // one, so a worker-side acquisition fails a check (or the compile) instead of
     // deadlocking the whole server the way 轮次187's did.
-    OwnerCheckedMutex games_mutex_;
+    // 轮次208 #113：从「属主登记 + 一把真 mutex」降级成「只登记属主、从不阻塞」。
+    // 依据是这一轮的两台仪器：真实赛具（两台服务器 × 24 局）里这台进程共获取 419 次、
+    // 被走到的 18 个获取点**全部 distinct=1**（唯一出现第二根线程的地方是轮次199 那支故意
+    // 跨线程的死臂自己）；而 #93 把这条规矩做成机制时用的就是这个断言 —— 锁体从来没有挡过
+    // 第二根线程，它只是每次都付一对原子 RMW。边界照旧：`NDEBUG` 下不拦人。
+    OwnerOnlySection games_owner_;
     // Only the io thread ever assigns deferred_end_for_, but an AI worker can report
     // a settlement for the same session pointer concurrently, so this pair needs its
     // own lock and nothing else may be locked while holding it.

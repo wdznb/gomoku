@@ -4096,9 +4096,9 @@ void test_games_mutex_records_one_owner_thread() {
         const auto records = scratch("r199_games_records.jsonl");
         Harness h(dir, records);
         h.server.handle_make_move(h.socket, json{{"row", 7}, {"col", 2}});
-        assert(h.server.games_mutex_.owner() == std::this_thread::get_id());
-        assert(h.server.games_mutex_.current_thread_is_owner());
-        assert(h.server.games_mutex_.owner_slot_is_lock_free());
+        assert(h.server.games_owner_.owner() == std::this_thread::get_id());
+        assert(h.server.games_owner_.current_thread_is_owner());
+        assert(h.server.games_owner_.owner_slot_is_lock_free());
     }
 
     // ④ 那句 assert 本身有没有牙：把自己重跑一遍，让第二个线程去拿这把锁。属主登记在

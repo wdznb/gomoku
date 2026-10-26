@@ -1984,6 +1984,22 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次208 #113：`games_mutex_` 也降级成只登记 —— 一台真实赛具量出 419 次获取、被走到的 18 个点全部只有一根线程；产品里的 `std::mutex` 到此清零
+
+`#113` 的第四把，也是最大的一把（20 个获取点）。**先量**：临时仪器（不入库，`/tmp/r208/srvA.log`、`srvB.log`）在 20 个获取点各记「哪根线程拿过、拿了几次」，跑两遍：
+
+| 环境 | 总获取次数 | 被走到的点 | 每点 distinct 线程 |
+|---|---|---|---|
+| 真实赛具：两台 `gomoku_server` + `tree_match` 24 局（`--timeout-ms 1200 --max-depth 6 --max-nodes 1500`） | **419 / 台**（≈17.5 次/局） | 18 / 20（没走到的两个点是 flush/resign 分支） | **全部 =1**，最热的点 189 次 |
+| `test_server` 全套 | 同一张表 | — | 出现 `distinct=2` 的只有轮次199 那支**故意**跨线程的死臂自己 |
+
+⇒ 与轮次199 的判断一致但更进一步：那把锁里的 `std::mutex` 从来没挡过第二根线程，它只是让每次获取付一对原子 RMW；而「只许一根线程」这句话的机制本来就在属主登记 + assert 那一半里。
+
+**落实**（`src/server/server.h`、`server.cpp` 20 处、`tests/test_server.cpp` 3 处白盒引用）：成员 `OwnerCheckedMutex games_mutex_` → **`OwnerOnlySection games_owner_`**（改名因为它不再是 mutex），20 个获取点只换模板参数、顺序与早退一字不动。观察面 `owner()` / `current_thread_is_owner()` / `owner_slot_is_lock_free()` 与轮次199 逐字同形，所以那条用例（`test_games_mutex_records_one_owner_thread` 的③段）现在直接读的是**成员**而不是类型。
+
+**读到的新事实（顺手记进 #113 的账）**：产品树里已经没有 `std::mutex` 了（`grep -rn OwnerCheckedMutex src/` 只剩注释），`OwnerCheckedMutex` 这个类型现在**只有测试在用** —— 它成了 #87 同族的死代码，删它要连带把 #93 那条用例的 4 处类型引用换成 `OwnerOnlySection`（历史叙述保留）。这格单独开一个任务，不与本轮混在一起。
+---
+
 ## 轮次207 #114：取用点的「只在属主线程」不再是话 —— `OwnerOnlySection` 钉住 adopt/失效，死臂与一支**能打红**的变异臂都在
 
 轮次206 的存活臂读出一个不舒服的事实：把 #113 的原子发布改回「worker 直接写共享字段」，TSan 仍读 `clean races=0` —— 树上每一次取用都在 join 之后，两根线程从不同时在场，**仪器看不见没被创造的窗口**。所以「races=0」不能当「撤锁安全」的证据；真正的依据是那条顺序纪律，而它当时只有注释。
