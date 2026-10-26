@@ -7,8 +7,8 @@ namespace gomoku {
 VCFSearch::VCFSearch(const Evaluator& evaluator, TranspositionTable& tt)
     : evaluator_(evaluator), tt_(tt), node_limit_(1000000), nodes_searched_(0) {}
 
-std::vector<Move> VCFSearch::generate_rush_fours(const Board& board, int color) {
-    std::vector<std::pair<int, Move>> scored_moves;
+void VCFSearch::collect_rush_fours(const Board& board, int color,
+                                   std::vector<std::pair<int, Move>>& scored) const {
     const auto& candidates = board.active_empty();
 
     for (const auto& pos : candidates) {
@@ -30,19 +30,39 @@ std::vector<Move> VCFSearch::generate_rush_fours(const Board& board, int color) 
         if (has_four) {
             int score = evaluator_.evaluate_position_with_pattern(board, pos.row, pos.col, pattern,
                                                                   color);
-            scored_moves.emplace_back(score, Move(pos.row, pos.col, color));
+            scored.emplace_back(score, Move(pos.row, pos.col, color));
         }
     }
 
-    std::sort(scored_moves.begin(), scored_moves.end(),
+    std::sort(scored.begin(), scored.end(),
               [](const auto& a, const auto& b) { return a.first > b.first; });
+}
 
-    std::vector<Move> moves;
-    moves.reserve(scored_moves.size());
-    for (auto& p : scored_moves) {
-        moves.push_back(std::move(p.second));
+const std::vector<Move>& VCFSearch::generate_rush_fours(const Board& board, int color, int depth,
+                                                         std::vector<Move>& overflow) {
+    // 越界那一档（depth 超出槽数）走调用方的局部表：不池化，其余一字不变。
+    if (depth < 0 || depth >= kMoveSlotCount) {
+        std::vector<std::pair<int, Move>> scored;
+        collect_rush_fours(board, color, scored);
+        overflow.clear();
+        overflow.reserve(scored.size());
+        for (auto& p : scored) {
+            overflow.push_back(std::move(p.second));
+        }
+        return overflow;
     }
-    return moves;
+
+    MoveSlots& slot = slots_[depth];
+    slot.scored.clear();
+    collect_rush_fours(board, color, slot.scored);
+    slot.moves.clear();
+    // 首次用到的槽按几何扩容（1、2、4…），第二次起容量还在 ⇒ reserve 与 push_back
+    // 都不再分配 —— 这正是这一档要省掉的东西。
+    slot.moves.reserve(slot.scored.size());
+    for (auto& p : slot.scored) {
+        slot.moves.push_back(std::move(p.second));
+    }
+    return slot.moves;
 }
 
 Move VCFSearch::find_block_move(const Board& board, int row, int col, int color) {
@@ -139,7 +159,9 @@ int VCFSearch::vcf_attack(Board& board, int color, int depth, int alpha, int bet
     if (nodes_searched_ > node_limit_ || aborted(stop_flag)) return 0;
     if (depth <= 0) return 0;
 
-    auto rush_fours = generate_rush_fours(board, color);
+    // 槽号就是这里的 depth：递归严格减 depth，父层握着 slots[d] 时子层只会用 slots[d-1]。
+    std::vector<Move> overflow;
+    const std::vector<Move>& rush_fours = generate_rush_fours(board, color, depth, overflow);
     if (rush_fours.empty()) return 0;
 
     int best_score = -INT_MAX;
@@ -249,7 +271,8 @@ VCFMove VCFSearch::search_impl(Board& board, int color, int max_depth,
                                 std::atomic<bool>& stop_flag) {
     VCFMove result;
 
-    auto rush_fours = generate_rush_fours(board, color);
+    std::vector<Move> overflow;
+    const std::vector<Move>& rush_fours = generate_rush_fours(board, color, max_depth, overflow);
     if (rush_fours.empty()) {
         result.result = VCFResult::UNKNOWN;
         return result;

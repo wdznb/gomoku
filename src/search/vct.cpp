@@ -7,8 +7,8 @@ namespace gomoku {
 VCTSearch::VCTSearch(const Evaluator& evaluator, TranspositionTable& tt)
     : evaluator_(evaluator), tt_(tt), node_limit_(500000), nodes_searched_(0) {}
 
-std::vector<Move> VCTSearch::generate_attacks(const Board& board, int color) {
-    std::vector<std::pair<int, Move>> scored_moves;
+void VCTSearch::collect_attacks(const Board& board, int color,
+                                 std::vector<std::pair<int, Move>>& scored_moves) const {
     const auto& candidates = board.active_empty();
 
     for (const auto& pos : candidates) {
@@ -37,19 +37,35 @@ std::vector<Move> VCTSearch::generate_attacks(const Board& board, int color) {
 
     std::sort(scored_moves.begin(), scored_moves.end(),
               [](const auto& a, const auto& b) { return a.first > b.first; });
-
-    std::vector<Move> moves;
-    moves.reserve(scored_moves.size());
-    for (auto& p : scored_moves) {
-        moves.push_back(std::move(p.second));
-    }
-    return moves;
 }
 
-std::vector<Move> VCTSearch::generate_defenses(const Board& board, int color,
-                                                 int attack_row, int attack_col) {
+const std::vector<Move>& VCTSearch::generate_attacks(const Board& board, int color, int depth,
+                                                      std::vector<Move>& overflow) {
+    if (depth < 0 || depth >= kMoveSlotCount) {
+        std::vector<std::pair<int, Move>> scored;
+        collect_attacks(board, color, scored);
+        overflow.clear();
+        overflow.reserve(scored.size());
+        for (auto& p : scored) {
+            overflow.push_back(std::move(p.second));
+        }
+        return overflow;
+    }
+
+    MoveSlots& slot = attack_slots_[depth];
+    slot.scored.clear();
+    collect_attacks(board, color, slot.scored);
+    slot.moves.clear();
+    slot.moves.reserve(slot.scored.size());
+    for (auto& p : slot.scored) {
+        slot.moves.push_back(std::move(p.second));
+    }
+    return slot.moves;
+}
+
+void VCTSearch::collect_defenses(const Board& board, int color, int attack_row, int attack_col,
+                                  std::vector<std::pair<int, Move>>& scored_defenses) const {
     int opp = opponent(color);
-    std::vector<std::pair<int, Move>> scored_defenses;
     const auto& candidates = board.active_empty();
 
     for (const auto& pos : candidates) {
@@ -115,13 +131,31 @@ std::vector<Move> VCTSearch::generate_defenses(const Board& board, int color,
 
     std::sort(scored_defenses.begin(), scored_defenses.end(),
               [](const auto& a, const auto& b) { return a.first > b.first; });
+}
 
-    std::vector<Move> defenses;
-    defenses.reserve(scored_defenses.size());
-    for (auto& p : scored_defenses) {
-        defenses.push_back(std::move(p.second));
+const std::vector<Move>& VCTSearch::generate_defenses(const Board& board, int color,
+                                                      int attack_row, int attack_col, int depth,
+                                                      std::vector<Move>& overflow) {
+    if (depth < 0 || depth >= kMoveSlotCount) {
+        std::vector<std::pair<int, Move>> scored;
+        collect_defenses(board, color, attack_row, attack_col, scored);
+        overflow.clear();
+        overflow.reserve(scored.size());
+        for (auto& p : scored) {
+            overflow.push_back(std::move(p.second));
+        }
+        return overflow;
     }
-    return defenses;
+
+    MoveSlots& slot = defense_slots_[depth];
+    slot.scored.clear();
+    collect_defenses(board, color, attack_row, attack_col, slot.scored);
+    slot.moves.clear();
+    slot.moves.reserve(slot.scored.size());
+    for (auto& p : slot.scored) {
+        slot.moves.push_back(std::move(p.second));
+    }
+    return slot.moves;
 }
 
 int VCTSearch::vct_defend(Board& board, int color, int depth, int alpha, int beta,
@@ -132,7 +166,9 @@ int VCTSearch::vct_defend(Board& board, int color, int depth, int alpha, int bet
     if (nodes_searched_ > node_limit_ || aborted(stop_flag)) return 0;
     if (depth <= 0) return 0;
 
-    auto attacks = generate_attacks(board, color);
+    // 槽号 = 这里的 depth：递归严格减 depth，父层握着 attacks[d] 时子层只碰 d-1。
+    std::vector<Move> overflow;
+    const std::vector<Move>& attacks = generate_attacks(board, color, depth, overflow);
     if (attacks.empty()) return 0;
 
     // vct_defend is entered after the defender's reply: it is the attacker's
@@ -185,7 +221,8 @@ int VCTSearch::vct_defend(Board& board, int color, int depth, int alpha, int bet
             return 100000 + depth;
         }
 
-        auto defenses = generate_defenses(board, color, move.pos.row, move.pos.col);
+        const std::vector<Move>& defenses =
+            generate_defenses(board, color, move.pos.row, move.pos.col, depth, overflow);
         if (defenses.empty()) {
             board.undo_last_move();
             out_line.push_back(move);
@@ -264,7 +301,9 @@ int VCTSearch::vct_attack(Board& board, int color, int depth, int alpha, int bet
     if (nodes_searched_ > node_limit_ || aborted(stop_flag)) return 0;
     if (depth <= 0) return 0;
 
-    auto attacks = generate_attacks(board, color);
+    // 槽号 = 这里的 depth：递归严格减 depth，父层握着 attacks[d] 时子层只碰 d-1。
+    std::vector<Move> overflow;
+    const std::vector<Move>& attacks = generate_attacks(board, color, depth, overflow);
     if (attacks.empty()) return 0;
 
     int best_score = -INT_MAX;
@@ -312,7 +351,8 @@ int VCTSearch::vct_attack(Board& board, int color, int depth, int alpha, int bet
             return 100000 + depth;
         }
 
-        auto defenses = generate_defenses(board, color, move.pos.row, move.pos.col);
+        const std::vector<Move>& defenses =
+            generate_defenses(board, color, move.pos.row, move.pos.col, depth, overflow);
         if (defenses.empty()) {
             board.undo_last_move();
             out_line.push_back(move);
@@ -390,7 +430,9 @@ VCTMove VCTSearch::search(const Board& board, int color, int max_depth,
 
     Board mutable_board = board;
 
-    auto attacks = generate_attacks(mutable_board, color);
+    // 根扫描这一层的槽号就是 max_depth；下面的 vct_defend 从 max_depth-1 起，不会撞到根。
+    std::vector<Move> overflow;
+    const std::vector<Move>& attacks = generate_attacks(mutable_board, color, max_depth, overflow);
     if (attacks.empty()) {
         result.result = VCTResult::UNKNOWN;
         return result;
@@ -447,7 +489,9 @@ VCTMove VCTSearch::search(const Board& board, int color, int max_depth,
             return result;
         }
 
-        auto defenses = generate_defenses(mutable_board, color, move.pos.row, move.pos.col);
+        const std::vector<Move>& defenses =
+            generate_defenses(mutable_board, color, move.pos.row, move.pos.col, max_depth,
+                              overflow);
         if (defenses.empty()) {
             mutable_board.undo_last_move();
             result.result = VCTResult::WIN;

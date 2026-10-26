@@ -2150,6 +2150,9 @@ void test_generators_keep_five_points_and_drop_forbidden() {
     }
     assert(cross_has_four);
 
+    // 轮次216：生成器现在交出的是深度槽里的表（越界那一档才用 `ovf`）。这两处都是
+    // `const auto` = 当场拷一份，所以槽号用什么都不会互相盖；0 就够。
+    std::vector<Move> ovf;
     const auto drop = [](const std::vector<Move>& moves, int row, int col) {
         for (const Move& m : moves) {
             if (m.pos.row == row && m.pos.col == col) return false;
@@ -2162,8 +2165,8 @@ void test_generators_keep_five_points_and_drop_forbidden() {
         }
         return false;
     };
-    assert(drop(vcf.generate_rush_fours(cross, BLACK), 7, 7));
-    assert(drop(vct.generate_attacks(cross, BLACK), 7, 7));
+    assert(drop(vcf.generate_rush_fours(cross, BLACK, 0, ovf), 7, 7));
+    assert(drop(vct.generate_attacks(cross, BLACK, 0, ovf), 7, 7));
 
     // (7,7) here completes an exact five on the row (and would be a rush four on
     // the column): the five exemption keeps the cell legal and both generators
@@ -2187,8 +2190,8 @@ void test_generators_keep_five_points_and_drop_forbidden() {
         if (five_pattern.directions[d].type == PatternType::FIVE) row_is_five = true;
     }
     assert(row_is_five);
-    assert(keep(vcf.generate_rush_fours(five, BLACK), 7, 7));
-    assert(keep(vct.generate_attacks(five, BLACK), 7, 7));
+    assert(keep(vcf.generate_rush_fours(five, BLACK, 0, ovf), 7, 7));
+    assert(keep(vct.generate_attacks(five, BLACK, 0, ovf), 7, 7));
 
     std::cout << "test_generators_keep_five_points_and_drop_forbidden passed" << std::endl;
 }
@@ -6760,6 +6763,7 @@ void test_threat_probe_answers_what_the_two_phases_would_enumerate() {
     VCFSearch vcf(evaluator, tt);
     VCTSearch vct(evaluator, tt);
 
+    std::vector<Move> ovf_probe;  // 轮次216：分深度的池化表，越界才用这张
     int rows = 0;
     for (const B5ProbeRow& row : b5_probe_rows) {
         for (int color : {BLACK, WHITE}) {
@@ -6772,9 +6776,9 @@ void test_threat_probe_answers_what_the_two_phases_would_enumerate() {
             assert(probe.own_three == (expected[1] != 0));
             assert(probe.opp_four == (expected[2] != 0));
 
-            const auto fours = vcf.generate_rush_fours(board, color);
-            const auto attacks = vct.generate_attacks(board, color);
-            const auto opponent_fours = vcf.generate_rush_fours(board, opponent(color));
+            const auto fours = vcf.generate_rush_fours(board, color, 0, ovf_probe);
+            const auto attacks = vct.generate_attacks(board, color, 0, ovf_probe);
+            const auto opponent_fours = vcf.generate_rush_fours(board, opponent(color), 1, ovf_probe);
             assert(fours.size() == static_cast<size_t>(expected_lists[0]));
             assert(attacks.size() == static_cast<size_t>(expected_lists[1]));
             assert(opponent_fours.size() == static_cast<size_t>(expected_lists[2]));
@@ -9887,6 +9891,109 @@ void test_stable_merge_matches_stable_sort_on_tied_keys() {
               << std::endl;
 }
 
+// 轮次216 #118 档二：战术层的两张临时表（打分对表 + 输出表）改成按递归深度分槽常驻。
+// 池化只有两种会把答案改坏的走法：① 一个槽被两处同时活着的东西共用（父循环还在迭代，
+// 子调用改了同一张表）；② 上一趟搜索留下的脏内容没清干净就读了。两种都躲不过同一个
+// 观察：**同一个对象先搜别的位置、再搜目标位置**，交回的结果必须与**一开场就用新对象搜
+// 目标位置**逐字段相等；而且交回的变例必须能一手一手在盘上走通、以成五收口。
+// 所以这里不钉死任何具体答案（那是逐点答案对照与 ctest 其余用例的活），钉的是
+// 「复用不许改变结论」这一条 —— 它只在池化有别名/残留时才红。
+void test_tactical_pooled_slots_answer_the_same_after_reuse() {
+    Evaluator evaluator;
+    std::atomic<bool> stop(false);
+
+    // P1：黑三连、两头空 —— 根扫描就能答，深度也照样走完整条递归。
+    Board p1;
+    p1.place_stone(7, 4, BLACK);
+    p1.place_stone(7, 5, BLACK);
+    p1.place_stone(7, 6, BLACK);
+
+    // P2：轮次42 那条对角线棋形 —— 防守枚举（generate_defenses）在这里被真正走深。
+    Board p2;
+    p2.place_stone(6, 6, BLACK);
+    p2.place_stone(7, 7, BLACK);
+    p2.place_stone(8, 8, BLACK);
+    p2.place_stone(4, 4, WHITE);
+    p2.place_stone(10, 10, WHITE);
+    p2.place_stone(0, 0, WHITE);
+
+    // P3：黑握着一头挡住的冲四 —— VCF 的候选表非空，递归层会一路展开。
+    Board p3;
+    p3.place_stone(10, 3, BLACK);
+    p3.place_stone(10, 4, BLACK);
+    p3.place_stone(10, 5, BLACK);
+    p3.place_stone(10, 6, WHITE);
+    p3.place_stone(0, 0, WHITE);
+
+    auto same_vct = [](const VCTMove& a, const VCTMove& b) {
+        return a.result == b.result && a.best_move == b.best_move &&
+               a.variation == b.variation;
+    };
+    auto same_vcf = [](const VCFMove& a, const VCFMove& b) {
+        return a.result == b.result && a.best_move == b.best_move &&
+               a.variation == b.variation;
+    };
+
+    // 冷对象：目标位置就是它搜的第一趟。
+    TranspositionTable tt_cold_vct;
+    VCTSearch cold_vct(evaluator, tt_cold_vct);
+    const VCTMove cold_p2 = cold_vct.search(p2, BLACK, 8, stop);
+
+    TranspositionTable tt_warm_vct;
+    VCTSearch warm_vct(evaluator, tt_warm_vct);
+    const VCTMove warm_p1 = warm_vct.search(p1, BLACK, 6, stop);   // 先把槽用过一遍
+    const VCTMove warm_p2 = warm_vct.search(p2, BLACK, 8, stop);    // 再搜目标
+    assert(same_vct(cold_p2, warm_p2));
+
+    // 反序复用：目标先、干扰后，结论不许因为「槽里有过别的东西」而移动。
+    TranspositionTable tt_warm_vct2;
+    VCTSearch warm_vct2(evaluator, tt_warm_vct2);
+    const VCTMove rev_p2 = warm_vct2.search(p2, BLACK, 8, stop);
+    const VCTMove rev_p1 = warm_vct2.search(p1, BLACK, 6, stop);
+    assert(same_vct(cold_p2, rev_p2));
+    assert(same_vct(cold_p2, warm_vct2.search(p2, BLACK, 8, stop)));
+    assert(same_vct(rev_p1, warm_p1));
+
+    // 交回的变例必须逐手走得通：别名把候选表改掉时，best_move/变例会指向一条盘上没有的线。
+    if (warm_p2.result == VCTResult::WIN) {
+        assert(!warm_p2.variation.empty());
+        Board replay;
+        replay.place_stone(6, 6, BLACK);
+        replay.place_stone(7, 7, BLACK);
+        replay.place_stone(8, 8, BLACK);
+        replay.place_stone(4, 4, WHITE);
+        replay.place_stone(10, 10, WHITE);
+        replay.place_stone(0, 0, WHITE);
+        for (const Move& m : warm_p2.variation) {
+            assert(m.pos.is_valid());
+            assert(replay.is_empty(m.pos.row, m.pos.col));
+            replay.place_stone(m.pos.row, m.pos.col, m.color);
+        }
+        const Move& last = warm_p2.variation.back();
+        assert(replay.has_five_in_a_row(last.pos.row, last.pos.col, last.color));
+    }
+
+    TranspositionTable tt_cold_vcf;
+    VCFSearch cold_vcf(evaluator, tt_cold_vcf);
+    const VCFMove cold_p3 = cold_vcf.search(p3, BLACK, 12, stop);
+
+    TranspositionTable tt_warm_vcf;
+    VCFSearch warm_vcf(evaluator, tt_warm_vcf);
+    const VCFMove vcf_junk_1 = warm_vcf.search(p2, BLACK, 20, stop);   // 深到根扫描就铺开
+    const VCFMove vcf_junk_2 = warm_vcf.search(p1, BLACK, 3, stop);
+    const VCFMove vcf_p3 = warm_vcf.search(p3, BLACK, 12, stop);
+    assert(same_vcf(cold_p3, vcf_p3));
+    // 越界那一档（depth 20）走的是局部表：它自己也得与冷对象一致，并且不污染后面的槽。
+    TranspositionTable tt_cold_deep;
+    VCFSearch cold_deep(evaluator, tt_cold_deep);
+    assert(same_vcf(cold_deep.search(p2, BLACK, 20, stop), vcf_junk_1));
+    TranspositionTable tt_cold_shallow;
+    VCFSearch cold_shallow(evaluator, tt_cold_shallow);
+    assert(same_vcf(cold_shallow.search(p1, BLACK, 3, stop), vcf_junk_2));
+
+    std::cout << "test_tactical_pooled_slots_answer_the_same_after_reuse passed" << std::endl;
+}
+
 int main() {
     std::cout << "Running search tests..." << std::endl;
 
@@ -10098,6 +10205,7 @@ int main() {
     test_vct_recursive_win_returns_a_ply_by_ply_checkable_variation();
 
     test_opening_book_weighted_draw_reaches_every_candidate();
+    test_tactical_pooled_slots_answer_the_same_after_reuse();
     std::cout << "All search tests passed!" << std::endl;
     return 0;
 }

@@ -1984,6 +1984,70 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次216 #118 档二：对局层每手 1240 次堆分配 —— 战术层临时表按递归深度分槽，分配 −78.8 %（20 局口径 −74.7 %），答案一个没动；「快了多少」这台量不出
+
+轮次213 那档量的是「一次搜索的每节点分配」（3.93 → 0.01）。用户要求里还有一句「避免频繁重分配内存，使用预分配或固定大小内存」，而训练/会话两条路径的开销都是**按手**结算的，所以这一轮把台架搬到对局层：同一台分配具（替换全局 `operator new`，只数次数、按请求尺寸分桶、固定 96 槽调用点表），驱动 `SelfPlay::run`，读**每手付多少次堆**。
+
+### 基线归因（先数清楚钱花在哪儿，再动手）
+
+台架 `/tmp/r218/hand_probe2.cpp`，链本轮改动前的树（`88ffc16`，`build/` 的 `-O2 -std=gnu++17`），`max_depth=3 / timeout_ms=50 / max_nodes=2000 / max_moves=30`，4 局 = 92 手：
+
+- **114,076 次分配 = 每手 1240.0 次**；`frees` 与 `allocs` 逐字相等（114,076），未被仪器记账的只有 4 次（静态初始化期）⇒ 这台具是闭合的。
+- 33 个调用点的命中数**加起来正好等于 114,076**（不是「挑几个大头看」），前三名：
+  1. `vector<pair<int, Move>>::_M_realloc_append` —— **77,619 = 68.0 %**：`vcf.cpp` 的 `scored_moves` 与 `vct.cpp` 的 `scored_moves`/`scored_defenses`，三处同一个模板实例；每次调用从容量 0 靠几何扩容往上长。
+  2. `vector<Move>::reserve` —— **14,489 = 12.7 %**：同一批生成器把打分表摊平成返回值的那张表，每次调用现 reserve 一次。
+  3. `vector<Move>::_M_realloc_append<Move const&>` —— **11,526 = 10.1 %**：变例（`variation`/`best_line`/`worst_line`/`child_line`）。
+   ⇒ 前两名（都是「每节点建两张表、返回即弃」）合计 **92,108 = 80.7 %**，就是这一轮的靶子；第三名要动的是变例的持有期约定，另开一档。
+
+上一版台架（`hand_probe.cpp`）先 abort（`malloc(): corrupted top size`）后 segfault，两轮都定不了性 —— 本轮先给仪器本身做了对照：同一份源 `-DNO_PROBE`（完全不替换分配器）跑满 4 局 rc=0 ⇒ **路径不越界，坏的是仪器**。两处仪器病都找到了：带头布局（payload 前 16 字节记尺寸）会把任何未被我替换的分配路交出来的子算错基址 ⇒ 改成**不带头**，payload 就是 `malloc` 的指针，只数次数、不再统计 live/peak 字节（字节那一档归 memcheck）；`__builtin_return_address(1)` 在 `-O2` 下 GCC 自己警告「nonzero argument is unsafe」，实测就是它段的进程 ⇒ 默认只取第一帧。
+
+### 改法：槽号就是递归深度
+
+`VCFSearch`/`VCTSearch` 各挂一组按深度分槽的常驻表（`static constexpr int kMoveSlotCount = 24`，覆盖出厂值 `vcf_max_depth_=20`/`vct_max_depth_=12`）：
+
+- 生成器拆两半：`collect_*()` 填调用方给的打分表（枚举、禁手判定、比较器逐字没动），`generate_*()` 把 `slots[depth]` 填满后交出**该槽输出表的 const 引用**；深度越出槽数就填调用方的局部 `overflow` —— 只是不池化，其余一字不变。
+- 为什么 `depth` 能当槽号：递归严格减 `depth`，父层还握着 `slots[d]` 时子层只会碰 `slots[d-1]`。VCT 的攻击表与防守表是**两套**数组，因为同一层里 `attacks` 与 `defenses` 是同时活着的（里层循环还在迭代外层交回的表）。
+- `find_defense()` 反复调 `search_impl()`（同一个 `max_depth`）是顺序的，前一趟早就返回了，槽不构成共享。
+
+改动只在 `src/search/vcf.{h,cpp}`、`src/search/vct.{h,cpp}`（+34/−11、+65/−21、两个头 +26/+27）。三处**私有一样**的旧用例调用点（`tests/test_search.cpp:2168-2169`、`:2193-2194`、`:6779-6781`）跟着签名走：它们本来就 `const auto` 当场拷一份，所以各传一个槽号即可 —— 第 6779 那处三张表要同时活着，特意把 `opponent_fours` 放到 1 号槽，与 0 号槽的两张互不遮挡。
+
+### 「答案一个没动」的四条独立证明
+
+| 证明 | 读数 |
+| --- | --- |
+| 全量 ctest（本轮树，含新用例） | `100% tests passed, 0 tests failed out of 10`，984 s，rc=0 |
+| 逐点答案跨树对照（`88ffc16` vs 本轮树，同一份 `pose_dump`） | 两边各 15 行，`diff` **逐字节相同** ⇒ 一个答案都没移动 |
+| 同一台分配具，两棵树同一配方 | 4 局：两树**每一局的 plies 与 winner 全同**（21/29/25/17，winner=1×4），分配 114,076 → 24,175（**1240.0 → 262.8 次/手，−78.8 %**）；20 局（364 手）：236,307 → 59,850（**649.2 → 164.4，−74.7 %**） |
+| memcheck（池化树，20 局，**替换分配器关掉**） | `ERROR SUMMARY: 0 errors from 0 contexts`、`in use at exit: 0 bytes`、rc=0 |
+
+新用例 `test_tactical_pooled_slots_answer_the_same_after_reuse`（`tests/test_search.cpp:9901`）不钉具体答案（那是上表的活），钉的是池化独有的两类事故：**别名**（一个槽被两处同时活着的东西共用）与**残留**（上一趟的脏内容没清就读了）。做法是同一个对象先搜别的位置再搜目标位置，结论必须与「一开场就搜目标」的新对象逐字段相等，正反两序各一遍；交回 WIN 时变例必须一手一手在盘上走得通并以成五收口；越界那一档（`depth=20`）自己也要与冷对象一致，并且不许污染后面的槽。
+
+### 变异台：三条臂，两条红的红在哪儿
+
+| 臂 | 改法 | 结果 |
+| --- | --- | --- |
+| M0 对照 | 树不动 | rc=0，`All search tests passed!`，走到新用例（命中 1） |
+| M1 别名 | `generate_defenses` 的槽改成借用 `attack_slots_[depth]` | **rc=134**，死在 `tests/test_search.cpp:1077`：`test_engine_stamps_elapsed_on_tactical_wins` 的 `result.best_move.pos.is_valid()` |
+| M2 残留 | `vcf.cpp` 里注释掉 `slot.scored.clear()` | **rc=134**，死在 `tests/test_search.cpp:1075`：同一用例的 `result.method == "vct"` |
+
+两条红臂都在**跑到新用例之前**就被既有用例拦下了（那条用例就在同一段里）—— 这既说明池化约定早就被套件盯着，也留下一个必须写清的账：**这两条臂没有证明新用例自己会红**（它在 main 的登记序里排在后面，两臂都没走到，`grep -c` 命中 0）。要让新用例自己红，得有一条「只在跨趟复用上出错、单趟搜索看不出来」的变异，本轮没造出来 ⇒ 记为未证，不写成已钉。
+
+### 门禁（与上面同一棵树、同一形状）
+
+强制全量重建 `rc=0`，356 个编译单元，**警告 0 条**（228 s）→ ctest `rc=0` 10/10（984 s）→ `readme_anchor_check` 122 条引用 0 problems、`source citations resolved: 151, ok: 151, problems: 0` → `web_frontend_check 113/113` → TSan `test_server` `clean races=0 deadlocks=0 thread_leaks=0`（180 s）。
+分配具自己的 memcheck 臂（带替换）报 `rc=9 / 24 errors from 5 contexts`，逐条看全是 `Mismatched free() / delete / delete []` —— 是仪器把 `operator delete` 里的 `free()` 当成错配，不是产品的；上面表里那条「替换关掉」的臂 0 errors 就是它的对照。两臂都跑完才收口，`in use at exit: 0 bytes` 两边一致。
+
+### 「省了分配」到底快了多少：这台量不出，别抄成收益
+
+同一台具、同一配方（20 局自对弈，`-O2` 门禁档），CPU 时间三对三：base `2.27 / 2.23 / 2.38 s` vs after `2.25 / 2.23 / 2.25 s` ⇒ 中位 −0.9 %，**两侧区间相接（base 最小值 = after 最小值 = 2.23）**。按轮次215 立的规矩，这不叫变快，也不叫变慢，只写「在这台机器这一档这一负载上量不出来」。也就是说：**这一档买到的是分配次数（−74.7 %）和内存 churn，不是墙钟收益**；`allocs == frees` 闭合、`in use at exit: 0 bytes`，所以它是「该付的钱不再每次付」，收益在长会话/多工人并发那一侧（glibc 每线程 arena 的膨胀），本轮没有量。
+
+### 欠账（按可操作性排）
+
+1. **变例那 10.1 %**（`vector<Move> push_back` 11,526 + `range_insert` 1,466 + `default_append` 968）：`out_line = best_line;` 那条赋值意味着父的 `child_line` 与子的 `best_line` 必须不同槽 —— 要做的话得按「角色」分族并逐处核对持有期，比本轮这一档风险高一档，单开。
+2. **`MoveGenerator::generate` 1,238 + `vector<Candidate>` 2,917/968**：轮次213 已把主路池化，剩下的这几百次是候选表首触扩容，读数量级小，先不动。
+3. **新用例自己的活体证明**（M3）：见变异台那条账，未证。
+4. **#119 / #111 / #117 / `--ponder` 默认值 / `architecture/` 与 `build_sa/` 的去留**：仍在原地等用户。
+
 ## 轮次215：把「省了分配」翻译成「快了多少」—— `-O3` 下 d8 +4.6 %（两侧区间不相交）、`-O0` 下持平略负；顺手把 G5 那格的旧 nps 重量了一遍
 
 轮次213 报的是 `3.93 → 0.01 次/节点`，那是**次数**，不是性能。用户要求里「性能优先」是另一条，所以要拿机器数回答：同一次改动，到底快了多少。

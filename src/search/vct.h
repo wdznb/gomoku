@@ -5,8 +5,10 @@
 #include "../core/evaluator.h"
 #include "../core/pattern.h"
 #include "../optimization/transposition.h"
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <utility>
 #include <vector>
 
 namespace gomoku {
@@ -60,6 +62,17 @@ public:
     }
 
 private:
+    // #118 档二，与 VCF 那一族同形：打分对表与输出表按递归深度分槽常驻，槽号就是这里的
+    // depth。攻击表与防守表是**两套**数组，因为同一个节点会同时握着 `attacks[d]` 和
+    // `defenses[d]`（vct_defend/vct_attack 的里层循环），共用一套就会互相覆盖。
+    // 递归严格减 depth，所以父层持有期间子层只碰 d-1，不会碰 d。
+    static constexpr int kMoveSlotCount = 24;
+
+    struct MoveSlots {
+        std::vector<std::pair<int, Move>> scored;
+        std::vector<Move> moves;
+    };
+
     const Evaluator& evaluator_;
     TranspositionTable& tt_;
     int node_limit_;
@@ -69,6 +82,8 @@ private:
     int attack_rejections_ = 0;
     std::chrono::steady_clock::time_point deadline_{};
     bool has_deadline_ = false;
+    std::array<MoveSlots, kMoveSlotCount> attack_slots_{};
+    std::array<MoveSlots, kMoveSlotCount> defense_slots_{};
 
     bool aborted(std::atomic<bool>& stop_flag) const {
         return stop_flag.load() ||
@@ -81,8 +96,18 @@ private:
     int vct_defend(Board& board, int color, int depth, int alpha, int beta,
                    std::atomic<bool>& stop_flag, std::vector<Move>& out_line);
 
-    std::vector<Move> generate_attacks(const Board& board, int color);
-    std::vector<Move> generate_defenses(const Board& board, int color, int attack_row, int attack_col);
+    // collect_* 填的是调用方给的那张打分表（顺序、比较器与从前完全一致）；
+    // generate_* 把深度对应槽位填满后交出该槽的输出表引用，越界时退回 `overflow`。
+    void collect_attacks(const Board& board, int color,
+                         std::vector<std::pair<int, Move>>& scored) const;
+    void collect_defenses(const Board& board, int color, int attack_row, int attack_col,
+                          std::vector<std::pair<int, Move>>& scored) const;
+
+    const std::vector<Move>& generate_attacks(const Board& board, int color, int depth,
+                                              std::vector<Move>& overflow);
+    const std::vector<Move>& generate_defenses(const Board& board, int color, int attack_row,
+                                               int attack_col, int depth,
+                                               std::vector<Move>& overflow);
 
     // #84：对面此刻有没有「下一手成五」的点。一条威胁主张（活四/双四/无防守点）只有在答案
     // 是「没有」时才成立 —— 否则防守方不必来挡，先落那一子棋就结束了。根扫描与递归两层原来
