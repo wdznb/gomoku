@@ -1984,6 +1984,25 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次214 #116：TT 分片锁的**真实训练路径**读数 —— 保留，但代价换成了一个新 bug 号；三遍复测后方向不再翻
+
+这一格之前只有合成臂（均匀哈希打 1<<14 的小表，争用 7.315 %），边界写在那儿：它不是真实重排布，而且插桩自己把 `lock()` 换成了「先 `try_lock`」。这轮换真路径：树外插桩副本 `tc2.cpp`（`src/optimization/transposition.cpp` 的唯一改动 = `ShardLock` 获取处计数 + 一个**无条件**的 `store` 计数，用来把「表有没有被用到」和「锁有没有被拿」分开量）链 `gomoku_train.dir` 的对象，驱动 `Trainer::run(2 轮)`、`data_games=8 / data_threads=4 / max_nodes=4000`（**不拿墙钟出价**）。
+
+**第一遍读数是假的，原因在仪器外面**：A/B 两档都读到 `acq=0`。不是锁没被拿，是**共享表根本没被建** —— 建表那几行在 `generate_data_games` 里，而它开头就有 `if (config_.records_path.empty() && config_.samples_path.empty()) return 0;`，我的缺省探针两个路径都没设 ⇒ 数据收集整段跳过。补上 `records_path`/`samples_path`/`checkpoint_path` 与 `data_games` 后，`is_shared=1` 才出现，`store` 计数也跳到 32 万级 —— 那个「无条件 `store` 计数」就是这一格的对错判据：**两个 0 挤在一起时，只有它能说明仪器接没接上**。
+
+| 读数（三遍） | A：共享表（缺省 `shared_tt_entries = 1<<18`） | B：每 worker 自表（`--shared-tt 0`） |
+| --- | --- | --- |
+| `store` 次数 | 323,811 / 326,109 / 324,515 上下浮动 | **324,515 三遍一字不差** |
+| 分片获取 `acq` | 500,410 / 510,367 / 743,169 | 0（`ShardLock(nullptr)` 空操作） |
+| 争用 `spin` / 率 | 8,502 / **1.699 %**、4,386 / 0.859 %、4,584 / **0.617 %** | — |
+| **ns / store（CPU 时间）** | **176.2 / 174.1 / 172.9** | **349.4 / 347.1 / 346.8** |
+
+**判据（换成机器的数，旧的「72-bit 键」那句作废并已在轮次211 重推）**：① 条目原始 224 bit、按值域打包 92 bit，都 > 64，而本机 `atomic<__int128>` 的 `is_lock_free()=0`、16 字节 CAS 反汇编是 `call __atomic_compare_exchange_16`（CPU 明明有 `cx16`）⇒ 融合式无锁表只会把锁从分片**挪进 libatomic 的锁池**；② 真实训练路径上这把锁的争用 ≤ **1.7 %** 的获取；③ 共享表本身值 **1.98×**（每存一条 CPU 从 ~347 ns 降到 ~174 ns）。三条合起来：`src/` 里最后这一族 `std::mutex` **保留** —— 它是「用 1.7 % 的争用换一半的每存成本」，而撤它没有可用的无锁原语。墙钟那一列（55 s vs 55 s）**不引用**：这一档工作量只有 2 轮 × 8 局，端到端收益要按 S4/S5 那种规模另量。
+
+**顺剂量出一个之前没人记过的事实**：A 档三遍的 `store`/`acq` 都在飘（32.38 万 ↔ 32.61 万、50 万 ↔ 74 万），B 档三遍完全相同 ⇒ **共享置换表让训练不可复现**（谁先存、谁把谁换出去由线程交错决定），而这与「`--seed` 钉住一次训练」的既有口径是冲突的。这是新格 **#119**：要么给共享表加一条「按批首清空之外再固定交错」的机制（可能又引回同步），要么把可复现的那一档（`--shared-tt 0`）写成缺省并把那 1.98× 当作明码代价 —— 两者都是语义决定，不自己改。
+
+**本轮没有改产品代码**（只加树外具与这节账），所以门禁只跑引用检查：`node tests/readme_anchor_check.js` ⇒ source `151/151 ok`、README `122 citations, 0 problems`。
+
 ## 轮次213 #118：搜索热路径的分配从「每节点 3.9 次」降到 0.01 —— 预分配 + 常驻缓冲，排序语义一字不动
 
 新要求是「**避免频繁重分配内存，使用预分配或固定大小内存**」。这条不能靠读代码点头，所以先做仪器：`/tmp/r218/alloc_probe*.cpp` 替换全局 `operator new/delete`（带 16 字节头记请求尺寸 —— 不带头的话 `operator delete(void*)` 那条不知道尺寸的路会把 live 只减 1），按 8 B 步长分桶，固定 64 槽的调用点表，内部一律不再分配；`backtrace_symbols` 只在**关掉计数之后**调（它自己会分配）。自检格：故意漏一块 4096 ⇒ `allocs=1 frees=0 live=4096`。
