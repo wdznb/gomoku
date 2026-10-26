@@ -9735,6 +9735,95 @@ void test_opening_book_weighted_draw_reaches_every_candidate() {
               << light << " heavy " << heavy << " distinct " << distinct.size() << ")" << std::endl;
 }
 
+// 轮次211 #113：`SearchController` 的结论不再走「共享字段 + mutex」，改走一条消息槽。
+// 六段各钉一半，其中第 ⑤ 段专门去制造**以前所有用例都没制造过的那个窗口**：读者在思考
+// 进行中就冲进去读。轮次127 的教训是「join 之后才取用」的读数证明不了任何并发问题。
+//   ① 槽是真的原子指针（「无锁」在这里是一个可核对的数）；
+//   ② 没思考过时读回默认值（空槽那一半）；
+//   ③ 一次思考交回**那一步的答案**，且发布计数 +1；
+//   ④ 同一个结论**只能读走一次**（改成「只读不取」的恒等变异会红在这里）；
+//   ⑤ 思考进行中并发读：一个结论被两根线程**恰好读走一次**（多读少读都算红）；
+//   ⑥ 连读三次都不取：槽里最多一份，只交回最新那份（`delete stale` 摘掉 ⇒ memcheck 报漏）。
+void test_controller_result_travels_through_the_slot() {
+    SearchController controller;
+    assert(controller.result_slot_is_lock_free());     // ①
+    assert(!controller.get_result().best_move.pos.is_valid());  // ② 空槽
+    assert(controller.results_published() == 0);
+
+    Board board;
+    board.place_stone(7, 3, BLACK);
+    board.place_stone(7, 4, BLACK);
+    board.place_stone(7, 5, BLACK);
+    board.place_stone(7, 6, BLACK);
+    board.place_stone(7, 2, WHITE);   // closes the left end: only (7,7) wins
+    board.place_stone(9, 9, WHITE);
+
+    std::atomic<bool> done(false);
+    controller.set_completion_callback(
+        [&](SearchResult) { done.store(true); });
+    controller.start_search(board, BLACK, 4, 1500);
+    int wait_count = 0;
+    while (!done.load() && wait_count < 50) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        wait_count++;
+    }
+    assert(done.load());
+    SearchResult first = controller.get_result();
+    assert(first.best_move.pos.row == 7 && first.best_move.pos.col == 7);  // ③
+    assert(first.score >= 99000);
+    assert(controller.results_published() == 1);
+    assert(!controller.get_result().best_move.pos.is_valid());  // ④ 取走即消耗
+
+    // ⑤ 读者在第二次思考进行中间冲进来：谁拿到不确定，但**拿到几次**必须是 1。
+    std::atomic<bool> stop_reading(false);
+    std::atomic<int> valid_reads{0};
+    std::thread reader([&] {
+        while (!stop_reading.load()) {
+            if (controller.get_result().best_move.pos.is_valid()) {
+                valid_reads.fetch_add(1, std::memory_order_relaxed);
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    });
+    done.store(false);
+    controller.start_search(board, BLACK, 4, 1500);
+    wait_count = 0;
+    while (!done.load() && wait_count < 50) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        wait_count++;
+    }
+    assert(done.load());
+    stop_reading.store(true);
+    reader.join();
+    if (controller.get_result().best_move.pos.is_valid()) {
+        valid_reads.fetch_add(1, std::memory_order_relaxed);
+    }
+    assert(valid_reads.load() == 1);                   // ⑤ 一个结论只被读走一次
+    assert(controller.results_published() == 2);       // ③ 的另一半：发布计数按次走
+
+    // ⑥ 连着三次思考**一次都不读**：发布侧要把上一份换下来删掉，所以槽里最多一份 ——
+    //    最后只读到**最后一次**的答案（读到两份＝没删；一份读不到＝把新的也丢了）。
+    //    这一段是 M2 变异臂（`delete stale` 摘掉）的现场：漏的那两份由 memcheck 报出来。
+    for (int i = 0; i < 3; ++i) {
+        done.store(false);
+        controller.start_search(board, BLACK, 4, 1500);
+        wait_count = 0;
+        while (!done.load() && wait_count < 50) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            wait_count++;
+        }
+        assert(done.load());
+    }
+    assert(controller.results_published() == 5);
+    SearchResult last = controller.get_result();
+    assert(last.best_move.pos.row == 7 && last.best_move.pos.col == 7);  // 最新那一份
+    assert(!controller.get_result().best_move.pos.is_valid());           // 槽里不存第二份
+    std::cout << "test_controller_result_travels_through_the_slot passed (5 thinks: "
+                 "one consumed by the owner, one raced for by owner+reader, three never read; "
+                 "publishes=" << controller.results_published()
+              << ", slot holds only the newest)" << std::endl;
+}
+
 int main() {
     std::cout << "Running search tests..." << std::endl;
 
@@ -9785,6 +9874,7 @@ int main() {
     test_controller_restart_after_completion();
     test_controller_think_ignores_later_caller_board_edits();
     test_controller_second_think_uses_the_new_position();
+    test_controller_result_travels_through_the_slot();
     test_forced_move();
     test_fast_path_labels_fill_no_depth();
     test_search_result_fields_initialized_on_fast_paths();

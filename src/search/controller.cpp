@@ -12,6 +12,7 @@ SearchController::~SearchController() {
     if (search_thread_ && search_thread_->joinable()) {
         search_thread_->join();
     }
+    delete published_result_.exchange(nullptr, std::memory_order_acq_rel);
 }
 
 void SearchController::start_search(const Board& board, int color,
@@ -44,9 +45,13 @@ void SearchController::stop() {
     stop_flag_.store(true);
 }
 
-SearchResult SearchController::get_result() const {
-    std::lock_guard<std::mutex> lock(result_mutex_);
-    return last_result_;
+SearchResult SearchController::get_result() {
+    // 取走即消耗：`exchange` 给这根线程独占权，所以复制 `*taken` 期间没有别人能删它，
+    // 也不需要一把锁或一套回收机制。槽里没东西（还没思考、或已被读走）就交回默认值。
+    const std::unique_ptr<SearchResult> taken(
+        published_result_.exchange(nullptr, std::memory_order_acq_rel));
+    if (!taken) return SearchResult{};
+    return std::move(*taken);
 }
 
 void SearchController::set_progress_callback(ProgressCallback cb) {
@@ -62,10 +67,11 @@ void SearchController::search_worker(const Board& board, int color,
                                      int max_depth, int time_limit_ms) {
     SearchResult result = engine_.search(board, color, max_depth, time_limit_ms, stop_flag_);
 
-    {
-        std::lock_guard<std::mutex> lock(result_mutex_);
-        last_result_ = result;
-    }
+    // 发布 = 一次 exchange：上一份要是没被读者取走，由这根线程换下来并删掉，槽里最多一份。
+    result_publishes_.fetch_add(1, std::memory_order_relaxed);
+    SearchResult* stale = published_result_.exchange(new SearchResult(result),
+                                                     std::memory_order_acq_rel);
+    delete stale;
 
     thinking_.store(false);
 

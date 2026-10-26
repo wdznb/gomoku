@@ -4,8 +4,6 @@
 #include "search_engine.h"
 #include <atomic>
 #include <thread>
-#include <future>
-#include <mutex>
 #include <functional>
 
 namespace gomoku {
@@ -23,7 +21,17 @@ public:
 
     bool is_thinking() const { return thinking_.load(); }
 
-    SearchResult get_result() const;
+    // 轮次211 #113：一次思考的结论用**一条消息**交回，不再用「共享字段 + mutex」。读者取走
+    // 即消耗（第二次读回的是默认值），这不是省事而是唯一能不引回收机制的做法：`SearchResult`
+    // 里有 string 和三个 vector，读者要能在写者还在发布时安全复制，就得要么加锁要么做
+    // hazard pointer —— 而这个类在产品里没有使用者（`grep` 只剩测试）。
+    SearchResult get_result();
+
+    // 「无锁」在这里是一个数，不是形容词（#93/#114/#210 同一用途）。
+    bool result_slot_is_lock_free() const { return published_result_.is_lock_free(); }
+    unsigned long long results_published() const {
+        return result_publishes_.load(std::memory_order_relaxed);
+    }
 
     void set_progress_callback(ProgressCallback cb);
     void set_completion_callback(std::function<void(SearchResult)> cb) {
@@ -39,8 +47,10 @@ private:
     std::atomic<bool> stop_flag_;
     std::atomic<bool> thinking_;
 
-    mutable std::mutex result_mutex_;
-    SearchResult last_result_;
+    // 发布/取用都走 `exchange`：每个节点恰好被一根线程拿到，拿到的人负责删。写者发布时把
+    // 上一份没被读走的换掉并删除，所以最多一份活在槽里，析构再兜一次（轮次205 的漏账教训）。
+    std::atomic<SearchResult*> published_result_{nullptr};
+    std::atomic<unsigned long long> result_publishes_{0};
 
     std::unique_ptr<std::thread> search_thread_;
 

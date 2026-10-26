@@ -1984,6 +1984,50 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次211 #113：`SearchController::result_mutex_` 撤掉 —— 结论改走一条消息槽；`src/` 里的 `std::mutex` 到这里只剩 TT 那一族
+
+**先量再动**（不采信轮次209 记下的那句「要先判退役还是补」）：`result_mutex_` 只有两个获取点（读者 `get_result()`、写者 `search_worker`），而 `get_result()` 的读者全树只有两处，都在 `tests/test_search.cpp:8615` 与 `:8666`，**两处都是先等 `is_thinking()` 落下再读** —— 与轮次127 同形：测试从不制造那个窗口，所以「加了锁也没被证过有用」和「撤了会不会出事」都不能靠现成用例回答。产品侧这个类 0 用户（`grep` 只剩测试）。
+
+**改了什么**：`mutable std::mutex result_mutex_` + `SearchResult last_result_` 换成 `std::atomic<SearchResult*> published_result_{nullptr}`（`controller.h:52`）+ 一个 relaxed 的发布计数；读者 `exchange(nullptr)` **取走即消耗**（`controller.cpp:52`），写者 `exchange(new SearchResult(result))` 并把上一份换下来删掉（`controller.cpp:71-73`），析构再兜一次（`controller.cpp:15`）。`exchange` 给每根线程唯一所有权 ⇒ 复制 `*taken` 期间没有人能删它，**既不需要锁也不需要回收机制**。顺手删掉两个不再被引用的头：`<mutex>`、`<future>`（`grep` 全类 0 处 `std::future`）。
+
+为什么不用另外两条看着更省事的形状（都是量的，不是想的）：
+- `SearchResult` 里有一个 `std::string` 和两个 `std::vector`（`search_engine.h:29`、`:30`、`:33`）⇒ 负载不是可平凡复制的 POD，**seqlock 不适用**（读者复制中途被写 = 复制一个正在换缓冲区的 vector）。
+- 反复可读 + 多读者 + 无锁 + 内存安全，四件同时成立要引 hazard pointer / epoch 回收；这个类产品里没人用。所以语义收紧成「一份结论读走一次」，并把它**钉成断言**（④），不是悄悄改。
+
+**新用例** `test_controller_result_travels_through_the_slot`（`tests/test_search.cpp:9747`，六段）：① 槽是真原子；② 没思考过 ⇒ 读回默认值；③ 一次思考交回那一步的答案且发布计数 +1；④ 同一份只能读走一次；⑤ **读者在思考进行中冲进来**（一根线程轮询 + 属主线程），一个结论被两根线程恰好读走一次；⑥ 连三次思考都不读 ⇒ 槽里最多一份，只交回最新那份。
+
+**并发具**（树外 `/tmp/r211/mc_ctrl.cpp`，8 次思考 + 一根不睡眠的读者线程，链本轮 `test_search.dir` 的 TSan 对象）：
+
+| 臂 | 仪器 | 读数 |
+| --- | --- | --- |
+| 交树用例（六段） | 裸跑 | `publishes=5`：一次属主读走、一次属主+读者抢第二次恰好一份、三次没读 |
+| 交树用例 | memcheck | `ERROR SUMMARY: 0 errors from 0 contexts`、`67 allocs / 67 frees`、`in use at exit: 0 bytes in 0 blocks` |
+| 交树用例 | TSan | `WARNING: ThreadSanitizer` = **0**（大小写不敏感数） |
+| 交树并发具 | TSan | rc=0、`published=8 consumed=8`、`thinking_seen=5113` ⇒ **窗口真的存在过 5113 次**，不是 join 之后的读数 |
+| M1 读者改成只看不取（`exchange`→`load`） | 裸跑 | rc=**134** `free(): double free detected in tcache 2` —— 红在断言④**之前**：唯一所有权就是那道防线，两份删同一节点 |
+| M2 发布时不删旧份（摘掉 `delete stale`） | memcheck | rc=**9**、`352 bytes in 2 blocks are definitely lost`，帧名 `SearchController::search_worker (controller.cpp:72)`；2 块而不是 3 块也对得上：最后一次那份被读走，前两次未读的换下来才漏 |
+| M3′ 读者复制负载但不取走（原子指针仍在） | TSan | rc=**66**、`data race` 1 条点名 `SearchController::get_result` / `search_worker`，且 `slot_lock_free=1` ⇒ 抢的是**负载的所有权**而不是原子性；同时总账炸成 `consumed=26764`（应 8） |
+
+两处自身教训：
+- **变异臂只能动要证的那一半**。M3 第一版把 `published_result_` 连 `result_slot_is_lock_free()` 一起改裸，用例第①段当场断言死掉，TSan 根本没跑到那个窗口 —— 那次 `races=0` 是「进程在窗口之前就没了」的 0。改成只动读者（M3′）才拿到那条 race。
+- **链错对象集会量到未变异的树**。并发具第一次链 `build/CMakeFiles/gomoku_server.dir` 的对象，链接直接报 `undefined reference to gomoku::SearchController::get_result()`（旧签名是 `const`），这是好事 —— 它当场拒绝；换成 `test_search.dir` 自己的 15 支才是本轮的树。两次变异都 `cp` 复原 + `diff -q` 逐字节相同。
+
+**顺带把 TT 那一格的旧结论重推了**（#116 后半的前置测量）：`src/` 里现在只剩 TT 一族 `std::mutex`（`transposition.h:173/216`、`transposition.cpp:25/36/44/56`），而 #113 的账一直抄「轮次134/J：融合表要 72-bit 键」。按今天的布局重量：`sizeof(TTEntry)=28` ⇒ **224 bit**（键 32 + 分 32 + `static_eval` 32 + 深度 16 + flag 8 + age 8 + `Move` 96；`sizeof(Move)=12`、`sizeof(Position)=8`，`Position` 是两个 `int`），按值域打包也是 **92 bit**。真正绑死结论的是这台机器的原子宽度：`atomic<uint64_t> lock_free=1`，`atomic<__int128> lock_free=0` —— 加 `-mcx16`、加 `-O2` 都还是 0；反汇编对上：8 字节 CAS 内联 `lock cmpxchg`，16 字节 CAS 是 `call __atomic_compare_exchange_16`（**把锁搬进 libatomic 的锁池**），而 `/proc/cpuinfo` 明确有 `cx16` ⇒ 不是 CPU 不支持，是这套 gcc 15.2 的 C++ 原子路径不发 `lock cmpxchg16b`（这句限定要一起留着，否则下轮会当硬件限制去绕）。所以融合式 TT 撤不掉并发保护，只剩「给这把锁一个代价读数」这条。读数**已经开出来了**（树外插桩副本 `/tmp/r212/tc.cpp`：只把 `ShardLock` 的获取处从 `lock()` 改成 `try_lock` 先试一次 + 两个进程级原子计数，表的布局与四个调用点没动；`/tmp/r212/tt_contend.cpp` 链本轮 `test_search.dir` 的对象）：
+
+| 格子 | 形状 | 读数 |
+| --- | --- | --- |
+| A | `shared=false` 的表，单线程 20000 次 store+probe | `acq=0 spin=0` ⇒ `transposition.cpp:19-22` 那句「非共享表一分钱不花」**成立，是可核对的 0** |
+| B | `shared=true` 的表（1<<14 条目），4 根线程各 20000 次 store+probe | `acq=160000`（= 4 × 20000 × 2，逐次对上 ⇒ 仪器接到了每一个获取点）、`spin=11704`、**争用率 7.315 %** |
+
+这两格的边界也要写在账上：B 是**合成的均匀哈希**打在一个小表上，不是真实训练的重排布（训练里同一根线程会沿一条线连续读写，命中同一分片的比例更高），而且插桩本身把 `lock()` 换成「先 `try_lock`」，所以 7.315 % 是**这台仪器看到的争用**、不是生产路径的等待时间。真实那一格（跑一轮 `gomoku_train` 用 `shared_tt_`、按 `--max-nodes` 定价，对照 `--shared-tt 0` 的每 worker 自表）留给下一轮，它才是「保留」还是「非共享化」的定价依据。
+
+
+**#113 的账**：七把阻塞锁里 `src/` 现在只剩 **TT 的 16 个分片**一族（且只在 `shared_` 时拿，非共享表一分钱不花 —— `transposition.cpp:25-29` 的 `ShardLock(nullptr)` 是空操作；产品里唯一 `shared=true` 的表在 `trainer.cpp:373/388`，同进程多根 worker）。撤掉的六把：`thinking_mutex_`（205）、`end_frame_mutex_`（206）、`games_mutex_` 降级为只登记（208）、`OwnerCheckedMutex` 删除（209）、`OpeningBook::rng_mutex_`（210）、本轮 `result_mutex_`。
+
+**门禁**（`/tmp/r211/gates.log`，串行不重叠）：① 强制全量重建 stage1 rc=0 recompiles=356 warnings=0 elapsed=261s；② `ctest -j1` stage2 rc=0 elapsed=1028s；③ anchor resolved: 150, ok: 150, problems: 0、README 122 条 0 problems；④ web_frontend_check: 113/113 passed；⑤ TSan `test_server` stage5 rc=0 elapsed=215s test_server    clean  races=0 deadlocks=0 thread_leaks=0 rc=0 64s。**欠的一臂**：套件级 memcheck —— 见下一段。
+**欠的一臂（明记）**：套件级 memcheck 仍没跑 —— `test_search` 是本轮改动所属的套件，原生 ~600 s、valgrind 下 ~30×，超出可跑预算；改动那一段的内存正确性由上表那台具代答（交树 0 错误 + M2 能报 352 字节）。
+
+
 ## 轮次210 #113：`OpeningBook::rng_mutex_` 撤掉 —— 这把和前面几把不同，它**真被多根线程拿**，所以撤它靠的是把共享可变状态整个去掉
 
 前面四把的依据都是「一根线程独占」，这一把不是：`src/main.cpp:10` 缺省就装 `data/opening_book.json`，`server.cpp:1243` 把同一个 `book_` 装进每一个会话，而 book 的查询发生在**每一手思考自己的 worker 线程**里（`search_engine.cpp:212-215`）⇒ 共享的 `std::mt19937 rng_` 被 N 根线程拿，那把 mutex 是**撑着真实并发的**，不能靠属主登记那套撤。
@@ -2018,7 +2062,7 @@ no existing assertion was edited.
 ③ anchor rc=0：源码引用 `resolved 150, ok 150, problems 0`，`readme_anchor_check: 122 citations, 0 problems`（README 仍是 765 行，没动表格）；
 ④ web rc=0：`web_frontend_check: 113/113 passed`；
 ⑤ TSan `test_server` rc=0：`clean races=0 deadlocks=0 thread_leaks=0`，64 s（段 182 s）。
-**欠的一臂（明记）**：⑥ memcheck `test_search` **没跑完，按没跑记**。原因是我把目标选错了：`test_search` 原生 ~600 s，valgrind 下 ~30× 远超给它的外层 2400 s 预算（`build-vg` 已建好、二进制 02:09 是新的，跑到 02:10 仍在中途，按 pid 收尸）。本轮改动不新增堆分配（`40,118 allocs / 40,118 frees / 0 in use at exit` 是上面那台并发具的实测），memcheck 的问题由那台具代答了；套件级 memcheck 仍是欠账，下轮按 `test_server` 补（1536–1628 s 那一档）。
+**欠的一臂（明记）**：⑥ memcheck `test_search` **没跑完，按没跑记**。原因是我把目标选错了：`test_search` 原生 ~600 s，valgrind 下 ~30× 远超给它的外层 2400 s 预算（`build-vg` 已建好、二进制 02:09 是新的，跑到 02:10 仍在中途，按 pid 收尸）。本轮改动不新增堆分配（`40,118 allocs / 40,118 frees / 0 in use at exit` 是上面那台并发具的实测），memcheck 的问题由那台具代答了；套件级 memcheck 仍是欠账，下轮按 `test_server` 补（1536–1628 s 那一档）。**补上了（轮次211 期间、同一台机器、轮次210 那棵树）**：照两步法跑 —— 先单独 `cmake --build build-vg`（148 s，不占臂预算），再 `timeout 3200 valgrind --tool=memcheck --error-exitcode=9 --leak-check=full --show-leak-kinds=definite --errors-for-leak-kinds=definite --track-origins=yes --num-callers=16 build-vg/test_server` ⇒ **`ERROR SUMMARY: 0 errors from 0 contexts`、`definitely lost: 0 bytes in 0 blocks`、`indirectly lost: 0 bytes in 0 blocks`、`in use at exit: 7,370,408 bytes in 53 blocks`（这是仍可达的那部分，缺省口径只把 definite 记成错）、`arm rc=0 elapsed=1660 s`**。所以这一格从「没跑完」改成「跑完且 0 错误」，轮次210 欠的账清掉；`7,370,408 字节 / 53 块`这一行也记下来，因为它不是本轮引入的（本轮改动不新增堆分配，那台并发具读的是 40,118 allocs / 40,118 frees、in use at exit 0 字节）。**补上了（轮次211 期间同一台机器、轮次210 那棵树）**：先单独 `cmake --build build-vg`（148 s）再 `timeout 3200 valgrind --tool=memcheck … build-vg/test_server` ⇒ ERROR SUMMARY: 0 errors from 0 contexts、definitely lost: 0 bytes in 0 blocks、in use at exit: 7,370,408 bytes in 53 blocks、arm rc=0 elapsed=1660s。所以那一格的口径从「没跑完」改成「跑完且 0 错误」，欠的账清掉。
 记账后两处只改注释的收尾（`tests/test_search.cpp` 的段头从「这三段」改成实测的五段；`src/server/owner_checked_mutex.h:21` 那句「剩下 controller / opening_book / TT 分片三处」已过期，改成两处并注明 opening_book 那把的去向）都是**行数中性**改写，重编 12 支 0 警告、引用检查仍读 `150/150 ok` 与 `122 citations, 0 problems`。
 
 ## 轮次209 #115：`OwnerCheckedMutex` 删掉了 —— 轮次208 之后它在产品里没有使用者，机制留在只登记的那一档里
