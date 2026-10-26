@@ -1998,6 +1998,7 @@ no existing assertion was edited.
 **落实**（`src/server/server.h`、`server.cpp` 20 处、`tests/test_server.cpp` 3 处白盒引用）：成员 `OwnerCheckedMutex games_mutex_` → **`OwnerOnlySection games_owner_`**（改名因为它不再是 mutex），20 个获取点只换模板参数、顺序与早退一字不动。观察面 `owner()` / `current_thread_is_owner()` / `owner_slot_is_lock_free()` 与轮次199 逐字同形，所以那条用例（`test_games_mutex_records_one_owner_thread` 的③段）现在直接读的是**成员**而不是类型。
 
 **读到的新事实（顺手记进 #113 的账）**：产品树里已经没有 `std::mutex` 了（`grep -rn OwnerCheckedMutex src/` 只剩注释），`OwnerCheckedMutex` 这个类型现在**只有测试在用** —— 它成了 #87 同族的死代码，删它要连带把 #93 那条用例的 4 处类型引用换成 `OwnerOnlySection`（历史叙述保留）。这格单独开一个任务，不与本轮混在一起。
+**门禁**（一条链串行，`/tmp/r208/chain.log`；按段计警告，不再拿整条日志计数）：强制全量重建 **356 编译单元 0 warning、165 s** → `ctest -j1` **rc=0、950 s** → `readme_anchor_check` **150 条源码指认 150/150 ok、122 条 README 引用 0 problems** → `web_frontend_check` **113/113** → TSan `test_server` **clean races=0 deadlocks=0 thread_leaks=0 rc=0 61 s** → memcheck `test_server` **clean：reports=0 invalid_read=0 invalid_write=0 uninitialised=0 definite_leak=0，1536 s（stage6 rc=0，1589 s 含建表）**。六臂全绿 —— 这是产品树里 `std::mutex` 归零之后第一次完整 memcheck：既没有漏，也没有未初始化读；轮次205 那 6 块 24 字节的教训（发布没人取用就要在属主退出时回收）到此有仪器背书。
 ---
 
 ## 轮次207 #114：取用点的「只在属主线程」不再是话 —— `OwnerOnlySection` 钉住 adopt/失效，死臂与一支**能打红**的变异臂都在
