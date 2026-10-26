@@ -1984,6 +1984,43 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次210 #113：`OpeningBook::rng_mutex_` 撤掉 —— 这把和前面几把不同，它**真被多根线程拿**，所以撤它靠的是把共享可变状态整个去掉
+
+前面四把的依据都是「一根线程独占」，这一把不是：`src/main.cpp:10` 缺省就装 `data/opening_book.json`，`server.cpp:1243` 把同一个 `book_` 装进每一个会话，而 book 的查询发生在**每一手思考自己的 worker 线程**里（`search_engine.cpp:212-215`）⇒ 共享的 `std::mt19937 rng_` 被 N 根线程拿，那把 mutex 是**撑着真实并发的**，不能靠属主登记那套撤。
+
+（顺带纠正我自己的一个口头判断：轮次208 的真实赛具用的是 `--no-book`，那台仪器**看不到**这条路径 —— 所以这里不拿它当证据，改判据是结构性的：共享对象 + 每会话一根 worker。）
+
+**改了什么**：`opening_book.h` 去掉 `mutable std::mt19937 rng_` 与 `mutable std::mutex rng_mutex_`（连 `#include <mutex>` 一起），换成
+- `uint64_t rng_seed_`（构造时取两次 `random_device`；**先量过**：`rng_` 从来没有被 `--seed` 再播种的路径，本轮 grep 过 `rng_` 只命中构造那一次 ⇒ 抽签本来就不参与任何可重复性，换算法不破坏任何被钉住的东西）
+- `mutable std::atomic<uint64_t> draw_seq_`（一次 relaxed `fetch_add`）+ 旁边的 splitmix64 混合，取模偏差在 2^-32 级（权重合计远小于 2^32）
+- 观察面 `draw_counter_is_lock_free()` / `draws_taken()`（#93/#114 同一用途：「无锁」要是一个可核对的数）
+
+**新用例** `test_opening_book_weighted_draw_reaches_every_candidate`（`tests/test_search.cpp:9706`，五段各钉一半）：① 计数器是真原子；② 200 次查询恰好推进 200 格（没有偷偷走回共享生成器）；③ 交回的着法在 200 次里至少两种（常数哈希会红）；④ 永远不是已占的 (7,7) 且必是空格；⑤ 权重 1 那族与权重 3 那族**都出得来**，且重族 ≥ 2×轻族。
+**这里也把 `add_line` 的真实形状量了一遍**（我原先的假设是错的）：两条线共享第一手时，那一格上不是两个候选而是**八个** —— `add_line` 把整条线按 8 个对称变换各存一份（`VARIANT_COUNT = 8`，`opening_book.cpp:12`）。200 抽实测（`/tmp/r210/probe2`）：轻族 57 / 重族 143，比值 2.5、期望 3。所以断言按实测的族来写，不按我以为的两个点写。
+
+**并发臂（树外，`/tmp/r210/mc_draw.cpp`）**：一把真实并发的仪器比单线程用例值钱 —— 4 根线程 × 5000 抽同一个 `OpeningBook`，各自数两个家族，最后核对总账。链接的是本轮 `build-vg` / `build-tsan` 的对象（24 支，`main*.o` 除外）。
+
+| 臂 | 仪器 | 读数 | 结论 |
+| --- | --- | --- | --- |
+| 交树 | 裸跑 | `lock_free=1 sizeof_book=104`、`4/4` 线程看到两族、`draws_taken=20000 expected=20000` | 计数器一格不丢 |
+| 交树 | memcheck（不带 `-q`） | `ERROR SUMMARY: 0 errors from 0 contexts`、`in use at exit: 0 bytes in 0 blocks`、`total heap usage: 40,118 allocs, 40,118 frees` | 2.30 s，报告是**看得见的 0** |
+| 交树 | TSan | `WARNING: ThreadSanitizer` 计数 = **0**，rc=0，同一行仍读 20000/20000 | 撤锁后没有 race，且这台仪器确实跑到了那段代码 |
+| 泄漏臂（`GOMOKU_MC_LEAK=1`） | memcheck | rc=**9**、`17 bytes in 1 blocks are definitely lost` | memcheck 对这台具会说话 ⇒ 上面那个 0 才算数 |
+| 变异臂（`draw_seq_` 退回裸 `uint64_t` + `draw_seq_++`） | TSan | rc=**66**、`data race` **2** 条，帧名 `OpeningBook::query(...)` at `opening_book.cpp:236`（T2 读 8 字节 / T1 写 8 字节，同一地址） | TSan 看得见这一格；同时总账当场塌成 `draws_taken=1781`（丢 18,219 格） |
+
+两处要记下来的自身教训：
+- **计数的正则一开始是错的**：我用 `grep -c "WARNING: ThreadSanitizer: Data race"` 去数，而 TSan 打的是小写 `data race` —— 交树臂那个「0」当时是**坏计数器给的 0**（碰巧对上）。改判法：按 `grep -ci 'WARNING: ThreadSanitizer'` 重数，并按同一正则数变异臂，两边都读得到非 0 才承认交树臂的 0。
+- **变异臂是混建的**（只重编 `opening_book.cpp`，其余 23 支沿用 `build-tsan`），所以先量 `sizeof(OpeningBook) = 104` 两臂相同（`std::atomic<uint64_t>` 与 `uint64_t` 同宽同对齐），再承认那条 race 报告的是真窗口而不是布局错位；跑完用 `cp` 复原，`diff -q` 两文件逐字节相同，`git diff --stat` 回到本轮那三个文件。
+
+**门禁**：`/tmp/r210/chain.log` 五臂串跑，全绿 ——
+① 强制全量重建 rc=0，`recompiles=356 warnings=0`，208 s（警告按段数，不是整条链；TSan 段的 `-Wtsan` 不计进这一段）；
+② `ctest -j1` rc=0，1040 s；
+③ anchor rc=0：源码引用 `resolved 150, ok 150, problems 0`，`readme_anchor_check: 122 citations, 0 problems`（README 仍是 765 行，没动表格）；
+④ web rc=0：`web_frontend_check: 113/113 passed`；
+⑤ TSan `test_server` rc=0：`clean races=0 deadlocks=0 thread_leaks=0`，64 s（段 182 s）。
+**欠的一臂（明记）**：⑥ memcheck `test_search` **没跑完，按没跑记**。原因是我把目标选错了：`test_search` 原生 ~600 s，valgrind 下 ~30× 远超给它的外层 2400 s 预算（`build-vg` 已建好、二进制 02:09 是新的，跑到 02:10 仍在中途，按 pid 收尸）。本轮改动不新增堆分配（`40,118 allocs / 40,118 frees / 0 in use at exit` 是上面那台并发具的实测），memcheck 的问题由那台具代答了；套件级 memcheck 仍是欠账，下轮按 `test_server` 补（1536–1628 s 那一档）。
+记账后两处只改注释的收尾（`tests/test_search.cpp` 的段头从「这三段」改成实测的五段；`src/server/owner_checked_mutex.h:21` 那句「剩下 controller / opening_book / TT 分片三处」已过期，改成两处并注明 opening_book 那把的去向）都是**行数中性**改写，重编 12 支 0 警告、引用检查仍读 `150/150 ok` 与 `122 citations, 0 problems`。
+
 ## 轮次209 #115：`OwnerCheckedMutex` 删掉了 —— 轮次208 之后它在产品里没有使用者，机制留在只登记的那一档里
 
 轮次205-208 连着把 `src/server/` 的三把阻塞锁降级成 `OwnerOnlySection`（每台服务器 419 次获取全部 `distinct=1` 那台仪器量的），带真 mutex 的 `OwnerCheckedMutex` 就此**只剩测试在用** —— 这是 #87 那一族的死代码，删。

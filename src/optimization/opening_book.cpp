@@ -209,12 +209,15 @@ bool OpeningBook::query(const std::vector<Move>& history, int color, Move& out_m
     }
     if (total_weight <= 0) return false;
 
-    long long pick;
-    {
-        std::lock_guard<std::mutex> lock(rng_mutex_);
-        std::uniform_int_distribution<long long> dist(0, total_weight - 1);
-        pick = dist(rng_);
-    }
+    // 一次 relaxed 递增喂给 splitmix64 —— 没有共享可变状态，所以没有锁。
+    // 取模偏差：total_weight 远小于 2^32（权重是按手累加的 int），偏差在 2^-32 级。
+    const uint64_t n = draw_seq_.fetch_add(1, std::memory_order_relaxed);
+    uint64_t x = rng_seed_ + (n + 1) * 0x9e3779b97f4a7c15ull;
+    x += 0x9e3779b97f4a7c15ull;
+    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ull;
+    x = (x ^ (x >> 27)) * 0x94d049bb133111ebull;
+    x = x ^ (x >> 31);
+    long long pick = static_cast<long long>(x % static_cast<uint64_t>(total_weight));
 
     const BookEntry* chosen = &candidates.back();
     for (const auto& c : candidates) {

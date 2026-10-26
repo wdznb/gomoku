@@ -18,8 +18,8 @@ namespace gomoku {
 // 用哪一种的判据也写在机器上，不写在文档里：
 //   * 只有「一个对象恒由一根线程独占触碰」被仪器量到，才允许用 `OwnerOnlySection`；
 //   * 真有第二根线程会并发进入的，仍然该用一把真锁（本轮之后 `src/server/` 里没有这种了；
-//     `src/` 里剩下的 `std::mutex` 见 REVIEW_LOG 轮次208 的更正段：controller / opening_book /
-//     TT 分片三处，各自还欠一次判定）。
+//     `src/` 里剩下的 `std::mutex` 见 REVIEW_LOG 轮次208 的更正段与轮次210：controller /
+//     TT 分片两处，各自还欠一次判定；opening_book 那把已在轮次210 用「去掉共享状态」撤掉）。
 // 边界照旧：`NDEBUG` 下不拦人 —— 把它做成生产级失败方式仍是一个待点头的取舍（#93 起就没动）。
 
 class OwnerOnlySection {

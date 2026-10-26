@@ -4,6 +4,7 @@
 #include "core/transforms.h"
 #include "optimization/transposition.h"
 #include <atomic>
+#include <set>
 #include <chrono>
 #include <climits>
 #include <array>
@@ -9693,6 +9694,47 @@ void test_vct_recursive_win_returns_a_ply_by_ply_checkable_variation() {
               << std::endl;
 }
 
+
+// 轮次210 #113 的读者：`OpeningBook` 的抽签去掉了「共享 mt19937 + mutex」，换成一次 relaxed
+// 递增喂 splitmix64。撤这把锁的依据不是「反正只有一根线程」—— 恰恰相反，book 只在服务端用，
+// 查询发生在每一手思考自己的 worker 线程里，这把锁原本是**真被多根线程拿的**；能撤它是因为
+// 共享可变状态整个没了。这五段各钉一半：
+//   ① 计数器是真原子（「无锁」在这里是一个数，不是形容词）；② 每抽一次恰好推进一格（没走回共享生成器）；
+//   ③ 交回的着法 200 次里至少两种（常数哈希会红）；④ 永不交回已占的 (7,7)，且必是空格；
+//   ⑤ 权重 1 与 3 两个家族**都出得来**，且重族 ≥ 2×轻族：漏掉轻族的概率 0.75^200 ≈ 1e-25，
+//      重轻颠倒约 1e-13 —— 不是墙钟断言。
+void test_opening_book_weighted_draw_reaches_every_candidate() {
+    OpeningBook book;
+    assert(book.draw_counter_is_lock_free());          // ① 「无锁」是一个可核对的数
+    // 两条线共享第一手 (7,7) ⇒ 那一格上挂着两个候选家族：(5,5) 权重 1 与 (6,6) 权重 3
+    // （`add_line` 会把整条线按对称变换各存一份，所以每个家族是四个坐标 —— 本轮实测：
+    //   轻族 57 次 / 重族 143 次，200 抽，比值 2.5，期望 3）。
+    book.add_line({{7, 7}, {5, 5}}, 1, "light");
+    book.add_line({{7, 7}, {6, 6}}, 3, "heavy");
+    Board board;
+    assert(board.place_stone(7, 7, BLACK));
+    const std::set<std::pair<int, int>> light_family{{{5, 5}, {5, 9}, {9, 5}, {9, 9}}};
+    int light = 0;
+    int heavy = 0;
+    std::set<std::pair<int, int>> distinct;
+    const unsigned long long before = book.draws_taken();
+    for (int i = 0; i < 200; ++i) {
+        Move out;
+        assert(book.query(board, WHITE, out));
+        const std::pair<int, int> at{out.pos.row, out.pos.col};
+        assert(!(out.pos.row == 7 && out.pos.col == 7) && board.is_empty(out.pos));  // ④
+        distinct.insert(at);
+        if (light_family.count(at)) ++light;
+        else ++heavy;
+    }
+    assert(book.draws_taken() - before == 200);        // ② 每抽一次恰好推进一格，没有偷用共享生成器
+    assert(distinct.size() >= 2);                      // ③ 抽签真的在挑，不是常数
+    assert(light > 0 && heavy > 0);                    // ⑤ 两个家族都出得来
+    assert(heavy >= 2 * light);                        //   且权重 3 那侧压倒权重 1 那侧（4.5σ 余量）
+    std::cout << "test_opening_book_weighted_draw_reaches_every_candidate passed (light "
+              << light << " heavy " << heavy << " distinct " << distinct.size() << ")" << std::endl;
+}
+
 int main() {
     std::cout << "Running search tests..." << std::endl;
 
@@ -9901,6 +9943,7 @@ int main() {
     test_vct_recursive_race_gates_have_assertion_readers();
     test_vct_recursive_win_returns_a_ply_by_ply_checkable_variation();
 
+    test_opening_book_weighted_draw_reaches_every_candidate();
     std::cout << "All search tests passed!" << std::endl;
     return 0;
 }
