@@ -44,6 +44,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <csignal>
+#include <sys/wait.h>
+#include <unistd.h>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -4024,7 +4027,103 @@ void test_an_unfinished_game_stays_out_of_the_record_stream_until_it_ends() {
               << std::endl;
 }
 
+// #93：`games_mutex_` 那条「只有 io 线程碰这几张表」的规矩从注释变成机制之后的第一条用例。
+// 钉三件事，各钉各的（一条 `if` 只锁得住它的整个合取，所以三段分开写）：
+//   ① 空槽 —— 没拿过锁时属主是默认 id，`current_thread_is_owner()` 在没有主张可违反时为假；
+//      而属主槽**必须**是真原子（「最好无锁」在这里是一个可核对的数，不是形容词）。
+//   ② 别的线程只能读，读到的还是第一手那个线程 —— 自己不算属主。这一半就是产品里那句
+//      assert 拦住的东西：worker 线程来拿这把锁，形状先不对，断言再当场崩。
+//   ③ 真服务器：走过任何一条取锁的 handler（`open_session` 就取），属主必须是驱动它的那个线程。
+void test_games_mutex_records_one_owner_thread() {
+    // ① 空槽与锁free 属性
+    {
+        OwnerCheckedMutex fresh;
+        assert(fresh.owner() == std::thread::id{});
+        assert(!fresh.current_thread_is_owner());
+        assert(fresh.owner_slot_is_lock_free());
+        {
+            std::lock_guard<OwnerCheckedMutex> lock(fresh);
+            assert(fresh.owner() == std::this_thread::get_id());
+            assert(fresh.current_thread_is_owner());
+        }
+        // 出作用域之后属主不回收：这把锁的属主是「第一个拿它的人」，不是「现在持有的人」。
+        assert(fresh.current_thread_is_owner());
+    }
+
+    // ② 另一个线程读到同一个属主，但它自己不是
+    {
+        OwnerCheckedMutex held;
+        std::lock_guard<OwnerCheckedMutex> lock(held);
+        const std::thread::id owner_here = std::this_thread::get_id();
+        std::thread::id seen_owner = std::this_thread::get_id();
+        bool other_is_owner = true;
+        std::thread::id other_id{};
+        std::thread other([&] {
+            other_id = std::this_thread::get_id();
+            seen_owner = held.owner();
+            other_is_owner = held.current_thread_is_owner();
+        });
+        other.join();
+        assert(other_id != owner_here);
+        assert(seen_owner == owner_here);
+        assert(!other_is_owner);
+    }
+
+    // ③ 服务器真走过这条路：属主 = 驱动 handler 的这个线程（测试里没有 io 线程，
+    //    调用者就是唯一的属主，与产品里「io 线程独占」是同一条形状）
+    {
+        const auto dir = scratch("r199_games_sessions");
+        const auto records = scratch("r199_games_records.jsonl");
+        Harness h(dir, records);
+        h.server.handle_make_move(h.socket, json{{"row", 7}, {"col", 2}});
+        assert(h.server.games_mutex_.owner() == std::this_thread::get_id());
+        assert(h.server.games_mutex_.current_thread_is_owner());
+        assert(h.server.games_mutex_.owner_slot_is_lock_free());
+    }
+
+    // ④ 那句 assert 本身有没有牙：把自己重跑一遍，让第二个线程去拿这把锁。属主登记在
+    //    `mu_.lock()` **之前**，所以另一手一进 `lock()` 就撞上断言 —— 子进程必须死在
+    //    SIGABRT 上；它要是活着回来（断言被删掉或 NDEBUG 掉了），这一条就红。
+    //    重跑自己而不是 fork 别的二进制，是因为要证的正是「这个套件里的断言是活的」。
+    {
+        char self[4096];
+        const ssize_t len = ::readlink("/proc/self/exe", self, sizeof(self) - 1);
+        assert(len > 0);
+        self[len] = '\0';
+        const std::string path(self);
+        const pid_t child = ::fork();
+        assert(child >= 0);
+        if (child == 0) {
+            ::setenv("GOMOKU_GAMES_OWNER_DEATH_ARM", "1", 1);
+            char* argv[] = {const_cast<char*>(path.c_str()), nullptr};
+            ::execv(path.c_str(), argv);
+            ::_exit(127);
+        }
+        int status = 0;
+        assert(::waitpid(child, &status, 0) == child);
+        assert(WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT);
+    }
+
+    std::cout << "test_games_mutex_records_one_owner_thread passed" << std::endl;
+}
+
+// ④ 那一面：只有断言失灵才会走到「返回 0」。主线程放手之后再 join，所以断言被编译掉时
+// 另一手能正常拿到锁、进程正常退出，父进程按「没崩」判红，而不是挂在那里等。
+int games_owner_death_arm() {
+    OwnerCheckedMutex m;
+    std::thread other;
+    {
+        std::lock_guard<OwnerCheckedMutex> held(m);
+        other = std::thread([&m] { std::lock_guard<OwnerCheckedMutex> inner(m); });
+    }
+    other.join();
+    return 0;
+}
+
 int main() {
+    if (std::getenv("GOMOKU_GAMES_OWNER_DEATH_ARM") != nullptr) {
+        return games_owner_death_arm();
+    }
     std::cout << "Running server tests..." << std::endl;
 
     PatternRecognizer::init();
@@ -4089,6 +4188,7 @@ int main() {
     test_analyze_progress_then_exactly_one_result_per_ply();
     test_analyze_is_refused_while_the_ai_is_thinking();
     test_analyze_refuses_the_positions_it_cannot_rebuild_and_the_games_it_cannot_read();
+    test_games_mutex_records_one_owner_thread();
 
 
     std::cout << "All server tests passed!" << std::endl;

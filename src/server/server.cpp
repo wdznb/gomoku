@@ -615,7 +615,7 @@ void GameServer::stop() {
     // 一次定预算搜索；不等它就把 sessions_ 拆掉，等于在 joinable 的 std::thread 上
     // 析构，那是 std::terminate —— 整个进程，不是这一局。
     {
-        std::lock_guard<std::mutex> lock(games_mutex_);
+        std::lock_guard<OwnerCheckedMutex> lock(games_mutex_);
         for (const auto& pair : sessions_) stop_analyze(*pair.second);
     }
     beast::error_code ec;
@@ -681,7 +681,7 @@ void GameServer::on_open(std::shared_ptr<WebSocketSession> session) {
 // writing into this socket, flushes what the game has, and leaves the session in
 // the table so `resume` with the same token can hand it to a new socket.
 void GameServer::on_disconnect(WebSocketSession* session) {
-    std::lock_guard<std::mutex> lock(games_mutex_);
+    std::lock_guard<OwnerCheckedMutex> lock(games_mutex_);
     detach_socket(session);
 }
 
@@ -762,7 +762,7 @@ void GameServer::send_error(std::shared_ptr<WebSocketSession> session, const std
 }
 
 void GameServer::handle_choose_side(std::shared_ptr<WebSocketSession> session, const json& msg) {
-    std::lock_guard<std::mutex> lock(games_mutex_);
+    std::lock_guard<OwnerCheckedMutex> lock(games_mutex_);
     auto it = games_.find(session.get());
     if (it == games_.end()) return;
     
@@ -884,7 +884,7 @@ void GameServer::handle_set_position(std::shared_ptr<WebSocketSession> session, 
         return;
     }
 
-    std::lock_guard<std::mutex> lock(games_mutex_);
+    std::lock_guard<OwnerCheckedMutex> lock(games_mutex_);
     auto it = games_.find(session.get());
     if (it == games_.end()) return;
 
@@ -971,7 +971,7 @@ void GameServer::handle_make_move(std::shared_ptr<WebSocketSession> session, con
 }
 
 void GameServer::do_make_move(std::shared_ptr<WebSocketSession> session, int row, int col) {
-    std::lock_guard<std::mutex> lock(games_mutex_);
+    std::lock_guard<OwnerCheckedMutex> lock(games_mutex_);
     auto it = games_.find(session.get());
     // 排队期间这一局可能已经被拿走（断开、重开）；没有局就没有欠帧。
     if (it == games_.end()) return;
@@ -1027,7 +1027,7 @@ void GameServer::do_make_move(std::shared_ptr<WebSocketSession> session, int row
 }
 
 void GameServer::handle_undo(std::shared_ptr<WebSocketSession> session) {
-    std::lock_guard<std::mutex> lock(games_mutex_);
+    std::lock_guard<OwnerCheckedMutex> lock(games_mutex_);
     auto it = games_.find(session.get());
     if (it == games_.end()) return;
     
@@ -1056,7 +1056,7 @@ void GameServer::handle_undo(std::shared_ptr<WebSocketSession> session) {
 }
 
 void GameServer::handle_request_replay(std::shared_ptr<WebSocketSession> session) {
-    std::lock_guard<std::mutex> lock(games_mutex_);
+    std::lock_guard<OwnerCheckedMutex> lock(games_mutex_);
     auto it = games_.find(session.get());
     if (it == games_.end()) return;
 
@@ -1108,7 +1108,7 @@ void GameServer::handle_request_replay(std::shared_ptr<WebSocketSession> session
 }
 
 void GameServer::handle_request_hint(std::shared_ptr<WebSocketSession> session, const json& msg) {
-    std::lock_guard<std::mutex> lock(games_mutex_);
+    std::lock_guard<OwnerCheckedMutex> lock(games_mutex_);
     auto it = games_.find(session.get());
     if (it == games_.end()) return;
     
@@ -1122,7 +1122,7 @@ void GameServer::handle_request_hint(std::shared_ptr<WebSocketSession> session, 
 }
 
 void GameServer::handle_resign(std::shared_ptr<WebSocketSession> session) {
-    std::lock_guard<std::mutex> lock(games_mutex_);
+    std::lock_guard<OwnerCheckedMutex> lock(games_mutex_);
     auto it = games_.find(session.get());
     if (it == games_.end()) return;
 
@@ -1144,7 +1144,7 @@ void GameServer::handle_resign(std::shared_ptr<WebSocketSession> session) {
 }
 
 void GameServer::handle_stop_thinking(std::shared_ptr<WebSocketSession> session) {
-    std::lock_guard<std::mutex> lock(games_mutex_);
+    std::lock_guard<OwnerCheckedMutex> lock(games_mutex_);
     auto it = games_.find(session.get());
     if (it == games_.end()) return;
     
@@ -1152,7 +1152,7 @@ void GameServer::handle_stop_thinking(std::shared_ptr<WebSocketSession> session)
 }
 
 void GameServer::handle_set_config(std::shared_ptr<WebSocketSession> session, const json& msg) {
-    std::lock_guard<std::mutex> lock(games_mutex_);
+    std::lock_guard<OwnerCheckedMutex> lock(games_mutex_);
     auto it = games_.find(session.get());
     if (it == games_.end()) return;
     
@@ -1170,7 +1170,7 @@ void GameServer::handle_set_config(std::shared_ptr<WebSocketSession> session, co
 void GameServer::handle_restart(std::shared_ptr<WebSocketSession> session) {
     std::shared_ptr<TrackedGame> fresh;
     {
-        std::lock_guard<std::mutex> lock(games_mutex_);
+        std::lock_guard<OwnerCheckedMutex> lock(games_mutex_);
         const std::shared_ptr<TrackedGame> previous = entry_locked(session.get());
         const ReplaySnapshot replay =
             previous ? previous->game->replay_snapshot() : ReplaySnapshot();
@@ -1213,7 +1213,7 @@ void GameServer::handle_restart(std::shared_ptr<WebSocketSession> session) {
 // learns about tokens still gets a game the moment it asks for one.
 std::shared_ptr<GameServer::TrackedGame> GameServer::ensure_attached(
     std::shared_ptr<WebSocketSession> session) {
-    std::lock_guard<std::mutex> lock(games_mutex_);
+    std::lock_guard<OwnerCheckedMutex> lock(games_mutex_);
     if (const std::shared_ptr<TrackedGame> existing = entry_locked(session.get())) {
         return existing;
     }
@@ -1393,7 +1393,7 @@ void GameServer::handle_resume(std::shared_ptr<WebSocketSession> session, const 
     std::shared_ptr<TrackedGame> entry;
     bool resumed = false;
     {
-        std::lock_guard<std::mutex> lock(games_mutex_);
+        std::lock_guard<OwnerCheckedMutex> lock(games_mutex_);
         // A socket that already played a game and is now asking for another one
         // leaves that game where it was: flushed, and open to whoever holds its
         // token.
@@ -1467,7 +1467,7 @@ void GameServer::handle_resume(std::shared_ptr<WebSocketSession> session, const 
 
 void GameServer::load_saved_sessions() {
     if (sessions_dir_.empty()) return;
-    std::lock_guard<std::mutex> lock(games_mutex_);
+    std::lock_guard<OwnerCheckedMutex> lock(games_mutex_);
     for (const std::string& path : list_sessions(sessions_dir_)) {
         const std::string token = std::filesystem::path(path).stem().string();
         SessionSnapshot snap;
@@ -1595,7 +1595,7 @@ bool GameServer::flush_entry(const std::shared_ptr<TrackedGame>& entry) {
 // Shutdown exports first: a failed append leaves the session file at its
 // pre-ending state, so the next start can still write that record.
 void GameServer::flush_all() {
-    std::lock_guard<std::mutex> lock(games_mutex_);
+    std::lock_guard<OwnerCheckedMutex> lock(games_mutex_);
     for (const auto& token_entry : sessions_) {
         // This snapshot is only the append's; flush_entry takes its own for the
         // file, and a game decided here is decided there - the record cannot grow
@@ -1626,7 +1626,7 @@ void GameServer::schedule_flush() {
 }
 
 void GameServer::on_flush_tick() {
-    std::lock_guard<std::mutex> lock(games_mutex_);
+    std::lock_guard<OwnerCheckedMutex> lock(games_mutex_);
     for (auto it = sessions_.begin(); it != sessions_.end();) {
         const bool settled = flush_entry(it->second);
         TrackedGame& entry = *it->second;
@@ -1810,7 +1810,7 @@ void GameServer::setup_game_callbacks(std::shared_ptr<WebSocketSession> session,
         // anyway and takes that lock where handlers take it. flush_entry is
         // content-deduped and respects the exported flag, so tick/detach stay cheap.
         net::post(ioc_, [this, session] {
-            std::lock_guard<std::mutex> lock(games_mutex_);
+            std::lock_guard<OwnerCheckedMutex> lock(games_mutex_);
             if (auto entry = entry_locked(session.get())) flush_entry(entry);
         });
     });
@@ -1851,7 +1851,7 @@ void send_analysis_frame(const std::weak_ptr<WebSocketSession>& socket, const js
 }  // namespace
 
 void GameServer::handle_analyze_request(std::shared_ptr<WebSocketSession> session, const json& msg) {
-    std::lock_guard<std::mutex> lock(games_mutex_);
+    std::lock_guard<OwnerCheckedMutex> lock(games_mutex_);
     const std::shared_ptr<TrackedGame> entry = entry_locked(session.get());
     if (!entry) return;
 
@@ -2078,7 +2078,7 @@ void GameServer::handle_config_frame(std::shared_ptr<WebSocketSession> session, 
         return;
     }
 
-    std::lock_guard<std::mutex> lock(games_mutex_);
+    std::lock_guard<OwnerCheckedMutex> lock(games_mutex_);
     const std::shared_ptr<TrackedGame> entry = entry_locked(session.get());
     if (!entry) return;
     std::shared_ptr<GameManager> game = entry->game;

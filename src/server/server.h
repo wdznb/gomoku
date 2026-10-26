@@ -2,6 +2,7 @@
 #define GOMOKU_SERVER_H
 
 #include "game_manager.h"
+#include "owner_checked_mutex.h"
 #include "session_store.h"
 #include "../optimization/opening_book.h"
 #include "../training/game_record.h"
@@ -15,6 +16,7 @@
 #include <boost/asio/signal_set.hpp>
 #include <nlohmann/json.hpp>
 #include <atomic>
+#include <cassert>
 #include <filesystem>
 #include <memory>
 #include <map>
@@ -176,9 +178,12 @@ private:
     // accept (descriptor exhaustion, a client resetting mid-accept) would leave no
     // pending operation and the port would stop being served for the rest of the run.
     net::steady_timer accept_retry_timer_;
-    // Guards every map above. The io thread is the only thread that touches them
-    // today, so the lock is the record of that rule rather than a requirement.
-    std::mutex games_mutex_;
+    // Guards every map above. The io thread is the only thread that touches them,
+    // and since 轮次199 that is no longer just a comment: this type records the
+    // thread that first locks it and asserts every later lock comes from the same
+    // one, so a worker-side acquisition fails a check (or the compile) instead of
+    // deadlocking the whole server the way 轮次187's did.
+    OwnerCheckedMutex games_mutex_;
     // Only the io thread ever assigns deferred_end_for_, but an AI worker can report
     // a settlement for the same session pointer concurrently, so this pair needs its
     // own lock and nothing else may be locked while holding it.
