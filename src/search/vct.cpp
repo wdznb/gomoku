@@ -176,7 +176,10 @@ int VCTSearch::vct_defend(Board& board, int color, int depth, int alpha, int bet
     // (the previous std::min made this node pretend the attacker was picking
     // their worst move).
     int best_score = -INT_MAX;
-    std::vector<Move> best_line;
+    LineSet ln_overflow;
+    LineSet& ln = lines(depth, ln_overflow);
+    std::vector<Move>& best_line = ln.best;
+    best_line.clear();
     bool evaluated_any = false;
 
     for (const auto& move : attacks) {
@@ -230,7 +233,8 @@ int VCTSearch::vct_defend(Board& board, int color, int depth, int alpha, int bet
         }
 
         int worst_for_attacker = INT_MAX;
-        std::vector<Move> worst_line;
+        std::vector<Move>& worst_line = ln.worst;
+        worst_line.clear();
         for (const auto& def : defenses) {
             board.place_stone(def.pos.row, def.pos.col, def.color);
 
@@ -263,7 +267,7 @@ int VCTSearch::vct_defend(Board& board, int color, int depth, int alpha, int bet
                 break;
             }
 
-            std::vector<Move> child_line;
+            std::vector<Move>& child_line = ln.child;
             int score = vct_attack(board, color, depth - 1, alpha, beta, stop_flag, child_line);
             board.undo_last_move();
             // 变例跟着**对防守方最好的那一手**走：这一层交回的分数就是它，线也必须是它的线，
@@ -307,7 +311,10 @@ int VCTSearch::vct_attack(Board& board, int color, int depth, int alpha, int bet
     if (attacks.empty()) return 0;
 
     int best_score = -INT_MAX;
-    std::vector<Move> best_line;
+    LineSet ln_overflow;
+    LineSet& ln = lines(depth, ln_overflow);
+    std::vector<Move>& best_line = ln.best;
+    best_line.clear();
     bool evaluated_any = false;
 
     for (const auto& move : attacks) {
@@ -360,7 +367,8 @@ int VCTSearch::vct_attack(Board& board, int color, int depth, int alpha, int bet
         }
 
         int worst_for_attacker = INT_MAX;
-        std::vector<Move> worst_line;
+        std::vector<Move>& worst_line = ln.worst;
+        worst_line.clear();
         for (const auto& def : defenses) {
             board.place_stone(def.pos.row, def.pos.col, def.color);
 
@@ -391,7 +399,7 @@ int VCTSearch::vct_attack(Board& board, int color, int depth, int alpha, int bet
                 break;
             }
 
-            std::vector<Move> child_line;
+            std::vector<Move>& child_line = ln.child;
             int score = vct_defend(board, color, depth - 1, alpha, beta, stop_flag, child_line);
             board.undo_last_move();
             if (score < worst_for_attacker) {
@@ -440,7 +448,10 @@ VCTMove VCTSearch::search(const Board& board, int color, int max_depth,
 
     int best_score = -INT_MAX;
     Move best_move;
-    std::vector<Move> best_line;
+    LineSet ln_overflow;
+    LineSet& ln = lines(max_depth, ln_overflow);
+    std::vector<Move>& best_line = ln.best;
+    best_line.clear();
 
     for (const auto& move : attacks) {
         if (aborted(stop_flag)) break;
@@ -501,7 +512,8 @@ VCTMove VCTSearch::search(const Board& board, int color, int max_depth,
         }
 
         int worst = INT_MAX;
-        std::vector<Move> worst_line;
+        std::vector<Move>& worst_line = ln.worst;
+        worst_line.clear();
         for (const auto& def : defenses) {
             mutable_board.place_stone(def.pos.row, def.pos.col, def.color);
 
@@ -532,7 +544,7 @@ VCTMove VCTSearch::search(const Board& board, int color, int max_depth,
                 break;
             }
 
-            std::vector<Move> child_line;
+            std::vector<Move>& child_line = ln.child;
             int score = vct_defend(mutable_board, color, max_depth - 1,
                                    -INT_MAX, INT_MAX, stop_flag, child_line);
             mutable_board.undo_last_move();

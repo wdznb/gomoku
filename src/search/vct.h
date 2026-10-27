@@ -68,6 +68,18 @@ private:
     // 递归严格减 depth，所以父层持有期间子层只碰 d-1，不会碰 d。
     static constexpr int kMoveSlotCount = 24;
 
+    // #118 档四：装配变例的三张线表（best / worst / child）按角色分族、按 depth 取槽。
+    // 递归严格减 depth，父层握着 @d 时子层只碰 @(d-1)；父交给子的 out_line 就是 child@d，
+    // 而子层三个角色都不占 d 号槽，所以 out_line = best_line 永不自赋值。
+    // 越界退回调用方栈上的局部 LineSet：只是不池化，语义一字不变。
+    static constexpr int kLineSlots = 24;
+
+    struct LineSet {
+        std::vector<Move> best;
+        std::vector<Move> worst;
+        std::vector<Move> child;
+    };
+
     struct MoveSlots {
         std::vector<std::pair<int, Move>> scored;
         std::vector<Move> moves;
@@ -84,6 +96,12 @@ private:
     bool has_deadline_ = false;
     std::array<MoveSlots, kMoveSlotCount> attack_slots_{};
     std::array<MoveSlots, kMoveSlotCount> defense_slots_{};
+    std::array<LineSet, kLineSlots> line_sets_{};
+
+    // 族槽号 = 本节点的 depth。
+    LineSet& lines(int depth, LineSet& fallback) {
+        return (depth >= 0 && depth < kLineSlots) ? line_sets_[depth] : fallback;
+    }
 
     bool aborted(std::atomic<bool>& stop_flag) const {
         return stop_flag.load() ||

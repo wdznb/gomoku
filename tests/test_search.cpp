@@ -10056,6 +10056,63 @@ void test_injected_scratch_is_the_one_the_search_writes_and_answers_hold() {
               << std::endl;
 }
 
+// 轮次219 #118 档四：VCT 装配变例的三张线表（best/worst/child）改成「角色分族 + depth
+// 取槽」。这一档独有的两种坏法：① 别名 —— 父层还握着 child@d 时子层若也写 @d，父层那条线
+// 就被改掉；② 残留 —— 槽里上一趟/上一层的内容没清就被读。这里只用可核对的观察量下结论：
+// 同一个对象先把线表按别的深度用脏、再搜目标位置，结论必须与「一开场就搜目标」的冷对象
+// 逐字段相等；反序（先目标后干扰再回头目标）也要相等。具体答案由 ctest 其余用例与跨树
+// pose_dump 对照钉，本用例钉的是「复用与顺序不许移动结论」。
+void test_vct_line_slots_answer_the_same_after_depth_alternation() {
+    Evaluator evaluator;
+    std::atomic<bool> stop(false);
+
+    Board p, q;
+    p.place_stone(6, 6, BLACK);
+    p.place_stone(7, 7, BLACK);
+    p.place_stone(8, 8, BLACK);
+    p.place_stone(4, 4, WHITE);
+    p.place_stone(10, 10, WHITE);
+    p.place_stone(0, 0, WHITE);
+    q.place_stone(7, 4, BLACK);
+    q.place_stone(7, 5, BLACK);
+    q.place_stone(7, 6, BLACK);
+
+    auto same = [](const VCTMove& a, const VCTMove& b) {
+        return a.result == b.result && a.best_move == b.best_move && a.variation == b.variation;
+    };
+
+    TranspositionTable tt_ref;
+    VCTSearch ref(evaluator, tt_ref);
+    const VCTMove ref_p8 = ref.search(p, BLACK, 8, stop);
+    TranspositionTable tt_ref_q;
+    VCTSearch ref_q(evaluator, tt_ref_q);
+    const VCTMove ref_q6 = ref_q.search(q, BLACK, 6, stop);
+
+    // 热对象：先用别的深度把三张线表用脏，再搜目标。
+    TranspositionTable tt_hot;
+    VCTSearch hot(evaluator, tt_hot);
+    const VCTMove hot_q6 = hot.search(q, BLACK, 6, stop);
+    const VCTMove hot_p4 = hot.search(p, BLACK, 4, stop);
+    const VCTMove hot_p8 = hot.search(p, BLACK, 8, stop);
+    assert(same(ref_p8, hot_p8));
+    assert(same(ref_q6, hot_q6));
+    TranspositionTable tt_p4;
+    VCTSearch ref_p4(evaluator, tt_p4);
+    assert(same(ref_p4.search(p, BLACK, 4, stop), hot_p4));
+
+    // 反序：目标先、干扰后、再回头搜目标 —— 残留只可能在第二次跨过去。
+    TranspositionTable tt_rev;
+    VCTSearch rev(evaluator, tt_rev);
+    const VCTMove rev_p8_first = rev.search(p, BLACK, 8, stop);
+    const VCTMove rev_q6 = rev.search(q, BLACK, 6, stop);
+    const VCTMove rev_p8_again = rev.search(p, BLACK, 8, stop);
+    assert(same(ref_p8, rev_p8_first));
+    assert(same(ref_p8, rev_p8_again));
+    assert(same(ref_q6, rev_q6));
+
+    std::cout << "test_vct_line_slots_answer_the_same_after_depth_alternation passed" << std::endl;
+}
+
 int main() {
     std::cout << "Running search tests..." << std::endl;
 
@@ -10269,6 +10326,7 @@ int main() {
     test_opening_book_weighted_draw_reaches_every_candidate();
     test_tactical_pooled_slots_answer_the_same_after_reuse();
     test_injected_scratch_is_the_one_the_search_writes_and_answers_hold();
+    test_vct_line_slots_answer_the_same_after_depth_alternation();
     std::cout << "All search tests passed!" << std::endl;
     return 0;
 }

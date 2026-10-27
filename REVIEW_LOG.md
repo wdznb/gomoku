@@ -1984,6 +1984,49 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次219 #118 档四：VCT 装配变例的三张线表按「角色分族 + depth 取槽」常驻 —— 可复现档 126.7 → 63.1 次/手，深档 2,219.1 → 93.0 次/手
+
+靶子是轮次218 量出来的：深档同一趟里 `vector<Move>::push_back(const Move&)` 1,124,469 次 + `vector<Move>::range_insert` 238,399 次，占 1,331,486 的 99 %以上，而 `range_insert` 这条站点直接落在 `vct.cpp` —— 钱花在 `vct_defend` / `vct_attack` / `search` 每节点新建又丢掉的 `best_line` / `worst_line` / `child_line`。
+
+### 改法
+
+`VCTSearch` 加 `kLineSlots = 24`、`struct LineSet { best; worst; child; }`、`std::array<LineSet, kLineSlots> line_sets_` 和 `lines(depth, fallback)`：号段内取槽，越界退回调用方栈上的局部 `LineSet`（只是不池化，语义不变）。九个局部表换成族槽引用；入口清 `best`，每个攻击候选清 `worst`，`child` 交给被调方入口的 `out_line.clear()`。
+
+槽号为什么不撞：递归严格减 depth，父层握着 `@d` 时子层只碰 `@(d-1)`；父交给子的 `out_line` 正是 `child@d`，而子层三个角色都在 `d-1` 号槽上，所以 `out_line = best_line;` 永远不会是自赋值。改动：`src/search/vct.h` +18/0、`src/search/vct.cpp` +21/−9、`tests/test_search.cpp` +58/0。
+
+### 读数（同一台具、同一配方；基线 = `d63bf5a`）
+
+| 档 | 基线 | 本轮树 |
+| --- | --- | --- |
+| 可复现小档 `20 50 3 2000` | 46,113 次 = 126.7/手（364 手） | 22,979 次 = **63.1/手（−50.2 %）**，364 手不变，**两遍逐字相同** |
+| 深档 `20 0 4 50000` | 1,331,486 次 = 2,219.1/手（轮次218 同源读数） | 55,806 次 = **93.0/手（−95.8 %）**，600 手 |
+
+`allocs − frees = 70` 就是线表按住不还的那部分；memcheck（替换分配器关掉，10 局）报 `in use at exit: 0 bytes`、`ERROR SUMMARY: 0 errors from 0 contexts`、rc=0、69 s。
+
+### 答案没动 + 用例
+
+跨树 `pose_dump`：两边各 15 行，**md5 相同 `ea7fbe2d350269ea0322f6874624cd3f`**。
+新用例 `test_vct_line_slots_answer_the_same_after_depth_alternation`（`tests/test_search.cpp:10065`，登记于 `:10329`）钉这一档独有的失败类：同一个对象先用别的深度把线表用脏、再搜目标，结论必须与冷对象逐字段相等（result / best_move / variation），正反两序各一遍，且冷对象自己的同深度答案要能复现。
+
+变异臂两条，结果一红一绿，绿的那条是必须记账的缺口：
+
+| 臂 | 改法 | 结果 |
+| --- | --- | --- |
+| 对照 | 树不动 | ctest 10/10（986 s） |
+| M1 别名 | `worst_line` 借 `ln.best` | **rc=134**，死在 `tests/test_search.cpp:9641`（既有钉子 `test_vct_recursive_win_returns_a_ply_by_ply_checkable_variation` 的 `r.variation.size() >= 3`）；新用例没走到 |
+| M4 跨深度撞槽 | `lines()` 永远返回 `line_sets_[0]` | **rc=0 全绿**，走到了新用例（命中 1） |
+
+⇒ 诚实的账：**M4 证明当前语料里没有「同一趟搜索中两个不同深度同时持有各自的线表并被覆盖」的局面**，所以跨深度撞槽这类事故在现有断言下不可见；本轮没有把它变成可打红的钉子（下一档要补一条会深度交替调用 VCT 的用例）。M1 说明同节点两条线同时活着这一类确实被盯着，但拦下它的是既有用例而不是新用例。
+
+### 门禁（同一棵树）
+
+全量编译 rc=0、88 个编译单元、**0 条警告** → ctest rc=0 `100% tests passed, 0 failed out of 10`（986 s）→ `source citations resolved: 152, ok: 152, problems: 0`、`readme_anchor_check: 122 citations, 0 problems` → `web_frontend_check: 113/113` → TSan `test_server clean races=0 deadlocks=0 thread_leaks=0`（176 s，`WARNING: ThreadSanitizer` 计数 0）。变异臂跑完后已从快照还原（`MUT4=0`、`bestalias=0`）并重建 rc=0。
+
+### 欠账
+
+1. 补一条能真正把 M4 打红的用例（深档里让父子同时持有各自线表的局面），这是本轮唯一的证据缺口。
+2. `#118` 下一档：`pair<int,Move>` 打分表的 5,344 次/20 局仍在原地，因为 VCF/VCT 对象本身还是每趟思考新建；把对象抬到引擎属主会让 `deadline_` / `nodes_searched_` 变跨趟状态 ⇒ 语义决定，不顺手做。
+3. 仍在等用户：`#119` 共享 TT 的可复现取舍、`#111` 段 A 阈值、`#117` v1 文档行号、`--ponder` 默认值、`architecture/` 与 `build_sa/` 的处置。
 ## 轮次218（只记账，未改产品码）：#118 档四的定位量 —— 我用来定价 216/217 的那一档几乎不跑战术层，而战术层的线表才是生产档的 99 %
 
 这轮没有落地任何产品改动：工作树已逐项还原到 `dc50313`（`git status` 干净、`cmake --build build --target gomoku_train` rc=0 / 0 警告），下面全是量出来的账。
