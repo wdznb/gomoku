@@ -1984,6 +1984,24 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次221 #117：历史文档 v1 的引用漂移第一次被机器扫了一遍 —— P4 根因链里两条**事实**也已经不成立，只加注不改写
+
+`readme_anchor_check.js` 把 `docs/ENGINE_REDESIGN.md`（v1）与 `REVIEW_LOG.md` 归进 `HISTORY_DOCS`，**故意不当引用者**（历史账不是当前合约，`readme_anchor_check.js:180` 那句注释就是理由）。这条取舍对，但代价是 v1 里 35 条带行号的引用从此没人看 —— 就是 #117。
+
+新加 `tests/doc_citation_audit.js`：把历史文档里的 `` `file.cpp:NNN` `` 逐条对着当前的树解一遍，分 `ok / moved / missing`，默认**不当门禁**（`moved` 要人判语义），只有「文件找不到 / 行超出文件长度」这一类硬伤在 `--strict` 下 exit 非 0。首跑：35 条引用，ok=21、落在注释行=14、missing=0。
+
+对着 P4 那五条根因逐条读树，量出的不只有行号：
+
+| v1 的说法 | 今天的树 |
+| --- | --- |
+| 3. `search_worker(Board board, ...)` 按值传参（`controller.cpp:55-57`） | **事实已废**：签名是 `search_worker(const Board& board, int, int, int)`（`controller.h:68`、`controller.cpp:66`）；引用的 55-57 今天落在 `set_progress_callback` 开头 |
+| 3. `AlphaBetaSearch::search` 每层再复制（`alphabeta.cpp:329`） | 两个入口都是 `const Board&`（`alphabeta.cpp:540`、`:553`）；329 今天是注释 |
+| 4. `SearchEngine` **内嵌** `TranspositionTable tt_alphabeta_`（`search_engine.h:77`） | **事实已废**：`unique_ptr<TranspositionTable> owned_tt_` + 裸指针 `tt_alphabeta_`（`search_engine.h:209-210`），且支持外部共享表（§2.8 #1）；77 今天是注释 |
+| 4. `GameManager` 每会话持有一个 `SearchEngine`（`game_manager.h:142`） | 这句话**仍然成立**，只有行号漂：`SearchEngine engine_;` 在 `game_manager.h:226` |
+| 4. `trainer.cpp:107-108` / `:221` | 两处都漂：107-108 今天是 `winner_owner` / `binary`，221 今天是 `SprtConfig settings;` |
+| 1、2、5（`alphabeta.cpp:99`、`:69-78`、`self_play.h:15`） | 行号未漂，所指内容仍在原位 |
+
+处理方式按「历史账不改写」：v1 的 P4 那一段**原文一个字没动**，在其后插一段带日期的核对（`> 轮次221 的核对…`），把上面这张表写进去，并给出每条引用的今天读法。插完之后审计器读数变成 40 条引用、ok=26、missing=0 —— 新加的引用自己也是可核对的。门禁：`readme_anchor_check` 122 citations / 0 problems、`web_frontend_check` 113/113、v1 与脚本 UTF-8 均有效。
 ## 轮次220 #118 档四的证据面：观察量原来数错了东西 —— 第一版按 depth 现算槽号，M4 因此打不红；改成登记「`lines()` 实际交回那张表的地址」之后，M4 红在新用例自己身上
 
 轮次219 留下一条明账：让 `lines()` 永远返回 0 号槽（M4）跑起来**全绿**，也就是「跨深度撞槽」这一类事故在现有断言下不可见。本轮补这条证据，补的过程本身暴露了一个更值得记的事实。

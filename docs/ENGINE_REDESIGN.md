@@ -107,6 +107,15 @@
 3. **Board 被反复按值复制**。`SearchController::search_worker(Board board, ...)` 按值传参（`controller.cpp:55-57`）；`AlphaBetaSearch::search` 内每层迭代再复制一次（`alphabeta.cpp:329`）。Board 内含 `vector`、多个 `array`，复制不便宜。
 4. **每个引擎独立 TT，内存线性膨胀**。`SearchEngine` 内嵌 `TranspositionTable tt_alphabeta_`（`search_engine.h:77`），默认 2^18 × 32B ≈ 8.4MB；`GameManager` 每会话持有一个 `SearchEngine`（`game_manager.h:142`）。训练侧：每轮建 `candidate_engine` + `reference_engine`（`trainer.cpp:107-108`），每个数据采集 worker 再建一个（`trainer.cpp:221`）——一次自对弈同时存在 2 张表，多线程 × N。
 5. **时间预算不可预测 → 训练时长不可控**。自对弈用 `timeout_ms`（`self_play.h:15`）而非节点预算，机器负载波动直接放大训练时长；且时间预算被 VCF/VCT 固定切走，实际深度浮动。
+
+> **轮次221 的核对（2026-10-27，对着 `09697a7` 的树逐条读）**：上面第 3、4 两条的**事实与行号都已过**，第 1、2、5 条行号已漂。历史账不改写，只在此记正确读法：
+> - 第 3 条「`search_worker(Board board, ...)` 按值传参」——**已经不成立**：签名现在是 `void search_worker(const Board& board, int color, int max_depth, int time_limit_ms)`（声明在 `src/search/controller.h:68`，定义在 `src/search/controller.cpp:66`）。按值那份复制是 §2.8 #5（D-5）拿掉的；本文引用的 `controller.cpp:55-57` 今天落在 `set_progress_callback` 的开头。
+> - 第 3 条「`AlphaBetaSearch::search` 内每层再复制一次」——两个入口都是 `const Board&`（`src/search/alphabeta.cpp:540`、`:553`）；引用的 `alphabeta.cpp:329` 今天是一行注释。
+> - 第 4 条「`SearchEngine` **内嵌** `TranspositionTable tt_alphabeta_`」——已经不是内嵌值：`std::unique_ptr<TranspositionTable> owned_tt_` + `TranspositionTable* tt_alphabeta_`（`src/search/search_engine.h:209-210`），并支持外部共享表（§2.8 #1）。引用的 `search_engine.h:77` 今天是一行注释。
+> - 同条「`GameManager` 每会话持有一个 `SearchEngine`」——**这句话仍然成立**，只是行号漂了：成员是 `SearchEngine engine_;`（`src/server/game_manager.h:226`），不是 `:142`。
+> - 同条的 `trainer.cpp:107-108` 与 `trainer.cpp:221` —— 两处都已漂：107-108 今天是自对弈胜负折算适配分的两行（`winner_owner` / `binary`），221 今天是 `SprtConfig settings;`（§2.8 #3 的产物）。
+> - 第 1、2、5 条（`alphabeta.cpp:99`、`alphabeta.cpp:69-78`、`self_play.h:15`）行号未漂，所指内容仍在原位。
+> 漂移本身由 `tests/doc_citation_audit.js` 机器核对：35 条带行号的引用里 ok=21、落在注释行=14、文件或行根本不存在=0。它默认**不当门禁** —— 历史文档的行号是账，不是合约；只有「文件改名 / 行超出长度」那一类在 `--strict` 下才拦人。
 6. **优化信号弱 → 需要更多对局**。README 已记录：验证赛「颜色通吃」，`--fitness-games 2` 时优化器只能看到 `{0, 0.5, 1}` 三档，几乎是个平台；要提升区分度只能加大对局数，**资源需求随对局数线性上升**。根因是评估函数缺少位置项与形状空间修正，导致黑白胜负由先手决定而非由系数决定。
 
 ---
