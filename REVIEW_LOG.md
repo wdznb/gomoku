@@ -1984,6 +1984,29 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次223 #118 档五：战术层生成器的槽表属主抬到引擎 —— 确定性深档 93.0 → 50.6 次/手（−45.6 %），跨树逐点答案 md5 未动
+
+轮次218 的残余账里写着「`pair<int,Move>` 那 5,344 次一分没省，因为 VCF/VCT 对象本身还是每趟思考新建的」。这轮省它，但**只抬缓冲物的属主，不抬对象**：把 `deadline_` / `nodes_searched_` 变成跨趟状态（上一趟装过期限 ⇒ 下一趟不带期限也立刻中止）是语义决定，不顺手做。
+
+- `search_scratch.h` 加 `TacticalSlots`（`scored` + `moves`）与 `TacticalScratch`（`vcf` / `vct_attacks` / `vct_defenses` / `loss_probe` 四份 × 24 槽）；两个类里内嵌的 `MoveSlots` 改成 `using MoveSlots = TacticalSlots;`，否则注入时类型对不上。
+- `use_slots(...)` 传 `nullptr` 退回自持那份，注入不会静默失效；用例直接建对象的写法一字不改。
+- `SearchEngine` 持一份 `TacticalScratch`，三个构造点各注入自己那一份；求招的 loss_probe **另给一份** —— 它与主思考那趟 VCF 今天确实是顺序的，但分开就不必再去论证「哪天会不会变成同时」。
+
+### 读数（节点帽 binding 的确定性档，两树同一配方同一台具，20 局 / 600 手）
+
+| | 每手分配 |
+| --- | --- |
+| 基线树 `5a4318e` | 55,806 次 = **93.0/手** |
+| 本轮树 | 30,368 次 = **50.6/手（−45.6 %）**，600 手不变 |
+| 注入有效性臂：`use_slots` 改成忽略实参 | 54,283 次 = **90.5/手** ⇒ 弹回基线附近，省下来的确实是注入买到的 |
+
+另一档（`--timeout-ms 50 --max-nodes 2000`）本轮读到 365 手、基线 364 手 —— 墙钟档按轮次218/222 的规矩**不许当答案对照**，只记它 43.2/手 这个分配数。窗口里 `allocs − frees = 152` 是四份常驻槽表按住的；memcheck（替换分配器关掉，同档 20 局）`in use at exit: 0 bytes`、`ERROR SUMMARY: 0 errors from 0 contexts`、rc=0（592 s）。
+
+### 门禁
+
+跨树逐点答案与 `5a4318e` 的 `pose_dump` 两边各 15 行、**md5 相同 `ea7fbe2d350269ea0322f6874624cd3f`**；`ctest -j1` rc=0、10/10（996 s）；`web_frontend_check 113/113`；`doc_citation_audit --strict` rc=0（missing=0）；编译 rc=0、**0 条警告**；TSan `test_server` 见下段。
+
+一条自己制造又自己修掉的门禁红：新注释里我写了 `search_engine.cpp:244/271/465` 这类**行号**，`readme_anchor_check` 当场报 2 problems（`blank anchor 291`）。这正是 #86 记过的老毛病 —— 注释里带行号就是预埋漂移。改成点名函数（`SearchEngine::search()` / `ponder_search()`）后 `source citations resolved: 151, ok: 151, problems: 0`。规矩落到文字上：**新写的注释只点名，不写行号**。
 ## 轮次222 #119 欠的那份证明：比的是 `records.jsonl` 的**走子序列**，不是计数器 —— 量出来的方向与账上写着的相反
 
 轮次214 记下「共享置换表让训练不可复现（三遍 acq 500k→743k，自表三遍一字不差）」，当时留了一句欠账：**要结论得比两遍同配置训练的走子序列，而不是比计数器**（计数是过程量，序列才是结果）。本轮就是把这台测量做完 —— 做完的结果是这条账要改写。

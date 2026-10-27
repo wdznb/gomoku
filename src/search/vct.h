@@ -5,6 +5,7 @@
 #include "../core/evaluator.h"
 #include "../core/pattern.h"
 #include "../optimization/transposition.h"
+#include "search_scratch.h"
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -42,6 +43,12 @@ public:
     // Nodes actually examined by the last search() - the readout tools/vct_slice_probe.cpp
     // prices VCT with. Observability only; nothing in the engine branches on it.
     int nodes_searched() const { return nodes_searched_; }
+
+    // 两套生成器槽表一起交出属主：攻击表与防守表必须分家（同一层里两张同时活着）。
+    void use_slots(TacticalSlots* attacks, TacticalSlots* defenses) {
+        attack_slots_ = attacks != nullptr ? attacks : own_attack_slots_.data();
+        defense_slots_ = defenses != nullptr ? defenses : own_defense_slots_.data();
+    }
 
     // 轮次220 的观察面：见 LineGuard 的注释。
     int line_depth_peak() const { return line_peak_; }
@@ -84,10 +91,7 @@ private:
         std::vector<Move> child;
     };
 
-    struct MoveSlots {
-        std::vector<std::pair<int, Move>> scored;
-        std::vector<Move> moves;
-    };
+    using MoveSlots = TacticalSlots;   // 轮次223：与引擎注入的槽表同一个类型
 
     const Evaluator& evaluator_;
     TranspositionTable& tt_;
@@ -98,8 +102,11 @@ private:
     int attack_rejections_ = 0;
     std::chrono::steady_clock::time_point deadline_{};
     bool has_deadline_ = false;
-    std::array<MoveSlots, kMoveSlotCount> attack_slots_{};
-    std::array<MoveSlots, kMoveSlotCount> defense_slots_{};
+    // 轮次223：默认自持，引擎注入时换成引擎那一份（见 `search_scratch.h`）。
+    std::array<MoveSlots, kTacticalDepthSlots> own_attack_slots_{};
+    std::array<MoveSlots, kTacticalDepthSlots> own_defense_slots_{};
+    MoveSlots* attack_slots_ = own_attack_slots_.data();
+    MoveSlots* defense_slots_ = own_defense_slots_.data();
     std::array<LineSet, kLineSlots> line_sets_{};
 
     // 族槽号 = 本节点的 depth。

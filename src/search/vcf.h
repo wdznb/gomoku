@@ -5,6 +5,7 @@
 #include "../core/evaluator.h"
 #include "../core/pattern.h"
 #include "../optimization/transposition.h"
+#include "search_scratch.h"
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -51,6 +52,9 @@ public:
     // Optional absolute wall-clock deadline shared with the rest of the search
     // (see VCTSearch::set_deadline); without it VCF runs to node_limit_ and can
     // overrun the caller's timeout_ms.
+
+    // 把生成器槽表的属主交给调用方（见 `search_scratch.h` 的注释）。`nullptr` 退回自持那份。
+    void use_slots(TacticalSlots* slots) { slots_ = slots != nullptr ? slots : own_slots_.data(); }
     void set_deadline(std::chrono::steady_clock::time_point deadline) {
         deadline_ = deadline;
         has_deadline_ = true;
@@ -65,10 +69,7 @@ private:
     // 局部表（`overflow`）：只是不池化，语义一个字节没变。
     static constexpr int kMoveSlotCount = 24;
 
-    struct MoveSlots {
-        std::vector<std::pair<int, Move>> scored;
-        std::vector<Move> moves;
-    };
+    using MoveSlots = TacticalSlots;   // 轮次223：与引擎注入的槽表同一个类型
 
     const Evaluator& evaluator_;
     TranspositionTable& tt_;
@@ -76,7 +77,9 @@ private:
     int nodes_searched_;
     std::chrono::steady_clock::time_point deadline_{};
     bool has_deadline_ = false;
-    std::array<MoveSlots, kMoveSlotCount> slots_{};
+    // 轮次223：默认自持一份（用例就这么建对象）；引擎注入自己那份时换成注入的。
+    std::array<MoveSlots, kTacticalDepthSlots> own_slots_{};
+    MoveSlots* slots_ = own_slots_.data();
 
     bool aborted(std::atomic<bool>& stop_flag) const {
         return stop_flag.load() ||

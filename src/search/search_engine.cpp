@@ -242,6 +242,7 @@ SearchResult SearchEngine::search(const Board& board, int color,
 
     if (vcf_enabled_ && probe.own_four && !stop_flag.load()) {
         VCFSearch vcf(evaluator_, *tt_alphabeta_);
+        vcf.use_slots(tactical_scratch_.vcf.data());
         if (max_nodes_ > 0) {
             // 按节点出价的这一手：战术层只花自己那份份额，且不挂墙钟 deadline —— 它的
             // 结局从此只是局面的函数，与机器当时多忙无关。
@@ -269,6 +270,7 @@ SearchResult SearchEngine::search(const Board& board, int color,
 
     if (vct_enabled_ && probe.own_three && !stop_flag.load()) {
         VCTSearch vct(evaluator_, *tt_alphabeta_);
+        vct.use_slots(tactical_scratch_.vct_attacks.data(), tactical_scratch_.vct_defenses.data());
         if (max_nodes_ > 0) {
             vct.set_node_limit(std::min(kVctDefaultNodeLimit,
                                         max_nodes_ * kVctBudgetPercent / 100));
@@ -464,6 +466,7 @@ SearchResult SearchEngine::search(const Board& board, int color,
                     : static_cast<int>(std::min<long long>(resign_node_limit_, time_scaled_nodes));
 
                 VCFSearch loss_probe(evaluator_, *tt_alphabeta_);
+                loss_probe.use_slots(tactical_scratch_.loss_probe.data());
                 loss_probe.set_node_limit(probe_nodes);
                 // 按节点出价时不再挂墙钟 deadline：探针的结局从此只是局面的函数。
                 if (max_nodes_ == 0 && has_deadline) loss_probe.set_deadline(search_deadline);
