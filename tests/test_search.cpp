@@ -10113,6 +10113,45 @@ void test_vct_line_slots_answer_the_same_after_depth_alternation() {
     std::cout << "test_vct_line_slots_answer_the_same_after_depth_alternation passed" << std::endl;
 }
 
+// 轮次220 #118 档四的证据面：把「不同深度拿到不同槽」这句前提变成一个数。
+// 实测（/tmp/r220/probe2，与用例同一棵树）：白方活三 (7,4)(7,5)(7,6) + 黑方挡子 (7,7)，
+// 执白 depth 8 ⇒ 同时握线表的深度峰值 = 2、撞槽 = 0、61 个节点（便宜且确定）。
+// 先断言峰值 >= 2 —— 这是这条钉子非空的前提；峰值只有 1 的局面下「不同深度不同槽」
+// 无从谈起，那就必须写「证据为空」而不是假装钉住了什么。再断言撞槽 == 0，那才是前提本身。
+// M4（`lines()` 永远返回 0 号槽）会让撞槽计数变成非 0 ⇒ 这条钉子红。
+void test_vct_nested_depths_never_share_a_line_slot() {
+    Evaluator evaluator;
+    std::atomic<bool> stop(false);
+
+    Board board;
+    board.place_stone(7, 4, WHITE);
+    board.place_stone(7, 5, WHITE);
+    board.place_stone(7, 6, WHITE);
+    board.place_stone(7, 7, BLACK);
+
+    TranspositionTable tt;
+    VCTSearch vct(evaluator, tt);
+    assert(vct.line_depth_peak() == 0);
+    assert(vct.line_slot_collisions() == 0);
+    const VCTMove m = vct.search(board, WHITE, 8, stop);
+
+    const int peak = vct.line_depth_peak();
+    std::cout << "  nested line depths peak=" << peak
+              << " slot collisions=" << vct.line_slot_collisions() << std::endl;
+    assert(peak >= 2);
+    assert(vct.line_slot_collisions() == 0);
+
+    // 读数每次 search 清零、不跨趟累加：另一颗干净的表再搜同一局面，读数必须一致。
+    TranspositionTable tt2;
+    VCTSearch again(evaluator, tt2);
+    const VCTMove m2 = again.search(board, WHITE, 8, stop);
+    assert(m2.result == m.result && m2.best_move == m.best_move);
+    assert(again.line_depth_peak() == peak);
+    assert(again.line_slot_collisions() == 0);
+
+    std::cout << "test_vct_nested_depths_never_share_a_line_slot passed" << std::endl;
+}
+
 int main() {
     std::cout << "Running search tests..." << std::endl;
 
@@ -10327,6 +10366,7 @@ int main() {
     test_tactical_pooled_slots_answer_the_same_after_reuse();
     test_injected_scratch_is_the_one_the_search_writes_and_answers_hold();
     test_vct_line_slots_answer_the_same_after_depth_alternation();
+    test_vct_nested_depths_never_share_a_line_slot();
     std::cout << "All search tests passed!" << std::endl;
     return 0;
 }

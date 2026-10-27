@@ -1984,6 +1984,40 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次220 #118 档四的证据面：观察量原来数错了东西 —— 第一版按 depth 现算槽号，M4 因此打不红；改成登记「`lines()` 实际交回那张表的地址」之后，M4 红在新用例自己身上
+
+轮次219 留下一条明账：让 `lines()` 永远返回 0 号槽（M4）跑起来**全绿**，也就是「跨深度撞槽」这一类事故在现有断言下不可见。本轮补这条证据，补的过程本身暴露了一个更值得记的事实。
+
+### 第一版观察面是错的，错法与被测对象同形
+
+先加的是 `hold(int depth)`：进来时按 `depth` 现算槽号（`slot = depth in range ? depth : kLineSlots`），看那个槽是不是已经被别的深度握着。听起来正好钉「不同深度不同槽」。**但 `lines()` 一旦无视 depth，这个函数自己还在按 depth 算**，于是它永远看不见事故 —— M4 加上以后第二次仍然全绿，就是这条。观察量必须读**实际发生的那件事**，不能读「我以为代码在做的事」；这一条与它要钉的缺陷长得一模一样，所以自查很难查出来，是 M4 把它逼出来的。
+
+改成登记地址：三个入口 `LineSet& ln = lines(...); LineGuard guard(this, &ln);`，`hold(const void*)` 只问「这张表现在是不是已经被别的持有者登记过」，`release` 按地址摘除；`peak` = 同时被握住的表数，`collisions` = 握期间被撞的次数。栈对象登记/注销，函数多出口不影响，也不用锁。
+
+### 仪器换了以后，同一批臂的读数（`/tmp/r220/probe`，与用例同一棵树）
+
+| 局面 | 修好的仪器 · 正常树 | 修好的仪器 · M4（`lines()` 永远回 0 号槽） |
+| --- | --- | --- |
+| 白活三 (7,4)(7,5)(7,6) + 黑 (7,7)，执白 depth 8（61 节点） | peak=2，collisions=**0** | peak=2，collisions=**59** |
+| 白两条活三，执白 depth 10（503,025 节点） | peak=10，collisions=0 | peak=10，collisions=**557,512** |
+| 同上执黑 depth 10 | peak=10，collisions=0 | peak=10，collisions=822,098 |
+
+新用例 `test_vct_nested_depths_never_share_a_line_slot`（`tests/test_search.cpp:10122`，登记于 `:10369`）两段各钉一半：先 `assert(peak >= 2)` —— 这一趟必须真的嵌套过，否则「不同深度不同槽」无从谈起，这条钉子就是空的（这条断言的红法是把局面换成不嵌套的形状）；再 `assert(collisions == 0)` —— 前提本身。最后换一颗干净的表重搜同一局面，读数必须复现，钉的是「计数每次 search 清零、不跨趟累加」。
+
+| 臂 | 改法 | 结果 |
+| --- | --- | --- |
+| 对照 | 树不动，全套 `test_search` | rc=0（559 s），`nested line depths peak=2 slot collisions=0`，`All search tests passed!` |
+| M4 | `lines()` 无视 depth，永远回 `line_sets_[0]` | **rc=134**，红点正是新用例：`tests/test_search.cpp:10142` 的 `assert(vct.line_slot_collisions() == 0)` —— 轮次219 那条「M4 打不红」的账到此收掉 |
+
+臂跑完从快照 `cp` 还原（`MUT4left=0`，`git status` 只剩本轮三处改动），还原后重建 rc=0 / 0 警告。
+
+### 门禁
+
+全量编译 rc=0、**0 条警告** → `test_search` 对照 rc=0 → M4 红 → 还原 → `ctest -j1` **rc=0，100% tests passed, 0 failed out of 10** → `source citations resolved: 152, ok: 152, problems: 0` → `web_frontend_check: 113/113` → TSan `test_server` rc=0、`clean races=0 deadlocks=0 thread_leaks=0`（59 s）。产品码这一轮只动 `src/search/vct.{h,cpp}`（观察面 + 三个 guard，不改任何决策），加 46 行用例。
+
+### 一条流程账
+
+停后台流水线时用了 `pgrep -f "r220/gates.sh"`，模式匹配到发起命令的 shell 自己，第一次 kill 把自己的命令行杀了（exit 143，半截 sed 没跑）。改用括号形式 `pgrep -f "[g]2.sh"` 才停干净 —— 手册里那条规矩（别用 `-f` 匹配自己）本轮是靠自己重踩才想起来的。
 ## 轮次219 #118 档四：VCT 装配变例的三张线表按「角色分族 + depth 取槽」常驻 —— 可复现档 126.7 → 63.1 次/手，深档 2,219.1 → 93.0 次/手
 
 靶子是轮次218 量出来的：深档同一趟里 `vector<Move>::push_back(const Move&)` 1,124,469 次 + `vector<Move>::range_insert` 238,399 次，占 1,331,486 的 99 %以上，而 `range_insert` 这条站点直接落在 `vct.cpp` —— 钱花在 `vct_defend` / `vct_attack` / `search` 每节点新建又丢掉的 `best_line` / `worst_line` / `child_line`。

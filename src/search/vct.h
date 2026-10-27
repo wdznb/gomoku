@@ -43,6 +43,10 @@ public:
     // prices VCT with. Observability only; nothing in the engine branches on it.
     int nodes_searched() const { return nodes_searched_; }
 
+    // 轮次220 的观察面：见 LineGuard 的注释。
+    int line_depth_peak() const { return line_peak_; }
+    int line_slot_collisions() const { return line_collisions_; }
+
     // #89 的观察面：上一次 search() 里「对面此刻已经攥着成五点」这条判据（#84 立的规矩）
     // 拒掉了几条候选，按那三个调用点分开数：search() 的根扫描、vct_defend、vct_attack。
     // 根扫描那一处的行为早有结论级用例钉着；递归两处实测只动工作量、不动 result 与 best_move
@@ -102,6 +106,48 @@ private:
     LineSet& lines(int depth, LineSet& fallback) {
         return (depth >= 0 && depth < kLineSlots) ? line_sets_[depth] : fallback;
     }
+
+    // 轮次220 的观察面 —— 登记的是「lines() 实际交回来那张表的地址」，不是按 depth 现算的槽号。
+    // 这条区别就是这一档的全部风险：如果观察面自己去数 depth，那么「`lines()` 无视 depth、
+    // 永远回同一张表」这类事故对它是不可见的（第一次做的版本就是这样，M4 打了照绿）。
+    //   peak       —— 一次 search 里最多同时有几张线表正被握着（= 嵌套真实发生过）；
+    //   collisions —— 某张表在被这个深度握着的期间，已经被另一个深度握着。
+    class LineGuard {
+    public:
+        LineGuard(VCTSearch* owner, const void* table) : owner_(owner), table_(table) {
+            owner_->hold(table);
+        }
+        ~LineGuard() { owner_->release(table_); }
+
+    private:
+        VCTSearch* owner_;
+        const void* table_;
+    };
+    friend class LineGuard;
+
+    void hold(const void* table) {
+        for (int i = 0; i < held_n_; ++i) {
+            if (held_[i] == table) ++line_collisions_;
+        }
+        held_[held_n_] = table;
+        ++held_n_;
+        if (held_n_ > line_peak_) line_peak_ = held_n_;
+    }
+
+    void release(const void* table) {
+        for (int i = 0; i < held_n_; ++i) {
+            if (held_[i] == table) {
+                held_[i] = held_[held_n_ - 1];
+                break;
+            }
+        }
+        --held_n_;
+    }
+
+    std::array<const void*, kLineSlots + 2> held_{};
+    int held_n_ = 0;
+    int line_peak_ = 0;
+    int line_collisions_ = 0;
 
     bool aborted(std::atomic<bool>& stop_flag) const {
         return stop_flag.load() ||

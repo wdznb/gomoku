@@ -178,6 +178,7 @@ int VCTSearch::vct_defend(Board& board, int color, int depth, int alpha, int bet
     int best_score = -INT_MAX;
     LineSet ln_overflow;
     LineSet& ln = lines(depth, ln_overflow);
+    LineGuard guard(this, &ln);
     std::vector<Move>& best_line = ln.best;
     best_line.clear();
     bool evaluated_any = false;
@@ -313,6 +314,7 @@ int VCTSearch::vct_attack(Board& board, int color, int depth, int alpha, int bet
     int best_score = -INT_MAX;
     LineSet ln_overflow;
     LineSet& ln = lines(depth, ln_overflow);
+    LineGuard guard(this, &ln);
     std::vector<Move>& best_line = ln.best;
     best_line.clear();
     bool evaluated_any = false;
@@ -435,6 +437,9 @@ VCTMove VCTSearch::search(const Board& board, int color, int max_depth,
     root_rejections_ = 0;
     defend_rejections_ = 0;
     attack_rejections_ = 0;
+    line_peak_ = 0;
+    line_collisions_ = 0;
+    held_n_ = 0;
 
     Board mutable_board = board;
 
@@ -450,6 +455,7 @@ VCTMove VCTSearch::search(const Board& board, int color, int max_depth,
     Move best_move;
     LineSet ln_overflow;
     LineSet& ln = lines(max_depth, ln_overflow);
+    LineGuard guard(this, &ln);
     std::vector<Move>& best_line = ln.best;
     best_line.clear();
 
