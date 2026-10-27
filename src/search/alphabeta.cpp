@@ -94,7 +94,7 @@ void AlphaBetaSearch::sort_moves(std::vector<Move>& moves, const Board& board, i
     const bool in_slots = (ply >= 0 && ply < kPlySlots);
     std::vector<std::pair<int, size_t>> overflow_scored;
     std::vector<std::pair<int, size_t>>& scored =
-        in_slots ? sort_index_scratch_[ply] : overflow_scored;
+        in_slots ? scratch_->sort_index[ply] : overflow_scored;
     scored.clear();
     scored.reserve(count);
     for (int i = 0; i < count; ++i) {
@@ -126,7 +126,7 @@ void AlphaBetaSearch::sort_moves(std::vector<Move>& moves, const Board& board, i
     // stable_sort is the same belt from the other side, with nothing left to
     // stabilise.
     // #118：同一件事，但归并工作区是成员里那块（`std::stable_sort` 会每次自借临时缓冲）。
-    stable_merge_in_place(scored, sort_merge_scratch_, [&](const std::pair<int, size_t>& a,
+    stable_merge_in_place(scored, scratch_->sort_merge, [&](const std::pair<int, size_t>& a,
                                                         const std::pair<int, size_t>& b) {
         if (a.first != b.first) return a.first > b.first;
         const int ha = heuristics_.history_value(color, moves[a.second].pos);
@@ -143,7 +143,7 @@ void AlphaBetaSearch::sort_moves(std::vector<Move>& moves, const Board& board, i
     // #118：重排结果同样走这一 ply 的常驻缓冲。原来是 `moves = std::move(reordered);`
     // —— 移动会把常驻缓冲抽干，下一次又从零分配；改成按长度赋值并保留容量。
     std::vector<Move> overflow_reordered;
-    std::vector<Move>& reordered = in_slots ? sort_reorder_scratch_[ply] : overflow_reordered;
+    std::vector<Move>& reordered = in_slots ? scratch_->sort_reorder[ply] : overflow_reordered;
     reordered.assign(moves.size(), Move());
     for (size_t i = 0; i < static_cast<size_t>(start); ++i) reordered[i] = moves[i];
     for (size_t i = 0; i < scored.size(); ++i) {
@@ -229,7 +229,7 @@ NodeResult AlphaBetaSearch::quiescence(Board& board, int alpha, int beta, int co
     // 所以号段给到 [kPlySlots, kPlySlots + kQdepthSlots)，与 alphabeta 的 ply 号段不相交。
     CandidateSet overflow_set;
     CandidateSet& forcing = (qdepth >= 0 && qdepth < kQdepthSlots)
-        ? tier_scratch_[kPlySlots + qdepth]
+        ? scratch_->tiers[kPlySlots + qdepth]
         : overflow_set;
     move_gen_.generate(board, color, /*ply=*/0, /*in_quiescence=*/true, &forcing);
     if (forcing.threats.empty()) return {stand_pat, true};
@@ -420,11 +420,11 @@ NodeResult AlphaBetaSearch::alphabeta(Board& board, int depth, int alpha, int be
     // 期间只读自己那一份 ⇒ 不会互相覆盖）。超出号段时退回局部对象，只是不省分配。
     std::vector<Move> overflow_moves;
     std::vector<Move>& moves =
-        (ply >= 0 && ply < kPlySlots) ? flat_scratch_[ply] : overflow_moves;
+        (ply >= 0 && ply < kPlySlots) ? scratch_->flat[ply] : overflow_moves;
     {
         CandidateSet overflow_set;
         CandidateSet& set =
-            (ply >= 0 && ply < kPlySlots) ? tier_scratch_[ply] : overflow_set;
+            (ply >= 0 && ply < kPlySlots) ? scratch_->tiers[ply] : overflow_set;
         move_gen_.generate(board, color, ply, /*in_quiescence=*/false, &set);
         set.flatten_into(moves);
     }

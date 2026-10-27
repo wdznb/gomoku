@@ -1984,6 +1984,56 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次217 #118 档三：把 alpha-beta 缓冲区的属主从「这一次思考」抬到「这个引擎」—— 节点帽档 164.4 → 126.7 次/手（−22.9 %），364 手逐局全同；第一次红的是用例自己
+
+轮次216 把对局层从 1240 次/手打到 262.8（4 局档）之后，残余里最扎眼的一列不是搜索自己要付的钱：`vector<Candidate>` 的扩容站点 9,127 次、`MoveGenerator::generate` 3,869 次、`_M_default_append` 2,941 次、`vector<Move>::reserve` 2,099 次 —— 加起来占当时残余的 **35.6 %**，而它们的形状全是「同一批表从零长起来」。查构造点就明白为什么：`AlphaBetaSearch ab(evaluator_, *tt_alphabeta_)` 是**每趟思考**在 `SearchEngine::search()` 的栈上新建的（`search_engine.cpp:291`，`ponder_search` 在 `:524`），轮次213 给它配的五张常驻缓冲（73 个 `CandidateSet`、24 条摊平表、24 条 decorate 表、24 条重排表、1 条归并区）于是每趟思考都从容量 0 重新几何扩容一遍。
+
+### 改法：属主上抬，一条路一份，注入而不是共享
+
+新增 `src/search/search_scratch.h`：把五张缓冲收进一个 `SearchScratch`（槽号约定与常量原样搬过去，`kPlySlots = 64` / `kQdepthSlots = 9` 与静止层 `[64, 73)` 的不相交号段都没动）。
+
+- `AlphaBetaSearch` 现在持 `SearchScratch own_scratch_; SearchScratch* scratch_ = &own_scratch_;`，公开 `use_scratch(SearchScratch*)` —— **传 `nullptr` 是退回自持那份，不是退回「没登记的表」**，所以注入不会静默失效；默认（用例直接建对象）行为形状与从前一样。
+- `SearchEngine` 备**两份**：`search_scratch_` 给主思考，`ponder_scratch_` 给 `ponder_search`。这两条路径可能同时在飞（预搜线程与 io 线程），按用户「所有代码无锁」的要求，做法是**拆开而不是加锁**：两根线程永远不会共用同一张表。`exact_root_score` → `ponder_search` 这条嵌套走的也是 `ponder_scratch_`，与主思考那份不相交。
+- `retained_bytes()` 是这张表的观察面：用例靠它钉「搜索确实写在被交出去的那份里」，总账靠它报换来多少常驻。
+
+改动面：`src/search/alphabeta.{h,cpp}`（+14/−8、+6/−6）、`src/search/search_engine.{h,cpp}`（+6、+2）、新头 62 行、`tests/test_search.cpp` +63。
+
+### 两棵树的对照：先把「哪个档位能算答案」定下来
+
+同一台分配具（`/tmp/r218/hand_probe2.cpp`）、同一配方、base = `bec12ab` 的 worktree：
+
+| 档位 | base | 本轮树 | 能不能当答案对照 |
+| --- | --- | --- | --- |
+| `timeout_ms=50 / max_nodes=2000` | 20 局 364 手、59,850 次 = 164.4/手、`allocs == frees` | 20 局 **372 手**、49,686 次 = 133.6/手、`frees` 少 70 | **不能**：这一档装着墙钟期限，每趟思考在 50 ms 里跑到哪算哪，分配变少 ⇒ 同一段时间里多跑节点 ⇒ 有一局岔开。按手册的规矩，按墙钟的臂不许当复现证据 |
+| `timeout_ms=0 / max_nodes=2000`（只留节点帽） | 20 局 364 手、59,850 次 = **164.4/手** | 20 局 **同样 364 手**、46,113 次 = **126.7/手（−22.9 %）** | **能**：逐局 `plies/winner` 对照 20 局 **0 局不同** |
+
+同档位里按站点看钱从哪儿省的：`vector<Candidate>` 扩容 **9,127 → 4,021（−56 %）**、`_M_default_append` 与 `generate`/`reserve` 那几个预热站点合计再降几千；而 `vector<Move>` 的 `_M_realloc_append<Move const&>` **23,135 次一字未动** —— 那是变例/线表（轮次216 就记在欠账里的档四），还有 `pair<int,Move>` 的 5,344 次也没动，因为**战术层那两个对象本身还是每趟思考新建的**（同一形状的浪费在 VCF/VCT 上又出现了一次，见欠账）。
+
+常驻的代价，也按同一台具报：峰值 RSS base 19,272 / 19,196 kB（4 局 / 20 局）vs 本轮树 19,356 / 19,332 kB ⇒ **+84 / +136 kB（+0.4 %–+0.7 %）**，两个引擎各一份缓冲按住不还给堆。窗口里 `allocs − frees = 67`（4 局）/ `70`（20 局）就是这部分；它们不是泄漏 —— 关掉替换分配器的那条 memcheck 臂在 20 局上报 `in use at exit: 0 bytes`、`ERROR SUMMARY: 0 errors from 0 contexts`、rc=0（175 s），引擎析构时都还回去了。
+
+### 用例：新用例这次自己红了
+
+`test_injected_scratch_is_the_one_the_search_writes_and_answers_hold`（`tests/test_search.cpp:10004` 起）分四段：① 注入生效后 `injected.retained_bytes() > 0`（搜索写的必须是交出去那张）；② 用热表搜出的着法与自持冷表的对象**同盘同深度同帽**给同一个着法；③ 同一张热表换深度再搜，与另一台冷表对象一致，且 `retained_bytes` 只增不减；④ `use_scratch(nullptr)` 退回自持那份时答案不变，换一张表后新表才被写红。
+
+| 臂 | 改法 | 结果 |
+| --- | --- | --- |
+| M0 对照 | 树不动 | rc=0，`All search tests passed!`，走到新用例（命中 1） |
+| M1 | `use_scratch` 什么都不做（注入被忽略） | **rc=134，红在新用例自己身上**：`tests/test_search.cpp:10025` 的 `assert(after_injected > 0)` —— 上一轮欠的那条账（「新用例自己会不会红」）这一轮补上了 |
+| M2 | alphabeta 与静止层的所有层共用 0 号槽（别名事故） | **rc=134**，死在更早的既有节点数钉子 `tests/test_search.cpp:3776`：`test_root_choice_reproducible` 的 `assert(other.nodes == first.nodes)`；新用例没走到（命中 0）⇒ 「槽号撞车」这一类由套件里更早的用例拦下，本轮不宣称新用例对它独有 |
+
+**第一次红的是用例自己**：第一趟流水线在 stage2 报 `rc=8 / 1 tests failed`，`test_search` 于 562 s abort —— 我写第④段时断言了一张**从来没被搜索写过的**表（`other.retained_bytes() > 0`，但漏了先跑一次 `fallback.search`）。这是产品码无罪、用例有罪，修完单跑 `build/test_search` rc=0（554 s，`All search tests passed!`）再续跑门禁。
+
+### 门禁（与上表同一棵树）
+
+强制全量重建 rc=0、356 个编译单元、**0 条警告**（228 s）→ `ctest -j1` **rc=0，100% tests passed, 0 failed out of 10**（987 s）→ `source citations resolved: 152, ok: 152, problems: 0`（新头文件自己带引用）、`readme_anchor_check: 122 citations, 0 problems` → `web_frontend_check: 113/113` → TSan `test_server` `clean races=0 deadlocks=0 thread_leaks=0`（187 s，`WARNING: ThreadSanitizer` 计数 0）→ 跨树逐点答案 `pose_dump` 两边各 15 行、**md5 相同 `ea7fbe2d350269ea0322f6874624cd3f`**。
+墙钟档的 CPU 时间三对三：base 2.27/2.26/2.37 vs after 2.24/2.27/2.22 s —— 区间相接，且那一档本身被 50 ms 期限绑住，**不写成收益**（与轮次215、216 同口径）。
+
+### 欠账
+
+1. **档四：变例/线表 23,135 次 = 现残余的 50.2 %**（节点帽档）。它是 `variation`/`best_line`/`worst_line`/`child_line`，`out_line = best_line;` 那条赋值要求父的 `child_line` 与子的 `best_line` 不同槽 —— 按角色分族 + 逐处核对持有期，风险比本轮高一档。
+2. **战术层对象本身还是每趟思考新建的**（`search_engine.cpp:244/271/465`），所以 `pair<int,Move>` 的 5,344 次预热一分没省。同形状的第二份「属主上抬」候选：要么把 `TacticalScratch` 注入（与本轮同形、低风险），要么把对象抬到引擎属主 —— 后者会顺带把 `has_deadline_`/`deadline_`/`nodes_searched_` 变成跨趟状态，`set_deadline()` 在一趟里装过期限以后，下一趟不带期限会**带着上一次的旧期限立刻中止**，属于语义决定，不许顺手做。
+3. 本轮**没有**改 `--ponder` 默认值、`docs/ENGINE_REDESIGN.md:549/:555/:556`，#111 段 A 阈值、#117 v1 文档行号大扫除、#119 共享 TT 的可复现取舍仍在原地等用户；`architecture/`、`build_sa/` 两个非本轮产物仍未入库。
+
 ## 轮次216 #118 档二：对局层每手 1240 次堆分配 —— 战术层临时表按递归深度分槽，分配 −78.8 %（20 局口径 −74.7 %），答案一个没动；「快了多少」这台量不出
 
 轮次213 那档量的是「一次搜索的每节点分配」（3.93 → 0.01）。用户要求里还有一句「避免频繁重分配内存，使用预分配或固定大小内存」，而训练/会话两条路径的开销都是**按手**结算的，所以这一轮把台架搬到对局层：同一台分配具（替换全局 `operator new`，只数次数、按请求尺寸分桶、固定 96 槽调用点表），驱动 `SelfPlay::run`，读**每手付多少次堆**。

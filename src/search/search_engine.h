@@ -231,6 +231,12 @@ private:
     bool training_ = false;
     const SearchClock* clock_ = nullptr;
 
+    // 轮次217 #118 档三：alpha-beta 的常驻缓冲由引擎持有，思考结束不再释放。
+    // 两条**可能并发**的路径各备一份：主思考与 `ponder_search`（预搜线程可能与 io 线程
+    // 同时在飞），所以两根线程永远不会共用同一张表 —— 这是「解耦」而不是「加锁」。
+    SearchScratch search_scratch_;
+    SearchScratch ponder_scratch_;
+
     bool resign_detection_;
     int resign_node_limit_;
 

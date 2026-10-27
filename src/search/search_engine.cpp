@@ -289,6 +289,7 @@ SearchResult SearchEngine::search(const Board& board, int color,
 
     if (alphabeta_enabled_ && !stop_flag.load()) {
         AlphaBetaSearch ab(evaluator_, *tt_alphabeta_);
+    ab.use_scratch(&search_scratch_);
         if (clock_ != nullptr) ab.set_clock(clock_);
         // The absolute end-of-move deadline, not a slice: remaining_time below
         // is only this phase's share of the budget, so on its own it lets the
@@ -522,6 +523,7 @@ SearchResult SearchEngine::ponder_search(const Board& board, int color, int max_
     // caller's side and the layered search stays what it is - a search. A flag no node
     // behaves differently for would be a claim, not a mechanism.
     AlphaBetaSearch ab(evaluator_, *tt_alphabeta_);
+    ab.use_scratch(&ponder_scratch_);
     SearchLimits limits;
     limits.max_depth = max_depth;
     limits.hard_time_ms = 0;

@@ -7,6 +7,7 @@
 #include "../optimization/transposition.h"
 #include "move_generator.h"
 #include "search_limits.h"
+#include "search_scratch.h"
 #include "search_state.h"
 #include <array>
 #include <atomic>
@@ -91,6 +92,11 @@ public:
     // deadline cross" from a race into an input.
     void set_clock(const SearchClock* clock) { clock_ = clock; }
 
+    // 交出缓冲区的属主：`nullptr` 退回自持的那份，所以注入这件事本身不改变行为形状。
+    void use_scratch(SearchScratch* scratch) {
+        scratch_ = scratch != nullptr ? scratch : &own_scratch_;
+    }
+
     // Absolute end-of-move wall-clock deadline (VCF/VCT get their own slices of
     // the same budget). The time_limit_ms handed to search() is only this
     // phase's share, so without the deadline a search that starts after the
@@ -133,18 +139,18 @@ private:
     // 先在模型里跑过（`/tmp/r218/slot_model.cpp`）：引擎自己的深度帽 8 层时最多同时占
     // 18 槽，按设计文档的 20 层压一遍是 30 槽 ⇒ 64 + 8 + 1 = 73 有余量，
     // 号段外的调用点退回每节点局部对象（只是不省分配，语义不变）。
-    static constexpr int kPlySlots = 64;        // 与 search_state.h 的 kMaxPly 同一约定
-    static constexpr int kQdepthSlots = 9;      // kMaxQdepth(8) + 1
-    static constexpr int kTierScratchSlots = kPlySlots + kQdepthSlots;
-    std::array<CandidateSet, kTierScratchSlots> tier_scratch_;
-    std::array<std::vector<Move>, kPlySlots> flat_scratch_;
+    static constexpr int kPlySlots = SearchScratch::kPlySlots;
+    static constexpr int kQdepthSlots = SearchScratch::kQdepthSlots;
+    // 轮次217 #118 档三：缓冲区的**属主**从「这一次思考」抬到「这个引擎」。
+    // `AlphaBetaSearch` 是每趟思考在 `SearchEngine::search()` 栈上新建的，所以自持的槽
+    // 每趟都从容量 0 重新几何扩容一遍（实测 20 局里这类首触占残余的 39 %）。
+    // 默认还是自持一份（用例就这么建对象），只有引擎主动注入时才换成引擎那一份。
+    SearchScratch own_scratch_;
+    SearchScratch* scratch_ = &own_scratch_;
     // `sort_moves` 的每一层也要地方放它的 decorate 数组、重排结果与归并工作区：
     // 实测每节点各一次分配（`vector<pair<int,size_t>>` 与它的
     // `__get_temporary_buffer<pair<int,unsigned long>>` 各 13,276 次）。
     // decorate 与归并区成对，都是同一种 `pair<int, size_t>`。
-    std::array<std::vector<std::pair<int, size_t>>, kPlySlots> sort_index_scratch_;
-    std::array<std::vector<Move>, kPlySlots> sort_reorder_scratch_;
-    std::vector<std::pair<int, size_t>> sort_merge_scratch_;
 
     int node_limit_;
     // Only the layered accounting left in the object: the counters and the three

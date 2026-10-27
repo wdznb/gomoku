@@ -9994,6 +9994,68 @@ void test_tactical_pooled_slots_answer_the_same_after_reuse() {
     std::cout << "test_tactical_pooled_slots_answer_the_same_after_reuse passed" << std::endl;
 }
 
+// 轮次217 #118 档三：alpha-beta 的常驻缓冲（四层候选、摊平结果、排序 decorate/重排/归并
+// 区）过去随 `AlphaBetaSearch` 一起生灭，而那个对象是**每趟思考**在 `SearchEngine::search()`
+// 栈上新建的 ⇒ 槽的容量每趟都从 0 重新几何扩容。现在缓冲可以由调用方注入，于是「同一张表
+// 被两趟思考复用」成了实际路径。这里钉三件事，各自红法不同：
+// ① 注入生效 —— 搜索写的必须是被交出去的那张表（`use_scratch` 若被忽略，这张表永远 0 字节）；
+// ② 预热的那张与自持一张冷表的对象，同盘同深度同帽给**同一个着法**（槽号撞车会把答案挪走）；
+// ③ 换一张新表再搜另一个深度，热表仍然给出与冷表一致的答案（残留内容不许参与决策）。
+void test_injected_scratch_is_the_one_the_search_writes_and_answers_hold() {
+    Evaluator evaluator;
+    std::atomic<bool> stop(false);
+
+    Board board;
+    board.place_stone(7, 7, BLACK);
+    board.place_stone(7, 8, WHITE);
+    board.place_stone(8, 7, BLACK);
+    board.place_stone(8, 8, WHITE);
+
+    SearchScratch injected;
+    assert(injected.retained_bytes() == 0);  // 冷表：一个字节都还没按住
+
+    TranspositionTable tt_warm;
+    AlphaBetaSearch warm(evaluator, tt_warm);
+    warm.use_scratch(&injected);
+    const Move first = warm.search(board, BLACK, 4, 5000, stop);
+    assert(first.pos.is_valid());
+
+    // ① 注入生效：这张表现在按住着搜索用过的容量。
+    const std::size_t after_injected = injected.retained_bytes();
+    assert(after_injected > 0);
+
+    // ② 自持缓冲的对照对象（另一张空表，同盘同帽）：答案必须与注入版一致。
+    TranspositionTable tt_cold;
+    AlphaBetaSearch cold(evaluator, tt_cold);
+    const Move second = cold.search(board, BLACK, 4, 5000, stop);
+    assert(second == first);
+
+    // ③ 同一张热表、第三张空表、换一个深度：预热过的槽不许把上一趟的内容带进决策。
+    TranspositionTable tt_again;
+    AlphaBetaSearch again(evaluator, tt_again);
+    again.use_scratch(&injected);
+    const Move third = again.search(board, BLACK, 6, 5000, stop);
+    TranspositionTable tt_cold_deep;
+    AlphaBetaSearch cold_deep(evaluator, tt_cold_deep);
+    assert(third == cold_deep.search(board, BLACK, 6, 5000, stop));
+    // 热表只会更肥不会更瘦：复用不许把已经按住的容量还回去。
+    assert(injected.retained_bytes() >= after_injected);
+
+    // 传 `nullptr` 是「退回自持那份」而不是「换一张没登记的表」：注入这件事不许静默失效。
+    SearchScratch other;
+    TranspositionTable tt_fallback;
+    AlphaBetaSearch fallback(evaluator, tt_fallback);
+    fallback.use_scratch(nullptr);
+    assert(first == fallback.search(board, BLACK, 4, 5000, stop));  // 退回自持那份，答案不变
+    fallback.use_scratch(&other);
+    assert(first == fallback.search(board, BLACK, 4, 5000, stop));
+    assert(other.retained_bytes() > 0);  // 第二次确实写在 `other` 上
+    assert(injected.retained_bytes() >= after_injected);
+
+    std::cout << "test_injected_scratch_is_the_one_the_search_writes_and_answers_hold passed"
+              << std::endl;
+}
+
 int main() {
     std::cout << "Running search tests..." << std::endl;
 
@@ -10206,6 +10268,7 @@ int main() {
 
     test_opening_book_weighted_draw_reaches_every_candidate();
     test_tactical_pooled_slots_answer_the_same_after_reuse();
+    test_injected_scratch_is_the_one_the_search_writes_and_answers_hold();
     std::cout << "All search tests passed!" << std::endl;
     return 0;
 }
