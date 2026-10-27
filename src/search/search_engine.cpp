@@ -271,6 +271,7 @@ SearchResult SearchEngine::search(const Board& board, int color,
     if (vct_enabled_ && probe.own_three && !stop_flag.load()) {
         VCTSearch vct(evaluator_, *tt_alphabeta_);
         vct.use_slots(tactical_scratch_.vct_attacks.data(), tactical_scratch_.vct_defenses.data());
+        vct.use_lines(tactical_scratch_.vct_lines.data());
         if (max_nodes_ > 0) {
             vct.set_node_limit(std::min(kVctDefaultNodeLimit,
                                         max_nodes_ * kVctBudgetPercent / 100));

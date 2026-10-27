@@ -10113,6 +10113,118 @@ void test_vct_line_slots_answer_the_same_after_depth_alternation() {
     std::cout << "test_vct_line_slots_answer_the_same_after_depth_alternation passed" << std::endl;
 }
 
+// 轮次225 #118 档六：装配变例的线表有了引擎那份属主 ⇒「同一张线表被两趟思考（两个
+// `VCTSearch` 对象）复用」成了实际路径。这里钉四件事，各自红法不同：
+// ① 注入生效 —— 搜索写的必须是被交出去的那张池（`use_lines` 若忽略实参，这张池永远 0 字节）；
+// ② 用过热池的对象与自持一份冷线表的对象，同盘同深度同帽给逐字相同的结论；
+// ③ 交到手上的那条变例，在别的搜索把同一张池写脏之后必须一字不变、且仍能逐手走到成五
+//   （这一条是唯一能红于「把 `variation` 改成指向池里的视图」的）；
+// ④ 换一张池、或传 `nullptr` 退回自持那份，都不许偷偷写到第一张池上（跨对象别名）。
+void test_injected_line_pool_is_the_one_vct_writes_and_answers_hold() {
+    Evaluator evaluator;
+    std::atomic<bool> stop(false);
+
+    // 轮次220 量过的嵌套局面（白活三 + 黑挡子，执白 depth 8 ⇒ 同时握线表的深度峰值 2）：
+    // 递归真的发生，线表真的被写过，①那张钉子才不是空的。
+    Board nested;
+    nested.place_stone(7, 4, WHITE);
+    nested.place_stone(7, 5, WHITE);
+    nested.place_stone(7, 6, WHITE);
+    nested.place_stone(7, 7, BLACK);
+
+    Board p;
+    p.place_stone(6, 6, BLACK);
+    p.place_stone(7, 7, BLACK);
+    p.place_stone(8, 8, BLACK);
+    p.place_stone(4, 4, WHITE);
+    p.place_stone(10, 10, WHITE);
+    p.place_stone(0, 0, WHITE);
+
+    auto same = [](const VCTMove& a, const VCTMove& b) {
+        return a.result == b.result && a.best_move == b.best_move && a.variation == b.variation;
+    };
+    auto pool_bytes = [](const std::array<TacticalLines, kTacticalDepthSlots>& pool) {
+        std::size_t bytes = 0;
+        for (const TacticalLines& lines : pool) bytes += lines.retained_bytes();
+        return bytes;
+    };
+
+    std::array<TacticalLines, kTacticalDepthSlots> injected{};
+    assert(pool_bytes(injected) == 0);  // 冷池：一个字节都还没按住
+
+    TranspositionTable tt_warm;
+    VCTSearch warm(evaluator, tt_warm);
+    warm.use_lines(injected.data());
+    const VCTMove first = warm.search(nested, WHITE, 8, stop);
+
+    // ① 注入生效：这张池现在按住着搜索用过的容量。
+    // （这个局面 VCT 的答案是 UNKNOWN —— 实测 `best_move.pos.is_valid()` 为假，第一版把
+    // 那句当成前提写进断言，当场红。这里要钉的从来不是「有没有胜着」，而是「搜索确实写在
+    // 被交出去的那份里」：根上那条 `worst_line`/`best_line` 装配在无胜着的路径上照样发生。）
+    const std::size_t after_first = pool_bytes(injected);
+    assert(after_first > 0);
+
+    // ② 自持一份冷线表的对照对象：同盘同深度必须同结论。
+    TranspositionTable tt_cold;
+    VCTSearch cold(evaluator, tt_cold);
+    const VCTMove cold_answer = cold.search(nested, WHITE, 8, stop);
+    assert(same(first, cold_answer));
+
+    // ③ 记下已经交到手上的那条线，然后用同一个热池搜**另一个**位置把池写脏。
+    const std::vector<Move> line_in_hand = first.variation;
+    TranspositionTable tt_dirty;
+    VCTSearch dirty(evaluator, tt_dirty);
+    dirty.use_lines(injected.data());
+    const VCTMove dirty_p = dirty.search(p, BLACK, 8, stop);
+    assert(first.variation == line_in_hand);
+    TranspositionTable tt_cold_p;
+    VCTSearch cold_p(evaluator, tt_cold_p);
+    assert(same(dirty_p, cold_p.search(p, BLACK, 8, stop)));  // ②同一个形状：脏池答 == 冷池答
+
+    if (dirty_p.result == VCTResult::WIN) {
+        // ③的后半：手里那条线不只是没变，它还得能在盘上一手一手走得通并以成五收口。
+        Board replay;
+        replay.place_stone(6, 6, BLACK);
+        replay.place_stone(7, 7, BLACK);
+        replay.place_stone(8, 8, BLACK);
+        replay.place_stone(4, 4, WHITE);
+        replay.place_stone(10, 10, WHITE);
+        replay.place_stone(0, 0, WHITE);
+        assert(!line_in_hand.empty());
+        for (const Move& m : line_in_hand) {
+            assert(m.pos.is_valid());
+            assert(replay.is_empty(m.pos.row, m.pos.col));
+            replay.place_stone(m.pos.row, m.pos.col, m.color);
+        }
+        const Move& last = line_in_hand.back();
+        assert(replay.has_five_in_a_row(last.pos.row, last.pos.col, last.color));
+    }
+
+    // 热池只会更肥不会更瘦：复用不许把已经按住的容量还回去。
+    assert(pool_bytes(injected) >= after_first);
+
+    // ④ 另一张池 + 退回自持那份：都不许动第一张池，也不许改结论。
+    const std::size_t injected_before_other = pool_bytes(injected);
+    std::array<TacticalLines, kTacticalDepthSlots> other{};
+    TranspositionTable tt_other;
+    VCTSearch other_obj(evaluator, tt_other);
+    other_obj.use_lines(other.data());
+    assert(same(cold_answer, other_obj.search(nested, WHITE, 8, stop)));
+    assert(pool_bytes(other) > 0);  // 这一趟写在 `other` 上
+    assert(pool_bytes(injected) == injected_before_other);  // ④ 第一张池没被动过
+
+    TranspositionTable tt_fb;
+    VCTSearch fallback(evaluator, tt_fb);
+    fallback.use_lines(nullptr);  // 退回自持那份，不是「换一张没登记的表」
+    assert(same(cold_answer, fallback.search(nested, WHITE, 8, stop)));
+    fallback.use_lines(other.data());
+    assert(same(cold_answer, fallback.search(nested, WHITE, 8, stop)));
+    assert(pool_bytes(injected) == injected_before_other);  // ④ 两趟都没写到第一张池
+
+    std::cout << "test_injected_line_pool_is_the_one_vct_writes_and_answers_hold passed"
+              << std::endl;
+}
+
 // 轮次220 #118 档四的证据面：把「不同深度拿到不同槽」这句前提变成一个数。
 // 实测（/tmp/r220/probe2，与用例同一棵树）：白方活三 (7,4)(7,5)(7,6) + 黑方挡子 (7,7)，
 // 执白 depth 8 ⇒ 同时握线表的深度峰值 = 2、撞槽 = 0、61 个节点（便宜且确定）。
@@ -10366,6 +10478,7 @@ int main() {
     test_tactical_pooled_slots_answer_the_same_after_reuse();
     test_injected_scratch_is_the_one_the_search_writes_and_answers_hold();
     test_vct_line_slots_answer_the_same_after_depth_alternation();
+    test_injected_line_pool_is_the_one_vct_writes_and_answers_hold();
     test_vct_nested_depths_never_share_a_line_slot();
     std::cout << "All search tests passed!" << std::endl;
     return 0;

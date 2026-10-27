@@ -69,6 +69,23 @@ struct TacticalSlots {
 };
 static constexpr int kTacticalDepthSlots = 24;   // 覆盖出厂值 vcf_max_depth_=20 / vct_max_depth_=12
 
+// 轮次225 #118 档六：VCT 装配变例的三张线表（`best` / `worst` / `child`），与
+// `VCTSearch::lines()` 的按深度分槽同一个族。过去它是 `VCTSearch` 的成员、跟着那个对象
+// 每趟思考生灭 ⇒ 槽里的容量每趟从 0 重新几何扩容。实测（同一台具、确定性节点帽档
+// `20 0 4 50000`，本轮树）：`vector<Move>::_M_range_insert`@`vct.cpp` 20 局共 2,226 次
+// = 每局 111.3 次，是该档前六名里唯一**随工作量增长**的站点。
+struct TacticalLines {
+    std::vector<Move> best;
+    std::vector<Move> worst;
+    std::vector<Move> child;
+
+    // 观察面，与 `SearchScratch::retained_bytes()` 同一条用途：用例靠它钉「线表确实写在
+    // 被交出去的那份里」（注入被忽略 ⇒ 恒为 0 ⇒ 红）。
+    std::size_t retained_bytes() const {
+        return (best.capacity() + worst.capacity() + child.capacity()) * sizeof(Move);
+    }
+};
+
 struct TacticalScratch {
     std::array<TacticalSlots, kTacticalDepthSlots> vcf;
     std::array<TacticalSlots, kTacticalDepthSlots> vct_attacks;
@@ -76,6 +93,10 @@ struct TacticalScratch {
     // 求招那条路（`SearchEngine::search()` 里 loss_probe 那一段）单独一份：它与主思考里
     // 那一趟 VCF 是顺序的，但两份就不必去论证「有没有哪天变成同时」。
     std::array<TacticalSlots, kTacticalDepthSlots> loss_probe;
+    // 轮次225：VCT 的线表一份。`VCTSearch` 只在 `SearchEngine::search()` 的 VCT 那一段建，
+    // `ponder_search()` 只跑 alpha-beta，所以可能同时活着的 VCT 对象只有一个 —— 与
+    // `SearchScratch` 那边「每条路径一份」是同一条规矩，这里那条路径只有一个对象。
+    std::array<TacticalLines, kTacticalDepthSlots> vct_lines;
 };
 }  // namespace gomoku
 

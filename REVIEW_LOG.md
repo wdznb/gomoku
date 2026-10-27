@@ -1984,6 +1984,81 @@ half; the `{"coefficients": {"five": 90000}}` run differs only in the ten gene v
 additive only (`test_position.cpp` +42, `test_server.cpp` +51, `test_training.cpp` +71, zero deleted lines), so
 no existing assertion was edited.
 
+## 轮次225 #118 档六：VCT 装配变例的线表有了引擎那份属主 —— 深档 50.6 → 41.1 次/手（−18.7 %），`_M_range_insert`@`vct.cpp` 这一整条站点消失；顺带把这台量具自己会翻局量成了新格 #123
+
+### 先把轮次224 那条判据重做一遍
+
+轮次224 用「2 局跑 vs 20 局跑的每局比值」判哪个站点随工作量长，读出 `_M_range_insert` = 3.2，并据此把这档改判成「等真实瓶颈证据再做」。开工前同一台具（`/tmp/r218/hand_probe2.cpp`，链改动前的 `1fe1bf7`）复测：
+
+- 20 局 / 600 手 = 30,368 次 = **50.6/手**；站点表 11 行合计正好 30,368 ⇒ 具是闭合的。
+- `addr2line -f` 认出来的前六名（旧树，每 20 局累计）：`vector<Candidate>::_M_realloc_append` 8,002；`vector<Move>::_M_realloc_append<Move const&>` 4,578；`AlphaBetaSearch::search_root_layer` 3,127；**`vector<Move>::_M_range_insert`（文件 `vct.cpp`）2,226**；`Board::place_stone` 1,351；`Board::activate` 1,341。
+
+那条比值判据本身不干净：同一二进制、同一配方连跑，逐局结果会变（最后一节 #123），所以「2 局 vs 20 局」比的不是工作量而是噪声。**判据换成改法自己的读数**：抬完属主，这个站点 2,226 → **0**（新树的站点表里没有这一行），总账 30,368 → 24,677。这才叫「那 2,226 次是每趟思考重付的预热」的证据。
+
+### 改法：只抬线表的属主，别的一律不动
+
+- `search_scratch.h`：新增 `TacticalLines{best, worst, child}`（带 `retained_bytes()` 观察面）；`TacticalScratch` 多一个 `std::array<TacticalLines, kTacticalDepthSlots> vct_lines`。
+- `vct.h`：内嵌的 `struct LineSet` 换成 `using LineSet = TacticalLines;`（`vct.cpp` 一个字没改）；`kLineSlots` 从字面量 `24` 改成 `= kTacticalDepthSlots` —— 数组大小与引擎那份必须是同一个数，写两遍 24 就是预埋漂移；`line_sets_` 由数组换成 `own_line_sets_` 数组 + 一个指针；新增 `use_lines()`，传 `nullptr` 退回自持那份 ⇒ 直接建对象的调用方（用例、`tools/vct_slice_probe.cpp`）行为不变。
+- `search_engine.cpp`：VCT 的构造点注入 `tactical_scratch_.vct_lines.data()`。
+
+两条前提都是查出来的，不是推的：
+
+1. **一份就够**：产品码里 `VCTSearch` 只有 `SearchEngine::search()` 的 VCT 那一段一处构造点，`SearchEngine::ponder_search()` 只新建 `AlphaBetaSearch`（那条路另有自己的 `ponder_scratch_`）⇒ 不会有两张 VCT 同时活着。
+2. **跨趟复用不改变语义**：三个角色每次被读之前都整个覆写 —— `best_line.clear()` 在每处装配的头上，`worst_line.clear()` 在每条防守循环的头上与 tempo 分支里，`ln.child` 只作为 `out_line` 交给被调方，而 `vct_attack`/`vct_defend` 的第一条语句就是 `out_line.clear()`。#88 那条「非 100000+ 不许带线」的约定一字未动。
+
+### 读数（节点帽 binding 档 `20 0 4 50000`，两树同一配方同一台具）
+
+| 树 | 手数 | 分配 | 每手 |
+| --- | --- | --- | --- |
+| 改动前 `1fe1bf7` | 600 | 30,368 | 50.6 |
+| 本轮树 | 600 | 24,677 | **41.1（−18.7 %）** |
+| M1（`use_lines` 忽略实参） | 600 | 30,365 | 50.6 ⇒ 省下来的确实是注入买到的 |
+
+新树前四名：`Candidate::_M_realloc_append` 8,002（一分没动，那是候选表的）、`search_root_layer` 3,127、`place_stone` 1,351、`activate` 1,341；`_M_range_insert` 那一行不存在了。另一族 `vector<Move>` 的扩容读数从旧树 4,578（`0x41bf9d`）降到新树 1,181（`0x41c01d`）—— 目的表也进了池，容量不再每趟归零（这一条按地址认，两棵树的地址不可跨比）。
+
+### 新用例，以及它自己踩的那条坑
+
+`test_injected_line_pool_is_the_one_vct_writes_and_answers_hold`（`tests/test_search.cpp`，登记在深度轮换那条之后）钉四件事：① 注入生效（冷池 0 字节 → 搜完 >0）；② 用过热池的对象与自持一份冷线表的对象逐字段同结论；③ 已经交到手上的变例在别的搜索把同一张池写脏之后一字不变、且仍能逐手走到成五（这条是唯一能红于「把 `variation` 改成指向池里的视图」的）；④ 换一张池或传 `nullptr` 都不许写到第一张池上（跨对象别名）。
+
+第一版把 `first.best_move.pos.is_valid()` 当前提写进断言，**当场红**：那个局面（白活三 + 黑挡子，执白 depth 8）VCT 的答案是 UNKNOWN、`best_move` 是空的。轮次220 记过的同一条毛病换了个地方再犯一次 —— 拿「应该会赢」当观察量。改成只断「池被写过」这个真观察量以后绿。
+
+### 变异台：两臂，两条都红在该红的那句上
+
+| 臂 | 改法 | 读数 |
+| --- | --- | --- |
+| M0 对照 | 树不动 | `ctest` rc=0、10/10；`test_search` 全套绿 |
+| M1 注入被忽略 | `use_lines` 改成无视实参 | rc=134，红在**新用例自己的** `assert(after_first > 0)`；同臂分配读数 30,365 = 50.6/手，弹回基线 |
+| M2 别名 | `lines()` 无视 depth，永远回 0 号槽 | rc=134，红在轮次220 那条钉子 `test_vct_nested_depths_never_share_a_line_slot` 的 `line_slot_collisions() == 0` |
+
+M1 与轮次216 那两条「跑到新用例之前就被既有用例拦下」的臂不同：**这一次红在新用例身上**，①那张钉子有活体证明。M2 红在既有用例上（同一族事故早就被盯着），所以它不算新用例的独有证据，记在这儿是为了别把它当成新用例的功劳。
+
+### 门禁（与上面同一棵树）
+
+强制全量重建 rc=0、356 个编译单元、**警告 0 条**（232 s）→ `ctest -j1` rc=0、10/10（1,017 s）→ 跨树逐点答案与 `1fe1bf7` 的 `pose_dump` 两边各 15 行、**md5 相同 `ea7fbe2d350269ea0322f6874624cd3f`**、`diff` 报 SAME bytes → 两臂还原后全量编译 rc=0、警告 0、`MUT` 残留 0 → `readme_anchor_check` 122 条引用 0 problems、`source citations resolved: 151, ok: 151, problems: 0` → `web_frontend_check 113/113` → `doc_citation_audit --strict` ok=26 moved=14 **missing=0** → memcheck（替换分配器关掉，同档 20 局）rc=0、543 s、`ERROR SUMMARY: 0 errors from 0 contexts`、`in use at exit: 0 bytes`。
+
+### 新格 #123：这台量具的「确定性节点帽档」会翻局，而且两棵树都会
+
+同一二进制、同一配方 `2 0 4 50000`（`timeout_ms=0` ⇒ `has_deadline` 假，只留 `max_nodes=50000`），重复跑记逐局 `plies/winner`：
+
+| 臂 | 改动前树 `1fe1bf7` | 本轮树 |
+| --- | --- | --- |
+| 12 跑（ASLR 缺省，第一轮抽样） | 1 跑 `g0 27手/胜1`，其余 `30/0, 30/0` | 0 跑翻盘（更早的 4 跑抽样里 1 次 `g1 27手/胜1`） |
+| 12 跑（ASLR 开） | 0 跑翻盘 | 2 跑 `g1 27手/胜1` |
+| 12 跑（`setarch -R`，ASLR 关） | 0 跑翻盘 | 1 跑翻盘 |
+| 40 跑（扩样） | **4 跑翻盘** | **2 跑翻盘** |
+
+⇒ 翻盘率 **两棵树同量级（各约 5～10 %，合计 ~1/15）**，本轮改动没有把它抬高（第一轮的 0/12 vs 1/12 与扩样的 4/40 vs 2/40 方向相反，正是样本不够的签名）。已逐条排除：开局书抽签 —— 探针用默认构造的 `SearchEngine`，`book_` 是 `nullptr`（只有 `GameManager::set_opening_book` 那条服务端路会赋值，`trainer.cpp` 还显式关书），那条 `random_device` 抽签路径不在飞；墙钟 deadline —— `has_deadline = (time_limit_ms > 0)` 而这里传 0；地址派生的键 —— `src/` 里 `uintptr_t` / `std::hash<` 零命中；RNG —— `self_play.cpp` / `search_engine.cpp` 无，`board.cpp:17` 是固定种子 `12345`。**ASLR 关掉照样翻 ⇒ 进程布局不是变量**。
+
+还有一条没排除、且现在最可疑的：翻盘集中在**第一局之后**的第 2 局（本轮树 3 次全在 `g1`），而 `g1` 与 `g0` 之间唯一跨局活着的状态就是那两个常驻 `SearchEngine` 的置换表（以及本轮起多出来的引擎属主缓冲）。改动前的树在 `g0` 也翻过一次 —— 所以这条只能写成「嫌疑，未定性」。定性要一台能逐手比对两跑走子序列的具（`/tmp/r218/ab.sh` 那版 `moves_hash` 补丁当时没进这份具），下一档做。
+
+由此本轮把一条规矩改成文字：**逐局的 `plies/winner` 不许当答案不变性的证明**（它自己就有 ~1/15 的翻盘率），答案不变性只认 `pose_dump` 跨树对照 + 全量 `ctest`；#118 各档表里「600 手不变」那一列读作「负载形状没变」，不读作「答案没动」。
+
+### 欠账（按可操作性排）
+
+1. **#123 定性**：给具加上逐手 `moves_hash`，同配方两跑比走子序列，再决定是修（去掉跨局状态对结论的影响）还是把这档明确降级成「只量分配形状」。
+2. **#118 余量**：候选表那 8,002 次（`vector<Candidate>::_M_realloc_append`）与 `search_root_layer` 的 3,127 次按轮次224 的读数是一次性预热，深档每手只剩 41.1 次分配；要继续压得先有新的、能随工作量增长的站点证据，否则不动。
+3. 新用例的 M2 类变异（跨对象别名）在既有钉子上就红了，本轮没有再造一条只红新用例的别名臂。
+
 ## 轮次224 #118 档六的定位：深档残余里只有一个站点还在随工作量增长（VCT 线表的 insert），其余前六名是每局/每引擎的一次性预热
 
 本轮不动产品码，只判 #118 还该不该继续做。基线读数：节点帽档 `20 0 4 50000` 下 30,112 次 / 600 手 = **50.2 次/手**（轮次223 之后）。

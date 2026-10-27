@@ -50,6 +50,12 @@ public:
         defense_slots_ = defenses != nullptr ? defenses : own_defense_slots_.data();
     }
 
+    // 轮次225 档六：装配变例的线表也交出属主。与 `use_slots` 一样，`nullptr` 退回自持那份
+    // ⇒ 注入不会静默失效，直接建对象的调用方（用例、`tools/vct_slice_probe`）行为不变。
+    void use_lines(TacticalLines* lines) {
+        line_sets_ = lines != nullptr ? lines : own_line_sets_.data();
+    }
+
     // 轮次220 的观察面：见 LineGuard 的注释。
     int line_depth_peak() const { return line_peak_; }
     int line_slot_collisions() const { return line_collisions_; }
@@ -83,14 +89,10 @@ private:
     // 递归严格减 depth，父层握着 @d 时子层只碰 @(d-1)；父交给子的 out_line 就是 child@d，
     // 而子层三个角色都不占 d 号槽，所以 out_line = best_line 永不自赋值。
     // 越界退回调用方栈上的局部 LineSet：只是不池化，语义一字不变。
-    static constexpr int kLineSlots = 24;
+    // 槽数与引擎那份 `TacticalScratch::vct_lines` 必须是同一个数，所以直接用同一个常量。
+    static constexpr int kLineSlots = kTacticalDepthSlots;
 
-    struct LineSet {
-        std::vector<Move> best;
-        std::vector<Move> worst;
-        std::vector<Move> child;
-    };
-
+    using LineSet = TacticalLines;     // 轮次225：与引擎注入的线表同一个类型
     using MoveSlots = TacticalSlots;   // 轮次223：与引擎注入的槽表同一个类型
 
     const Evaluator& evaluator_;
@@ -107,7 +109,9 @@ private:
     std::array<MoveSlots, kTacticalDepthSlots> own_defense_slots_{};
     MoveSlots* attack_slots_ = own_attack_slots_.data();
     MoveSlots* defense_slots_ = own_defense_slots_.data();
-    std::array<LineSet, kLineSlots> line_sets_{};
+    // 轮次225 档六：线表与生成器槽表同一条路 —— 默认自持，引擎注入时换成引擎那一份。
+    std::array<LineSet, kLineSlots> own_line_sets_{};
+    LineSet* line_sets_ = own_line_sets_.data();
 
     // 族槽号 = 本节点的 depth。
     LineSet& lines(int depth, LineSet& fallback) {
